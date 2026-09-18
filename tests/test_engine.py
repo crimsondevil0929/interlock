@@ -1,0 +1,702 @@
+"""Tests for the escrow lifecycle.
+
+The claims under test, in order of how much they matter:
+
+1. A blocked plan leaves the database byte-identical. If this is wrong the
+   product is worse than useless, because it advertises safety it lacks.
+2. The diff is *measured*, not predicted. A trigger cascade the plan never
+   mentioned must appear in the diff.
+3. A legitimate plan commits. A gate that blocks everything is not a gate.
+4. The chain detects tampering.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import uuid
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from interlock import (
+    AdmissionError,
+    BlastRadius,
+    ChainIntegrityError,
+    ColumnValueGuard,
+    CyclicPlanError,
+    Effect,
+    EffectId,
+    EffectKind,
+    EffectPlan,
+    EscrowChain,
+    EscrowEngine,
+    PlanError,
+    PlanId,
+    Severity,
+    SqliteSubstrate,
+    StageState,
+    TableSpec,
+    TenantIsolation,
+    TruncationGuard,
+    default_checkers,
+)
+from interlock.chain import RecordType
+from interlock.types import CommitReceipt, InvariantViolation, StageHandle
+
+SCHEMA = """
+CREATE TABLE orders(
+    id INTEGER PRIMARY KEY, tenant TEXT NOT NULL, customer INTEGER, total REAL NOT NULL
+);
+CREATE TABLE order_audit(id INTEGER PRIMARY KEY, order_id INTEGER, note TEXT);
+-- A production trigger. No agent plan will ever mention it.
+CREATE TRIGGER orders_audit AFTER UPDATE ON orders BEGIN
+    INSERT INTO order_audit(order_id, note) VALUES (NEW.id, 'total changed');
+END;
+"""
+
+TABLES = [
+    TableSpec("orders", columns=["id", "tenant", "customer", "total"], tenant_column="tenant"),
+    TableSpec("order_audit", columns=["id", "order_id", "note"]),
+]
+
+
+@pytest.fixture
+def db(tmp_path: Path) -> str:
+    path = str(tmp_path / "prod.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    rows = [
+        (1, "acme", 42, 100.0),
+        (2, "acme", 42, 200.0),
+        (3, "acme", 77, 300.0),
+        (4, "globex", 91, 400.0),
+        (5, "initech", 12, 500.0),
+    ]
+    conn.executemany("INSERT INTO orders VALUES (?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def totals(path: str) -> list[tuple[int, float]]:
+    conn = sqlite3.connect(path)
+    try:
+        return [(int(r[0]), float(r[1])) for r in conn.execute("SELECT id,total FROM orders")]
+    finally:
+        conn.close()
+
+
+def make_plan(*effects: Effect, intent: str = "", scope: str = "agent") -> EffectPlan:
+    return EffectPlan(
+        plan_id=PlanId(f"plan-{uuid.uuid4().hex[:8]}"),
+        scope_id=scope,
+        trajectory_id="t1",
+        created_at=datetime.now(UTC),
+        effects=effects,
+        intent=intent,
+    )
+
+
+def engine_for(path: str, **kwargs: object) -> EscrowEngine:
+    substrate = SqliteSubstrate(path, tables=TABLES)
+    checkers = kwargs.pop(
+        "checkers",
+        default_checkers(row_limit=5, allowed_tables=["orders", "order_audit"]),
+    )
+    return EscrowEngine(substrate, checkers=checkers)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------
+# 1. A blocked plan changes nothing
+# --------------------------------------------------------------------------
+
+
+def test_blocked_plan_leaves_the_database_untouched(db: str) -> None:
+    before = totals(db)
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 0",
+            stated_rows=1,
+        ),
+        intent="zero every order",
+    )
+    result = engine_for(db).execute(plan)
+
+    assert not result.committed
+    assert result.state is StageState.ABORTED
+    # 5 orders zeroed, plus 5 audit rows the schema trigger cascaded: 10 measured.
+    assert set(result.blocked_by) == {"blast_radius", "tenant_isolation"}
+    assert result.diff is not None and result.diff.blast_radius == 10
+    assert totals(db) == before, "rollback failed; the product's central claim is broken"
+
+
+def test_cross_tenant_plan_is_refused(db: str) -> None:
+    before = totals(db)
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = total * 0.9 WHERE id IN (1,4)",
+        )
+    )
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES),
+        checkers=[TenantIsolation(max_tenants=1)],
+    )
+    result = engine.execute(plan)
+    assert not result.committed
+    assert result.blocked_by == ("tenant_isolation",)
+    assert result.diff is not None
+    assert result.diff.tenant_ids == frozenset({"acme", "globex"})
+    assert totals(db) == before
+
+
+def test_value_guard_catches_an_aggregate_that_every_row_passes(db: str) -> None:
+    """Each row stays a valid float. The total collapses. Only the sum sees it."""
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 0 WHERE tenant = 'acme'",
+        )
+    )
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES),
+        checkers=[ColumnValueGuard("orders", "total", max_drop_fraction=0.25)],
+    )
+    result = engine.execute(plan)
+    assert not result.committed
+    assert result.blocked_by == ("column_value_guard:orders.total",)
+    assert totals(db) == [(1, 100.0), (2, 200.0), (3, 300.0), (4, 400.0), (5, 500.0)]
+
+
+# --------------------------------------------------------------------------
+# 2. The diff is measured, not predicted
+# --------------------------------------------------------------------------
+
+
+def test_diff_includes_trigger_cascade_the_plan_never_mentioned(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = total * 0.9 WHERE tenant = 'acme'",
+            stated_rows=3,
+        )
+    )
+    engine = EscrowEngine(SqliteSubstrate(db, tables=TABLES), checkers=[])
+    result = engine.execute(plan)
+
+    assert result.diff is not None
+    # Three order rows, plus three audit rows the schema's own trigger wrote.
+    assert result.diff.rows_updated == 3
+    assert result.diff.rows_inserted == 3
+    assert result.diff.blast_radius == 6
+    assert result.diff.tables_touched == frozenset({"orders", "order_audit"})
+    # The statement reported three. The substrate measured six.
+    assert result.outcomes[0].rows_affected == 3
+
+
+def test_stated_footprint_reports_the_gap(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = total - 1 WHERE tenant = 'acme'",
+            stated_rows=1,
+        )
+    )
+    engine = engine_for(db)
+    result = engine.execute(plan)
+    assert result.verdict is not None
+    gaps = [v for v in result.verdict.violations if v.invariant == "stated_footprint"]
+    assert len(gaps) == 1
+    assert gaps[0].severity is Severity.ADVISORY
+    assert gaps[0].evidence["stated"] == "1"
+    assert gaps[0].evidence["measured"] == "6"
+
+
+def test_before_and_after_images_are_captured(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 111.0 WHERE id = 1",
+        )
+    )
+    engine = EscrowEngine(SqliteSubstrate(db, tables=TABLES), checkers=[])
+    result = engine.execute(plan)
+    assert result.diff is not None
+    order_row = next(d for d in result.diff.deltas if d.table == "orders")
+    assert order_row.before is not None and order_row.after is not None
+    assert order_row.before["total"] == 100.0
+    assert order_row.after["total"] == 111.0
+    assert order_row.changed_columns() == ("total",)
+    assert order_row.tenant_id == "acme"
+
+
+# --------------------------------------------------------------------------
+# 3. Legitimate work still lands
+# --------------------------------------------------------------------------
+
+
+def test_legitimate_plan_commits(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = total * 0.9 WHERE id = :oid",
+            parameters={"oid": 1},
+            stated_rows=1,
+        ),
+        intent="apply a 10% loyalty discount to order 1",
+    )
+    result = engine_for(db).execute(plan)
+    assert result.committed
+    assert result.state is StageState.COMMITTED
+    assert dict(totals(db))[1] == pytest.approx(90.0)
+
+
+def test_parameters_are_bound_not_interpolated(db: str) -> None:
+    """A parameter carrying SQL is data, not code."""
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET tenant = :t WHERE id = 1",
+            parameters={"t": "'; DROP TABLE orders; --"},
+        )
+    )
+    engine = EscrowEngine(SqliteSubstrate(db, tables=TABLES), checkers=[])
+    result = engine.execute(plan)
+    assert result.committed
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 5
+        assert conn.execute("SELECT tenant FROM orders WHERE id=1").fetchone()[0] == (
+            "'; DROP TABLE orders; --"
+        )
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 4. Admission and fail-closed behaviour
+# --------------------------------------------------------------------------
+
+
+def test_unobserved_table_is_refused_at_admission(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:secrets",
+            statement="UPDATE secrets SET v = 1",
+        )
+    )
+    with pytest.raises(PlanError, match="unobserved"):
+        engine_for(db).execute(plan)
+
+
+def test_dependency_cycle_is_refused(db: str) -> None:
+    a = Effect(
+        effect_id=EffectId("a"),
+        kind=EffectKind.UPDATE,
+        target="sqlite:orders",
+        statement="UPDATE orders SET total = 1 WHERE id = 1",
+        depends_on=(EffectId("b"),),
+    )
+    b = Effect(
+        effect_id=EffectId("b"),
+        kind=EffectKind.UPDATE,
+        target="sqlite:orders",
+        statement="UPDATE orders SET total = 2 WHERE id = 2",
+        depends_on=(EffectId("a"),),
+    )
+    with pytest.raises(CyclicPlanError):
+        engine_for(db).execute(make_plan(a, b))
+
+
+def test_a_checker_that_raises_blocks_rather_than_approves(db: str) -> None:
+    class Broken:
+        @property
+        def name(self) -> str:
+            return "broken"
+
+        def check(self, plan: object, diff: object) -> tuple[InvariantViolation, ...]:
+            raise RuntimeError("boom")
+
+    before = totals(db)
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 1 WHERE id = 1",
+        )
+    )
+    engine = EscrowEngine(SqliteSubstrate(db, tables=TABLES), checkers=[Broken()])
+    result = engine.execute(plan)
+    assert not result.committed
+    assert result.blocked_by == ("broken",)
+    assert totals(db) == before
+
+
+def test_truncated_diff_is_refused(db: str) -> None:
+    substrate = SqliteSubstrate(db, tables=TABLES, max_diff_rows=2)
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = total - 1",
+        )
+    )
+    engine = EscrowEngine(substrate, checkers=[TruncationGuard()])
+    result = engine.execute(plan)
+    assert result.diff is not None and result.diff.truncated
+    assert result.blocked_by == ("truncation_guard",)
+
+
+def test_execute_or_raise_surfaces_the_refusal(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 0",
+        )
+    )
+    with pytest.raises(AdmissionError) as caught:
+        engine_for(db).execute_or_raise(plan)
+    assert "blast_radius" in str(caught.value) or "limit" in str(caught.value)
+
+
+def test_every_checker_runs_so_a_refusal_lists_every_reason(db: str) -> None:
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 0",
+        )
+    )
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES),
+        checkers=[
+            BlastRadius(2),
+            TenantIsolation(1),
+            ColumnValueGuard("orders", "total", max_drop_fraction=0.1),
+        ],
+    )
+    result = engine.execute(plan)
+    assert set(result.blocked_by) == {
+        "blast_radius",
+        "tenant_isolation",
+        "column_value_guard:orders.total",
+    }
+
+
+# --------------------------------------------------------------------------
+# 5. The chain
+# --------------------------------------------------------------------------
+
+
+def test_chain_records_the_whole_lifecycle(db: str) -> None:
+    engine = engine_for(db)
+    engine.execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",
+                statement="UPDATE orders SET total = total - 1 WHERE id = 1",
+            )
+        )
+    )
+    kinds = [r.record_type for r in engine.chain.records()]
+    assert kinds == [
+        RecordType.PLAN_ADMITTED,
+        RecordType.STAGE_OPENED,
+        RecordType.DIFF_COMPUTED,
+        RecordType.VERDICT,
+        RecordType.COMMITTED,
+    ]
+    engine.chain.verify()
+
+
+def test_chain_detects_an_edited_record() -> None:
+    chain = EscrowChain()
+    chain.append(RecordType.PLAN_ADMITTED, plan_id=PlanId("p1"), payload_hash="a" * 64)
+    chain.append(RecordType.VERDICT, plan_id=PlanId("p1"), payload_hash="b" * 64)
+    chain.verify()
+
+    # Records are frozen, so tampering means substituting a rebuilt one. That
+    # is exactly what an attacker with file access would do.
+    records = list(chain.records())
+    tampered = replace(records[0], note="after the fact")
+    chain._records[0] = tampered
+    with pytest.raises(ChainIntegrityError, match="contents were edited"):
+        chain.verify()
+
+
+def test_chain_round_trips_through_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "chain.jsonl"
+    chain = EscrowChain(path)
+    for index in range(3):
+        chain.append(RecordType.VERDICT, plan_id=PlanId(f"p{index}"), payload_hash=f"{index:064d}")
+    reloaded = EscrowChain.load(path)
+    assert len(reloaded) == 3
+    assert reloaded.head_hash == chain.head_hash
+    reloaded.verify()
+
+
+def test_anchor_monotonicity_rejects_a_regression() -> None:
+    chain = EscrowChain()
+    chain.append(
+        RecordType.VERDICT,
+        plan_id=PlanId("p1"),
+        payload_hash="a" * 64,
+        anchored=True,
+        agentgov_sequence=10,
+    )
+    chain.append(
+        RecordType.VERDICT,
+        plan_id=PlanId("p2"),
+        payload_hash="b" * 64,
+        anchored=True,
+        agentgov_sequence=4,
+    )
+    chain.verify()  # the links are fine
+    with pytest.raises(ChainIntegrityError, match="regressed"):
+        chain.verify_anchors()
+
+
+# --------------------------------------------------------------------------
+# 5. Configuration that would silently disable a check
+# --------------------------------------------------------------------------
+
+
+def test_tenant_column_missing_from_columns_is_refused_at_construction() -> None:
+    """A tenant column absent from the captured image makes TenantIsolation inert.
+
+    The label is read back out of the before/after JSON, so if it was never
+    captured every RowDelta.tenant_id is None, tenant_count is 0, and
+    TenantIsolation(1) passes a plan spanning any number of tenants. Fail at
+    construction rather than adjudicate against a measurement that cannot see
+    the axis it is checking.
+    """
+    with pytest.raises(ValueError, match="must also be listed in columns"):
+        TableSpec("orders", columns=["id", "total"], tenant_column="tenant")
+
+
+def test_tenant_column_present_is_accepted() -> None:
+    spec = TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")
+    assert spec.tenant_column == "tenant"
+
+
+def test_non_ascii_identifiers_are_refused() -> None:
+    """str.isalnum accepts non-ASCII letters; the trigger DDL should not."""
+    with pytest.raises(ValueError, match="unsafe SQL identifier"):
+        TableSpec("ordérs", columns=["id"])
+    with pytest.raises(ValueError, match="unsafe SQL identifier"):
+        TableSpec("orders", columns=["id", "tötal"])
+
+
+# --------------------------------------------------------------------------
+# 6. Gaps that are documented rather than closed
+#
+# These pin current behaviour so that closing any of them is a deliberate
+# change with a failing test, not a silent one. Each is listed under "What
+# this is not yet a boundary against" in README.md.
+# --------------------------------------------------------------------------
+
+
+def test_statement_writing_an_unobserved_table_commits_unmeasured(db: str) -> None:
+    """admit() gates Effect.target, which the agent supplies, not the statement.
+
+    The statement below writes a table outside TableSpec. It executes, the
+    diff is empty because no capture trigger exists for that table, and every
+    diff-reading checker passes on an empty measurement.
+    """
+    conn = sqlite3.connect(db)
+    conn.executescript("CREATE TABLE unobserved(id INTEGER PRIMARY KEY, v TEXT);")
+    conn.execute("INSERT INTO unobserved VALUES (1,'before')")
+    conn.commit()
+    conn.close()
+
+    result = engine_for(db).execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",  # the label says orders
+                statement="UPDATE unobserved SET v='after'",  # the statement does not
+            )
+        )
+    )
+
+    assert result.committed
+    assert result.diff is not None
+    assert result.diff.blast_radius == 0
+    assert result.diff.tables_touched == frozenset()
+
+    conn = sqlite3.connect(db)
+    written = conn.execute("SELECT v FROM unobserved WHERE id=1").fetchone()[0]
+    conn.close()
+    assert written == "after", "the write landed and the diff did not see it"
+
+
+def test_ddl_declared_as_dml_is_not_caught(db: str) -> None:
+    """NoSchemaChange reads Effect.kind, which the agent sets.
+
+    DDL fires no row triggers, so the diff is empty as well. Enforcement has
+    to come from a role that cannot execute DDL.
+    """
+    result = engine_for(db).execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,  # not DDL, as far as the checker knows
+                target="sqlite:orders",
+                statement="ALTER TABLE orders ADD COLUMN injected TEXT",
+            )
+        )
+    )
+
+    assert result.committed
+    assert result.blocked_by == ()
+
+    conn = sqlite3.connect(db)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
+    conn.close()
+    assert "injected" in columns
+
+
+def test_blast_radius_counts_mutations_not_distinct_rows(db: str) -> None:
+    """One row updated twice in a plan contributes 2, so the limit is conservative."""
+    result = engine_for(db, checkers=[BlastRadius(50)]).execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("a"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",
+                statement="UPDATE orders SET total=1 WHERE id=1",
+            ),
+            Effect(
+                effect_id=EffectId("b"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",
+                statement="UPDATE orders SET total=2 WHERE id=1",
+                depends_on=(EffectId("a"),),
+            ),
+        )
+    )
+
+    assert result.diff is not None
+    orders = [d for d in result.diff.deltas if d.table == "orders"]
+    assert len(orders) == 2
+    assert len({(d.table, d.primary_key) for d in orders}) == 1
+
+
+def test_column_value_guard_does_not_bound_inflation(db: str) -> None:
+    """ColumnValueGuard fires on a fall in the total. A rise passes."""
+    result = engine_for(
+        db, checkers=[ColumnValueGuard("orders", "total", max_drop_fraction=0.30)]
+    ).execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",
+                statement="UPDATE orders SET total=total*1000",
+            )
+        )
+    )
+
+    assert result.committed
+    assert result.diff is not None
+    before, after = result.diff.column_total("orders", "total")
+    assert after > before * 900
+
+
+def test_committed_record_is_not_write_ahead(db: str, tmp_path: Path) -> None:
+    """A crash between substrate.commit() and the chain append loses the record.
+
+    Pins the ordering documented in engine.py: the effect is durable before
+    the COMMITTED record exists. Closing this needs an intent record written
+    before the commit plus a startup scan.
+    """
+
+    class CrashAfterCommit(SqliteSubstrate):
+        def commit(self, handle: StageHandle) -> CommitReceipt:
+            super().commit(handle)
+            raise KeyboardInterrupt("killed after COMMIT")
+
+    chain_path = tmp_path / "chain.jsonl"
+    engine = EscrowEngine(
+        CrashAfterCommit(db, tables=TABLES),
+        checkers=[BlastRadius(50)],
+        chain=EscrowChain(chain_path),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        engine.execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="UPDATE orders SET total=777 WHERE id=1",
+                )
+            )
+        )
+
+    assert (1, 777.0) in totals(db), "the effect is durable"
+    kinds = [r.record_type for r in EscrowChain.load(chain_path).records()]
+    assert RecordType.COMMITTED not in kinds, "and there is no record that it committed"
+
+
+def test_effect_labelled_for_another_substrate_is_refused(db: str) -> None:
+    """Effect.target carries a substrate id that was parsed and never checked.
+
+    apply() only ever uses the substrate the engine was built with, so an
+    effect labelled ``stripe:orders`` was being executed against SQLite.
+    """
+    with pytest.raises(PlanError, match="but this engine holds"):
+        engine_for(db).execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="stripe:orders",
+                    statement="UPDATE orders SET total=0",
+                )
+            )
+        )
+
+
+def test_unprefixed_target_still_admits(db: str) -> None:
+    """A bare table name carries no substrate id and is not treated as foreign."""
+    result = engine_for(db, checkers=[BlastRadius(50)]).execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,
+                target="orders",
+                statement="UPDATE orders SET total=1 WHERE id=1",
+            )
+        )
+    )
+    assert result.committed

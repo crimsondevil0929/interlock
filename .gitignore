@@ -1,0 +1,34 @@
+# Python build and bytecode
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# Demo and test artifacts: SQLite files and chain journals
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.jsonl
+
+# Pitch, positioning and brainstorming material. This repository is public and
+# its documentation is engineering mechanics only. Keep strategy notes out of it.
+CONCEPT*.md
+PITCH*.md
+*_pitch.md
+NOTES.md
+BRAINSTORM*.md
+
+# OS metadata
+.DS_Store
