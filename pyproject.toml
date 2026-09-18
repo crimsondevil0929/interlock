@@ -24,13 +24,17 @@ classifiers = [
     "Typing :: Typed",
 ]
 # agentgov is consumed read-only, as an audit dependency. See src/interlock/anchor.py.
+# A git source rather than a path source, so a clone with no sibling checkout
+# resolves. Note this keeps interlock off PyPI as-is: PyPI rejects direct-URL
+# dependencies, so publishing means putting agentgov on PyPI and pinning a
+# version here instead.
 dependencies = ["agentgov"]
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
 
 [tool.uv.sources]
-agentgov = { path = "../agentgov" }
+agentgov = { git = "https://github.com/crimsondevil0929/agentgov", branch = "main" }
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        os: [ubuntu-latest]
+        include:
+          # SQLite trigger semantics and file locking differ by platform, and
+          # the stage holds a write transaction for its whole life. Cover a
+          # second platform on the current Python.
+          - python-version: "3.12"
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      # agentgov resolves from its public git repository, pinned in uv.lock to
+      # an exact commit. --frozen asserts the lock matches pyproject.toml, so a
+      # dependency edit that was not re-locked fails here rather than silently
+      # resolving to something else.
+      - name: Install the project
+        run: uv sync --frozen --python ${{ matrix.python-version }}
+
+      - name: Lint (ruff check)
+        run: uv run ruff check .
+
+      - name: Format (ruff format --check)
+        run: uv run ruff format --check .
+
+      - name: Type-check the package (mypy --strict)
+        run: uv run mypy src/
+
+      - name: Type-check tests and the demo (mypy --strict)
+        run: uv run mypy --strict tests/ demo.py
+
+      - name: Tests with coverage
+        run: uv run pytest -v --cov=interlock --cov-report=term-missing --cov-report=xml
+
+      # 85%, against 87% measured. anchor.py (the AgentGov seam) sits at 34%
+      # and is the gap to close; raise this floor as that comes up.
+      - name: Enforce coverage floor
+        run: uv run coverage report --fail-under=85
+
+      - name: Run the demo end to end
+        run: uv run python demo.py --no-color
+
+  install-from-clone:
+    name: install from a clean clone (no sibling checkout)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # The path source this replaced resolved only when agentgov happened to
+      # sit next to the checkout, so a third party's clone never built. Clone
+      # into a directory with no sibling checkout and resolve from scratch.
+      #
+      # This gates `git clone` + `uv sync`, which is what README.md documents
+      # and all that [tool.uv.sources] can support: uv sources are workspace
+      # configuration and are not written into built distribution metadata, so
+      # the wheel still declares a bare `Requires-Dist: agentgov` that resolves
+      # against PyPI. Installing the artifact standalone needs agentgov on PyPI
+      # (or a PEP 508 direct reference in `dependencies`, which then bars PyPI
+      # publication). Neither is done here.
+      - name: Resolve and import from an isolated clone
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/thirdparty
+          git clone --depth 1 "file://$GITHUB_WORKSPACE" /tmp/thirdparty/interlock
+          test ! -e /tmp/thirdparty/agentgov  # no sibling to fall back on
+          cd /tmp/thirdparty/interlock
+          uv sync --frozen
+          uv run python -c "
+          import agentgov, interlock
+          from interlock import EscrowEngine, SqliteSubstrate, TableSpec
+          assert agentgov.__file__ is not None
+          print('interlock', interlock.__version__, '+ agentgov', agentgov.__version__)
+          "
+          uv run pytest -q
+
+  build:
+    name: build (wheel + sdist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build, failing on packaging warnings
+        # `uv build` reports metadata problems (deprecated license fields, bad
+        # classifiers) as warnings but still exits 0, so a clean release has to
+        # assert on them. It writes all progress to stderr, so match the
+        # warnings themselves rather than treating any stderr as failure.
+        run: |
+          set -o pipefail
+          uv build 2>&1 | tee build.log
+          if grep -i '^warning' build.log; then
+            echo "::error::uv build emitted packaging warnings"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
