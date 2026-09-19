@@ -51,6 +51,9 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
+    # scripts/live_stress_test.py only. Not a runtime dependency: nothing in
+    # src/ imports it, and the library never talks to a model provider.
+    "anthropic>=1.0.0",
 ]
 
 [tool.pytest.ini_options]

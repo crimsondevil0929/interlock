@@ -15,6 +15,10 @@ wheels/
 .mypy_cache/
 .coverage
 
+# Live stress-test artifacts (scripts/live_stress_test.py). Evidence, not
+# repository content; regenerate with the script.
+benchmarks/
+
 # Demo and test artifacts: SQLite files and chain journals
 *.db
 *.db-wal
