@@ -102,7 +102,12 @@ class EscrowEngine:
     :param anchor: The AgentGov seam. Optional; records written without one are
         flagged ``anchored=False``.
     :param settle_cost: Amount to settle when writing a reverse anchor into
-        AgentGov, representing what the plan cost to produce.
+        AgentGov, representing what the plan cost to produce. Must be
+        positive to enable reverse anchoring: AgentGov has no zero-value entry
+        that can carry a memo, so there is nothing to write the chain head
+        into. The default of ``"0"`` therefore means forward anchoring only,
+        and ``StageResult.anchored_to`` is empty. Pass the plan's real cost to
+        get the bidirectional anchor.
     """
 
     __slots__ = ("_anchor", "_chain", "_checkers", "_settle_cost", "_substrate")
@@ -361,7 +366,14 @@ class EscrowEngine:
         That is what bounds a record's time from above; see
         ``EscrowChain.verify_anchors`` for the lower bound.
         """
+        # Runs after commit, so anything raised here arrives when the effects
+        # are already durable and would destroy the caller's StageResult. A
+        # non-positive settle cost cannot anchor at all (see
+        # LedgerAnchor.reverse_anchor), so it is treated as "not configured"
+        # rather than attempted and thrown from the commit path.
         if self._anchor is None or not self._anchor.can_reverse_anchor:
+            return ""
+        if self._settle_cost <= 0:
             return ""
         entry = self._anchor.reverse_anchor(plan.scope_id, head, cost=self._settle_cost)
         return entry.entry_hash if entry is not None else ""

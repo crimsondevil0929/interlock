@@ -39,10 +39,10 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      # agentgov resolves from its public git repository, pinned in uv.lock to
-      # an exact commit. --frozen asserts the lock matches pyproject.toml, so a
-      # dependency edit that was not re-locked fails here rather than silently
-      # resolving to something else.
+      # agentgov resolves from its public git repository via a PEP 508 direct
+      # reference, pinned in uv.lock to an exact commit. --frozen asserts the
+      # lock matches pyproject.toml, so a dependency edit that was not
+      # re-locked fails here rather than silently resolving to something else.
       - name: Install the project
         run: uv sync --frozen --python ${{ matrix.python-version }}
 
@@ -61,10 +61,10 @@ jobs:
       - name: Tests with coverage
         run: uv run pytest -v --cov=interlock --cov-report=term-missing --cov-report=xml
 
-      # 85%, against 87% measured. anchor.py (the AgentGov seam) sits at 34%
-      # and is the gap to close; raise this floor as that comes up.
+      # 90%, against 94% measured. Every module is at or above 90%; anchor.py,
+      # the AgentGov seam, is at 100%. Raise this as the rest come up.
       - name: Enforce coverage floor
-        run: uv run coverage report --fail-under=85
+        run: uv run coverage report --fail-under=90
 
       - name: Run the demo end to end
         run: uv run python demo.py --no-color
@@ -84,13 +84,8 @@ jobs:
       # sit next to the checkout, so a third party's clone never built. Clone
       # into a directory with no sibling checkout and resolve from scratch.
       #
-      # This gates `git clone` + `uv sync`, which is what README.md documents
-      # and all that [tool.uv.sources] can support: uv sources are workspace
-      # configuration and are not written into built distribution metadata, so
-      # the wheel still declares a bare `Requires-Dist: agentgov` that resolves
-      # against PyPI. Installing the artifact standalone needs agentgov on PyPI
-      # (or a PEP 508 direct reference in `dependencies`, which then bars PyPI
-      # publication). Neither is done here.
+      # Gates `git clone` + `uv sync`. The standalone-wheel path is gated
+      # separately below, now that the direct reference travels in metadata.
       - name: Resolve and import from an isolated clone
         run: |
           set -euo pipefail
@@ -106,6 +101,46 @@ jobs:
           print('interlock', interlock.__version__, '+ agentgov', agentgov.__version__)
           "
           uv run pytest -q
+
+  install-wheel-standalone:
+    name: install the built wheel into a bare environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # A PEP 508 direct reference is written into distribution metadata, so
+      # unlike a [tool.uv.sources] entry it survives into the wheel. Assert
+      # that: build, install the artifact into a bare venv outside the source
+      # tree, and import it with nothing else on the path.
+      #
+      # This is also the check that fails the day interlock is submitted to
+      # PyPI, which rejects direct-URL dependencies. Putting agentgov on PyPI
+      # and pinning a version range is what replaces this.
+      - name: Build a wheel and install it standalone
+        run: |
+          set -euo pipefail
+          uv build --wheel
+          python -c "
+          import glob, zipfile
+          z = zipfile.ZipFile(glob.glob('dist/*.whl')[0])
+          name = [n for n in z.namelist() if n.endswith('METADATA')][0]
+          meta = z.read(name).decode()
+          assert 'Requires-Dist: agentgov @ git+' in meta, meta
+          print('wheel metadata carries the direct reference')
+          "
+          uv venv /tmp/bare
+          VIRTUAL_ENV=/tmp/bare uv pip install dist/*.whl
+          cd /tmp
+          /tmp/bare/bin/python -c "
+          import agentgov, interlock
+          from interlock import EscrowEngine, LedgerAnchor, SqliteSubstrate, TableSpec
+          print('interlock', interlock.__version__, '+ agentgov', agentgov.__version__)
+          "
 
   build:
     name: build (wheel + sdist)

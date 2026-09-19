@@ -22,6 +22,7 @@ surface.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -29,7 +30,7 @@ from pathlib import Path
 from agentgov.core import BudgetManager, EntryType, LedgerEntry
 from agentgov.exceptions import AgentGovError, LedgerIntegrityError
 
-from interlock.exceptions import LedgerUnverifiedError, ScopeHaltedError
+from interlock.exceptions import AnchorError, LedgerUnverifiedError, ScopeHaltedError
 from interlock.types import GENESIS_HASH
 
 __all__ = ["AnchorPoint", "LedgerAnchor"]
@@ -61,7 +62,10 @@ class LedgerAnchor:
         ``verify_anchors`` has nothing to check.
     :param governed: An already-open, write-capable ``BudgetManager`` for
         co-resident deployments. Supplying it enables reverse anchoring.
-    :raises LedgerUnverifiedError: If the ledger exists but fails verification.
+    :raises LedgerUnverifiedError: If ``audit_path`` names nothing, names
+        something that is not an AgentGov ledger, or names one whose chain
+        does not verify. Every unusable-ledger path raises this and nothing
+        else, so a caller can fail closed on one exception type.
     """
 
     __slots__ = ("_audit", "_governed")
@@ -81,7 +85,13 @@ class LedgerAnchor:
             raise LedgerUnverifiedError(f"no AgentGov ledger at {path}")
         try:
             manager = BudgetManager.open_sqlite(str(path), read_only=True)
-        except AgentGovError as exc:
+        except (AgentGovError, sqlite3.Error, OSError) as exc:
+            # sqlite3.Error and OSError are in here because a truncated or
+            # otherwise corrupt file raises at the driver, below AgentGov's
+            # own exception hierarchy. Letting that through would hand the
+            # caller a sqlite3.DatabaseError from a module whose documented
+            # contract is LedgerUnverifiedError, so a caller that fails closed
+            # on LedgerUnverifiedError would instead crash.
             raise LedgerUnverifiedError(f"cannot open {path} as an AgentGov ledger: {exc}") from exc
         # Admissibility gate. A record anchored to a chain that does not
         # verify still reads as anchored, so refuse at attach time rather than
@@ -168,14 +178,29 @@ class LedgerAnchor:
         anchor cannot be edited without breaking AgentGov's own verification.
         That is the upper time bound one-way anchoring does not give.
 
-        :param cost: Amount to settle. A zero-cost plan still anchors, by
-            authorizing and capturing zero.
+        :param cost: Amount to settle, representing what the plan cost to
+            produce. MUST be positive: this writes the memo through AgentGov's
+            ``authorize``/``capture`` pair, and AgentGov rejects a
+            non-positive authorization. There is no zero-value entry on that
+            surface to carry a memo, so a reverse anchor always costs
+            something.
         :returns: The settled entry, or ``None`` when not co-resident.
+        :raises AnchorError: If ``cost`` is not positive. Raised here rather
+            than letting AgentGov's ``ValueError`` surface from inside the
+            commit path, where it arrives after the effects are already
+            durable.
         """
         if self._governed is None:
             return None
-        memo = f"interlock:{record_hash[:16]}"
         amount = Decimal(cost) if not isinstance(cost, Decimal) else cost
+        if amount <= 0:
+            raise AnchorError(
+                f"reverse anchoring needs a positive settle cost, got {amount}; "
+                f"AgentGov has no zero-value entry that can carry a memo, so "
+                f"pass the plan's real cost or leave settle_cost unset to run "
+                f"with forward anchoring only"
+            )
+        memo = f"interlock:{record_hash[:16]}"
         authorization = self._governed.authorize(scope_id, amount, memo=memo)
         return self._governed.capture(authorization, amount, memo=memo)
 

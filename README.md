@@ -110,8 +110,9 @@ that raises becomes a blocking violation: fail closed.
 
 ## AgentGov integration
 
-Interlock imports [`agentgov`](../agentgov) as a **read-only audit dependency**. The
-dependency runs one way (`interlock -> agentgov`) and requires no change to AgentGov.
+Interlock imports [`agentgov`](https://github.com/crimsondevil0929/agentgov) as a
+**read-only audit dependency**. The dependency runs one way (`interlock -> agentgov`) and
+requires no change to AgentGov.
 
 Every adjudication is written to a hash-linked chain whose records carry the AgentGov head
 hash observed at the time. That proves a *lower* bound on a record's time. It does not
@@ -123,6 +124,16 @@ Where Interlock is co-resident with a write-capable governor it also writes its 
 head into the `memo` of the ledger entries a plan causes. `memo` is inside AgentGov's hash
 payload, so the reverse anchor cannot be altered without breaking AgentGov's own
 verification. The two chains then interlock in both directions.
+
+**Reverse anchoring costs something.** AgentGov has no zero-value entry that can carry a
+memo, so the chain head rides on a real `authorize`/`capture` pair. `EscrowEngine`'s
+`settle_cost` defaults to `"0"`, which means forward anchoring only and leaves
+`StageResult.anchored_to` empty. Pass the plan's real cost to get the bidirectional
+anchor:
+
+```python
+engine = EscrowEngine(substrate, checkers=[...], anchor=anchor, settle_cost="0.01")
+```
 
 AgentGov's latching breaker is re-read immediately before commit, not at admission. The
 staging window is where a trip has to be observed, because a halt that does not stop
@@ -178,6 +189,26 @@ against the shipped code, not inferred.
 
 [`docs/ESCROW_SPEC.md`](docs/ESCROW_SPEC.md) is the interface contract, with a conformance
 section listing implemented, partial and unimplemented requirements.
+
+## Install
+
+`agentgov` resolves from git, so a clone needs no sibling checkout:
+
+```bash
+git clone https://github.com/crimsondevil0929/interlock
+cd interlock && uv sync
+```
+
+Or install the package directly:
+
+```bash
+uv pip install git+https://github.com/crimsondevil0929/interlock
+```
+
+The `agentgov` dependency is a PEP 508 direct reference, which is what makes the second
+form work. It also means interlock cannot be published to PyPI as-is: PyPI rejects
+direct-URL dependencies. Publishing means putting `agentgov` on PyPI and pinning a version
+range instead.
 
 ## Development
 

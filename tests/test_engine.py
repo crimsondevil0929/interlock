@@ -700,3 +700,85 @@ def test_unprefixed_target_still_admits(db: str) -> None:
         )
     )
     assert result.committed
+
+
+# --------------------------------------------------------------------------
+# 7. Reverse anchoring runs after commit, so it must not throw from there
+# --------------------------------------------------------------------------
+
+
+def test_default_settle_cost_commits_and_returns_rather_than_raising(
+    db: str, tmp_path: Path
+) -> None:
+    """EscrowEngine's default settle_cost is "0", which cannot reverse-anchor.
+
+    AgentGov rejects a non-positive authorization, and _reverse_anchor runs
+    after substrate.commit(), so attempting it used to raise ValueError with
+    the effects already durable: the caller lost the StageResult entirely and
+    no anchor was written. A non-positive cost is now "not configured".
+    """
+    from agentgov import BudgetManager, money
+
+    from interlock import LedgerAnchor
+
+    gov = BudgetManager.open_sqlite(str(tmp_path / "gov.db"))
+    try:
+        gov.open_root("agent", money("5.00"))
+        engine = EscrowEngine(
+            SqliteSubstrate(db, tables=TABLES),
+            checkers=[BlastRadius(50)],
+            anchor=LedgerAnchor(governed=gov),
+        )
+        result = engine.execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="UPDATE orders SET total=42 WHERE id=1",
+                ),
+                scope="agent",
+            )
+        )
+        assert result.committed
+        assert result.anchored_to == "", "no reverse anchor, and it says so"
+        assert (1, 42.0) in totals(db)
+    finally:
+        gov.close()
+
+
+def test_a_positive_settle_cost_writes_the_reverse_anchor(db: str, tmp_path: Path) -> None:
+    from agentgov import BudgetManager, money
+
+    from interlock import LedgerAnchor
+
+    gov = BudgetManager.open_sqlite(str(tmp_path / "gov.db"))
+    try:
+        gov.open_root("agent", money("5.00"))
+        anchor = LedgerAnchor(governed=gov)
+        engine = EscrowEngine(
+            SqliteSubstrate(db, tables=TABLES),
+            checkers=[BlastRadius(50)],
+            anchor=anchor,
+            settle_cost="0.01",
+        )
+        result = engine.execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="UPDATE orders SET total=42 WHERE id=1",
+                ),
+                scope="agent",
+            )
+        )
+        assert result.committed
+        assert result.anchored_to != ""
+
+        anchors = anchor.find_reverse_anchors()
+        assert len(anchors) == 1
+        assert anchors[0].memo == f"interlock:{result.chain_head[:16]}"
+        gov.verify_integrity()
+    finally:
+        gov.close()
