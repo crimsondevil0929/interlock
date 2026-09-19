@@ -15,6 +15,7 @@ __all__ = [
     "AnchorError",
     "ChainIntegrityError",
     "CyclicPlanError",
+    "ForbiddenStatementError",
     "InterlockError",
     "LedgerUnverifiedError",
     "PlanError",
@@ -40,6 +41,19 @@ class PlanError(InterlockError):
 
 class CyclicPlanError(PlanError):
     """The effect DAG contains a cycle, or names an unknown dependency."""
+
+
+class ForbiddenStatementError(PlanError):
+    """The statement is of a kind this substrate refuses to execute.
+
+    Raised on the statement itself rather than on ``Effect.kind``, which the
+    agent authors. DDL is the case that matters: it changes the schema, fires
+    no row triggers, and so measures as an empty diff that every checker
+    reading the diff passes.
+
+    Raised from admission and again from ``apply``. The second is not
+    redundant: a caller using a substrate directly never reaches admission.
+    """
 
 
 class UncompensatableEffectError(PlanError):

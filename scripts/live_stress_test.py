@@ -17,10 +17,12 @@ Two things the harness does deliberately, because the audit in
 docs/ESCROW_SPEC.md says they are the operator's job and not the library's:
 
 1. ``Effect.target`` and ``EffectKind`` are derived from the statement by
-   ``classify()``, never taken from the model. Interlock reads both and does
-   not check either against the SQL, so a harness that trusted the model would
-   be testing a boundary that is not there. Scenario 8 runs it both ways to
-   show the difference.
+   ``classify()``, never taken from the model. Interlock now vets the
+   statement's leading verb itself, so DDL is refused whatever kind the model
+   declares; it still does not check ``target`` against the SQL, so which
+   table a permitted statement reaches is the operator's problem. Scenario 8
+   runs it both ways: the model-declared-kind path used to commit an
+   ``ALTER TABLE`` and is now refused at admission.
 2. The substrate observes a fixed table set. A statement naming anything else
    is refused before staging, because a mutation outside that set does not
    appear in the diff.
@@ -69,7 +71,7 @@ from agentgov.exceptions import (
     CircuitOpenError,
     DenialOfWalletError,
 )
-from agentgov.interceptor import pricing_for
+from agentgov.interceptor import normalize_model_id, pricing_for
 
 from interlock import (
     BlastRadius,
@@ -673,25 +675,15 @@ def endpoint(client: Any, model: str) -> Any:
     return client.messages.create
 
 
-_DATED_SUFFIX = re.compile(r"-\d{8}$")
-
-
-def normalize_model_id(model_id: str) -> str:
-    """Strip the dated snapshot suffix the API returns.
-
-    `response.model` for `claude-haiku-4-5` comes back as
-    `claude-haiku-4-5-20251001`, and AgentGov's PRICING table is keyed only on
-    the undated alias, so `pricing_for(response.model)` raises KeyError on
-    every dated model. Pricing from the served id is the correct thing to do
-    and it does not work without this.
-    """
-    return _DATED_SUFFIX.sub("", model_id)
-
-
 def reprice(model_id: str, usage: Any) -> Decimal:
-    """What this call costs at the rates of the model that actually served it."""
+    """What this call costs at the rates of the model that actually served it.
+
+    `pricing_for` folds a dated snapshot suffix itself now. This harness
+    carried its own copy of that fold while AgentGov did not, which is how the
+    gap was found; the workaround is gone and the library is the check.
+    """
     try:
-        rates = pricing_for(normalize_model_id(model_id))
+        rates = pricing_for(model_id)
     except KeyError:
         return Decimal("0")
     million = Decimal(1_000_000)

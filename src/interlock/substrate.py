@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from interlock.exceptions import (
+    ForbiddenStatementError,
     StageConflictError,
     StageError,
     StageExpiredError,
@@ -43,9 +44,62 @@ from interlock.types import (
     SubstrateCapabilities,
 )
 
-__all__ = ["ShadowSubstrate", "SqliteSubstrate", "TableSpec"]
+__all__ = [
+    "FORBIDDEN_VERBS",
+    "ShadowSubstrate",
+    "SqliteSubstrate",
+    "TableSpec",
+    "leading_verb",
+]
 
 _CAPTURE_TABLE = "_interlock_capture"
+
+FORBIDDEN_VERBS: frozenset[str] = frozenset(
+    {
+        # Schema changes. They fire no row triggers, so the diff is empty and
+        # every checker that reads the diff passes on nothing.
+        "alter",
+        "create",
+        "drop",
+        "truncate",
+        "rename",
+        # Reach outside the observed database, or change how it behaves while
+        # a stage is open. ATTACH in particular puts any file the process can
+        # write inside the transaction, where no capture trigger exists.
+        "attach",
+        "detach",
+        "pragma",
+        # Not row mutations, and not transactional in the way a stage assumes.
+        "vacuum",
+        "reindex",
+        "analyze",
+    }
+)
+"""Statement verbs a stage refuses outright.
+
+Enforced on the statement text, never on ``Effect.kind``, which the agent
+supplies and which nothing else checks against the SQL.
+"""
+
+_LEADING_COMMENT = re.compile(r"\A(?:\s|--[^\n]*\n|/\*.*?\*/)+", re.S)
+_LEADING_WORD = re.compile(r"\A[A-Za-z_]+")
+
+
+def leading_verb(statement: str) -> str:
+    """The first SQL keyword, with leading comments and whitespace removed.
+
+    Comments are stripped first because ``/* x */ DROP TABLE t`` and
+    ``-- x\nDROP TABLE t`` are both valid SQL that a naive prefix check reads
+    as having no verb at all.
+
+    :param statement: A single SQL statement.
+    :returns: The lowercased leading keyword, or ``""`` when there is none.
+    """
+    stripped = _LEADING_COMMENT.sub("", statement.lstrip("(").strip())
+    found = _LEADING_WORD.match(stripped.lstrip("("))
+    return found.group(0).lower() if found else ""
+
+
 _IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 
 
@@ -61,6 +115,15 @@ class ShadowSubstrate(Protocol):
     @property
     def capabilities(self) -> SubstrateCapabilities:
         """What this driver supports. Constant for the driver's life."""
+        ...
+
+    def reject_reason(self, effect: Effect) -> str | None:
+        """Why this effect cannot be staged, or ``None`` if it can.
+
+        Called from ``EscrowEngine.admit`` before anything is opened, so a
+        plan this substrate would refuse never takes a write lock. Optional:
+        the engine skips the check on a driver that does not implement it.
+        """
         ...
 
     def open(self, plan: EffectPlan) -> StageHandle: ...
@@ -242,10 +305,44 @@ class SqliteSubstrate:
         self._handle = handle
         return handle
 
+    def reject_reason(self, effect: Effect) -> str | None:
+        """Why this effect cannot be staged, read from the statement.
+
+        Checks the SQL, not ``Effect.kind``. The kind is authored by the agent
+        and nothing compares it against the statement, so a ``DROP TABLE``
+        declared as ``kind=UPDATE`` otherwise reaches the substrate, executes,
+        fires no row triggers, and measures as an empty diff that every
+        diff-reading checker passes.
+
+        This is not a containment boundary on its own. A statement can still
+        reach a table outside ``tables``, where the mutation executes and does
+        not appear in the diff. Scope the connection's grants.
+
+        :param effect: The effect to vet.
+        :returns: A refusal reason, or ``None`` when the effect may be staged.
+        """
+        verb = leading_verb(effect.statement)
+        if verb in FORBIDDEN_VERBS:
+            return (
+                f"{verb.upper()} is not stageable: it fires no row triggers, so the "
+                f"diff would be empty and every measured invariant would pass on "
+                f"nothing. Grant the connection no DDL rather than relying on this"
+            )
+        return None
+
     def apply(self, handle: StageHandle, effect: Effect) -> EffectOutcome:
-        """Execute one effect inside the open stage. Never commits."""
+        """Execute one effect inside the open stage. Never commits.
+
+        Re-checks :meth:`reject_reason`. Not redundant with admission: a caller
+        driving a substrate directly never passes through the engine.
+
+        :raises ForbiddenStatementError: On a statement this substrate refuses.
+        """
         conn = self._require(handle)
         self._assert_live(handle)
+        refusal = self.reject_reason(effect)
+        if refusal is not None:
+            raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
         try:
             cursor = conn.execute(effect.statement, dict(effect.parameters))
         except sqlite3.Error as exc:

@@ -43,6 +43,8 @@ from interlock import (
     default_checkers,
 )
 from interlock.chain import RecordType
+from interlock.exceptions import ForbiddenStatementError
+from interlock.substrate import FORBIDDEN_VERBS, leading_verb
 from interlock.types import CommitReceipt, InvariantViolation, StageHandle
 
 SCHEMA = """
@@ -78,6 +80,14 @@ def db(tmp_path: Path) -> str:
     conn.commit()
     conn.close()
     return path
+
+
+def columns_of(path: str, table: str) -> list[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    finally:
+        conn.close()
 
 
 def totals(path: str) -> list[tuple[int, float]]:
@@ -432,8 +442,10 @@ def test_chain_records_the_whole_lifecycle(db: str) -> None:
         RecordType.STAGE_OPENED,
         RecordType.DIFF_COMPUTED,
         RecordType.VERDICT,
+        RecordType.COMMIT_INTENT,
         RecordType.COMMITTED,
     ]
+    assert engine.chain.unresolved_intents() == (), "the intent was resolved"
     engine.chain.verify()
 
 
@@ -559,30 +571,28 @@ def test_statement_writing_an_unobserved_table_commits_unmeasured(db: str) -> No
     assert written == "after", "the write landed and the diff did not see it"
 
 
-def test_ddl_declared_as_dml_is_not_caught(db: str) -> None:
-    """NoSchemaChange reads Effect.kind, which the agent sets.
+def test_ddl_declared_as_dml_is_refused_at_admission(db: str) -> None:
+    """The statement is checked, not the kind the agent declared.
 
-    DDL fires no row triggers, so the diff is empty as well. Enforcement has
-    to come from a role that cannot execute DDL.
+    NoSchemaChange reads Effect.kind. DDL fires no row triggers, so the diff
+    is empty and every diff-reading checker passes on nothing. Before the
+    substrate vetted the statement text this committed and changed the schema.
     """
-    result = engine_for(db).execute(
-        make_plan(
-            Effect(
-                effect_id=EffectId("e1"),
-                kind=EffectKind.UPDATE,  # not DDL, as far as the checker knows
-                target="sqlite:orders",
-                statement="ALTER TABLE orders ADD COLUMN injected TEXT",
+    before = columns_of(db, "orders")
+
+    with pytest.raises(ForbiddenStatementError, match="ALTER is not stageable"):
+        engine_for(db).execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,  # not DDL, as far as the checker knows
+                    target="sqlite:orders",
+                    statement="ALTER TABLE orders ADD COLUMN injected TEXT",
+                )
             )
         )
-    )
 
-    assert result.committed
-    assert result.blocked_by == ()
-
-    conn = sqlite3.connect(db)
-    columns = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
-    conn.close()
-    assert "injected" in columns
+    assert columns_of(db, "orders") == before, "the schema is untouched"
 
 
 def test_blast_radius_counts_mutations_not_distinct_rows(db: str) -> None:
@@ -782,3 +792,231 @@ def test_a_positive_settle_cost_writes_the_reverse_anchor(db: str, tmp_path: Pat
         gov.verify_integrity()
     finally:
         gov.close()
+
+
+# --------------------------------------------------------------------------
+# 8. The statement is vetted, not the kind the agent declared
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "ALTER TABLE orders ADD COLUMN injected TEXT",
+        "DROP TABLE orders",
+        "CREATE TABLE smuggled (id INTEGER)",
+        "CREATE INDEX idx_orders_total ON orders(total)",
+        "VACUUM",
+        "PRAGMA foreign_keys=OFF",
+        "ATTACH DATABASE '/tmp/elsewhere.db' AS side",
+        "REINDEX orders",
+    ],
+)
+def test_forbidden_statements_are_refused_whatever_kind_is_declared(
+    db: str, statement: str
+) -> None:
+    """Every one of these is declared kind=UPDATE, which is a lie the agent
+    is free to tell. The refusal reads the SQL."""
+    with pytest.raises(ForbiddenStatementError):
+        engine_for(db).execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement=statement,
+                )
+            )
+        )
+
+
+def test_a_forbidden_statement_never_opens_a_stage(db: str) -> None:
+    """Refused at admission, so no connection is bound and no write lock taken."""
+    engine = engine_for(db)
+    with pytest.raises(ForbiddenStatementError):
+        engine.execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="DROP TABLE orders",
+                )
+            )
+        )
+
+    kinds = [r.record_type for r in engine.chain.records()]
+    assert RecordType.STAGE_OPENED not in kinds
+
+    conn = sqlite3.connect(db, timeout=2.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+
+def test_a_forbidden_statement_is_refused_by_the_substrate_directly(db: str) -> None:
+    """A caller that skips the engine must not get a second answer."""
+    substrate = SqliteSubstrate(db, tables=TABLES)
+    effect = Effect(
+        effect_id=EffectId("e1"),
+        kind=EffectKind.UPDATE,
+        target="sqlite:orders",
+        statement="DROP TABLE orders",
+    )
+    assert substrate.reject_reason(effect) is not None
+
+    plan = make_plan(effect)
+    handle = substrate.open(plan)
+    try:
+        with pytest.raises(ForbiddenStatementError):
+            substrate.apply(handle, effect)
+    finally:
+        substrate.close(handle)
+
+    assert columns_of(db, "orders") == ["id", "tenant", "customer", "total"]
+
+
+def test_comments_do_not_hide_the_verb(db: str) -> None:
+    """`/* x */ DROP ...` and `-- x\\nDROP ...` are valid SQL.
+
+    A prefix check that does not strip comments reads them as having no verb.
+    """
+    for statement in (
+        "/* routine maintenance */ DROP TABLE orders",
+        "-- approved in ticket 4471\nDROP TABLE orders",
+        "   \n\t DROP TABLE orders",
+    ):
+        assert leading_verb(statement) == "drop"
+        with pytest.raises(ForbiddenStatementError):
+            engine_for(db).execute(
+                make_plan(
+                    Effect(
+                        effect_id=EffectId("e1"),
+                        kind=EffectKind.UPDATE,
+                        target="sqlite:orders",
+                        statement=statement,
+                    )
+                )
+            )
+
+
+def test_ordinary_dml_is_still_admitted(db: str) -> None:
+    """The veto must not be so broad that nothing stages."""
+    for verb, statement in (
+        ("update", "UPDATE orders SET total = total - 1 WHERE id = 1"),
+        ("insert", "INSERT INTO orders (id, tenant, customer, total) VALUES (99,'acme',1,5.0)"),
+        ("delete", "DELETE FROM orders WHERE id = 5"),
+        ("with", "WITH x AS (SELECT 1) UPDATE orders SET total = 1 WHERE id = 2"),
+    ):
+        assert leading_verb(statement) == verb
+        assert verb not in FORBIDDEN_VERBS
+
+
+def test_multi_statement_smuggling_is_refused_by_the_driver(db: str) -> None:
+    """sqlite3 executes one statement per call, so a trailing DROP cannot ride along."""
+    result_error: Exception | None = None
+    try:
+        engine_for(db).execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="UPDATE orders SET total = 1 WHERE id = 1; DROP TABLE orders",
+                )
+            )
+        )
+    except Exception as exc:
+        result_error = exc
+
+    assert result_error is not None
+    assert columns_of(db, "orders"), "the table is still there"
+
+
+# --------------------------------------------------------------------------
+# 9. Write-ahead commit records
+# --------------------------------------------------------------------------
+
+
+def test_a_crash_between_commit_and_the_record_leaves_a_resolvable_intent(
+    db: str, tmp_path: Path
+) -> None:
+    """The window is narrowed from silent to discoverable.
+
+    COMMIT_INTENT lands before the substrate is told to commit, so a crash in
+    the window leaves an intent with no terminal record after it. It does not
+    say the commit succeeded, only that one was attempted for this plan and
+    stage, which is the question recovery has to put to the substrate.
+    """
+
+    class CrashAfterCommit(SqliteSubstrate):
+        def commit(self, handle: StageHandle) -> CommitReceipt:
+            super().commit(handle)
+            raise KeyboardInterrupt("killed after COMMIT")
+
+    chain_path = tmp_path / "chain.jsonl"
+    engine = EscrowEngine(
+        CrashAfterCommit(db, tables=TABLES),
+        checkers=[BlastRadius(50)],
+        chain=EscrowChain(chain_path),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        engine.execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="UPDATE orders SET total=777 WHERE id=1",
+                ),
+                intent="write-ahead probe",
+            )
+        )
+
+    assert (1, 777.0) in totals(db), "the effect is durable"
+
+    reloaded = EscrowChain.load(chain_path)
+    kinds = [r.record_type for r in reloaded.records()]
+    assert RecordType.COMMIT_INTENT in kinds
+    assert RecordType.COMMITTED not in kinds
+
+    unresolved = reloaded.unresolved_intents()
+    assert len(unresolved) == 1
+    assert unresolved[0].record_type is RecordType.COMMIT_INTENT
+    reloaded.verify()
+
+
+def test_a_clean_run_leaves_no_unresolved_intent(db: str) -> None:
+    engine = engine_for(db, checkers=[BlastRadius(50)])
+    engine.execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",
+                statement="UPDATE orders SET total = 2 WHERE id = 1",
+            )
+        )
+    )
+    assert engine.chain.unresolved_intents() == ()
+
+
+def test_a_refused_plan_writes_no_commit_intent(db: str) -> None:
+    """The intent means 'about to commit'. A rejected plan never gets there."""
+    engine = engine_for(db, checkers=[BlastRadius(0)])
+    engine.execute(
+        make_plan(
+            Effect(
+                effect_id=EffectId("e1"),
+                kind=EffectKind.UPDATE,
+                target="sqlite:orders",
+                statement="UPDATE orders SET total = 3 WHERE id = 1",
+            )
+        )
+    )
+    kinds = [r.record_type for r in engine.chain.records()]
+    assert RecordType.COMMIT_INTENT not in kinds
+    assert RecordType.ABORTED in kinds
+    assert engine.chain.unresolved_intents() == ()

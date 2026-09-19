@@ -39,6 +39,11 @@ class RecordType(Enum):
     STAGE_OPENED = "stage_opened"
     DIFF_COMPUTED = "diff_computed"
     VERDICT = "verdict"
+    COMMIT_INTENT = "commit_intent"
+    """Written immediately before the substrate is told to commit. An intent
+    with no terminal record after it marks a plan whose outcome is unknown to
+    the chain: see :meth:`EscrowChain.unresolved_intents`."""
+
     COMMITTED = "committed"
     ABORTED = "aborted"
     ORPHANED = "orphaned"
@@ -197,6 +202,30 @@ class EscrowChain:
                     handle.write(json.dumps(record.to_json(), separators=(",", ":")) + "\n")
                     handle.flush()
             return record
+
+    def unresolved_intents(self) -> tuple[EscrowRecord, ...]:
+        """Commit intents with no terminal record after them.
+
+        Each one is a plan that was about to commit when the process stopped.
+        The effect may or may not be durable; the chain cannot say which, only
+        that the question is open for this plan and stage. Resolve it by asking
+        the substrate whether the transaction landed.
+
+        :returns: The unresolved ``COMMIT_INTENT`` records, in chain order.
+        """
+        terminal = {RecordType.COMMITTED, RecordType.ABORTED, RecordType.ORPHANED}
+        resolved: set[uuid.UUID | None] = set()
+        intents: dict[uuid.UUID | None, EscrowRecord] = {}
+        for record in self.records():
+            if record.record_type is RecordType.COMMIT_INTENT:
+                intents[record.stage_id] = record
+            elif record.record_type in terminal:
+                resolved.add(record.stage_id)
+        return tuple(
+            record
+            for stage_id, record in sorted(intents.items(), key=lambda kv: kv[1].sequence)
+            if stage_id not in resolved
+        )
 
     def for_plan(self, plan_id: PlanId) -> tuple[EscrowRecord, ...]:
         return tuple(r for r in self.records() if r.plan_id == plan_id)

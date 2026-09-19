@@ -11,14 +11,18 @@ Two properties hold by construction:
    new plan that carries an explicit waiver, which is then itself a recorded
    artifact rather than a flag somebody flipped.
 
-What does NOT hold, stated here because the ordering is easy to assume:
+3. A committed effect is always discoverable from the chain.
+   ``COMMIT_INTENT`` is appended before the substrate is told to commit and
+   ``COMMITTED`` after it returns, so a crash in that window leaves an intent
+   with no terminal record. :meth:`EscrowChain.unresolved_intents` reads them
+   back.
 
-3. The chain record is not write-ahead. ``COMMITTED`` is appended after
-   ``substrate.commit()`` returns, so a crash in that window leaves a durable
-   effect with no ``COMMITTED`` record. Recovering that case needs an intent
-   record written before the commit plus a startup scan for intents with no
-   outcome, and neither exists. Both chains are append-only, so the missing
-   record cannot be backfilled honestly after the fact.
+What the third one does not give: an intent says a commit was *attempted*, not
+that it succeeded. A crash inside that window leaves a plan whose outcome only
+the substrate knows, so recovery means asking the substrate whether that
+transaction landed. The chain narrows the question to one plan and one stage;
+it does not answer it, and an append-only chain cannot honestly backfill the
+answer afterwards.
 
 Scope: adjudication reads the measured diff, and the diff covers exactly the
 tables the substrate was configured to observe. ``admit`` checks
@@ -42,6 +46,7 @@ from interlock.chain import EscrowChain, RecordType
 from interlock.exceptions import (
     AdmissionError,
     CyclicPlanError,
+    ForbiddenStatementError,
     PlanError,
     ScopeHaltedError,
     UncompensatableEffectError,
@@ -139,6 +144,8 @@ class EscrowEngine:
         """Validate a plan before anything is touched.
 
         :raises CyclicPlanError: On a dependency cycle or unknown dependency.
+        :raises ForbiddenStatementError: If the substrate refuses the statement
+            itself. Read from the SQL, not from ``Effect.kind``.
         :raises UncompensatableEffectError: If an irreversible effect arrived
             without a serialized undo.
         :raises PlanError: If an effect's declared ``target`` names a substrate
@@ -151,6 +158,16 @@ class EscrowEngine:
             plan.topological_order()
         except ValueError as exc:
             raise CyclicPlanError(str(exc)) from exc
+
+        # The substrate vets the statement text. Done at admission so a plan
+        # it would refuse never opens a connection or takes a write lock; the
+        # substrate re-checks in apply() for callers who skip the engine.
+        veto = getattr(self._substrate, "reject_reason", None)
+        if callable(veto):
+            for effect in plan.effects:
+                refusal = veto(effect)
+                if refusal is not None:
+                    raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
 
         capabilities = self._substrate.capabilities
         for effect in plan.effects:
@@ -252,6 +269,19 @@ class EscrowEngine:
                 # and AgentGov's breaker latches, so this is a stable read.
                 if self._anchor is not None:
                     self._anchor.assert_scope_live(plan.scope_id)
+                # Write-ahead. The intent lands before the substrate is told to
+                # commit, so a crash in that window leaves COMMIT_INTENT with
+                # no terminal record after it and the effect is discoverable as
+                # possibly-durable. Without it the window is silent: the effect
+                # is on disk and the chain says the plan never got that far.
+                # EscrowChain.unresolved_intents() is the recovery read.
+                self._record(
+                    RecordType.COMMIT_INTENT,
+                    plan,
+                    diff.content_hash(),
+                    stage=handle.stage_id,
+                    note=f"about to commit {diff.blast_radius} rows",
+                )
                 self._substrate.commit(handle)
                 committed = True
                 state = StageState.COMMITTED

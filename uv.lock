@@ -10,7 +10,7 @@ resolution-markers = [
 [[package]]
 name = "agentgov"
 version = "0.1.0"
-source = { git = "https://github.com/crimsondevil0929/agentgov?rev=main#d11318266e88cbac068af25f9d1c5bae299b52cc" }
+source = { git = "https://github.com/crimsondevil0929/agentgov?rev=main#3184445de2d13414bf7bb5f0125a62b22b9512f1" }
 
 [[package]]
 name = "annotated-types"

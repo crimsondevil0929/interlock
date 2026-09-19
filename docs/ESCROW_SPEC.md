@@ -994,18 +994,22 @@ reading the test suite.
   `tables_touched`, so every measured checker passes on an empty measurement.
   The same gap covers FK cascades into unobserved tables: the cascade executes
   and does not appear in the diff.
-- **`no_ddl` reads `Effect.kind`, which the agent sets.** A DDL statement
-  declared as `kind=UPDATE` passes `NoSchemaChange`, produces no trigger rows,
-  and commits.
+- **`no_ddl` is enforced on the statement, not on `Effect.kind`.** The
+  checker still reads the agent-supplied kind, but `SqliteSubstrate` vets the
+  statement's leading verb through `reject_reason()`, which `admit()` calls
+  before a connection is opened and `apply()` re-checks for callers that skip
+  the engine. A verb allowlist is not a SQL parser: it says nothing about which
+  table a permitted statement reaches.
 - **`blast_radius` counts capture rows, not distinct rows.** A row mutated twice
   inside one plan contributes 2. The bound is therefore conservative for row
   count and is not a count of affected rows.
-- **Chain durability is opt-in and the commit record is written after the
-  commit.** `EscrowEngine` defaults to an in-memory `EscrowChain`. Even with
-  `EscrowChain(path)`, `_record(COMMITTED)` runs after
-  `substrate.commit()`, so a crash in that window leaves a durable effect with
-  no `COMMITTED` record. There is no write-ahead intent record and no recovery
-  scan.
+- **Chain durability is opt-in.** `EscrowEngine` defaults to an in-memory
+  `EscrowChain`, which does not survive the process. The commit record is now
+  write-ahead — `COMMIT_INTENT` before `substrate.commit()`, `COMMITTED` after
+  — and `EscrowChain.unresolved_intents()` reads back intents with no terminal
+  record. An intent attests an attempt, not an outcome: resolving one means
+  asking the substrate whether that transaction landed, and nothing here
+  automates that.
 - **`tenant_isolation` depends on `tenant_column` being present in
   `TableSpec.columns`.** It is not validated as of v0.1.0 in the spec's sense of
   a declared capability: if the column is absent from the captured image, every

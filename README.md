@@ -63,17 +63,19 @@ PLANNED -> STAGING -> STAGED -> VERIFIED  -> COMMITTED
                              \-> REJECTED -> ABORTED
 ```
 
-Two properties hold by construction:
+Three properties hold by construction:
 
 1. No path from `STAGED` to `COMMITTED` skips adjudication.
 2. `REJECTED` is not overridable in-process. Overriding means submitting a new plan that
    carries an explicit waiver, which is then itself a recorded artifact.
+3. A committed effect is discoverable from the chain. `COMMIT_INTENT` is written before
+   the substrate is told to commit and `COMMITTED` after it returns, so a crash in that
+   window leaves an intent with no terminal record after it.
 
-One that does not, because it is the obvious thing to assume: the chain record is **not**
-write-ahead. `COMMITTED` is appended after `substrate.commit()` returns, so a crash in
-that window leaves a durable effect with no `COMMITTED` record. Closing it needs an intent
-record before the commit plus a startup scan for intents with no outcome. Neither exists
-in v0.1.0.
+What the third does **not** give: an intent says a commit was *attempted*, not that it
+succeeded. `EscrowChain.unresolved_intents()` returns the open ones and narrows the
+question to a specific plan and stage; answering it means asking the substrate whether
+that transaction landed. An append-only chain cannot honestly backfill the answer.
 
 ## Usage
 
@@ -157,9 +159,12 @@ against the shipped code, not inferred.
   `blast_radius == 0` with an empty `tables_touched`, so every diff-reading checker passes
   on an empty measurement. **Restrict what the substrate's connection can reach.** Grant
   the role exactly the observed tables; do not rely on this layer for containment.
-- **DDL is not caught.** `NoSchemaChange` reads `Effect.kind`, which the agent sets. A
-  `DROP TABLE` declared as `kind=UPDATE` fires no row triggers, measures as an empty diff,
-  and commits. Use a role that cannot execute DDL.
+
+  DDL specifically is refused: `SqliteSubstrate.reject_reason()` reads the statement's
+  leading verb and the engine calls it at admission, so `ALTER`/`DROP`/`CREATE`/`TRUNCATE`
+  /`VACUUM`/`ATTACH`/`PRAGMA` and friends are rejected whatever `Effect.kind` claims. That
+  closes the specific hole, not the general one: the check is a verb allowlist, not a
+  parser, and it says nothing about which table a permitted statement reaches.
 - **Cascades reach outside the measurement.** A granted `DELETE` on an observed table whose
   foreign key cascades into an unobserved table destroys those rows and they do not appear
   in the diff.
