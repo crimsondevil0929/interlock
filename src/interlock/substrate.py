@@ -81,6 +81,21 @@ Enforced on the statement text, never on ``Effect.kind``, which the agent
 supplies and which nothing else checks against the SQL.
 """
 
+_WRITE_ACTIONS: dict[int, str] = {
+    sqlite3.SQLITE_INSERT: "INSERT",
+    sqlite3.SQLITE_UPDATE: "UPDATE",
+    sqlite3.SQLITE_DELETE: "DELETE",
+}
+"""Row-mutating actions the authorizer gates on the observed-table set."""
+
+_REACH_ACTIONS: dict[int, str] = {
+    sqlite3.SQLITE_ATTACH: "ATTACH",
+    sqlite3.SQLITE_DETACH: "DETACH",
+}
+"""Actions that would move the stage outside the database being measured.
+Also caught by ``FORBIDDEN_VERBS``; denied here too because that check reads a
+leading verb and this one reads what SQLite is about to do."""
+
 _LEADING_COMMENT = re.compile(r"\A(?:\s|--[^\n]*\n|/\*.*?\*/)+", re.S)
 _LEADING_WORD = re.compile(r"\A[A-Za-z_]+")
 
@@ -224,7 +239,17 @@ class SqliteSubstrate:
         locks for its whole life, so this is an operational limit.
     """
 
-    __slots__ = ("_by_name", "_conn", "_handle", "_max_rows", "_path", "_stage_seconds", "_tables")
+    __slots__ = (
+        "_by_name",
+        "_conn",
+        "_denied",
+        "_enforce",
+        "_handle",
+        "_max_rows",
+        "_path",
+        "_stage_seconds",
+        "_tables",
+    )
 
     def __init__(
         self,
@@ -233,12 +258,15 @@ class SqliteSubstrate:
         tables: Sequence[TableSpec],
         max_stage_seconds: float = 10.0,
         max_diff_rows: int = 50_000,
+        enforce_table_access: bool = True,
     ) -> None:
         self._path = path
         self._tables = tuple(tables)
         self._by_name = {t.name: t for t in tables}
         self._stage_seconds = max_stage_seconds
         self._max_rows = max_diff_rows
+        self._enforce = enforce_table_access
+        self._denied: tuple[str, str] | None = None
         self._conn: sqlite3.Connection | None = None
         self._handle: StageHandle | None = None
 
@@ -287,6 +315,11 @@ class SqliteSubstrate:
         # is not measured.
         conn.execute("PRAGMA recursive_triggers=ON")
         self._install_capture(conn)
+        # Installed *after* the capture DDL, which would otherwise be denied
+        # by its own authorizer, and before BEGIN, so the first statement of
+        # the stage is already covered.
+        if self._enforce:
+            conn.set_authorizer(self._authorize)
 
         opened = datetime.now(UTC)
         handle = StageHandle(
@@ -343,9 +376,27 @@ class SqliteSubstrate:
         refusal = self.reject_reason(effect)
         if refusal is not None:
             raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
+        self._denied = None
         try:
             cursor = conn.execute(effect.statement, dict(effect.parameters))
         except sqlite3.Error as exc:
+            denied = self._denied
+            self._denied = None
+            if denied is not None:
+                verb, table = denied
+                raise ForbiddenStatementError(
+                    f"effect {effect.effect_id!r} refused: statement attempts "
+                    f"{verb} on {table!r}, which this substrate does not observe. "
+                    f"A write there would execute, commit, and measure as an empty "
+                    f"diff that every invariant passes. Observed tables: "
+                    f"{', '.join(sorted(self._by_name)) or '<none>'}"
+                ) from exc
+            if "no name" in str(exc) and effect.parameters:
+                raise StageError(
+                    f"effect {effect.effect_id!r} failed: {exc}. Effect.parameters is "
+                    f"a Mapping, so statements must use named placeholders "
+                    f"(:name), not positional ones (?)"
+                ) from exc
             raise StageError(f"effect {effect.effect_id!r} failed: {exc}") from exc
         return EffectOutcome(
             effect_id=effect.effect_id,
@@ -451,6 +502,43 @@ class SqliteSubstrate:
                 f"stage {handle.stage_id} exceeded its {self._stage_seconds}s bound "
                 f"while holding write locks"
             )
+
+    def _authorize(
+        self,
+        action: int,
+        arg1: str | None,
+        arg2: str | None,
+        db_name: str | None,
+        trigger_name: str | None,
+    ) -> int:
+        """SQLite authorizer: deny row mutations outside ``tables``.
+
+        Runs inside SQLite at statement-prepare time, so a denied statement
+        never executes at all — this is enforcement in the engine, not a
+        predicate over a diff that was never captured. It closes the case
+        ``reject_reason`` cannot see: an ``Effect.target`` label claiming an
+        observed table while the statement writes somewhere else.
+
+        Reads are left alone. A statement may legitimately join or subquery a
+        table it does not write, and denying reads would break correct plans
+        without bounding any effect.
+
+        :returns: ``SQLITE_OK`` or ``SQLITE_DENY``.
+        """
+        if action in _WRITE_ACTIONS:
+            table = arg1 or ""
+            if table == _CAPTURE_TABLE or table in self._by_name:
+                return sqlite3.SQLITE_OK
+            # sqlite_* internal tables are touched by the engine itself, never
+            # by a statement the agent authored; denying them breaks SQLite.
+            if table.startswith("sqlite_"):
+                return sqlite3.SQLITE_OK
+            self._denied = (_WRITE_ACTIONS[action], table)
+            return sqlite3.SQLITE_DENY
+        if action in _REACH_ACTIONS:
+            self._denied = (_REACH_ACTIONS[action], arg1 or "")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
 
     def _install_capture(self, conn: sqlite3.Connection) -> None:
         """Create the session-local capture table and its triggers."""

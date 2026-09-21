@@ -27,6 +27,7 @@ import sqlite3
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -288,7 +289,7 @@ def rule(s: Style, title: str = "") -> None:
     print(s.dim("  " + "-" * (width - 2)))
 
 
-def money_str(value: float) -> str:
+def money_str(value: float | Decimal) -> str:
     return f"${value:,.2f}"
 
 

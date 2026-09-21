@@ -536,12 +536,14 @@ def test_non_ascii_identifiers_are_refused() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_statement_writing_an_unobserved_table_commits_unmeasured(db: str) -> None:
-    """admit() gates Effect.target, which the agent supplies, not the statement.
+def test_statement_writing_an_unobserved_table_is_denied(db: str) -> None:
+    """The statement is gated, not the label the agent wrote on it.
 
-    The statement below writes a table outside TableSpec. It executes, the
-    diff is empty because no capture trigger exists for that table, and every
-    diff-reading checker passes on an empty measurement.
+    ``admit()`` reads ``Effect.target``, which the agent supplies. The
+    statement below labels itself ``orders`` and writes somewhere else. The
+    substrate's authorizer denies the write inside SQLite at prepare time, so
+    it never executes and never reaches the diff as an empty measurement that
+    every checker would pass.
     """
     conn = sqlite3.connect(db)
     conn.executescript("CREATE TABLE unobserved(id INTEGER PRIMARY KEY, v TEXT);")
@@ -549,13 +551,49 @@ def test_statement_writing_an_unobserved_table_commits_unmeasured(db: str) -> No
     conn.commit()
     conn.close()
 
-    result = engine_for(db).execute(
+    with pytest.raises(ForbiddenStatementError) as caught:
+        engine_for(db).execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",  # the label says orders
+                    statement="UPDATE unobserved SET v='after'",  # the statement does not
+                )
+            )
+        )
+    assert "unobserved" in str(caught.value)
+
+    conn = sqlite3.connect(db)
+    written = conn.execute("SELECT v FROM unobserved WHERE id=1").fetchone()[0]
+    conn.close()
+    assert written == "before", "the denied write must not have landed"
+
+
+def test_unobserved_write_still_commits_when_enforcement_is_off(db: str) -> None:
+    """The escape hatch restores v0.1.0 behaviour, and it is genuinely unsafe.
+
+    Kept as a test because ``enforce_table_access=False`` is a documented
+    migration path: this pins exactly what a caller gives up by taking it.
+    """
+    conn = sqlite3.connect(db)
+    conn.executescript("CREATE TABLE unobserved(id INTEGER PRIMARY KEY, v TEXT);")
+    conn.execute("INSERT INTO unobserved VALUES (1,'before')")
+    conn.commit()
+    conn.close()
+
+    substrate = SqliteSubstrate(db, tables=TABLES, enforce_table_access=False)
+    engine = EscrowEngine(
+        substrate,
+        checkers=default_checkers(row_limit=5, allowed_tables=["orders", "order_audit"]),
+    )
+    result = engine.execute(
         make_plan(
             Effect(
                 effect_id=EffectId("e1"),
                 kind=EffectKind.UPDATE,
-                target="sqlite:orders",  # the label says orders
-                statement="UPDATE unobserved SET v='after'",  # the statement does not
+                target="sqlite:orders",
+                statement="UPDATE unobserved SET v='after'",
             )
         )
     )

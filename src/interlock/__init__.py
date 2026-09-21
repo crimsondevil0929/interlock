@@ -11,19 +11,27 @@ passes, and the injected instruction arrived inside a tool result after every
 provider-side filter had run, so a provider-side filter does not see it. What
 is left is measuring the consequence before it becomes durable.
 
-    from interlock import EscrowEngine, EscrowChain, SqliteSubstrate, TableSpec
-    from interlock import default_checkers
+    from interlock import EscrowRuntime, TableSpec
 
-    substrate = SqliteSubstrate("prod.db", tables=[TableSpec("orders", columns=[...])])
-    engine = EscrowEngine(
-        substrate,
-        checkers=default_checkers(row_limit=50, allowed_tables=["orders"]),
-        chain=EscrowChain("escrow.jsonl"),   # omit and the chain is in memory only
+    runtime = EscrowRuntime(
+        "prod.db",
+        tables=[TableSpec("orders", columns=["id", "tenant", "total"],
+                          tenant_column="tenant")],
+        scope_id="support-agent",
     )
-    result = engine.execute(plan)
+    result = runtime.execute_sql(
+        "UPDATE orders SET total = :total WHERE id = :id",
+        {"total": 100.0, "id": 1},
+        tenant_id="acme",
+        stated_rows=1,
+    )
 
     if not result.committed:
         print(result.blocked_by, result.diff.blast_radius)
+
+``EscrowRuntime`` owns the substrate, chain, anchor and engine. Drop to
+:class:`EscrowEngine` and :class:`PlanBuilder` when you need the primitives;
+the runtime is sugar over them and hands both back.
 
 Every adjudication is written to a hash-linked chain, anchored to an AgentGov
 ledger when one is attached. See :mod:`interlock.anchor` for the seam, which is
@@ -38,6 +46,7 @@ putting this in front of a production database.
 from __future__ import annotations
 
 from interlock.anchor import AnchorPoint, LedgerAnchor
+from interlock.builder import PlanBuilder, new_effect_id, new_plan_id
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.engine import EscrowEngine, StageResult
 from interlock.exceptions import (
@@ -64,10 +73,12 @@ from interlock.invariants import (
     NoSchemaChange,
     StatedFootprint,
     TableAllowlist,
+    TenantDrawdownGuard,
     TenantIsolation,
     TruncationGuard,
     default_checkers,
 )
+from interlock.runtime import EscrowRuntime
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.types import (
     Compensation,
@@ -103,6 +114,7 @@ __all__ = [
     "EscrowChain",
     "EscrowEngine",
     "EscrowRecord",
+    "EscrowRuntime",
     "ForbiddenStatementError",
     "InterlockError",
     "InvariantChecker",
@@ -111,6 +123,7 @@ __all__ = [
     "LedgerUnverifiedError",
     "NoDelete",
     "NoSchemaChange",
+    "PlanBuilder",
     "PlanError",
     "PlanId",
     "RecordType",
@@ -128,10 +141,13 @@ __all__ = [
     "SubstrateUnavailableError",
     "TableAllowlist",
     "TableSpec",
+    "TenantDrawdownGuard",
     "TenantIsolation",
     "TruncationGuard",
     "UncompensatableEffectError",
     "Verdict",
     "__version__",
     "default_checkers",
+    "new_effect_id",
+    "new_plan_id",
 ]

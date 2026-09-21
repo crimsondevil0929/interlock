@@ -18,6 +18,7 @@ which the untrusted agent sets. Each says so in its own docstring.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
 from interlock.types import (
@@ -36,6 +37,7 @@ __all__ = [
     "NoSchemaChange",
     "StatedFootprint",
     "TableAllowlist",
+    "TenantDrawdownGuard",
     "TenantIsolation",
     "TruncationGuard",
     "default_checkers",
@@ -220,7 +222,9 @@ class ColumnValueGuard:
     def __init__(self, table: str, column: str, *, max_drop_fraction: float) -> None:
         self._table = table
         self._column = column
-        self._max_drop = max_drop_fraction
+        # Decimal, because ``drop`` is Decimal: mixing the two raises
+        # TypeError, and a checker that raises is a blocking violation.
+        self._max_drop = Decimal(str(max_drop_fraction))
 
     @property
     def name(self) -> str:
@@ -248,6 +252,66 @@ class ColumnValueGuard:
                 },
             ),
         )
+
+
+class TenantDrawdownGuard:
+    """Bound how far any *single tenant's* column total may fall in one plan.
+
+    ``ColumnValueGuard`` measures the fall against the whole table. On a
+    multi-tenant substrate that is the wrong denominator: one tenant of forty
+    is 2.5% of the platform total, so a table-scoped 30% guard will admit that
+    tenant being zeroed without registering anything. This re-denominates the
+    same question per tenant, which is the denominator a tenant cares about.
+
+    Rows whose tenant could not be read group together under ``""`` and are
+    checked as one bucket. That is deliberate: a table with no
+    ``TableSpec.tenant_column`` degrades to exactly ``ColumnValueGuard``
+    rather than silently passing.
+
+    :param max_drop_fraction: Largest permitted decrease as a fraction of any
+        one tenant's pre-image total. ``0.30`` allows a 30% reduction.
+    """
+
+    __slots__ = ("_column", "_max_drop", "_table")
+
+    def __init__(self, table: str, column: str, *, max_drop_fraction: float) -> None:
+        self._table = table
+        self._column = column
+        self._max_drop = Decimal(str(max_drop_fraction))
+
+    @property
+    def name(self) -> str:
+        return f"tenant_drawdown_guard:{self._table}.{self._column}"
+
+    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        violations: list[InvariantViolation] = []
+        for tenant, (before, after) in sorted(
+            diff.tenant_column_totals(self._table, self._column).items()
+        ):
+            if before <= 0 or after >= before:
+                continue
+            drop = (before - after) / before
+            if drop <= self._max_drop:
+                continue
+            label = tenant or "<untenanted>"
+            violations.append(
+                InvariantViolation(
+                    invariant=self.name,
+                    severity=Severity.BLOCKING,
+                    message=(
+                        f"tenant {label!r} {self._table}.{self._column} falls "
+                        f"{drop * 100:.1f}% ({before:,.2f} to {after:,.2f}), "
+                        f"limit is {self._max_drop * 100:.0f}%"
+                    ),
+                    evidence={
+                        "tenant": label,
+                        "before_total": f"{before:.2f}",
+                        "after_total": f"{after:.2f}",
+                        "drop_fraction": f"{drop:.4f}",
+                    },
+                )
+            )
+        return tuple(violations)
 
 
 class TruncationGuard:

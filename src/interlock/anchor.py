@@ -23,17 +23,48 @@ surface.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
 from agentgov.core import BudgetManager, EntryType, LedgerEntry
-from agentgov.exceptions import AgentGovError, LedgerIntegrityError
+from agentgov.exceptions import AgentGovError, LedgerIntegrityError, UnknownScopeError
 
-from interlock.exceptions import AnchorError, LedgerUnverifiedError, ScopeHaltedError
+from interlock.exceptions import (
+    AnchorError,
+    InterlockError,
+    LedgerUnverifiedError,
+    ScopeHaltedError,
+)
 from interlock.types import GENESIS_HASH
 
 __all__ = ["AnchorPoint", "LedgerAnchor"]
+
+
+@contextmanager
+def _barrier(context: str) -> Iterator[None]:
+    """Translate every foreign exception into this package's hierarchy.
+
+    ``agentgov`` is an implementation detail of the anchor. A caller wrapping
+    the write path in ``except InterlockError`` must not have to know that
+    ``UnknownScopeError`` or ``ConcurrentGovernorError`` exist, let alone
+    import ``agentgov.exceptions`` to catch them. Anything this module cannot
+    classify more precisely becomes :class:`AnchorError`: the evidence chain
+    is unusable, so refuse to operate.
+
+    ``InterlockError`` passes through untouched so a deliberate
+    :class:`ScopeHaltedError` is not reclassified as an anchor failure.
+    """
+    try:
+        yield
+    except InterlockError:
+        raise
+    except AgentGovError as exc:
+        raise AnchorError(f"AgentGov refused {context}: {type(exc).__name__}: {exc}") from exc
+    except (sqlite3.Error, OSError) as exc:
+        raise AnchorError(f"AgentGov ledger unreachable during {context}: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +97,11 @@ class LedgerAnchor:
         something that is not an AgentGov ledger, or names one whose chain
         does not verify. Every unusable-ledger path raises this and nothing
         else, so a caller can fail closed on one exception type.
+
+    No method on this class raises an ``agentgov`` exception. Every foreign
+    error is translated into :class:`~interlock.exceptions.AnchorError` or
+    :class:`~interlock.exceptions.ScopeHaltedError`, so the whole write path
+    is catchable with ``except InterlockError``.
     """
 
     __slots__ = ("_audit", "_governed")
@@ -118,12 +154,13 @@ class LedgerAnchor:
         source = self._audit or self._governed
         if source is None:
             return AnchorPoint.unanchored()
-        entries = source.ledger.entries()
-        return AnchorPoint(
-            anchored=True,
-            head_hash=source.ledger.head_hash,
-            sequence=entries[-1].sequence if entries else 0,
-        )
+        with _barrier("a chain-head read"):
+            entries = source.ledger.entries()
+            return AnchorPoint(
+                anchored=True,
+                head_hash=source.ledger.head_hash,
+                sequence=entries[-1].sequence if entries else 0,
+            )
 
     def assert_scope_live(self, scope_id: str) -> None:
         """Refuse if AgentGov's breaker has tripped for this scope or an ancestor.
@@ -152,6 +189,34 @@ class LedgerAnchor:
                     f"refusing to commit staged effects for scope {scope_id!r}"
                 )
 
+    def assert_scope_known(self, scope_id: str) -> None:
+        """Refuse a plan whose scope AgentGov has never heard of.
+
+        Only meaningful when reverse anchoring is on, because that is the one
+        path that *writes* to AgentGov and therefore the one that can fail on
+        an unknown scope. Called from admission rather than from the commit
+        path deliberately: the reverse anchor is written after the substrate
+        has committed, so discovering the scope is bogus there means raising
+        on top of durable effects and destroying the caller's ``StageResult``.
+        Failing at admission costs nothing and stages nothing.
+
+        :raises AnchorError: If the scope is not present in AgentGov.
+        """
+        if self._governed is None:
+            return
+        try:
+            self._governed.node(scope_id)
+        except UnknownScopeError as exc:
+            raise AnchorError(
+                f"plan scope {scope_id!r} is not a scope AgentGov knows about, so "
+                f"its reverse anchor could never be written. Open or delegate the "
+                f"scope before staging, or build the engine without an anchor"
+            ) from exc
+        except AgentGovError as exc:
+            raise AnchorError(
+                f"AgentGov refused a scope lookup for {scope_id!r}: {type(exc).__name__}: {exc}"
+            ) from exc
+
     def verify(self) -> None:
         """Re-verify the attached ledger.
 
@@ -164,6 +229,10 @@ class LedgerAnchor:
             source.verify_integrity()
         except LedgerIntegrityError as exc:
             raise LedgerUnverifiedError(str(exc)) from exc
+        except AgentGovError as exc:
+            raise AnchorError(
+                f"AgentGov refused a verification read: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def reverse_anchor(
         self,
@@ -201,19 +270,21 @@ class LedgerAnchor:
                 f"with forward anchoring only"
             )
         memo = f"interlock:{record_hash[:16]}"
-        authorization = self._governed.authorize(scope_id, amount, memo=memo)
-        return self._governed.capture(authorization, amount, memo=memo)
+        with _barrier(f"a reverse anchor on scope {scope_id!r}"):
+            authorization = self._governed.authorize(scope_id, amount, memo=memo)
+            return self._governed.capture(authorization, amount, memo=memo)
 
     def find_reverse_anchors(self) -> tuple[LedgerEntry, ...]:
         """Every AgentGov entry carrying an Interlock reverse anchor."""
         source = self._audit or self._governed
         if source is None:
             return ()
-        return tuple(
-            entry
-            for entry in source.audit_trail()
-            if entry.memo.startswith("interlock:") and entry.entry_type is EntryType.SPEND
-        )
+        with _barrier("an audit-trail read"):
+            return tuple(
+                entry
+                for entry in source.audit_trail()
+                if entry.memo.startswith("interlock:") and entry.entry_type is EntryType.SPEND
+            )
 
     def close(self) -> None:
         if self._audit is not None:

@@ -45,6 +45,7 @@ from interlock.anchor import AnchorPoint, LedgerAnchor
 from interlock.chain import EscrowChain, RecordType
 from interlock.exceptions import (
     AdmissionError,
+    AnchorError,
     CyclicPlanError,
     ForbiddenStatementError,
     PlanError,
@@ -206,17 +207,31 @@ class EscrowEngine:
                     f"mutations there would not appear in the diff"
                 )
 
+        # The reverse anchor is written after commit, where a failure arrives
+        # on top of durable effects. Validate the scope now, while refusing
+        # still costs nothing.
+        if self._anchor is not None:
+            self._anchor.assert_scope_known(plan.scope_id)
+
     # -- the main path ------------------------------------------------------
 
-    def execute(self, plan: EffectPlan) -> StageResult:
+    def execute(self, plan: EffectPlan, *, settle_cost: Decimal | str | None = None) -> StageResult:
         """Run one plan through the full lifecycle.
 
         A refusal is a normal return with ``committed=False``, not an
         exception. Use :meth:`execute_or_raise` when a refusal should raise.
 
+        :param settle_cost: Overrides the engine's configured settle cost for
+            this plan only. What a plan cost to produce is a property of the
+            plan, not of the engine that stages it, so an engine-wide constant
+            forces either a flat rate for every plan or a new engine per plan.
+            ``None`` keeps the configured value.
         :returns: The outcome, including the diff and verdict, whether or not
             the plan committed.
+        :raises InterlockError: And only ``InterlockError``. Foreign
+            exceptions from the AgentGov seam are translated at the anchor.
         """
+        cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
         self.admit(plan)
         self._record(RecordType.PLAN_ADMITTED, plan, plan.content_hash(), note=plan.intent[:80])
 
@@ -323,13 +338,15 @@ class EscrowEngine:
             verdict=verdict,
             outcomes=tuple(outcomes),
             chain_head=head,
-            anchored_to=self._reverse_anchor(plan, head),
+            anchored_to=self._reverse_anchor(plan, head, cost),
             committed=committed,
         )
 
-    def execute_or_raise(self, plan: EffectPlan) -> StageResult:
+    def execute_or_raise(
+        self, plan: EffectPlan, *, settle_cost: Decimal | str | None = None
+    ) -> StageResult:
         """As :meth:`execute`, but raise :class:`AdmissionError` on refusal."""
-        result = self.execute(plan)
+        result = self.execute(plan, settle_cost=settle_cost)
         if result.verdict is not None and not result.verdict.admitted:
             reasons = "; ".join(v.message for v in result.verdict.blocking)
             raise AdmissionError(f"plan {plan.plan_id} refused: {reasons}", verdict=result.verdict)
@@ -388,7 +405,7 @@ class EscrowEngine:
             note=note,
         )
 
-    def _reverse_anchor(self, plan: EffectPlan, head: str) -> str:
+    def _reverse_anchor(self, plan: EffectPlan, head: str, cost: Decimal) -> str:
         """Write Interlock's chain head into AgentGov, when co-resident.
 
         ``memo`` is inside AgentGov's hash payload, so once written the reverse
@@ -403,7 +420,23 @@ class EscrowEngine:
         # rather than attempted and thrown from the commit path.
         if self._anchor is None or not self._anchor.can_reverse_anchor:
             return ""
-        if self._settle_cost <= 0:
+        if cost <= 0:
             return ""
-        entry = self._anchor.reverse_anchor(plan.scope_id, head, cost=self._settle_cost)
+        try:
+            entry = self._anchor.reverse_anchor(plan.scope_id, head, cost=cost)
+        except AnchorError:
+            # Degrade rather than raise. By here the substrate has already
+            # committed, so raising would replace a truthful StageResult about
+            # durable effects with an exception about bookkeeping. The forward
+            # anchor is already in the chain; only the reverse one is missing,
+            # and StageResult.anchored_to == "" says exactly that.
+            logger.warning(
+                "reverse anchor failed for plan %s on scope %s; effects are "
+                "committed and the forward anchor stands, but AgentGov carries "
+                "no reverse anchor for this plan",
+                plan.plan_id,
+                plan.scope_id,
+                exc_info=True,
+            )
+            return ""
         return entry.entry_hash if entry is not None else ""

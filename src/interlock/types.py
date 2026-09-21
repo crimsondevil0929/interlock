@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Final, NewType
 
@@ -361,23 +362,54 @@ class EffectDiff:
         """
         return len(self.tenant_ids)
 
-    def column_total(self, table: str, column: str) -> tuple[float, float]:
+    def column_total(self, table: str, column: str) -> tuple[Decimal, Decimal]:
         """Sum a numeric column across this diff, before and after.
+
+        Exact, not approximate. Every value is routed through
+        ``Decimal(str(value))`` rather than binary floating point, because this
+        total is the input to a financial predicate: a guard that permits a
+        30% drawdown must not admit a 30.000000000000004% one because two
+        representations of the same cent did not compare equal. The cost is
+        that a column of IEEE doubles is summed at the precision it was
+        *printed* with, which is the precision it was meant to have.
 
         Rows absent from one side contribute zero to that side, which is the
         correct treatment for inserts and deletes.
 
-        :returns: ``(before_total, after_total)``.
+        :returns: ``(before_total, after_total)`` as exact decimals.
         """
-        before = after = 0.0
+        before = after = Decimal(0)
         for delta in self.deltas:
             if delta.table != table:
                 continue
             if delta.before is not None:
-                before += _as_float(delta.before.get(column))
+                before += _as_decimal(delta.before.get(column))
             if delta.after is not None:
-                after += _as_float(delta.after.get(column))
+                after += _as_decimal(delta.after.get(column))
         return before, after
+
+    def tenant_column_totals(self, table: str, column: str) -> dict[str, tuple[Decimal, Decimal]]:
+        """As :meth:`column_total`, but grouped by tenant.
+
+        The whole-table total is the wrong denominator on a multi-tenant
+        substrate: draining one tenant completely is a small fraction of a
+        platform-wide sum, so a table-scoped guard admits a single-tenant
+        wipe. Rows whose tenant could not be read group under ``""``.
+
+        :returns: ``{tenant_id: (before_total, after_total)}``.
+        """
+        totals: dict[str, tuple[Decimal, Decimal]] = {}
+        for delta in self.deltas:
+            if delta.table != table:
+                continue
+            tenant = delta.tenant_id or ""
+            before, after = totals.get(tenant, (Decimal(0), Decimal(0)))
+            if delta.before is not None:
+                before += _as_decimal(delta.before.get(column))
+            if delta.after is not None:
+                after += _as_decimal(delta.after.get(column))
+            totals[tenant] = (before, after)
+        return totals
 
     def content_hash(self) -> str:
         rows = [
@@ -387,13 +419,25 @@ class EffectDiff:
         return canonical_hash([self.plan_id, self.substrate_id, self.truncated, rows])
 
 
-def _as_float(value: object) -> float:
-    """Coerce a column value to float, treating non-numerics as zero."""
+def _as_decimal(value: object) -> Decimal:
+    """Coerce a column value to an exact Decimal, non-numerics to zero.
+
+    ``bool`` is excluded deliberately: it is an ``int`` subclass in Python, and
+    summing a status flag into a money column is never what was meant.
+    ``str`` is accepted because SQLite is dynamically typed and a NUMERIC
+    column can hand back text; an unparseable string contributes zero rather
+    than raising, since a checker that dies on one bad row approves nothing.
+    """
     if isinstance(value, bool):
-        return 0.0
-    if isinstance(value, int | float):
-        return float(value)
-    return 0.0
+        return Decimal(0)
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float | str):
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return Decimal(0)
+    return Decimal(0)
 
 
 # --------------------------------------------------------------------------
