@@ -47,6 +47,7 @@ from __future__ import annotations
 
 from interlock.anchor import AnchorPoint, LedgerAnchor
 from interlock.builder import PlanBuilder, new_effect_id, new_plan_id
+from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.engine import EscrowEngine, StageResult
 from interlock.exceptions import (
@@ -103,6 +104,7 @@ __all__ = [
     "AnchorError",
     "AnchorPoint",
     "BlastRadius",
+    "CascadeReport",
     "ChainInUseError",
     "ChainIntegrityError",
     "ColumnValueGuard",

@@ -988,6 +988,8 @@ reading the test suite.
 | Commit intent written ahead of the commit and fsynced; a crashed commit resolved exactly from a marker written inside the stage's transaction | `substrate.SqliteSubstrate.commit`, `.resolve_intent`, `engine.EscrowEngine.recover` |
 | Chain resumed from its file and verified before any append; one writer per file | `chain.EscrowChain.__init__` |
 | Writes outside `TableSpec` denied at prepare time | `substrate.SqliteSubstrate._authorize` |
+| Cascade check: foreign-key reach into unobserved tables read from the schema, refused unless acknowledged; the gap recorded per stage | `cascade`, `substrate.SqliteSubstrate.check_cascades`, `engine.EscrowEngine.execute` |
+| The capture table, the commit marker and transaction control are out of a statement's reach | `substrate.SqliteSubstrate._authorize`, `substrate.FORBIDDEN_VERBS` |
 | `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
@@ -1001,9 +1003,12 @@ reading the test suite.
 
 - **Diff completeness is scoped to `TableSpec`.** A statement that writes a
   table outside it is denied by SQLite's authorizer when the statement is
-  prepared (unless `enforce_table_access=False`). A foreign-key cascade into an
-  unobserved table is executed internally and never prepared, so it is neither
-  denied nor measured: it does not appear in the diff.
+  prepared (unless `enforce_table_access=False`). A foreign-key action that
+  would reach an unobserved table is refused before a row changes (see
+  `cascade.analyze_cascades`), unless the operator acknowledged that table; an
+  acknowledged cascade runs unmeasured and the stage's `STAGE_OPENED` record
+  names the gap. A schema trigger that writes an unobserved table is denied by
+  the authorizer, like the statement that fired it.
 - **`no_ddl` is enforced on the statement, not on `Effect.kind`.** The
   checker still reads the agent-supplied kind, but `SqliteSubstrate` vets the
   statement's leading verb through `reject_reason()`, which `admit()` calls

@@ -69,6 +69,53 @@ jobs:
       - name: Run the demo end to end
         run: uv run python demo.py --no-color
 
+  postgres:
+    name: test against PostgreSQL ${{ matrix.postgres }} (py3.12)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_USER: interlock_admin
+          POSTGRES_PASSWORD: interlock
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U interlock_admin"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    # The same suite as the test job, with the PostgreSQL integration tests
+    # required rather than skippable: a service that failed to come up fails
+    # the job instead of passing it by skipping.
+    env:
+      INTERLOCK_TEST_POSTGRES_DSN: postgresql://interlock_admin:interlock@localhost:5432/postgres
+      INTERLOCK_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install the project
+        run: uv sync --frozen --python 3.12
+
+      - name: Tests with coverage, PostgreSQL required
+        run: uv run pytest -v --cov=interlock --cov-report=term-missing
+
+      - name: Enforce coverage floor
+        run: uv run coverage report --fail-under=90
+
   install-from-clone:
     name: install from a clean clone (no sibling checkout)
     runs-on: ubuntu-latest

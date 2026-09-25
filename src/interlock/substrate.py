@@ -12,20 +12,25 @@ Neither the agent nor a static analysis of the SQL sees any of that. The
 database does, because it has already executed it.
 
 Scope limit worth knowing before wiring this up: the measurement covers exactly
-the tables in ``tables``. A mutation to anything else is invisible here and the
-diff will not say so. See ``EscrowEngine.admit`` for what is and is not gated.
+the tables in ``tables``. A statement that writes any other table is refused,
+and so is an operation whose foreign-key actions would carry it into one,
+unless the operator acknowledged that table (see :mod:`interlock.cascade`).
+See ``EscrowEngine.admit`` for what is and is not gated.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
+from interlock.cascade import CascadeReport, analyze_cascades, read_sqlite_foreign_keys
 from interlock.exceptions import (
     ForbiddenStatementError,
     StageConflictError,
@@ -51,6 +56,8 @@ __all__ = [
     "TableSpec",
     "leading_verb",
 ]
+
+logger = logging.getLogger("interlock.substrate")
 
 _CAPTURE_TABLE = "_interlock_capture"
 
@@ -79,6 +86,16 @@ FORBIDDEN_VERBS: frozenset[str] = frozenset(
         "vacuum",
         "reindex",
         "analyze",
+        # Transaction control. The stage's transaction belongs to the
+        # substrate: a COMMIT here makes the effects so far durable before
+        # they are measured or adjudicated, and every later effect then runs
+        # in autocommit, outside anything a verdict can roll back.
+        "begin",
+        "commit",
+        "end",
+        "rollback",
+        "savepoint",
+        "release",
     }
 )
 """Statement verbs a stage refuses outright.
@@ -101,6 +118,16 @@ _REACH_ACTIONS: dict[int, str] = {
 """Actions that would move the stage outside the database being measured.
 Also caught by ``FORBIDDEN_VERBS``; denied here too because that check reads a
 leading verb and this one reads what SQLite is about to do."""
+
+_CONTROL_ACTIONS: frozenset[int] = frozenset({sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT})
+"""Transaction control. Only the substrate issues it; see ``FORBIDDEN_VERBS``."""
+
+_SENTINEL = "interlock: a write reached"
+"""Prefix of the message a sentinel trigger aborts with."""
+
+_ROWID_ALIASES: frozenset[str] = frozenset({"rowid", "_rowid_", "oid"})
+"""Names SQLite accepts for a table's rowid. Updating one updates an
+``INTEGER PRIMARY KEY`` column, which a foreign key may reference."""
 
 _LEADING_COMMENT = re.compile(r"\A(?:\s|--[^\n]*\n|/\*.*?\*/)+", re.S)
 _LEADING_WORD = re.compile(r"\A[A-Za-z_]+")
@@ -256,20 +283,45 @@ class SqliteSubstrate:
         commit intent and its record, :meth:`resolve_intent` answers whether
         that commit landed. The table is created in the database on first use
         and gains one row per committed stage.
+    :param acknowledge_cascades: Unobserved tables a foreign-key action may
+        write, unmeasured. By default an operation whose referential actions
+        reach an unobserved table is refused (see :meth:`check_cascades`);
+        naming the table here lets it run and records the gap on every stage.
+        Not lifted by ``enforce_table_access=False``.
+    :raises ValueError: If an acknowledged table is also observed.
+
+    The cascade check runs when a stage opens, inside its write lock, against
+    the live schema, so a foreign key added since setup is enforced from the
+    next stage on. It is cached on SQLite's ``schema_version``. It is enforced
+    three times over, because each layer sees a path the others might not:
+
+    - The authorizer refuses a statement that deletes from, or updates a
+      referenced column of, an observed table whose action is gated.
+    - The authorizer refuses a foreign-key action SQLite compiles into an
+      unobserved, unacknowledged table. It catches ``INSERT OR REPLACE`` and
+      ``ON CONFLICT REPLACE``, which delete through an ``INSERT``.
+    - Temporary ``BEFORE`` triggers on each gated unobserved table abort any
+      row change there while the stage is open.
     """
 
     __slots__ = (
+        "_acknowledged",
         "_by_name",
+        "_capture_triggers",
         "_conn",
         "_denied",
         "_enforce",
+        "_folded",
         "_handle",
+        "_internal",
         "_markers",
-        "_marking",
         "_max_rows",
         "_path",
+        "_report",
+        "_report_version",
         "_stage_seconds",
         "_tables",
+        "_target",
     )
 
     def __init__(
@@ -281,16 +333,32 @@ class SqliteSubstrate:
         max_diff_rows: int = 50_000,
         enforce_table_access: bool = True,
         commit_markers: bool = True,
+        acknowledge_cascades: Collection[str] = (),
     ) -> None:
         self._path = path
         self._tables = tuple(tables)
         self._by_name = {t.name: t for t in tables}
+        self._folded = frozenset(t.name.lower() for t in tables)
+        self._capture_triggers = frozenset(
+            f"ilok_{t.name}_{op}" for t in tables for op in ("i", "u", "d")
+        )
+        acknowledged = frozenset(a.lower() for a in acknowledge_cascades)
+        clash = sorted(acknowledged & self._folded)
+        if clash:
+            raise ValueError(
+                f"acknowledge_cascades names observed table(s) {', '.join(clash)}; a "
+                f"cascade into an observed table is measured, so there is no gap to accept"
+            )
+        self._acknowledged = acknowledged
         self._stage_seconds = max_stage_seconds
         self._max_rows = max_diff_rows
         self._enforce = enforce_table_access
         self._markers = commit_markers
-        self._marking = False
-        self._denied: tuple[str, str] | None = None
+        self._internal = False
+        self._target: str | None = None
+        self._denied: str | None = None
+        self._report: CascadeReport | None = None
+        self._report_version: int | None = None
         self._conn: sqlite3.Connection | None = None
         self._handle: StageHandle | None = None
 
@@ -317,6 +385,36 @@ class SqliteSubstrate:
     def commit_markers(self) -> bool:
         """Whether each commit writes the marker :meth:`resolve_intent` reads."""
         return self._markers
+
+    @property
+    def cascade_report(self) -> CascadeReport | None:
+        """The last cascade check, or ``None`` before the first one."""
+        return self._report
+
+    def check_cascades(self) -> CascadeReport:
+        """Read the foreign-key graph and report every reach out of ``tables``.
+
+        The setup-time form of the check a stage runs when it opens: call it
+        (``EscrowRuntime`` does) to learn at startup which operations will be
+        refused and which gaps were acknowledged. Each gated reach and each
+        acknowledged gap is logged as a warning when the schema changes.
+
+        :raises SubstrateUnavailableError: If the database cannot be read.
+        """
+        try:
+            conn = sqlite3.connect(
+                f"file:{self._path}?mode=rw", uri=True, timeout=self._stage_seconds
+            )
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(f"cannot open {self._path}: {exc}") from exc
+        try:
+            return self._cascades(conn)
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(
+                f"cannot read the foreign-key graph of {self._path}: {exc}"
+            ) from exc
+        finally:
+            conn.close()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -354,11 +452,6 @@ class SqliteSubstrate:
                     f"could not create the commit-marker table {_MARKER_TABLE}: {exc}"
                 ) from exc
         self._install_capture(conn)
-        # Installed *after* the capture DDL, which would otherwise be denied
-        # by its own authorizer, and before BEGIN, so the first statement of
-        # the stage is already covered.
-        if self._enforce:
-            conn.set_authorizer(self._authorize)
 
         opened = datetime.now(UTC)
         handle = StageHandle(
@@ -373,6 +466,22 @@ class SqliteSubstrate:
         except sqlite3.OperationalError as exc:
             conn.close()
             raise StageConflictError(f"could not acquire a write transaction: {exc}") from exc
+        # The graph is read under the write lock, so no schema change can land
+        # between the check and the statements it governs.
+        try:
+            report = self._cascades(conn)
+            self._install_sentinels(conn, report)
+        except sqlite3.Error as exc:
+            conn.close()
+            raise SubstrateUnavailableError(
+                f"cannot read the foreign-key graph of {self._path}: {exc}"
+            ) from exc
+        # Installed last, after every statement the substrate issues to set
+        # the stage up, so the first statement it covers is the first effect.
+        # Always installed: enforce_table_access governs only the
+        # unobserved-table rule, never the capture table, the commit marker,
+        # transaction control or the cascade gates.
+        conn.set_authorizer(self._authorize)
         self._conn = conn
         self._handle = handle
         return handle
@@ -416,19 +525,21 @@ class SqliteSubstrate:
         if refusal is not None:
             raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
         self._denied = None
+        self._target = None
         try:
             cursor = conn.execute(effect.statement, dict(effect.parameters))
         except sqlite3.Error as exc:
             denied = self._denied
             self._denied = None
             if denied is not None:
-                verb, table = denied
                 raise ForbiddenStatementError(
-                    f"effect {effect.effect_id!r} refused: statement attempts "
-                    f"{verb} on {table!r}, which this substrate does not observe. "
-                    f"A write there would execute, commit, and measure as an empty "
-                    f"diff that every invariant passes. Observed tables: "
-                    f"{', '.join(sorted(self._by_name)) or '<none>'}"
+                    f"effect {effect.effect_id!r} refused: {denied}"
+                ) from exc
+            if _SENTINEL in str(exc):
+                raise ForbiddenStatementError(
+                    f"effect {effect.effect_id!r} refused: {exc}. A foreign-key action "
+                    f"reached a table the cascade check gates; the statement was "
+                    f"aborted before the row changed"
                 ) from exc
             if "no name" in str(exc) and effect.parameters:
                 raise StageError(
@@ -453,10 +564,12 @@ class SqliteSubstrate:
         plan yields two deltas. See ``EffectDiff.blast_radius``.
         """
         conn = self._require(handle)
-        rows = conn.execute(
-            f"SELECT tbl, pk, before, after FROM {_CAPTURE_TABLE} ORDER BY tbl, pk, rowid LIMIT ?",
-            (self._max_rows + 1,),
-        ).fetchall()
+        with self._substrate_statements():
+            rows = conn.execute(
+                f"SELECT tbl, pk, before, after FROM {_CAPTURE_TABLE} "
+                f"ORDER BY tbl, pk, rowid LIMIT ?",
+                (self._max_rows + 1,),
+            ).fetchall()
 
         truncated = len(rows) > self._max_rows
         deltas: list[RowDelta] = []
@@ -500,17 +613,14 @@ class SqliteSubstrate:
         self._assert_live(handle)
         committed_at = datetime.now(UTC)
         try:
-            if self._markers:
-                self._marking = True
-                try:
+            with self._substrate_statements():
+                if self._markers:
                     conn.execute(
                         f"INSERT INTO main.{_MARKER_TABLE} (stage_id, plan_id, committed_at) "
                         f"VALUES (?, ?, ?)",
                         (str(handle.stage_id), handle.plan_id, committed_at.isoformat()),
                     )
-                finally:
-                    self._marking = False
-            conn.execute("COMMIT")
+                conn.execute("COMMIT")
         except sqlite3.Error as exc:
             raise StageError(f"commit failed: {exc}") from exc
         return CommitReceipt(
@@ -564,7 +674,8 @@ class SqliteSubstrate:
         if conn is None or self._handle is None or self._handle.stage_id != handle.stage_id:
             return
         try:
-            conn.execute("ROLLBACK")
+            with self._substrate_statements():
+                conn.execute("ROLLBACK")
         except sqlite3.Error:
             # Already resolved. abort() runs on error paths, where raising
             # would replace the original exception with this one.
@@ -594,6 +705,63 @@ class SqliteSubstrate:
                 f"while holding write locks"
             )
 
+    @contextmanager
+    def _substrate_statements(self) -> Iterator[None]:
+        """Statements the substrate itself issues: the authorizer lets them by.
+
+        The commit marker, ``COMMIT``, ``ROLLBACK`` and the capture read. Each
+        is authored here, never by the agent, so none needs the checks that
+        exist to bound what the agent's statements reach.
+        """
+        self._internal = True
+        try:
+            yield
+        finally:
+            self._internal = False
+
+    def _cascades(self, conn: sqlite3.Connection) -> CascadeReport:
+        """The cascade report for the schema ``conn`` sees, cached on its version."""
+        version = int(conn.execute("PRAGMA main.schema_version").fetchone()[0])
+        if self._report is not None and self._report_version == version:
+            return self._report
+        report = analyze_cascades(read_sqlite_foreign_keys(conn), self._folded, self._acknowledged)
+        previous = self._report
+        self._report = report
+        self._report_version = version
+        # Logged when what is gated changes, not on every schema change: the
+        # first stage creates the commit-marker table, which bumps the version.
+        if previous is not None and previous.reaches == report.reaches:
+            return report
+        for reach in report.gated:
+            logger.warning("cascade check: refusing %s", reach.describe())
+        for reach in report.gaps:
+            logger.warning("cascade check: acknowledged, unmeasured: %s", reach.describe())
+        for table in sorted(report.unreached_acknowledgments):
+            logger.warning(
+                "cascade check: acknowledge_cascades names %r, which no foreign-key "
+                "action from an observed table reaches",
+                table,
+            )
+        return report
+
+    def _install_sentinels(self, conn: sqlite3.Connection, report: CascadeReport) -> None:
+        """Abort any row change in a gated unobserved table while the stage is open.
+
+        The authorizer refuses the operations that would reach these tables.
+        This is the layer that does not depend on it: whatever path a write
+        takes into the table, SQLite fires these triggers first. Temporary, so
+        they exist on this connection only and die with it.
+        """
+        for index, table in enumerate(sorted(report.unmonitored_tables())):
+            quoted = '"' + table.replace('"', '""') + '"'
+            message = f"{_SENTINEL} unobserved table {table} during a stage"
+            literal = "'" + message.replace("'", "''") + "'"
+            for op, suffix in (("DELETE", "d"), ("UPDATE", "u")):
+                conn.execute(
+                    f"CREATE TEMP TRIGGER ilok_guard_{index}_{suffix} BEFORE {op} "
+                    f"ON main.{quoted} BEGIN SELECT RAISE(ABORT, {literal}); END"
+                )
+
     def _authorize(
         self,
         action: int,
@@ -602,13 +770,22 @@ class SqliteSubstrate:
         db_name: str | None,
         trigger_name: str | None,
     ) -> int:
-        """SQLite authorizer: deny row mutations outside ``tables``.
+        """SQLite authorizer: bound what a stage's statements can write.
 
         Runs inside SQLite at statement-prepare time, so a denied statement
         never executes at all — this is enforcement in the engine, not a
-        predicate over a diff that was never captured. It closes the case
-        ``reject_reason`` cannot see: an ``Effect.target`` label claiming an
-        observed table while the statement writes somewhere else.
+        predicate over a diff that was never captured. It closes the cases
+        ``reject_reason`` cannot see, because it reads what SQLite is about to
+        do rather than the statement's leading word:
+
+        - A write to a table outside ``tables``, whatever ``Effect.target``
+          claims (unless ``enforce_table_access=False``).
+        - A write to the capture table, which would rewrite the measurement,
+          except by the capture triggers themselves.
+        - A write to the commit marker, which would forge a recovery answer.
+        - Transaction control, which would commit before adjudication.
+        - A cascade-gated delete or key update (see :mod:`interlock.cascade`),
+          and a foreign-key action SQLite compiles into an unobserved table.
 
         Reads are left alone. A statement may legitimately join or subquery a
         table it does not write, and denying reads would break correct plans
@@ -616,25 +793,89 @@ class SqliteSubstrate:
 
         :returns: ``SQLITE_OK`` or ``SQLITE_DENY``.
         """
-        if action in _WRITE_ACTIONS:
-            table = arg1 or ""
-            if table == _CAPTURE_TABLE or table in self._by_name:
-                return sqlite3.SQLITE_OK
-            # The commit marker is written by commit() alone. A statement the
-            # agent authored that forged one would make recovery report a
-            # crashed stage as committed.
-            if table == _MARKER_TABLE and self._marking and db_name == "main":
-                return sqlite3.SQLITE_OK
-            # sqlite_* internal tables are touched by the engine itself, never
-            # by a statement the agent authored; denying them breaks SQLite.
-            if table.startswith("sqlite_"):
-                return sqlite3.SQLITE_OK
-            self._denied = (_WRITE_ACTIONS[action], table)
-            return sqlite3.SQLITE_DENY
+        if self._internal:
+            return sqlite3.SQLITE_OK
+        if action in _CONTROL_ACTIONS:
+            return self._deny(
+                f"statement attempts transaction control ({arg1 or 'SAVEPOINT'}). The "
+                f"stage's transaction belongs to the substrate: a COMMIT inside it makes "
+                f"the effects durable before they are measured or adjudicated"
+            )
         if action in _REACH_ACTIONS:
-            self._denied = (_REACH_ACTIONS[action], arg1 or "")
-            return sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK
+            return self._deny(
+                f"statement attempts {_REACH_ACTIONS[action]} on {arg1 or ''!r}, which "
+                f"reaches outside the database being measured"
+            )
+        if action not in _WRITE_ACTIONS:
+            return sqlite3.SQLITE_OK
+        verb = _WRITE_ACTIONS[action]
+        table = arg1 or ""
+        key = table.lower()
+        if key == _CAPTURE_TABLE:
+            # Written by the capture triggers and nothing else. A statement
+            # that deleted from it would erase the measurement, and the diff
+            # would read as empty to every checker.
+            if trigger_name in self._capture_triggers:
+                return sqlite3.SQLITE_OK
+            return self._deny(
+                f"statement attempts {verb} on the capture table {table!r}, which "
+                f"holds the stage's measurement"
+            )
+        if key == _MARKER_TABLE:
+            # Written by commit() alone. A statement the agent authored that
+            # forged one would make recovery report a crashed stage as
+            # committed.
+            return self._deny(
+                f"statement attempts {verb} on the commit-marker table {table!r}, "
+                f"which only the substrate writes"
+            )
+        # sqlite_* internal tables are touched by the engine itself, never by
+        # a statement the agent authored; denying them breaks SQLite.
+        if key.startswith("sqlite_"):
+            return sqlite3.SQLITE_OK
+
+        gate = self._report.gates().get(key) if self._report is not None else None
+        if gate is not None and self._report is not None:
+            if action == sqlite3.SQLITE_DELETE and gate.delete:
+                return self._deny(self._report.refusal(table, "delete"))
+            if action == sqlite3.SQLITE_UPDATE:
+                column = (arg2 or "").lower()
+                if gate.blocks_update_of(column) or (
+                    column in _ROWID_ALIASES and (gate.update_columns or gate.update_any)
+                ):
+                    return self._deny(self._report.refusal(table, "update", arg2 or ""))
+
+        if trigger_name is None:
+            # SQLite has no multi-table DML: the first unnamed write in a
+            # statement is the statement's own target. A later unnamed write to
+            # another table is a foreign-key action SQLite compiled for it.
+            if self._target is None:
+                self._target = key
+            elif key != self._target and key not in self._folded:
+                if key in self._acknowledged:
+                    return sqlite3.SQLITE_OK
+                return self._deny(
+                    f"statement's foreign-key action attempts {verb} on {table!r}, "
+                    f"which this substrate does not observe; the rows it changed there "
+                    f"would not appear in the diff. Observe the table, or accept the "
+                    f"unmeasured write with acknowledge_cascades"
+                )
+
+        if key in self._folded or not self._enforce:
+            return sqlite3.SQLITE_OK
+        return self._deny(
+            f"statement attempts {verb} on {table!r}, which this substrate does not "
+            f"observe. A write there would execute, commit, and measure as an empty "
+            f"diff that every invariant passes. Observed tables: "
+            f"{', '.join(sorted(self._by_name)) or '<none>'}"
+        )
+
+    def _deny(self, reason: str) -> int:
+        # The first denial is the one that names the statement's real problem;
+        # SQLite may call back again while unwinding the prepare.
+        if self._denied is None:
+            self._denied = reason
+        return sqlite3.SQLITE_DENY
 
     def _install_capture(self, conn: sqlite3.Connection) -> None:
         """Create the session-local capture table and its triggers."""

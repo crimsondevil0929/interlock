@@ -375,20 +375,33 @@ against the shipped code, not inferred.
   any table not in `TableSpec`, plus `ATTACH`/`DETACH`. A statement whose label claims an
   observed table while writing elsewhere never executes; it raises
   `ForbiddenStatementError` naming the table it reached for. Pass
-  `enforce_table_access=False` to restore the v0.1.0 behaviour for a migration.
+  `enforce_table_access=False` to lift the unobserved-table rule for a migration; the rules
+  below stay on.
 
-  **What this still does not cover.** The authorizer fires when SQLite *prepares a
-  statement*. Foreign-key cascades are executed internally and are not prepared, so a
-  cascade into an unobserved table is neither denied here nor visible in the diff — see
-  the next bullet. Grant the connection exactly the observed tables anyway; a
-  database-enforced grant is a boundary, and this is a second one in front of it.
+  The same callback refuses a statement that writes the capture table (which would erase
+  the measurement), the commit-marker table, or transaction control: a `COMMIT` inside a
+  stage used to make every effect before it durable before any checker ran. Grant the
+  connection exactly the observed tables anyway; a database-enforced grant is a boundary,
+  and this is a second one in front of it.
 
-  DDL specifically is refused twice over: `SqliteSubstrate.reject_reason()` reads the
-  statement's leading verb at admission, so `ALTER`/`DROP`/`CREATE`/`TRUNCATE`/`VACUUM`
-  /`ATTACH`/`PRAGMA` and friends are rejected whatever `Effect.kind` claims.
-- **Cascades reach outside the measurement.** A granted `DELETE` on an observed table whose
-  foreign key cascades into an unobserved table destroys those rows and they do not appear
-  in the diff.
+  DDL and transaction control are refused twice over: `SqliteSubstrate.reject_reason()`
+  reads the statement's leading verb at admission, so `ALTER`/`DROP`/`CREATE`/`TRUNCATE`
+  /`VACUUM`/`ATTACH`/`PRAGMA`/`COMMIT`/`SAVEPOINT` and friends are rejected whatever
+  `Effect.kind` claims.
+- **A foreign-key cascade into an unobserved table is refused unless you acknowledge it.**
+  A `DELETE` on `orders` that cascades into an unobserved `order_notes` used to destroy
+  those notes unmeasured. Every stage now reads the foreign-key graph under its write lock
+  and refuses, before a row changes, a delete or a referenced-key update whose `CASCADE`,
+  `SET NULL` or `SET DEFAULT` actions reach an unobserved table, naming the path. The
+  analysis follows chains of actions to any depth and is column-precise: updating
+  `orders.status` is never refused because of a key on `orders.id`. `EscrowRuntime` runs
+  the same check at startup and logs every gated operation. To let a cascade run
+  unmeasured, name the table in `acknowledge_cascades=[...]`; every stage that runs with
+  that gap says so in its `STAGE_OPENED` record. The refusal is enforced three ways, so no
+  single layer is load-bearing: the authorizer refuses the parent operation, the
+  authorizer refuses any foreign-key action SQLite compiles into the table (which is what
+  catches `INSERT OR REPLACE`), and temporary triggers on the table abort any row change
+  there while the stage is open.
 - **One engine stages one substrate.** A plan whose effects name another
   substrate is refused at admission; nothing coordinates two substrates, so a
   plan spanning SQL and a non-transactional sink needs the outbox pattern below.

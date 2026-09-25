@@ -9,6 +9,39 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added
+
+- **The cascade check (2.1).** New `interlock.cascade` reads the foreign-key
+  graph (`PRAGMA foreign_key_list` on SQLite, `pg_constraint` on PostgreSQL)
+  and works out every table a `DELETE` or `UPDATE` on an observed table can
+  reach through `CASCADE`, `SET NULL` or `SET DEFAULT`, to any depth, with the
+  shortest path. It is column-precise for updates, and `RESTRICT` and
+  `NO ACTION` reach nothing. `SqliteSubstrate` runs it when every stage opens,
+  under the write lock, cached on `schema_version`, and refuses an operation
+  whose actions reach an unobserved table, before a row changes, naming the
+  path. `acknowledge_cascades=[...]` lets a named table be cascaded into
+  unmeasured, and the gap is written into that stage's `STAGE_OPENED` record.
+  `EscrowRuntime` runs the check at startup (`cascade_report`), logs every
+  gated operation, and now requires the database to exist.
+
+### Fixed
+
+- **A statement could erase the measurement.** The authorizer allowed any write
+  to `_interlock_capture`, so an effect `DELETE FROM _interlock_capture` emptied
+  the diff, and a plan that zeroed every order committed past `BlastRadius(1)`.
+  Only the capture triggers may write it now, with or without
+  `enforce_table_access`.
+- **A statement could commit the stage before adjudication.** `COMMIT` was not
+  a forbidden verb and SQLite's transaction actions were authorized, so an
+  effect `COMMIT` made every earlier effect durable before any checker ran, and
+  every later one autocommitted. `BEGIN`, `COMMIT`, `END`, `ROLLBACK`,
+  `SAVEPOINT` and `RELEASE` are refused at admission and by the authorizer.
+- **The authorizer was off with `enforce_table_access=False`.** It now always
+  runs; the flag lifts only the unobserved-table rule.
+- The README said a foreign-key cascade is not seen by SQLite's authorizer. On
+  current SQLite it is, and it was refused with a message about an unobserved
+  write; the cascade check now refuses it first and says why.
+
 ## [0.1.2] - 2026-09-25
 
 Makes two of v0.1.1's guarantees true. Each fix is tested against a

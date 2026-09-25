@@ -45,6 +45,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from interlock.anchor import AnchorPoint, LedgerAnchor
+from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.exceptions import (
     AdmissionError,
@@ -72,6 +73,11 @@ from interlock.types import (
 __all__ = ["EscrowEngine", "StageResult"]
 
 logger = logging.getLogger("interlock.engine")
+
+_GAPS = "unmeasured cascades acknowledged: "
+"""Prefix on a ``STAGE_OPENED`` note naming each foreign-key reach into an
+unobserved table the operator accepted. The stage's diff does not cover those
+rows, and the chain says so for the stage it applies to."""
 
 _MARKER_ARMED = "; commit marker armed"
 """Suffix on a ``COMMIT_INTENT`` note: the substrate writes a commit marker
@@ -261,7 +267,13 @@ class EscrowEngine:
         committed = False
 
         try:
-            self._record(RecordType.STAGE_OPENED, plan, plan.content_hash(), stage=handle.stage_id)
+            self._record(
+                RecordType.STAGE_OPENED,
+                plan,
+                plan.content_hash(),
+                stage=handle.stage_id,
+                note=_coverage_note(self._substrate),
+            )
             for effect in plan.topological_order():
                 outcomes.append(self._substrate.apply(handle, effect))
             state = StageState.STAGED
@@ -561,3 +573,14 @@ class EscrowEngine:
             )
             return ""
         return entry.entry_hash if entry is not None else ""
+
+
+def _coverage_note(substrate: ShadowSubstrate) -> str:
+    """Name the acknowledged cascade gaps the stage just opened runs with.
+
+    Empty when the substrate reports none, or runs no cascade check.
+    """
+    report = getattr(substrate, "cascade_report", None)
+    if not isinstance(report, CascadeReport) or not report.gaps:
+        return ""
+    return _GAPS + report.describe_gaps()
