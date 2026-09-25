@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sqlite3
@@ -463,7 +464,7 @@ def test_a_failed_write_leaves_neither_a_torn_line_nor_a_record(
     good, head = path.read_bytes(), chain.head_hash
 
     def disk_full(fd: int) -> None:
-        raise OSError(28, "No space left on device")
+        raise OSError(errno.ENOSPC, "No space left on device")
 
     monkeypatch.setattr(os, "fsync", disk_full)
     with pytest.raises(OSError, match="No space"):
@@ -570,7 +571,7 @@ def test_bookkeeping_that_fails_after_a_durable_commit_never_records_a_rollback(
 
     def lose_the_committed_record(self: EscrowChain, path: Path, record: EscrowRecord) -> None:
         if record.record_type is RecordType.COMMITTED:
-            raise OSError(5, "I/O error")
+            raise OSError(errno.EIO, "I/O error")
         real_write(self, path, record)
 
     monkeypatch.setattr(EscrowChain, "_write", lose_the_committed_record)
@@ -712,7 +713,7 @@ def test_a_chain_claim_that_cannot_be_taken_is_an_anchor_error(
         EscrowChain(blocked)
 
     def no_locking(fd: int) -> None:
-        raise OSError(37, "No locks available")
+        raise OSError(errno.ENOLCK, "No locks available")
 
     monkeypatch.setattr("interlock.chain._lock_exclusive_nonblocking", no_locking)
     with pytest.raises(AnchorError, match="advisory locking"):
