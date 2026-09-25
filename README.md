@@ -443,11 +443,12 @@ form work. Two consequences worth knowing before you depend on this:
 
 - **Interlock cannot be published to PyPI as-is.** PyPI rejects direct-URL dependencies.
   Publishing means putting `agentgov` on PyPI and pinning a version range instead.
-- **The pin is an exact agentgov commit, not a branch.** A resolver cache is keyed on
-  name and version, and `@main` is a moving target: interlock 0.1.1 locked an agentgov
-  commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
-  0.1.2 needs agentgov 0.1.2, for its verified read-only refresh and its zero-value
-  anchor entries. Pin a tag or a commit for anything reproducible, and use
+- **The pin is an agentgov release tag, `v0.1.2`, not a branch.** A resolver cache is
+  keyed on name and version, and `@main` is a moving target: interlock 0.1.1 locked an
+  agentgov commit that reported itself as 0.1.0 and lacked APIs this README relied on.
+  Interlock 0.1.2 needs agentgov 0.1.2, for its verified read-only refresh and its
+  zero-value anchor entries. `uv.lock` records the exact commit the tag names. Pin a
+  tag or a commit for anything reproducible, and use
   `uv sync --refresh-package agentgov` when you suspect a stale build.
 
 ## Development

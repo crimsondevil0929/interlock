@@ -87,10 +87,10 @@ reproduction of the break in
   it can read a chain a live writer holds, and its `append()` raises. Resume
   appending with `EscrowChain(path)`. An engine refuses a read-only chain.
 - **Halt messages name the reason** the governor recorded for the trip.
-- **agentgov is pinned to an exact commit** of its 0.1.2 release, not `@main`.
-  Interlock 0.1.1's lock resolved an agentgov commit that reported itself as
-  0.1.0 and lacked `verify_conservation()`, so the two 0.1.1 releases had never
-  run together.
+- **agentgov is pinned to its `v0.1.2` release tag**, not `@main`, and
+  `uv.lock` records the exact commit. Interlock 0.1.1's lock resolved an
+  agentgov commit that reported itself as 0.1.0 and lacked
+  `verify_conservation()`, so the two 0.1.1 releases had never run together.
 - `docs/ESCROW_SPEC.md`'s conformance section describes 0.1.2, including two
   items it had not caught up with: writes outside `TableSpec` are denied by the
   authorizer, and `tenant_column` is validated.
