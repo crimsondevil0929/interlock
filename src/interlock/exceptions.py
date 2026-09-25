@@ -13,6 +13,7 @@ from __future__ import annotations
 __all__ = [
     "AdmissionError",
     "AnchorError",
+    "ChainInUseError",
     "ChainIntegrityError",
     "CyclicPlanError",
     "ForbiddenStatementError",
@@ -130,3 +131,13 @@ class LedgerUnverifiedError(AnchorError):
 
 class ChainIntegrityError(AnchorError):
     """Interlock's own record chain failed verification."""
+
+
+class ChainInUseError(AnchorError):
+    """Another live writer holds the escrow chain file.
+
+    One chain file has one writer. A second would append records carrying the
+    same sequence numbers, forking the chain, and its crash recovery would
+    resolve the first writer's in-flight commits as though that writer had
+    died. Read a live chain with ``EscrowChain.load``, which claims nothing.
+    """

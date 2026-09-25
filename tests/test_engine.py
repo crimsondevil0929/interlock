@@ -755,27 +755,26 @@ def test_unprefixed_target_still_admits(db: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_default_settle_cost_commits_and_returns_rather_than_raising(
-    db: str, tmp_path: Path
-) -> None:
-    """EscrowEngine's default settle_cost is "0", which cannot reverse-anchor.
+def test_default_settle_cost_writes_a_free_reverse_anchor(db: str, tmp_path: Path) -> None:
+    """EscrowEngine's default settle_cost is "0", which now anchors for free.
 
-    AgentGov rejects a non-positive authorization, and _reverse_anchor runs
-    after substrate.commit(), so attempting it used to raise ValueError with
-    the effects already durable: the caller lost the StageResult entirely and
-    no anchor was written. A non-positive cost is now "not configured".
+    Before AgentGov 0.1.2 a reverse anchor could only ride on a real
+    authorize/capture pair, so the default meant forward anchoring only. Now a
+    zero cost writes a zero-value ANCHOR entry and no money moves.
     """
     from agentgov import BudgetManager, money
+    from agentgov.core import EntryType
 
     from interlock import LedgerAnchor
 
     gov = BudgetManager.open_sqlite(str(tmp_path / "gov.db"))
     try:
         gov.open_root("agent", money("5.00"))
+        anchor = LedgerAnchor(governed=gov)
         engine = EscrowEngine(
             SqliteSubstrate(db, tables=TABLES),
             checkers=[BlastRadius(50)],
-            anchor=LedgerAnchor(governed=gov),
+            anchor=anchor,
         )
         result = engine.execute(
             make_plan(
@@ -789,10 +788,35 @@ def test_default_settle_cost_commits_and_returns_rather_than_raising(
             )
         )
         assert result.committed
-        assert result.anchored_to == "", "no reverse anchor, and it says so"
         assert (1, 42.0) in totals(db)
+        (entry,) = anchor.find_reverse_anchors()
+        assert entry.entry_type is EntryType.ANCHOR
+        assert result.anchored_to == entry.entry_hash
+        assert entry.memo == f"interlock:{result.chain_head[:16]}"
+        assert gov.available("agent") == money("5.00"), "the anchor cost nothing"
+        gov.verify_integrity()
     finally:
         gov.close()
+
+
+def test_a_negative_settle_cost_is_refused_before_anything_is_staged(db: str) -> None:
+    with pytest.raises(ValueError, match="cannot be negative"):
+        EscrowEngine(SqliteSubstrate(db, tables=TABLES), checkers=[], settle_cost="-0.01")
+
+    engine = engine_for(db, checkers=[BlastRadius(50)])
+    with pytest.raises(PlanError, match="cannot be negative"):
+        engine.execute(
+            make_plan(
+                Effect(
+                    effect_id=EffectId("e1"),
+                    kind=EffectKind.UPDATE,
+                    target="sqlite:orders",
+                    statement="UPDATE orders SET total=42 WHERE id=1",
+                )
+            ),
+            settle_cost="-1",
+        )
+    assert len(engine.chain) == 0 and (1, 42.0) not in totals(db)
 
 
 def test_a_positive_settle_cost_writes_the_reverse_anchor(db: str, tmp_path: Path) -> None:

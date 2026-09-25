@@ -1,9 +1,9 @@
 # Effect escrow: specification and interface contract
 
-**Status:** specification. `interlock` v0.1.0 implements a subset; see
-[Conformance](#conformance-of-interlock-v010) at the end of this document for
+**Status:** specification. `interlock` v0.1.2 implements a subset; see
+[Conformance](#conformance-of-interlock-v012) at the end of this document for
 what is implemented, what is partial, and what is unimplemented.
-**Applies to:** `interlock` v0.1.0 against `agentgov` v0.1.0.
+**Applies to:** `interlock` v0.1.2 against `agentgov` v0.1.2.
 **Normative language:** MUST, MUST NOT, SHOULD, MAY per RFC 2119.
 
 ---
@@ -27,9 +27,11 @@ opens the governor's SQLite ledger through
 anchors its own records to that chain. It does not write to the ledger, does not
 subclass `Ledger` or `BudgetManager`, and does not depend on any private name.
 
-`agentgov` v0.1.0 is frozen. Nothing in this document requires a change to
-`src/agentgov/`. If a requirement here appears to need one, the requirement is
-wrong and MUST be redesigned around the existing public surface.
+`agentgov`'s public surface is the whole contract. Nothing in this document
+depends on a private name. `agentgov` v0.1.2 added two public calls that
+`interlock` v0.1.2 uses, `BudgetManager.refresh()` and `BudgetManager.anchor()`;
+a requirement that appears to need anything beyond the public surface is wrong
+and MUST be redesigned around it.
 
 The `agentgov` surface listed in section 3.1 is the compatibility promise.
 Changing it is a breaking change for `interlock`.
@@ -666,11 +668,13 @@ Methods called:
 |---|---|
 | `BudgetManager.open_sqlite(path, read_only=True)` | Attach. Read-only mode takes no advisory file lock, so it is safe against a live governing process. |
 | `manager.verify_integrity()` | Admissibility gate (E3-2). |
-| `manager.ledger.head_hash` | The anchor value. Commits to the entire history. |
+| `manager.refresh()` | Catch a read-only view up with the governor, verified, before every head read and breaker check (E3-4). Since `agentgov` v0.1.2. |
+| `manager.ledger.head_hash`, `len(manager.ledger)`, `manager.ledger.lock` | The anchor value and its sequence, read together under the ledger's lock. |
 | `manager.ledger.entries()` | Chain read for anchor resolution. |
 | `manager.audit_trail(scope_id)` | Correlate committed plans to settled spend. |
-| `manager.control_events` | Halted-scope check (E3-6). |
-| `manager.node(scope_id)`, `.ancestry()` | Scope hierarchy for radius policy. |
+| `manager.control_events` | Halted-scope check (E3-6), and the reason a scope was halted. |
+| `manager.node(scope_id)`, `.ancestry()`, `.halted_by()` | Scope hierarchy for radius policy and the breaker check. |
+| `manager.anchor(scope_id, memo)` | Governed mode: a free, zero-value reverse anchor. Since `agentgov` v0.1.2. |
 
 Requirements:
 
@@ -685,6 +689,10 @@ Requirements:
   no governor runs unanchored, and every escrow record MUST then carry
   `agentgov_head_hash = GENESIS_HASH` with `anchored = False`, so unanchored
   records are distinguishable rather than indistinguishable.
+- **E3-4.** A read-only view is a snapshot until refreshed. The escrow MUST
+  refresh it, verified, before the pre-commit breaker check, and SHOULD before
+  every head read. A refresh that fails verification MUST fail the stage
+  closed.
 
 ## 3.2 The escrow's own chain
 
@@ -962,7 +970,7 @@ Unresolved, and listed because they are unresolved rather than minor.
 
 ---
 
-# Conformance of `interlock` v0.1.0
+# Conformance of `interlock` v0.1.2
 
 What the shipped package actually does against this document. Verified by
 reading `src/interlock/` and by running adversarial plans against it, not by
@@ -974,8 +982,13 @@ reading the test suite.
 |---|---|
 | One-way `interlock -> agentgov` dependency, read-only by default | `anchor.LedgerAnchor`, opens with `read_only=True` |
 | Ledger verified at attach; refuses to stage against a chain that fails | `anchor.LedgerAnchor.__init__` |
-| Reverse anchor into AgentGov `memo` when co-resident | `anchor.LedgerAnchor.reverse_anchor` |
-| Breaker re-read immediately before commit, not at admission | `engine.EscrowEngine.execute` |
+| `E3-4`: read-only view refreshed and verified before every record and breaker check | `anchor.LedgerAnchor.observe`, `assert_scope_live` |
+| Reverse anchor into AgentGov when co-resident: a free `ANCHOR` entry, or the memo of a settled spend | `anchor.LedgerAnchor.reverse_anchor` |
+| Breaker re-read immediately before commit, not at admission; with a governed manager, the governor's lock held from the check through the commit | `anchor.LedgerAnchor.guard_commit`, `engine.EscrowEngine.execute` |
+| Commit intent written ahead of the commit and fsynced; a crashed commit resolved exactly from a marker written inside the stage's transaction | `substrate.SqliteSubstrate.commit`, `.resolve_intent`, `engine.EscrowEngine.recover` |
+| Chain resumed from its file and verified before any append; one writer per file | `chain.EscrowChain.__init__` |
+| Writes outside `TableSpec` denied at prepare time | `substrate.SqliteSubstrate._authorize` |
+| `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
 | Row-level diff measured from the substrate via `AFTER` triggers | `substrate.SqliteSubstrate` |
@@ -986,14 +999,11 @@ reading the test suite.
 
 ## Partial
 
-- **Diff completeness is scoped to `TableSpec`, and admission does not enforce
-  that scope.** `admit()` rejects a plan whose `Effect.target` names an
-  unobserved table, but `target` is an agent-supplied label and is never
-  compared against the statement. A statement that writes a table outside
-  `TableSpec` executes, commits, and produces `blast_radius == 0` with an empty
-  `tables_touched`, so every measured checker passes on an empty measurement.
-  The same gap covers FK cascades into unobserved tables: the cascade executes
-  and does not appear in the diff.
+- **Diff completeness is scoped to `TableSpec`.** A statement that writes a
+  table outside it is denied by SQLite's authorizer when the statement is
+  prepared (unless `enforce_table_access=False`). A foreign-key cascade into an
+  unobserved table is executed internally and never prepared, so it is neither
+  denied nor measured: it does not appear in the diff.
 - **`no_ddl` is enforced on the statement, not on `Effect.kind`.** The
   checker still reads the agent-supplied kind, but `SqliteSubstrate` vets the
   statement's leading verb through `reject_reason()`, which `admit()` calls
@@ -1004,17 +1014,19 @@ reading the test suite.
   inside one plan contributes 2. The bound is therefore conservative for row
   count and is not a count of affected rows.
 - **Chain durability is opt-in.** `EscrowEngine` defaults to an in-memory
-  `EscrowChain`, which does not survive the process. The commit record is now
-  write-ahead — `COMMIT_INTENT` before `substrate.commit()`, `COMMITTED` after
-  — and `EscrowChain.unresolved_intents()` reads back intents with no terminal
-  record. An intent attests an attempt, not an outcome: resolving one means
-  asking the substrate whether that transaction landed, and nothing here
-  automates that.
-- **`tenant_isolation` depends on `tenant_column` being present in
-  `TableSpec.columns`.** It is not validated as of v0.1.0 in the spec's sense of
-  a declared capability: if the column is absent from the captured image, every
-  `tenant_id` reads as `None`, `tenant_count` is 0, and the check passes
-  regardless of how many tenants the plan spans.
+  `EscrowChain`, which does not survive the process. With a path, the intent is
+  write-ahead and fsynced, and `EscrowEngine.recover()` (run by `EscrowRuntime`
+  at startup) resolves every open intent from the substrate's commit marker.
+  An intent written before v0.1.2, or by a substrate without markers, carries
+  no armed marker and stays open for an operator. The marker table is not
+  pruned.
+- **The pre-commit breaker check across processes.** In audit mode no lock
+  spans the governor's database and the substrate, so a trip the governor
+  commits between the check and the commit cannot be excluded. When one is
+  observed immediately after the commit, the `COMMITTED` record says so.
+- **The escrow chain is keyless.** Anyone who can write the file can recompute
+  the chain from start to finish and it verifies. A reverse anchor in a
+  governed AgentGov is the only copy of its head outside the file.
 
 ## Unimplemented
 

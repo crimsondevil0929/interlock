@@ -37,7 +37,7 @@ Every adjudication is written to a hash-linked chain, anchored to an AgentGov
 ledger when one is attached. See :mod:`interlock.anchor` for the seam, which is
 read-only by default.
 
-v0.1.0 is one substrate (SQLite) and a measurement scoped to the tables that
+v0.1.x is one substrate (SQLite) and a measurement scoped to the tables that
 substrate was configured to observe. ``docs/ESCROW_SPEC.md`` has a conformance
 section listing what is implemented, partial and unimplemented; read it before
 putting this in front of a production database.
@@ -53,6 +53,7 @@ from interlock.exceptions import (
     AdmissionError,
     AnchorError,
     ChainIntegrityError,
+    ChainInUseError,
     CyclicPlanError,
     ForbiddenStatementError,
     InterlockError,
@@ -95,13 +96,14 @@ from interlock.types import (
     Verdict,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "AdmissionError",
     "AnchorError",
     "AnchorPoint",
     "BlastRadius",
+    "ChainInUseError",
     "ChainIntegrityError",
     "ColumnValueGuard",
     "Compensation",

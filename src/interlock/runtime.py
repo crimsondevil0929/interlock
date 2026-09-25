@@ -35,7 +35,7 @@ from types import TracebackType
 
 from interlock.anchor import LedgerAnchor
 from interlock.builder import PlanBuilder
-from interlock.chain import EscrowChain
+from interlock.chain import EscrowChain, EscrowRecord
 from interlock.engine import EscrowEngine, StageResult
 from interlock.invariants import InvariantChecker, default_checkers
 from interlock.substrate import SqliteSubstrate, TableSpec
@@ -55,20 +55,33 @@ class EscrowRuntime:
         ``default_checkers``, whose thresholds are **uncalibrated
         placeholders** — measure your own diffs and pass your own.
     :param chain_path: Where to persist the escrow chain. ``None`` keeps the
-        chain in memory, which is lost when the process exits.
+        chain in memory, which is lost when the process exits. An existing
+        chain is resumed, verified, and claimed for this runtime until
+        :meth:`close`; any commit a crashed predecessor left unresolved is
+        then resolved from the substrate's commit marker (see
+        :attr:`recovered`).
     :param governed: A live, write-capable ``BudgetManager``. Supplying it
         enables reverse anchoring into AgentGov.
     :param audit_path: Path to a governor ledger to read-only anchor against,
         when this process is not the one governing it.
-    :param settle_cost: Default cost charged to ``scope_id`` per plan when
-        reverse anchoring. Overridable per call.
+    :param settle_cost: Cost charged to ``scope_id`` per plan when reverse
+        anchoring. The default ``"0"`` writes a free ``ANCHOR`` entry.
+        Overridable per call.
     :param max_stage_seconds: Bound on stage lifetime; a stage holds write
         locks for its whole life.
     :param enforce_table_access: Deny row mutations outside ``tables`` inside
         SQLite itself. On by default.
     """
 
-    __slots__ = ("_anchor", "_chain", "_engine", "_scope_id", "_settle_cost", "_substrate")
+    __slots__ = (
+        "_anchor",
+        "_chain",
+        "_engine",
+        "_recovered",
+        "_scope_id",
+        "_settle_cost",
+        "_substrate",
+    )
 
     def __init__(
         self,
@@ -94,7 +107,6 @@ class EscrowRuntime:
             max_diff_rows=max_diff_rows,
             enforce_table_access=enforce_table_access,
         )
-        self._chain = EscrowChain(chain_path) if chain_path is not None else EscrowChain()
         self._anchor: LedgerAnchor | None = None
         if governed is not None or audit_path is not None:
             self._anchor = LedgerAnchor(audit_path, governed=governed)  # type: ignore[arg-type]
@@ -103,13 +115,24 @@ class EscrowRuntime:
                 row_limit=max_diff_rows,
                 allowed_tables=[t.name for t in tables],
             )
-        self._engine = EscrowEngine(
-            self._substrate,
-            checkers=checkers,
-            chain=self._chain,
-            anchor=self._anchor,
-            settle_cost=self._settle_cost,
-        )
+        try:
+            self._chain = EscrowChain(chain_path) if chain_path is not None else EscrowChain()
+            try:
+                self._engine = EscrowEngine(
+                    self._substrate,
+                    checkers=checkers,
+                    chain=self._chain,
+                    anchor=self._anchor,
+                    settle_cost=self._settle_cost,
+                )
+                self._recovered = self._engine.recover() if chain_path is not None else ()
+            except BaseException:
+                self._chain.close()
+                raise
+        except BaseException:
+            if self._anchor is not None:
+                self._anchor.close()
+            raise
 
     # -- accessors -------------------------------------------------------
 
@@ -129,6 +152,11 @@ class EscrowRuntime:
     @property
     def substrate(self) -> SqliteSubstrate:
         return self._substrate
+
+    @property
+    def recovered(self) -> tuple[EscrowRecord, ...]:
+        """Records appended at startup resolving a crashed predecessor's commits."""
+        return self._recovered
 
     def plan(self, *, intent: str = "", trajectory_id: str | None = None) -> PlanBuilder:
         """A builder pre-bound to this runtime's scope."""
@@ -204,11 +232,12 @@ class EscrowRuntime:
             self._anchor.verify()
 
     def close(self) -> None:
-        """Release the anchor's read-only ledger handle, if it holds one.
+        """Release the chain file and the anchor's read-only ledger handle.
 
         The substrate holds no connection between stages, so there is nothing
-        else to release.
+        else to release. Idempotent.
         """
+        self._chain.close()
         if self._anchor is not None:
             self._anchor.close()
 

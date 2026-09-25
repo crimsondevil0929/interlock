@@ -429,7 +429,8 @@ def act_audit(s: Style, engine: EscrowEngine, anchor: LedgerAnchor, gov: BudgetM
         entry = anchors[-1]
         print(
             s.dim(
-                f"      AGOV1 seq={entry.sequence} memo={entry.memo} hash={entry.entry_hash[:16]}"
+                f"      {entry.version} {entry.entry_type.value} seq={entry.sequence} "
+                f"memo={entry.memo} hash={entry.entry_hash[:16]}"
             )
         )
         print(s.dim("      memo is inside AgentGov's own hash payload, so the anchor"))

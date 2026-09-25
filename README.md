@@ -68,14 +68,18 @@ Three properties hold by construction:
 1. No path from `STAGED` to `COMMITTED` skips adjudication.
 2. `REJECTED` is not overridable in-process. Overriding means submitting a new plan that
    carries an explicit waiver, which is then itself a recorded artifact.
-3. A committed effect is discoverable from the chain. `COMMIT_INTENT` is written before
-   the substrate is told to commit and `COMMITTED` after it returns, so a crash in that
-   window leaves an intent with no terminal record after it.
-
-What the third does **not** give: an intent says a commit was *attempted*, not that it
-succeeded. `EscrowChain.unresolved_intents()` returns the open ones and narrows the
-question to a specific plan and stage; answering it means asking the substrate whether
-that transaction landed. An append-only chain cannot honestly backfill the answer.
+3. A committed effect is discoverable from the chain. `COMMIT_INTENT` is written, and
+   forced to stable storage, before the substrate is told to commit, and `COMMITTED`
+   after it returns, so a crash in that window leaves an intent with no terminal record
+   after it.
+4. That crash is resolved exactly, not guessed. An intent says only that a commit was
+   *attempted*, so the substrate also writes a marker row, in `_interlock_commits`,
+   inside the stage's own transaction: it exists if and only if the effects do. On
+   restart, `EscrowEngine.recover()` reads the marker for every intent a crashed process
+   left open and appends `COMMITTED` or `ABORTED`, noted as recovered. `EscrowRuntime`
+   runs it at startup whenever it has a `chain_path`. An intent written before v0.1.2,
+   or by a substrate without markers, is left open and logged for an operator: its
+   marker's absence proves nothing.
 
 ## Quickstart
 
@@ -177,6 +181,17 @@ if not result.committed:
 
 `execute()` takes a per-plan `settle_cost=` that overrides the engine's
 default, because what a plan cost to produce is a property of the plan.
+
+**The chain file.** `EscrowChain(path)` resumes an existing file: every record is read
+and verified before the first append, so a restarted process continues the chain rather
+than starting a second one at sequence 1. One file has one writer. The chain claims
+`<path>.lock` for as long as it is open, and a second writer, in this process or
+another, gets `ChainInUseError`: two writers would fork the chain, and recovery would
+resolve one writer's in-flight commits as if it had died. `EscrowChain.load(path)`
+reads and verifies a live chain without claiming it, and cannot append. A final line
+left torn by a crash mid-append is cut off by the next writer, because that append
+never returned. Intents and outcomes are fsynced before `append` returns; pass
+`fsync=False` to give that up for speed.
 
 ### Typing
 
@@ -283,16 +298,26 @@ prove an upper bound on its own, because a record could name a stale head, so
 `verify_anchors()` additionally requires the observed AgentGov sequence to be
 non-decreasing across an append-only chain.
 
+**The breaker is read as it is now, immediately before commit.** Attached read-only
+(`audit_path=`, the separate-process deployment), Interlock refreshes its view of the
+governor before every record and before the pre-commit breaker check, verifying
+everything the governor wrote since, so a halt written after Interlock attached stops
+the commit. A view that fails verification refuses to operate. With a governed manager
+in the same process, the governor's own lock is held from that check through the
+substrate's commit, so a trip lands strictly before it (and the commit is refused) or
+strictly after it. Across processes no lock spans both databases: a trip the governor
+commits between the check and the commit cannot be excluded, and when one happens the
+`COMMITTED` record says so.
+
 Where Interlock is co-resident with a write-capable governor it also writes its own chain
-head into the `memo` of the ledger entries a plan causes. `memo` is inside AgentGov's hash
+head into AgentGov's chain: into a zero-value `ANCHOR` entry, or, when the plan carries a
+cost, into the memo of the spend that settles it. `memo` is inside AgentGov's hash
 payload, so the reverse anchor cannot be altered without breaking AgentGov's own
 verification. The two chains then interlock in both directions.
 
-**Reverse anchoring costs something.** AgentGov has no zero-value entry that can carry a
-memo, so the chain head rides on a real `authorize`/`capture` pair. `EscrowEngine`'s
-`settle_cost` defaults to `"0"`, which means forward anchoring only and leaves
-`StageResult.anchored_to` empty. Pass the plan's real cost to get the bidirectional
-anchor:
+**Reverse anchoring is free.** `settle_cost` defaults to `"0"`, which writes a zero-value
+`ANCHOR` entry and charges nothing. Pass the plan's real cost and the anchor rides on the
+spend that settles it instead:
 
 ```python
 from agentgov import BudgetManager, money
@@ -334,7 +359,7 @@ in-flight side effects does not stop the effects.
 
 ## Scope
 
-**v0.1.0 ships one substrate: SQLite.** PostgreSQL is declared as an extra and has no
+**v0.1.x ships one substrate: SQLite.** PostgreSQL is declared as an extra and has no
 driver. One connector at the row-level-diff standard is worth more than several reporting
 only row counts, because a row count is the summary this design exists to replace.
 
@@ -375,8 +400,14 @@ against the shipped code, not inferred.
   per tenant; it does not make the guard symmetric.
 - **`StatedFootprint` is a cooperative diagnostic.** It reads `Effect.stated_rows`. An agent
   that omits the field on any effect turns the checker into a no-op.
-- **Chain durability is opt-in and the commit record is not write-ahead.** See
-  [Lifecycle](#lifecycle).
+- **Chain durability is opt-in.** With no `chain_path` the chain lives in memory and
+  dies with the process. With one, the intent is write-ahead and a crashed commit is
+  resolved exactly on restart; see [Lifecycle](#lifecycle). The `_interlock_commits`
+  table gains one row per committed stage and is not pruned.
+- **The chain is keyless.** Anyone who can write the chain file can recompute a SHA-256
+  chain from start to finish and it will verify. A reverse anchor in a governed AgentGov
+  is the one copy of the head outside the file; signed receipts and an external witness
+  are planned.
 - **Lock footprint.** A stage holds write locks for its whole life. `max_stage_seconds`
   bounds it. Human review must not happen inside an open stage; abort, present the recorded
   diff, and re-stage on approval, because the substrate may have moved.
@@ -412,10 +443,12 @@ form work. Two consequences worth knowing before you depend on this:
 
 - **Interlock cannot be published to PyPI as-is.** PyPI rejects direct-URL dependencies.
   Publishing means putting `agentgov` on PyPI and pinning a version range instead.
-- **`@main` is a moving target, and a resolver cache is keyed on name and version.** If
-  `agentgov`'s version does not change when its behaviour does, a cached wheel built from
-  an older commit satisfies `agentgov==0.1.0` forever and you get stale code with no
-  warning. Pin a tag or a commit for anything reproducible, and use
+- **The pin is an agentgov release tag, `v0.1.2`, not a branch.** A resolver cache is
+  keyed on name and version, and `@main` is a moving target: interlock 0.1.1 locked an
+  agentgov commit that reported itself as 0.1.0 and lacked APIs this README relied on.
+  Interlock 0.1.2 needs agentgov 0.1.2, for its verified read-only refresh and its
+  zero-value anchor entries. `uv.lock` records the exact commit the tag names. Pin a
+  tag or a commit for anything reproducible, and use
   `uv sync --refresh-package agentgov` when you suspect a stale build.
 
 ## Development
