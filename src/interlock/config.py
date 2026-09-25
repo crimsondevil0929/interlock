@@ -6,6 +6,7 @@ TOML, so the standard library reads it::
     database = "postgresql://interlock_agent@db/app"   # or a SQLite path
     schema = "public"                 # PostgreSQL only
     stage_roles = ["interlock_agent"] # PostgreSQL install only
+    audit_roles = ["interlock_audit"] # PostgreSQL install only
     acknowledge_cascades = []
 
     [[tables]]
@@ -45,6 +46,7 @@ class InterlockConfig:
     tables: tuple[TableSpec, ...]
     schema: str = "public"
     stage_roles: tuple[str, ...] = ()
+    audit_roles: tuple[str, ...] = ()
     acknowledge_cascades: tuple[str, ...] = ()
 
     def with_database(self, database: str | None) -> InterlockConfig:
@@ -56,6 +58,7 @@ class InterlockConfig:
             tables=self.tables,
             schema=self.schema,
             stage_roles=self.stage_roles,
+            audit_roles=self.audit_roles,
             acknowledge_cascades=self.acknowledge_cascades,
         )
 
@@ -106,6 +109,7 @@ def load_config(path: str | Path, *, database: str | None = None) -> InterlockCo
         tables=tuple(tables),
         schema=_string(raw, "schema", default="public"),
         stage_roles=tuple(_strings(raw, "stage_roles", required=False)),
+        audit_roles=tuple(_strings(raw, "audit_roles", required=False)),
         acknowledge_cascades=tuple(_strings(raw, "acknowledge_cascades", required=False)),
     )
 

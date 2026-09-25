@@ -26,8 +26,6 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator
-from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,7 +33,6 @@ from typing import Any
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
-from psycopg import sql  # noqa: E402
 from psycopg.conninfo import make_conninfo  # noqa: E402
 
 from interlock import (  # noqa: E402
@@ -61,56 +58,8 @@ from interlock.exceptions import (  # noqa: E402
 )
 from interlock.postgres import install  # noqa: E402
 from interlock.types import Effect, EffectPlan  # noqa: E402
+from tests.conftest import OBSERVED, PASSWORD, Pg, create_role, drop_role  # noqa: E402
 from tests.schemas import specs  # noqa: E402
-
-PASSWORD = "agent"  # noqa: S105 - a throwaway role in a throwaway database
-
-OBSERVED = ("orders", "order_items", "refunds", "shipments", "stock_reservations", "accounts")
-
-
-@dataclass(frozen=True)
-class Pg:
-    admin: str
-    """The tables' owner, which installed Interlock. A superuser here."""
-    agent: str
-    """The stage role: DML on the observed tables, SELECT on the rest."""
-    role: str
-    cluster: str
-
-
-def _create_role(cluster: str, name: str, *, extra: str = "") -> None:
-    with psycopg.connect(cluster, autocommit=True) as conn:
-        conn.execute(
-            sql.SQL("CREATE ROLE {} LOGIN PASSWORD {} " + extra).format(
-                sql.Identifier(name), sql.Literal(PASSWORD)
-            )
-        )
-
-
-def _drop_role(cluster: str, database: str, name: str) -> None:
-    with psycopg.connect(database, autocommit=True) as conn:
-        conn.execute(sql.SQL("DROP OWNED BY {} CASCADE").format(sql.Identifier(name)))
-    with psycopg.connect(cluster, autocommit=True) as conn:
-        conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(name)))
-
-
-@pytest.fixture
-def pg(pg_admin_dsn: str, pg_back_office: str) -> Iterator[Pg]:
-    role = f"il_agent_{uuid.uuid4().hex[:10]}"
-    _create_role(pg_admin_dsn, role)
-    try:
-        with psycopg.connect(pg_back_office, autocommit=True) as conn:
-            install(conn, specs(*OBSERVED), stage_roles=[role])
-            conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {', '.join(OBSERVED)} TO {role}")
-            conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}")
-        yield Pg(
-            admin=pg_back_office,
-            agent=make_conninfo(pg_back_office, user=role, password=PASSWORD),
-            role=role,
-            cluster=pg_admin_dsn,
-        )
-    finally:
-        _drop_role(pg_admin_dsn, pg_back_office, role)
 
 
 def substrate(env: Pg, **kwargs: Any) -> PostgresSubstrate:
@@ -465,7 +414,7 @@ def test_an_out_of_band_writer_cannot_open_a_stage(pg: Pg, pg_admin_dsn: str) ->
     """Only the stage role may call begin_stage; anyone else who could would
     have their writes captured into their own session instead of logged."""
     outsider = f"il_outsider_{uuid.uuid4().hex[:8]}"
-    _create_role(pg_admin_dsn, outsider)
+    create_role(pg_admin_dsn, outsider)
     try:
         with psycopg.connect(pg.admin, autocommit=True) as conn:
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {outsider}")
@@ -474,7 +423,7 @@ def test_an_out_of_band_writer_cannot_open_a_stage(pg: Pg, pg_admin_dsn: str) ->
         with psycopg.connect(dsn) as conn, pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("SELECT interlock.begin_stage(gen_random_uuid(), 'x', '{}'::jsonb)")
     finally:
-        _drop_role(pg_admin_dsn, pg.admin, outsider)
+        drop_role(pg_admin_dsn, pg.admin, outsider)
 
 
 def test_a_schema_trigger_cannot_write_where_the_role_may_not(pg: Pg) -> None:
@@ -583,14 +532,14 @@ def test_a_write_grant_through_a_group_role_counts(pg: Pg, pg_admin_dsn: str) ->
         with pytest.raises(SubstrateConfigurationError, match="invoices"):
             engine(pg).execute(one("orders", "SELECT 1"))
     finally:
-        _drop_role(pg_admin_dsn, pg.admin, group)
+        drop_role(pg_admin_dsn, pg.admin, group)
 
 
 def test_a_superuser_or_an_owner_cannot_stage(pg: Pg, pg_admin_dsn: str) -> None:
     with pytest.raises(SubstrateConfigurationError, match="superuser"):
         PostgresSubstrate(pg.admin, tables=specs(*OBSERVED)).check_cascades()
     owner = f"il_owner_{uuid.uuid4().hex[:8]}"
-    _create_role(pg_admin_dsn, owner)
+    create_role(pg_admin_dsn, owner)
     try:
         with psycopg.connect(pg.admin, autocommit=True) as conn:
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {owner}")
@@ -601,12 +550,12 @@ def test_a_superuser_or_an_owner_cannot_stage(pg: Pg, pg_admin_dsn: str) -> None
     finally:
         with psycopg.connect(pg.admin, autocommit=True) as conn:
             conn.execute("ALTER TABLE refunds OWNER TO CURRENT_USER")
-        _drop_role(pg_admin_dsn, pg.admin, owner)
+        drop_role(pg_admin_dsn, pg.admin, owner)
 
 
 def test_a_role_without_stage_grants_is_told_what_to_grant(pg: Pg, pg_admin_dsn: str) -> None:
     bare = f"il_bare_{uuid.uuid4().hex[:8]}"
-    _create_role(pg_admin_dsn, bare)
+    create_role(pg_admin_dsn, bare)
     try:
         dsn = make_conninfo(pg.admin, user=bare, password=PASSWORD)
         with pytest.raises(SubstrateConfigurationError, match="lacks a privilege"):
@@ -614,7 +563,7 @@ def test_a_role_without_stage_grants_is_told_what_to_grant(pg: Pg, pg_admin_dsn:
                 one("orders", "SELECT 1")
             )
     finally:
-        _drop_role(pg_admin_dsn, pg.admin, bare)
+        drop_role(pg_admin_dsn, pg.admin, bare)
 
 
 def test_an_unreachable_server_is_unavailable() -> None:

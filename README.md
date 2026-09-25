@@ -405,7 +405,8 @@ result = engine.execute(plan)
 What `interlock install` puts in the database: an `interlock` schema holding the stage
 table and four functions, and on each observed table one `AFTER` row trigger plus one
 `TRUNCATE` trigger, both `ENABLE ALWAYS` so `session_replication_role` does not switch them
-off. The trigger does nothing for a transaction that opened no stage. For one that did, it
+off. For a transaction that opened no stage, the trigger logs the write to
+`interlock.unmediated` (see [Unrecorded writes](#unrecorded-writes)). For one that did, it
 writes before and after images into a temporary table that exists only in that session for
 that transaction. Rows are keyed to the stage by `pg_current_xact_id()`, read from a row
 only the stage-opening function can write, not from the `interlock.stage_id` setting,
@@ -447,6 +448,45 @@ What grants cannot see, so the substrate cannot either: a `SECURITY DEFINER` fun
 role may call that writes elsewhere, an extension such as `dblink` that opens another
 connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
 or later; CI runs 16.
+
+## Unrecorded writes
+
+The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
+the agent's own credentials used directly all write observed tables and leave nothing in
+the escrow chain. `interlock reconcile-effects` is the check that closes the loop: nothing
+changes an observed table without a record.
+
+```bash
+interlock install           --config interlock.toml   # once; SQLite needs it for this too
+interlock reconcile-effects --config interlock.toml --chain escrow.jsonl [--after N]
+```
+
+It fails (exit 1) on:
+
+- **an unmediated write:** a row change no stage made. On PostgreSQL the installed trigger
+  logs each one to `interlock.unmediated` inside the writer's own transaction, with the
+  session user, `application_name` and transaction id; a `TRUNCATE` is logged too. On
+  SQLite, `interlock install` adds permanent journal triggers that record every row change
+  in `_interlock_journal`, and each committed stage records the range of journal rows it
+  produced, which is exact because `BEGIN IMMEDIATE` admits one writer at a time. A
+  cascade from a table nobody observes is found row by row;
+- **an unrecorded stage:** one the database committed that no chain records, such as one
+  opened by hand with the stage role's credentials, or by an engine on the default
+  in-memory chain;
+- **a contradicted stage:** recorded as aborted, or under another plan;
+- **an unresolved stage:** committed with only its commit intent in the chain, after a
+  crash in the commit window. Recovery resolves it; `EscrowRuntime` runs recovery at
+  startup;
+- on SQLite, an observed table whose journal trigger is missing.
+
+Each run prints `last entry: N`; pass it back as `--after N` to check only what is new.
+Exit code 5 means a chain failed verification and proves nothing. On PostgreSQL, run it as
+a role named in `audit_roles` at install, which may read Interlock's logs and write
+nothing.
+
+What it cannot see: anyone who can disable the triggers or edit the logs. On PostgreSQL
+that is the tables' owner or a superuser, which logical decoding would close; on SQLite it
+is anyone who can write the file.
 
 ## Scope
 

@@ -100,7 +100,7 @@ def test_the_cli_on_sqlite(back_office: str, tmp_path: Path) -> None:
     )
     out = io.StringIO()
     assert main(["install", "--config", str(config)], out=out) == 0
-    assert "SQLite needs nothing installed" in out.getvalue()
+    assert out.getvalue().startswith("installed: journal triggers on 1 table(s): order_items")
     out = io.StringIO()
     assert main(["check", "--config", str(config)], out=out) == 0
     assert out.getvalue().splitlines() == [

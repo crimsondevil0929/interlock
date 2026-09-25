@@ -1,16 +1,21 @@
 """The ``interlock`` command.
 
-``interlock install``   put Interlock's triggers into the database (PostgreSQL)
-``interlock check``     verify the installation and grants, print the cascade check
+``interlock install``            put Interlock's triggers into the database
+``interlock check``              verify the setup, print the cascade check
+``interlock reconcile-effects``  fail on any write to an observed table that no
+                                 escrow chain records
 
 Every command reads a TOML configuration file (see :mod:`interlock.config`).
 Exit codes, for scripts and CI:
 
 ====  =============================================================
-0     done; for ``check``, the setup is sound
+0     done; for ``check``, the setup is sound; for
+      ``reconcile-effects``, every write is accounted for
+1     ``reconcile-effects`` found an unrecorded write
 2     usage, or the configuration file is wrong
-3     the database is not set up for a stage (not installed, grants)
+3     the database is not set up (not installed, grants)
 4     the database cannot be reached
+5     an escrow chain failed verification, so it proves nothing
 ====  =============================================================
 """
 
@@ -22,21 +27,31 @@ from collections.abc import Sequence
 from typing import TextIO
 
 from interlock.cascade import CascadeReport, analyze_cascades, read_postgres_foreign_keys
+from interlock.chain import EscrowChain, EscrowRecord
 from interlock.config import ConfigError, InterlockConfig, load_config
 from interlock.exceptions import (
+    ChainIntegrityError,
     InterlockError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
 from interlock.postgres import PostgresSubstrate, install
+from interlock.reconcile import (
+    format_reconciliation,
+    install_sqlite_journal,
+    reconcile_postgres,
+    reconcile_sqlite,
+)
 from interlock.substrate import SqliteSubstrate
 
 __all__ = ["main", "main_entry"]
 
 EXIT_OK = 0
+EXIT_FINDINGS = 1
 EXIT_USAGE = 2
 EXIT_CONFIGURATION = 3
 EXIT_UNAVAILABLE = 4
+EXIT_CHAIN = 5
 
 
 def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int:
@@ -51,7 +66,12 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     try:
         if args.command == "install":
             return _install(config, stream)
+        if args.command == "reconcile-effects":
+            return _reconcile(config, args.chain, args.after, stream)
         return _check(config, stream)
+    except ChainIntegrityError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_CHAIN
     except SubstrateConfigurationError as exc:
         print(f"interlock: {exc}", file=sys.stderr)
         return EXIT_CONFIGURATION
@@ -68,6 +88,7 @@ def _parser() -> argparse.ArgumentParser:
     for name, text in (
         ("install", "install Interlock's schema and triggers (run as the tables' owner)"),
         ("check", "verify the setup and print what the cascade check refuses"),
+        ("reconcile-effects", "fail on any write to an observed table no escrow chain records"),
     ):
         command = commands.add_parser(name, help=text, description=text)
         command.add_argument("--config", required=True, help="the TOML configuration file")
@@ -75,22 +96,40 @@ def _parser() -> argparse.ArgumentParser:
             "--database",
             help="overrides the file's database (DSN or SQLite path), as does INTERLOCK_DATABASE",
         )
+        if name == "reconcile-effects":
+            command.add_argument(
+                "--chain",
+                action="append",
+                required=True,
+                help="an escrow chain file that stages against this database; repeat for each",
+            )
+            command.add_argument(
+                "--after",
+                type=int,
+                default=0,
+                help="only logged writes numbered above this: a previous run's last entry",
+            )
     return parser
 
 
 def _install(config: InterlockConfig, out: TextIO) -> int:
+    names = ", ".join(t.name for t in config.tables)
     if config.substrate != "postgres":
-        print(
-            "interlock install: SQLite needs nothing installed; its capture triggers "
-            "are temporary and created per stage",
-            file=out,
-        )
+        install_sqlite_journal(config.database, config.tables)
+        print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
+        _print_report(_sqlite(config).check_cascades(), out)
         return EXIT_OK
     import psycopg
 
     try:
         with psycopg.connect(config.database, autocommit=True) as conn:
-            install(conn, config.tables, schema=config.schema, stage_roles=config.stage_roles)
+            install(
+                conn,
+                config.tables,
+                schema=config.schema,
+                stage_roles=config.stage_roles,
+                audit_roles=config.audit_roles,
+            )
             report = analyze_cascades(
                 read_postgres_foreign_keys(conn, config.schema),
                 [t.name for t in config.tables],
@@ -100,10 +139,11 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
         raise SubstrateUnavailableError(f"install failed: {exc}") from exc
     except ValueError as exc:
         raise SubstrateConfigurationError(str(exc)) from exc
-    names = ", ".join(t.name for t in config.tables)
     print(f"installed: {len(config.tables)} table(s) in {config.schema}: {names}", file=out)
     for role in config.stage_roles:
         print(f"granted to stage role: {role}", file=out)
+    for role in config.audit_roles:
+        print(f"granted to audit role: {role}", file=out)
     _print_report(report, out)
     return EXIT_OK
 
@@ -117,14 +157,38 @@ def _check(config: InterlockConfig, out: TextIO) -> int:
             acknowledge_cascades=config.acknowledge_cascades,
         ).check_cascades()
     else:
-        report = SqliteSubstrate(
-            config.database,
-            tables=config.tables,
-            acknowledge_cascades=config.acknowledge_cascades,
-        ).check_cascades()
+        report = _sqlite(config).check_cascades()
     print(f"ok: {config.substrate}, {len(config.tables)} observed table(s)", file=out)
     _print_report(report, out)
     return EXIT_OK
+
+
+def _reconcile(config: InterlockConfig, chains: Sequence[str], after: int, out: TextIO) -> int:
+    records: list[EscrowRecord] = []
+    for path in chains:
+        try:
+            records.extend(EscrowChain.load(path).records())
+        except OSError as exc:
+            raise ChainIntegrityError(f"cannot read escrow chain {path}: {exc}") from exc
+    if config.substrate == "postgres":
+        import psycopg
+
+        try:
+            with psycopg.connect(config.database, autocommit=True) as conn:
+                result = reconcile_postgres(conn, records, after=after)
+        except psycopg.Error as exc:
+            raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
+    else:
+        result = reconcile_sqlite(config.database, config.tables, records, after=after)
+    for line in format_reconciliation(result):
+        print(line, file=out)
+    return EXIT_OK if result.clean else EXIT_FINDINGS
+
+
+def _sqlite(config: InterlockConfig) -> SqliteSubstrate:
+    return SqliteSubstrate(
+        config.database, tables=config.tables, acknowledge_cascades=config.acknowledge_cascades
+    )
 
 
 def _print_report(report: CascadeReport, out: TextIO) -> None:

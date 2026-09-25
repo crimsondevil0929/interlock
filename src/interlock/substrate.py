@@ -67,6 +67,15 @@ logger = logging.getLogger("interlock.substrate")
 _CAPTURE_TABLE = "_interlock_capture"
 
 _MARKER_TABLE = "_interlock_commits"
+
+JOURNAL_TABLE = "_interlock_journal"
+"""Written by the permanent journal triggers ``interlock install`` puts on
+each observed table: one row per row change, staged or not. See
+:mod:`interlock.reconcile`."""
+
+STAGE_JOURNAL_TABLE = "_interlock_stage_journal"
+"""The range of journal rows each committed stage produced, written by the
+substrate inside the stage's own transaction."""
 _MARKER_DDL = (
     f"CREATE TABLE IF NOT EXISTS main.{_MARKER_TABLE} "
     f"(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)"
@@ -321,6 +330,8 @@ class SqliteSubstrate:
         "_folded",
         "_handle",
         "_internal",
+        "_journal_start",
+        "_journal_triggers",
         "_markers",
         "_max_rows",
         "_path",
@@ -349,6 +360,10 @@ class SqliteSubstrate:
         self._capture_triggers = frozenset(
             f"ilok_{t.name}_{op}" for t in tables for op in ("i", "u", "d")
         )
+        self._journal_triggers = frozenset(
+            f"ilok_journal_{t.name}_{op}" for t in tables for op in ("i", "u", "d")
+        )
+        self._journal_start: int | None = None
         acknowledged = frozenset(a.lower() for a in acknowledge_cascades)
         clash = sorted(acknowledged & self._folded)
         if clash:
@@ -478,6 +493,7 @@ class SqliteSubstrate:
         try:
             report = self._cascades(conn)
             self._install_sentinels(conn, report)
+            self._journal_start = _journal_position(conn)
         except sqlite3.Error as exc:
             conn.close()
             raise SubstrateUnavailableError(
@@ -621,6 +637,14 @@ class SqliteSubstrate:
         committed_at = datetime.now(UTC)
         try:
             with self._substrate_statements():
+                if self._journal_start is not None:
+                    # Exact: BEGIN IMMEDIATE admits one writer, so every
+                    # journal row numbered after the stage opened is its own.
+                    conn.execute(
+                        f"INSERT INTO main.{STAGE_JOURNAL_TABLE} (stage_id, first_seq, last_seq) "
+                        f"VALUES (?, ?, ?)",
+                        (str(handle.stage_id), self._journal_start + 1, _journal_position(conn)),
+                    )
                 if self._markers:
                     conn.execute(
                         f"INSERT INTO main.{_MARKER_TABLE} (stage_id, plan_id, committed_at) "
@@ -815,6 +839,20 @@ class SqliteSubstrate:
                 f"statement attempts {verb} on the capture table {table!r}, which "
                 f"holds the stage's measurement"
             )
+        if key == JOURNAL_TABLE:
+            # Written by the journal triggers alone, like the capture table:
+            # a statement that deleted journal rows would hide an
+            # out-of-band write from reconciliation.
+            if trigger_name in self._journal_triggers:
+                return sqlite3.SQLITE_OK
+            return self._deny(
+                f"statement attempts {verb} on the journal table {table!r}, which "
+                f"only the journal triggers write"
+            )
+        if key == STAGE_JOURNAL_TABLE:
+            return self._deny(
+                f"statement attempts {verb} on {table!r}, which only the substrate writes"
+            )
         if key == _MARKER_TABLE:
             # Written by commit() alone. A statement the agent authored that
             # forged one would make recovery report a crashed stage as
@@ -915,3 +953,20 @@ def _load(raw: object) -> Mapping[str, Any] | None:
         return None
     parsed: Any = json.loads(str(raw))
     return parsed if isinstance(parsed, dict) else None
+
+
+def _journal_position(conn: sqlite3.Connection) -> int | None:
+    """The journal's high-water mark, or ``None`` when it is not installed.
+
+    Read from ``sqlite_sequence``, which AUTOINCREMENT never moves backwards,
+    so a deleted journal row cannot make two stages claim the same number.
+    """
+    installed = conn.execute(
+        "SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?", (JOURNAL_TABLE,)
+    ).fetchone()
+    if installed is None:
+        return None
+    row = conn.execute(
+        "SELECT seq FROM main.sqlite_sequence WHERE name = ?", (JOURNAL_TABLE,)
+    ).fetchone()
+    return int(row[0]) if row is not None else 0

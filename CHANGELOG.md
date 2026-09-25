@@ -42,8 +42,20 @@ Releases before 0.1.2 are described by their tags and commit history.
   stage's row is its commit marker and `pg_current_xact_id()` is written into
   the commit intent, so `resolve_intent` tells a transaction still open on the
   server from one that rolled back.
-- **The `interlock` command**, with `install` and `check`, reading a TOML
-  configuration file (`interlock.config`).
+- **Unrecorded writes (2.3).** `interlock reconcile-effects` fails (exit 1) on
+  any write to an observed table that no chain records: a row change no stage
+  made, a committed stage no chain records, one recorded as aborted or under
+  another plan, or one left with only its commit intent. On PostgreSQL the
+  installed trigger logs every write made outside a stage to
+  `interlock.unmediated`, in the writer's transaction, with its session user,
+  `application_name` and transaction id; `install(audit_roles=)` grants a role
+  read access to the logs and nothing else. On SQLite `interlock install` adds
+  permanent journal triggers writing `_interlock_journal`, and each committed
+  stage records the exact range of journal rows it produced; the authorizer
+  keeps statements away from both tables. `--after` takes the previous run's
+  `last entry`; exit 5 means a chain failed verification.
+- **The `interlock` command**, with `install`, `check` and `reconcile-effects`,
+  reading a TOML configuration file (`interlock.config`).
 - `SubstrateConfigurationError`; `CascadeReport` and `PostgresSubstrate` at the
   top level. A substrate may expose `transaction_id(handle)`; the engine writes
   it into `COMMIT_INTENT` and passes it back to `resolve_intent(..., txid=)`.

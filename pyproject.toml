@@ -94,6 +94,8 @@ ignore = ["S101"]
 # The same, for the PostgreSQL install DDL and catalog queries: identifiers are
 # validated TableSpec names, and the rest is constant SQL joined together.
 "src/interlock/postgres.py" = ["S608"]
+# The SQLite journal DDL and reads, over the same validated names and constants.
+"src/interlock/reconcile.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.11"

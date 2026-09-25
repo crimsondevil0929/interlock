@@ -5,9 +5,10 @@ into the database and one row trigger on each observed table. Nothing is
 created or altered on those tables per stage, so staging never takes the
 schema lock a busy table cannot spare.
 
-The trigger does nothing for a transaction that opened no stage. For one that
-did, it writes each row's before and after image into a temporary table that
-exists only in that session and only for that transaction. Whether a
+For a transaction that opened no stage, the trigger logs the write to
+``interlock.unmediated`` for ``interlock reconcile-effects``. For one that did,
+it writes each row's before and after image into a temporary table that exists
+only in that session and only for that transaction. Whether a
 transaction opened a stage is read from ``interlock.stages``, keyed by
 ``pg_current_xact_id()``, and not from the ``interlock.stage_id`` setting
 alone: a setting is a string any statement can change, and the stage's row is
@@ -168,6 +169,21 @@ BEGIN
                 'interlock: interlock.stage_id is set, but this transaction opened no stage'
                 USING ERRCODE = 'IL002';
         END IF;
+        -- Not mediated: nothing measured this write and nothing adjudicated
+        -- it. Logged for reconciliation, in the writer's own transaction, so
+        -- the entry exists exactly when the write does.
+        IF TG_LEVEL = 'STATEMENT' THEN
+            INSERT INTO interlock.unmediated (xid, tbl, pk, op)
+            VALUES (pg_catalog.pg_current_xact_id(), TG_TABLE_NAME, NULL, 'truncate');
+        ELSE
+            INSERT INTO interlock.unmediated (xid, tbl, pk, op)
+            VALUES (
+                pg_catalog.pg_current_xact_id(),
+                TG_TABLE_NAME,
+                coalesce(pg_catalog.to_jsonb(NEW), pg_catalog.to_jsonb(OLD)) ->> TG_ARGV[0],
+                pg_catalog.lower(TG_OP)
+            );
+        END IF;
         RETURN NULL;
     END IF;
     IF marker IS DISTINCT FROM stage::text THEN
@@ -271,6 +287,18 @@ CREATE TABLE IF NOT EXISTS interlock.stages (
 );
 REVOKE ALL ON interlock.stages FROM PUBLIC;
 
+CREATE TABLE IF NOT EXISTS interlock.unmediated (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    xid xid8 NOT NULL,
+    tbl text NOT NULL,
+    pk text,
+    op text NOT NULL,
+    at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    db_user name NOT NULL DEFAULT session_user,
+    application text DEFAULT current_setting('application_name', true)
+);
+REVOKE ALL ON interlock.unmediated FROM PUBLIC;
+
 CREATE TABLE IF NOT EXISTS interlock.installation (
     tbl text PRIMARY KEY,
     primary_key text NOT NULL,
@@ -305,6 +333,7 @@ def install(
     *,
     schema: str = "public",
     stage_roles: Iterable[str] = (),
+    audit_roles: Iterable[str] = (),
 ) -> None:
     """Install Interlock's schema, functions and triggers. Idempotent.
 
@@ -318,6 +347,9 @@ def install(
     :param stage_roles: Roles stages will run as. Each is granted what a stage
         needs from the ``interlock`` schema and nothing else; grant it DML on
         the observed tables yourself.
+    :param audit_roles: Roles that run ``interlock reconcile-effects``. Each
+        may read ``interlock.stages``, ``interlock.unmediated`` and
+        ``interlock.installation``, and write nothing.
     :raises ValueError: On a schema or role name that is not a plain
         identifier.
     """
@@ -325,7 +357,8 @@ def install(
 
     _identifier(schema)
     roles = list(stage_roles)
-    for role in roles:
+    auditors = list(audit_roles)
+    for role in (*roles, *auditors):
         _identifier(role)
     wanted = {spec.name.lower(): spec for spec in tables}
     with conn.transaction():
@@ -383,6 +416,12 @@ def install(
             conn.execute(f"GRANT SELECT ON interlock.installation TO {role}")
             for signature in _STAGE_FUNCTIONS:
                 conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
+        for role in auditors:
+            conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
+            conn.execute(
+                "GRANT SELECT ON interlock.stages, interlock.unmediated, "
+                f"interlock.installation TO {role}"
+            )
 
 
 def _identifier(name: str) -> None:
