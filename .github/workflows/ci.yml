@@ -61,10 +61,11 @@ jobs:
       - name: Tests with coverage
         run: uv run pytest -v --cov=interlock --cov-report=term-missing --cov-report=xml
 
-      # 90%, against 96% measured. Every module is at or above 90%; anchor.py,
-      # the AgentGov seam, is at 100%. Raise this as the rest come up.
+      # 90%, against 95% measured. postgres.py runs only against a server,
+      # so this job, which has none, leaves it out; the postgres job below
+      # measures everything, it included, against a higher floor.
       - name: Enforce coverage floor
-        run: uv run coverage report --fail-under=90
+        run: uv run coverage report --fail-under=90 --omit=src/interlock/postgres.py
 
       - name: Run the demo end to end
         run: uv run python demo.py --no-color
@@ -113,8 +114,9 @@ jobs:
       - name: Tests with coverage, PostgreSQL required
         run: uv run pytest -v --cov=interlock --cov-report=term-missing
 
+      # 95%, against 97% measured: every module, postgres.py included.
       - name: Enforce coverage floor
-        run: uv run coverage report --fail-under=90
+        run: uv run coverage report --fail-under=95
 
   install-from-clone:
     name: install from a clean clone (no sibling checkout)
