@@ -24,6 +24,31 @@ Releases before 0.1.2 are described by their tags and commit history.
   `EscrowRuntime` runs the check at startup (`cascade_report`), logs every
   gated operation, and now requires the database to exist.
 
+- **`PostgresSubstrate` (2.2).** Stages run in `REPEATABLE READ` on a
+  dedicated connection with the observed tables locked `ROW EXCLUSIVE`, and
+  `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`
+  set from `max_stage_seconds` and re-set before every effect. Changes are
+  captured by row triggers installed once with `interlock install` (or
+  `interlock.postgres.install`), `ENABLE ALWAYS`, which write to a temporary
+  table only for a transaction that opened a stage; the stage is identified by
+  `pg_current_xact_id()` in `interlock.stages`, and the `interlock.stage_id`
+  setting must agree. The capture table, the stage row and the gates belong to
+  the installing role and are written only through `SECURITY DEFINER`
+  functions, so no statement of the agent's can reach them. Each stage verifies
+  the installed triggers against its `TableSpec`s and that its role is not a
+  superuser, owns no observed table, and can write no other table
+  (`SubstrateConfigurationError` otherwise). Only row statements are accepted,
+  each sent as a prepared statement. `NUMERIC` is read as `Decimal`. The
+  stage's row is its commit marker and `pg_current_xact_id()` is written into
+  the commit intent, so `resolve_intent` tells a transaction still open on the
+  server from one that rolled back.
+- **The `interlock` command**, with `install` and `check`, reading a TOML
+  configuration file (`interlock.config`).
+- `SubstrateConfigurationError`; `CascadeReport` and `PostgresSubstrate` at the
+  top level. A substrate may expose `transaction_id(handle)`; the engine writes
+  it into `COMMIT_INTENT` and passes it back to `resolve_intent(..., txid=)`.
+- `EffectDiff.column_total` and the value guards read `Decimal` values exactly.
+
 ### Fixed
 
 - **A statement could erase the measurement.** The authorizer allowed any write

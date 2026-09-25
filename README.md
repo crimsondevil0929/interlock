@@ -357,11 +357,102 @@ AgentGov's latching breaker is re-read immediately before commit, not at admissi
 staging window is where a trip has to be observed, because a halt that does not stop
 in-flight side effects does not stop the effects.
 
+## PostgreSQL
+
+`PostgresSubstrate` stages each plan in a `REPEATABLE READ` transaction and measures it with
+row triggers installed once, so no stage ever alters a busy table. Install as the tables'
+owner, then stage as a separate role granted DML on the observed tables and nothing else:
+
+```bash
+uv pip install 'interlock[postgres]'
+interlock install --config interlock.toml --database postgresql://owner@db/app
+interlock check   --config interlock.toml --database postgresql://interlock_agent@db/app
+```
+
+```toml
+substrate = "postgres"
+schema = "public"
+stage_roles = ["interlock_agent"]   # granted the interlock schema's stage functions
+acknowledge_cascades = []
+
+[[tables]]
+name = "orders"
+columns = ["id", "tenant", "total"]
+tenant_column = "tenant"
+```
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+from interlock import EscrowEngine, PlanBuilder, PostgresSubstrate, TableSpec, default_checkers
+
+substrate = PostgresSubstrate(
+    "postgresql://interlock_agent@db/app",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+)
+engine = EscrowEngine(substrate, checkers=default_checkers(row_limit=8))
+plan = (
+    PlanBuilder("support-agent")
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = %(total)s WHERE id = %(id)s",
+        parameters={"total": 100, "id": 1},
+    )
+    .build()
+)
+result = engine.execute(plan)
+```
+
+What `interlock install` puts in the database: an `interlock` schema holding the stage
+table and four functions, and on each observed table one `AFTER` row trigger plus one
+`TRUNCATE` trigger, both `ENABLE ALWAYS` so `session_replication_role` does not switch them
+off. The trigger does nothing for a transaction that opened no stage. For one that did, it
+writes before and after images into a temporary table that exists only in that session for
+that transaction. Rows are keyed to the stage by `pg_current_xact_id()`, read from a row
+only the stage-opening function can write, not from the `interlock.stage_id` setting,
+which any statement could change; the setting is still set, and the trigger refuses to go
+on when the two disagree.
+
+Every stage checks, before its first effect and with the observed tables locked
+`ROW EXCLUSIVE` so none of it can change underneath:
+
+- each observed table carries Interlock's triggers, enabled always, capturing exactly
+  its `TableSpec`'s columns;
+- the stage's role is not a superuser, owns no observed table (an owner can disable a
+  trigger), and can write no other table, directly, through a column grant, or through
+  any role it belongs to. PostgreSQL has no statement authorizer, so the grant is the table
+  boundary; the substrate checks it rather than trusting it. `enforce_table_access=False`
+  trusts it;
+- the cascade check, read from `pg_constraint`.
+
+What differs from SQLite:
+
+- **Placeholders are psycopg's:** `%(name)s`, and `%%` for a literal percent sign.
+- **Only row statements stage:** `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+  `WITH`, `VALUES`, `TABLE`. Each is sent as a prepared statement, which the server will
+  not split, so `UPDATE ...; COMMIT` fails instead of committing before adjudication.
+- **A cascade gate fires per row.** A delete of a gated row, or an update that changes a
+  gated key, is refused inside the statement and PostgreSQL rolls the statement back,
+  cascade included. SQLite refuses when it prepares the statement.
+- **`NUMERIC` is read as `Decimal`**, exactly.
+- **Bounds are the server's:** `statement_timeout`, `lock_timeout` and
+  `idle_in_transaction_session_timeout` are set for the stage and re-set before every
+  effect, so a statement cannot lift them, and a stage whose client died cannot hold locks
+  past `max_stage_seconds`.
+- **Crash recovery reads the transaction.** The stage's row is its commit marker, and
+  `pg_current_xact_id()` is written into the commit intent, so recovery can tell a
+  transaction the server still has open (a crashed client's, until its session times out)
+  from one that rolled back, and leaves the first open.
+
+What grants cannot see, so the substrate cannot either: a `SECURITY DEFINER` function the
+role may call that writes elsewhere, an extension such as `dblink` that opens another
+connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
+or later; CI runs 16.
+
 ## Scope
 
-**v0.1.x ships one substrate: SQLite.** PostgreSQL is declared as an extra and has no
-driver. One connector at the row-level-diff standard is worth more than several reporting
-only row counts, because a row count is the summary this design exists to replace.
+**Two substrates: SQLite and PostgreSQL.** One connector at the row-level-diff standard is
+worth more than several reporting only row counts, because a row count is the summary this
+design exists to replace.
 
 ### What this is not yet a boundary against
 

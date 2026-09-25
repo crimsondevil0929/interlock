@@ -44,6 +44,9 @@ dependencies = [
     "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.1.2",
 ]
 
+[project.scripts]
+interlock = "interlock.cli:main_entry"
+
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
 
@@ -88,6 +91,9 @@ ignore = ["S101"]
 # substrate._assert_identifier at TableSpec construction and comes from
 # operator configuration, never from the agent.
 "src/interlock/substrate.py" = ["S608"]
+# The same, for the PostgreSQL install DDL and catalog queries: identifiers are
+# validated TableSpec names, and the rest is constant SQL joined together.
+"src/interlock/postgres.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.11"

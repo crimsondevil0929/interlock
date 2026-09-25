@@ -30,7 +30,12 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
-from interlock.cascade import CascadeReport, analyze_cascades, read_sqlite_foreign_keys
+from interlock.cascade import (
+    CascadeReport,
+    analyze_cascades,
+    log_report,
+    read_sqlite_foreign_keys,
+)
 from interlock.exceptions import (
     ForbiddenStatementError,
     StageConflictError,
@@ -191,7 +196,9 @@ class ShadowSubstrate(Protocol):
 # that stage's transaction commit? ``EscrowEngine.recover`` asks it about every
 # commit intent a crashed process left open, and leaves the intent open when
 # the driver cannot say. It is not part of the protocol, so a driver without it
-# still satisfies ``isinstance(driver, ShadowSubstrate)``.
+# still satisfies ``isinstance(driver, ShadowSubstrate)``. A driver that also
+# implements ``transaction_id(handle) -> str | None`` has that id written into
+# the commit intent, and gets it back as ``resolve_intent(stage_id, txid=...)``.
 
 
 class TableSpec:
@@ -728,20 +735,7 @@ class SqliteSubstrate:
         previous = self._report
         self._report = report
         self._report_version = version
-        # Logged when what is gated changes, not on every schema change: the
-        # first stage creates the commit-marker table, which bumps the version.
-        if previous is not None and previous.reaches == report.reaches:
-            return report
-        for reach in report.gated:
-            logger.warning("cascade check: refusing %s", reach.describe())
-        for reach in report.gaps:
-            logger.warning("cascade check: acknowledged, unmeasured: %s", reach.describe())
-        for table in sorted(report.unreached_acknowledgments):
-            logger.warning(
-                "cascade check: acknowledge_cascades names %r, which no foreign-key "
-                "action from an observed table reaches",
-                table,
-            )
+        log_report(logger, previous, report)
         return report
 
     def _install_sentinels(self, conn: sqlite3.Connection, report: CascadeReport) -> None:

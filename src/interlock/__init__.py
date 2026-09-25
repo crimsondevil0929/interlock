@@ -37,8 +37,8 @@ Every adjudication is written to a hash-linked chain, anchored to an AgentGov
 ledger when one is attached. See :mod:`interlock.anchor` for the seam, which is
 read-only by default.
 
-v0.1.x is one substrate (SQLite) and a measurement scoped to the tables that
-substrate was configured to observe. ``docs/ESCROW_SPEC.md`` has a conformance
+Two substrates, SQLite and PostgreSQL, and a measurement scoped to the tables
+each was configured to observe. ``docs/ESCROW_SPEC.md`` has a conformance
 section listing what is implemented, partial and unimplemented; read it before
 putting this in front of a production database.
 """
@@ -64,6 +64,7 @@ from interlock.exceptions import (
     StageConflictError,
     StageError,
     StageExpiredError,
+    SubstrateConfigurationError,
     SubstrateUnavailableError,
     UncompensatableEffectError,
 )
@@ -80,6 +81,7 @@ from interlock.invariants import (
     TruncationGuard,
     default_checkers,
 )
+from interlock.postgres import PostgresSubstrate
 from interlock.runtime import EscrowRuntime
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.types import (
@@ -130,6 +132,7 @@ __all__ = [
     "PlanBuilder",
     "PlanError",
     "PlanId",
+    "PostgresSubstrate",
     "RecordType",
     "RowDelta",
     "ScopeHaltedError",
@@ -142,6 +145,7 @@ __all__ = [
     "StageResult",
     "StageState",
     "StatedFootprint",
+    "SubstrateConfigurationError",
     "SubstrateUnavailableError",
     "TableAllowlist",
     "TableSpec",

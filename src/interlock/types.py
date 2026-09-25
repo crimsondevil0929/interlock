@@ -424,12 +424,16 @@ def _as_decimal(value: object) -> Decimal:
 
     ``bool`` is excluded deliberately: it is an ``int`` subclass in Python, and
     summing a status flag into a money column is never what was meant.
-    ``str`` is accepted because SQLite is dynamically typed and a NUMERIC
+    ``Decimal`` is passed through, which is how PostgreSQL's ``NUMERIC`` is
+    read. ``str`` is accepted because SQLite is dynamically typed and a NUMERIC
     column can hand back text; an unparseable string contributes zero rather
     than raising, since a checker that dies on one bad row approves nothing.
     """
     if isinstance(value, bool):
         return Decimal(0)
+    if isinstance(value, Decimal):
+        # PostgreSQL NUMERIC arrives exact; keep it that way.
+        return value if value.is_finite() else Decimal(0)
     if isinstance(value, int):
         return Decimal(value)
     if isinstance(value, float | str):

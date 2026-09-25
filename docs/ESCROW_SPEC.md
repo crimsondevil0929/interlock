@@ -970,7 +970,7 @@ Unresolved, and listed because they are unresolved rather than minor.
 
 ---
 
-# Conformance of `interlock` v0.1.2
+# Conformance of `interlock` (unreleased, v0.2 in progress)
 
 What the shipped package actually does against this document. Verified by
 reading `src/interlock/` and by running adversarial plans against it, not by
@@ -990,6 +990,8 @@ reading the test suite.
 | Writes outside `TableSpec` denied at prepare time | `substrate.SqliteSubstrate._authorize` |
 | Cascade check: foreign-key reach into unobserved tables read from the schema, refused unless acknowledged; the gap recorded per stage | `cascade`, `substrate.SqliteSubstrate.check_cascades`, `engine.EscrowEngine.execute` |
 | The capture table, the commit marker and transaction control are out of a statement's reach | `substrate.SqliteSubstrate._authorize`, `substrate.FORBIDDEN_VERBS` |
+| PostgreSQL substrate: `REPEATABLE READ` stages, row triggers installed once, `statement_timeout` / `lock_timeout` / idle timeout per stage, the capture, marker and gates out of the stage role's reach, installation and grants verified at every stage | `postgres.PostgresSubstrate`, `postgres.install` |
+| A crashed PostgreSQL commit resolved from its marker and `pg_xact_status`, so a transaction the server still holds is not read as rolled back | `postgres.PostgresSubstrate.resolve_intent`, `engine.EscrowEngine.recover` |
 | `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
@@ -1035,9 +1037,8 @@ reading the test suite.
 
 ## Unimplemented
 
-- **PostgreSQL substrate.** `pyproject.toml` declares a `postgres` extra; there
-  is no driver. Section 4.2's `statement_timeout` / `lock_timeout` / logical
-  decoding requirements are unexercised.
+- **Logical decoding.** Section 4.2's alternative to trigger capture is not
+  used; `PostgresSubstrate` captures with triggers.
 - **`E1-5`: expiry to `ORPHANED`.** `StageState.ORPHANED` and
   `RecordType.ORPHANED` exist and are never assigned. Expiry raises
   `StageExpiredError` from `apply()` and `commit()`; there is no reaper, and

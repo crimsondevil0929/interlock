@@ -33,6 +33,7 @@ cascaded update only changes the child's foreign-key columns, so an update of
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict, deque
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ __all__ = [
     "CascadeStep",
     "ForeignKey",
     "analyze_cascades",
+    "log_report",
     "read_postgres_foreign_keys",
     "read_sqlite_foreign_keys",
 ]
@@ -253,6 +255,28 @@ class CascadeReport:
     def describe_gaps(self) -> str:
         """One line naming every acknowledged gap, for the audit record."""
         return "; ".join(sorted({f"{r.operation} {r.parent}->{r.table}" for r in self.gaps}))
+
+
+def log_report(
+    logger: logging.Logger, previous: CascadeReport | None, report: CascadeReport
+) -> None:
+    """Warn about every gated reach, acknowledged gap and stale acknowledgment.
+
+    Only when what is gated changed since ``previous``: a substrate re-runs the
+    check every stage, and the answer rarely moves.
+    """
+    if previous is not None and previous.reaches == report.reaches:
+        return
+    for reach in report.gated:
+        logger.warning("cascade check: refusing %s", reach.describe())
+    for reach in report.gaps:
+        logger.warning("cascade check: acknowledged, unmeasured: %s", reach.describe())
+    for table in sorted(report.unreached_acknowledgments):
+        logger.warning(
+            "cascade check: acknowledge_cascades names %r, which no foreign-key "
+            "action from an observed table reaches",
+            table,
+        )
 
 
 def _fold(name: str) -> str:
