@@ -505,6 +505,45 @@ def test_a_tampered_installation_refuses_to_stage(pg: Pg, tamper: str, match: st
 
 
 @pytest.mark.parametrize(
+    "child",
+    [
+        "CREATE TABLE orders_archive (archived_at timestamptz) INHERITS (orders)",
+        "CREATE TABLE refunds_2026 (LIKE refunds); ALTER TABLE refunds_2026 INHERIT refunds",
+    ],
+)
+def test_an_observed_table_with_inheritance_children_refuses_to_stage(pg: Pg, child: str) -> None:
+    """UPDATE orders writes orders_archive's rows too, through no trigger and
+    past no grant: PostgreSQL checks privileges on the parent alone."""
+    with psycopg.connect(pg.admin, autocommit=True) as conn:
+        conn.execute(child)
+    with pytest.raises(SubstrateConfigurationError, match="inheritance children"):
+        engine(pg).execute(one("orders", "UPDATE orders SET status = 'x'"))
+
+
+def test_gates_match_mixed_case_columns_exactly(pg: Pg, pg_admin_dsn: str) -> None:
+    """A quoted, mixed-case key column: a gate on its lowercased name would
+    match nothing in the row image and let the update through."""
+    with psycopg.connect(pg.admin, autocommit=True) as conn:
+        conn.execute(
+            """
+            ALTER TABLE accounts ADD COLUMN "ExternalRef" text UNIQUE;
+            UPDATE accounts SET "ExternalRef" = 'ext-' || id;
+            CREATE TABLE statements (
+                id integer PRIMARY KEY,
+                account_ref text REFERENCES accounts ("ExternalRef") ON UPDATE CASCADE
+            );
+            INSERT INTO statements VALUES (1, 'ext-100');
+            """
+        )
+        conn.execute(f"GRANT SELECT ON statements TO {pg.role}")
+    with pytest.raises(ForbiddenStatementError, match="UPDATE of ExternalRef on 'accounts'"):
+        engine(pg).execute(
+            one("accounts", """UPDATE accounts SET "ExternalRef" = 'moved' WHERE id = 100""")
+        )
+    assert scalar(pg.admin, "SELECT account_ref FROM statements") == "ext-100"
+
+
+@pytest.mark.parametrize(
     "grant",
     [
         "GRANT INSERT ON customers TO {role}",

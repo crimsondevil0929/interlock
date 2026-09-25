@@ -35,8 +35,9 @@ Releases before 0.1.2 are described by their tags and commit history.
   setting must agree. The capture table, the stage row and the gates belong to
   the installing role and are written only through `SECURITY DEFINER`
   functions, so no statement of the agent's can reach them. Each stage verifies
-  the installed triggers against its `TableSpec`s and that its role is not a
-  superuser, owns no observed table, and can write no other table
+  the installed triggers against its `TableSpec`s, that no observed table has
+  inheritance children or partitions, and that its role is not a superuser,
+  owns no observed table, and can write no other table
   (`SubstrateConfigurationError` otherwise). Only row statements are accepted,
   each sent as a prepared statement. `NUMERIC` is read as `Decimal`. The
   stage's row is its commit marker and `pg_current_xact_id()` is written into

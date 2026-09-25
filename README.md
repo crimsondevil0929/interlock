@@ -417,7 +417,9 @@ Every stage checks, before its first effect and with the observed tables locked
 `ROW EXCLUSIVE` so none of it can change underneath:
 
 - each observed table carries Interlock's triggers, enabled always, capturing exactly
-  its `TableSpec`'s columns;
+  its `TableSpec`'s columns, and has no inheritance children or partitions (a statement
+  on the parent writes their rows too, through no trigger, and PostgreSQL checks
+  privileges on the parent alone);
 - the stage's role is not a superuser, owns no observed table (an owner can disable a
   trigger), and can write no other table, directly, through a column grant, or through
   any role it belongs to. PostgreSQL has no statement authorizer, so the grant is the table

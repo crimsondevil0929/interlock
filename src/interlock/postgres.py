@@ -607,17 +607,9 @@ class PostgresSubstrate:
             if self._enforce:
                 self._verify_grants(conn)
             report = self._cascades(conn)
-            gates = {
-                table: {
-                    "delete": gate.delete,
-                    "update_columns": sorted(gate.update_columns),
-                    "update_any": gate.update_any,
-                }
-                for table, gate in report.gates().items()
-            }
             row = conn.execute(
                 "SELECT interlock.begin_stage(%s, %s, %s::jsonb)::text",
-                (stage_id, plan.plan_id, json.dumps(gates)),
+                (stage_id, plan.plan_id, json.dumps(_gates(report))),
             ).fetchone()
         except psycopg.Error as exc:
             conn.close()
@@ -896,6 +888,26 @@ class PostgresSubstrate:
         ).fetchall()
         found = {(str(r[0]), str(r[1])): r for r in rows}
         problems: list[str] = []
+        # A statement on a parent writes its inheritance children's and its
+        # partitions' rows too. They carry no capture trigger, and PostgreSQL
+        # checks privileges on the parent alone, so neither the measurement
+        # nor the grant boundary would reach them.
+        inherited = conn.execute(
+            """
+            SELECT DISTINCT parent.relname::text
+              FROM pg_catalog.pg_inherits i
+              JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent
+              JOIN pg_catalog.pg_namespace n ON n.oid = parent.relnamespace
+             WHERE n.nspname = %s AND parent.relname = ANY (%s)
+             ORDER BY 1
+            """,
+            (self._schema, sorted(self._folded)),
+        ).fetchall()
+        for (table,) in inherited:
+            problems.append(
+                f"{table}: has inheritance children or partitions, whose rows a statement "
+                f"on it writes unmeasured; not supported"
+            )
         for key, spec in sorted(self._by_name.items()):
             capture = found.get((key, _CAPTURE_TRIGGER))
             truncate = found.get((key, _TRUNCATE_TRIGGER))
@@ -1046,6 +1058,29 @@ class PostgresSubstrate:
                 f"{who} refused: one effect is one statement, and this carries several"
             )
         return StageError(f"{who} failed: {exc}")
+
+
+def _gates(report: CascadeReport) -> dict[str, dict[str, object]]:
+    """The gates, keyed and listed as PostgreSQL spells them.
+
+    Not :meth:`CascadeReport.gates`, which lowercases for SQLite: the trigger
+    compares against ``TG_TABLE_NAME`` and ``to_jsonb(OLD)`` keys exactly, and
+    a folded name that matched nothing would let the update through.
+    """
+    gates: dict[str, dict[str, object]] = {}
+    for reach in report.gated:
+        entry = gates.setdefault(
+            reach.parent, {"delete": False, "update_columns": [], "update_any": False}
+        )
+        if reach.operation == "delete":
+            entry["delete"] = True
+        elif reach.columns:
+            listed = entry["update_columns"]
+            assert isinstance(listed, list)
+            entry["update_columns"] = sorted({*listed, *reach.columns})
+        else:
+            entry["update_any"] = True
+    return gates
 
 
 def _trigger_arguments(raw: object) -> list[str]:
