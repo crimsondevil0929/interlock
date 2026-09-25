@@ -1,6 +1,6 @@
 [project]
 name = "interlock"
-version = "0.1.1"
+version = "0.1.2"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,8 +34,14 @@ classifiers = [
 # The cost is that PyPI rejects direct-URL dependencies, so interlock cannot be
 # published there while this line stands. Publishing means putting agentgov on
 # PyPI and pinning a version range here instead.
+#
+# Pinned to an exact agentgov commit, never a branch: `@main` resolved to
+# whatever main was when the lock was cut, which is how interlock 0.1.1 came to
+# lock an agentgov commit that reported itself as 0.1.0. This is agentgov
+# 0.1.2, which interlock 0.1.2 requires for BudgetManager.refresh() and
+# BudgetManager.anchor(). Replace it with the v0.1.2 tag once that is cut.
 dependencies = [
-    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@main",
+    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@2d9be7e12e7261fe0869bdb86046729397baf05b",
 ]
 
 [project.optional-dependencies]

@@ -387,22 +387,34 @@ def test_reverse_anchor_truncates_the_head_to_sixteen_hex_characters() -> None:
     assert entry.memo == "interlock:0123456789abcdef"
 
 
-def test_a_zero_settle_cost_is_refused_with_a_typed_error() -> None:
-    """AgentGov rejects a non-positive authorization, so zero cannot anchor.
+def test_a_zero_settle_cost_writes_a_free_anchor_entry() -> None:
+    """AgentGov 0.1.2 has a zero-value ANCHOR entry, so an anchor costs nothing.
 
-    Caught at this boundary rather than allowed to surface as AgentGov's bare
-    ValueError from inside the commit path, where it arrives after the effects
-    are durable and destroys the caller's StageResult.
+    Before it, the chain head could only ride on a real authorize/capture pair,
+    and zero was refused.
     """
     gov = BudgetManager()
     gov.open_root("scope", money("5.00"))
-    with pytest.raises(AnchorError, match="needs a positive settle cost"):
-        LedgerAnchor(governed=gov).reverse_anchor("scope", "b" * 64)
+    entry = LedgerAnchor(governed=gov).reverse_anchor("scope", "b" * 64)
 
-    with pytest.raises(AnchorError):
+    assert entry is not None
+    assert entry.entry_type is EntryType.ANCHOR
+    assert entry.memo == f"interlock:{'b' * 16}"
+    assert entry.amount == 0
+    assert gov.available("scope") == Decimal("5.00"), "no money moved"
+    assert LedgerAnchor(governed=gov).find_reverse_anchors() == (entry,)
+    gov.verify_integrity()
+
+
+def test_a_negative_settle_cost_is_refused_with_a_typed_error() -> None:
+    """Caught at this boundary rather than allowed to surface as AgentGov's bare
+    ValueError from inside the commit path, where it arrives after the effects
+    are durable and destroys the caller's StageResult."""
+    gov = BudgetManager()
+    gov.open_root("scope", money("5.00"))
+    with pytest.raises(AnchorError, match="cannot be negative"):
         LedgerAnchor(governed=gov).reverse_anchor("scope", "b" * 64, cost=Decimal("-1"))
-
-    assert gov.available("scope") == Decimal("5.00"), "nothing was written"
+    assert len(gov.ledger) == 1, "nothing was written"
 
 
 def test_reverse_anchor_accepts_decimal_and_string_costs() -> None:

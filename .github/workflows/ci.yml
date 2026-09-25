@@ -61,7 +61,7 @@ jobs:
       - name: Tests with coverage
         run: uv run pytest -v --cov=interlock --cov-report=term-missing --cov-report=xml
 
-      # 90%, against 94% measured. Every module is at or above 90%; anchor.py,
+      # 90%, against 96% measured. Every module is at or above 90%; anchor.py,
       # the AgentGov seam, is at 100%. Raise this as the rest come up.
       - name: Enforce coverage floor
         run: uv run coverage report --fail-under=90

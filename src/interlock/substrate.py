@@ -54,6 +54,12 @@ __all__ = [
 
 _CAPTURE_TABLE = "_interlock_capture"
 
+_MARKER_TABLE = "_interlock_commits"
+_MARKER_DDL = (
+    f"CREATE TABLE IF NOT EXISTS main.{_MARKER_TABLE} "
+    f"(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)"
+)
+
 FORBIDDEN_VERBS: frozenset[str] = frozenset(
     {
         # Schema changes. They fire no row triggers, so the diff is empty and
@@ -154,6 +160,13 @@ class ShadowSubstrate(Protocol):
     def close(self, handle: StageHandle) -> None: ...
 
 
+# A driver may also implement ``resolve_intent(stage_id) -> bool | None``: did
+# that stage's transaction commit? ``EscrowEngine.recover`` asks it about every
+# commit intent a crashed process left open, and leaves the intent open when
+# the driver cannot say. It is not part of the protocol, so a driver without it
+# still satisfies ``isinstance(driver, ShadowSubstrate)``.
+
+
 class TableSpec:
     """A table Interlock is allowed to observe and mutate.
 
@@ -237,6 +250,12 @@ class SqliteSubstrate:
         tables need.
     :param max_stage_seconds: Bound on stage lifetime. A stage holds write
         locks for its whole life, so this is an operational limit.
+    :param commit_markers: Write a row into ``_interlock_commits`` inside
+        every stage's own transaction, just before it commits. The row exists
+        exactly when the stage's effects do, so after a crash between a
+        commit intent and its record, :meth:`resolve_intent` answers whether
+        that commit landed. The table is created in the database on first use
+        and gains one row per committed stage.
     """
 
     __slots__ = (
@@ -245,6 +264,8 @@ class SqliteSubstrate:
         "_denied",
         "_enforce",
         "_handle",
+        "_markers",
+        "_marking",
         "_max_rows",
         "_path",
         "_stage_seconds",
@@ -259,6 +280,7 @@ class SqliteSubstrate:
         max_stage_seconds: float = 10.0,
         max_diff_rows: int = 50_000,
         enforce_table_access: bool = True,
+        commit_markers: bool = True,
     ) -> None:
         self._path = path
         self._tables = tuple(tables)
@@ -266,6 +288,8 @@ class SqliteSubstrate:
         self._stage_seconds = max_stage_seconds
         self._max_rows = max_diff_rows
         self._enforce = enforce_table_access
+        self._markers = commit_markers
+        self._marking = False
         self._denied: tuple[str, str] | None = None
         self._conn: sqlite3.Connection | None = None
         self._handle: StageHandle | None = None
@@ -288,6 +312,11 @@ class SqliteSubstrate:
     @property
     def observed_tables(self) -> frozenset[str]:
         return frozenset(self._by_name)
+
+    @property
+    def commit_markers(self) -> bool:
+        """Whether each commit writes the marker :meth:`resolve_intent` reads."""
+        return self._markers
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -314,6 +343,16 @@ class SqliteSubstrate:
         # tables in self._tables; a cascade into any other table executes and
         # is not measured.
         conn.execute("PRAGMA recursive_triggers=ON")
+        if self._markers:
+            # Created before any stage can commit, so a missing table later
+            # means someone removed it, not that nothing ever committed.
+            try:
+                conn.execute(_MARKER_DDL)
+            except sqlite3.Error as exc:
+                conn.close()
+                raise StageConflictError(
+                    f"could not create the commit-marker table {_MARKER_TABLE}: {exc}"
+                ) from exc
         self._install_capture(conn)
         # Installed *after* the capture DDL, which would otherwise be denied
         # by its own authorizer, and before BEGIN, so the first statement of
@@ -451,21 +490,73 @@ class SqliteSubstrate:
         )
 
     def commit(self, handle: StageHandle) -> CommitReceipt:
-        """Make the staged work durable."""
+        """Make the staged work durable.
+
+        With commit markers on, the stage's marker row is written inside the
+        same transaction immediately before ``COMMIT``, so it becomes durable
+        with the effects or not at all.
+        """
         conn = self._require(handle)
         self._assert_live(handle)
+        committed_at = datetime.now(UTC)
         try:
+            if self._markers:
+                self._marking = True
+                try:
+                    conn.execute(
+                        f"INSERT INTO main.{_MARKER_TABLE} (stage_id, plan_id, committed_at) "
+                        f"VALUES (?, ?, ?)",
+                        (str(handle.stage_id), handle.plan_id, committed_at.isoformat()),
+                    )
+                finally:
+                    self._marking = False
             conn.execute("COMMIT")
         except sqlite3.Error as exc:
             raise StageError(f"commit failed: {exc}") from exc
         return CommitReceipt(
             stage_id=handle.stage_id,
             plan_id=handle.plan_id,
-            committed_at=datetime.now(UTC),
+            committed_at=committed_at,
             diff_hash="",
             verdict_hash="",
             substrate_txn_id=None,
         )
+
+    def resolve_intent(self, stage_id: uuid.UUID) -> bool | None:
+        """Whether a stage's transaction committed, read from its commit marker.
+
+        Exact, not a guess: the marker was written inside the stage's own
+        transaction, so it is present if and only if the effects are. Reads
+        through a fresh connection, which also rolls back any transaction a
+        crashed process left half-written.
+
+        :returns: ``True`` if the stage committed, ``False`` if it did not, or
+            ``None`` if this database has no marker table, so cannot say.
+        :raises SubstrateUnavailableError: If the database cannot be read.
+        """
+        try:
+            conn = sqlite3.connect(
+                f"file:{self._path}?mode=rw", uri=True, timeout=self._stage_seconds
+            )
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(f"cannot open {self._path}: {exc}") from exc
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_MARKER_TABLE,),
+            ).fetchone()
+            if exists is None:
+                return None
+            found = conn.execute(
+                f"SELECT 1 FROM main.{_MARKER_TABLE} WHERE stage_id = ?", (str(stage_id),)
+            ).fetchone()
+            return found is not None
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(
+                f"cannot read commit markers from {self._path}: {exc}"
+            ) from exc
+        finally:
+            conn.close()
 
     def abort(self, handle: StageHandle) -> None:
         """Roll back. Safe in any state, including after a commit."""
@@ -528,6 +619,11 @@ class SqliteSubstrate:
         if action in _WRITE_ACTIONS:
             table = arg1 or ""
             if table == _CAPTURE_TABLE or table in self._by_name:
+                return sqlite3.SQLITE_OK
+            # The commit marker is written by commit() alone. A statement the
+            # agent authored that forged one would make recovery report a
+            # crashed stage as committed.
+            if table == _MARKER_TABLE and self._marking and db_name == "main":
                 return sqlite3.SQLITE_OK
             # sqlite_* internal tables are touched by the engine itself, never
             # by a statement the agent authored; denying them breaks SQLite.

@@ -17,12 +17,14 @@ Two properties hold by construction:
    with no terminal record. :meth:`EscrowChain.unresolved_intents` reads them
    back.
 
-What the third one does not give: an intent says a commit was *attempted*, not
-that it succeeded. A crash inside that window leaves a plan whose outcome only
-the substrate knows, so recovery means asking the substrate whether that
-transaction landed. The chain narrows the question to one plan and one stage;
-it does not answer it, and an append-only chain cannot honestly backfill the
-answer afterwards.
+4. A crashed commit is resolved exactly, not guessed. An intent says a commit
+   was *attempted*. The substrate writes a commit marker inside the stage's
+   own transaction, so the marker exists if and only if the effects do, and
+   :meth:`EscrowEngine.recover` reads it for every intent a crashed process
+   left open and appends what actually happened. The intent records that the
+   marker was armed; an intent without that (written before v0.1.2, or by a
+   substrate with no marker) is left open for an operator rather than
+   resolved by guesswork.
 
 Scope: adjudication reads the measured diff, and the diff covers exactly the
 tables the substrate was configured to observe. ``admit`` checks
@@ -37,17 +39,19 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from interlock.anchor import AnchorPoint, LedgerAnchor
-from interlock.chain import EscrowChain, RecordType
+from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.exceptions import (
     AdmissionError,
     AnchorError,
     CyclicPlanError,
     ForbiddenStatementError,
+    InterlockError,
     PlanError,
     ScopeHaltedError,
     UncompensatableEffectError,
@@ -68,6 +72,11 @@ from interlock.types import (
 __all__ = ["EscrowEngine", "StageResult"]
 
 logger = logging.getLogger("interlock.engine")
+
+_MARKER_ARMED = "; commit marker armed"
+"""Suffix on a ``COMMIT_INTENT`` note: the substrate writes a commit marker
+inside this stage's transaction, so :meth:`EscrowEngine.recover` may read the
+marker's absence as "did not commit". The note is inside the record hash."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,16 +116,15 @@ class EscrowEngine:
         production.
     :param anchor: The AgentGov seam. Optional; records written without one are
         flagged ``anchored=False``.
-    :param settle_cost: Amount to settle when writing a reverse anchor into
-        AgentGov, representing what the plan cost to produce. Must be
-        positive to enable reverse anchoring: AgentGov has no zero-value entry
-        that can carry a memo, so there is nothing to write the chain head
-        into. The default of ``"0"`` therefore means forward anchoring only,
-        and ``StageResult.anchored_to`` is empty. Pass the plan's real cost to
-        get the bidirectional anchor.
+    :param settle_cost: What a plan cost to produce, charged to its scope
+        when writing the reverse anchor into a governed AgentGov. The default
+        of ``"0"`` writes a zero-value ``ANCHOR`` entry: the reverse anchor is
+        free. A positive cost is settled, and the spend carries the anchor.
+    :raises ValueError: If ``settle_cost`` is negative, or ``chain`` is a
+        read-only snapshot from :meth:`EscrowChain.load`.
     """
 
-    __slots__ = ("_anchor", "_chain", "_checkers", "_settle_cost", "_substrate")
+    __slots__ = ("_anchor", "_chain", "_checkers", "_inflight", "_settle_cost", "_substrate")
 
     def __init__(
         self,
@@ -130,10 +138,18 @@ class EscrowEngine:
         self._substrate = substrate
         self._checkers = tuple(checkers)
         self._chain = chain if chain is not None else EscrowChain()
+        if self._chain.read_only:
+            raise ValueError(
+                "EscrowChain.load() returns a read-only snapshot; pass EscrowChain(path) "
+                "to resume appending to the file"
+            )
         self._anchor = anchor
         self._settle_cost = (
             settle_cost if isinstance(settle_cost, Decimal) else Decimal(settle_cost)
         )
+        if self._settle_cost < 0:
+            raise ValueError(f"settle_cost cannot be negative, got {self._settle_cost}")
+        self._inflight: set[uuid.UUID] = set()
 
     @property
     def chain(self) -> EscrowChain:
@@ -232,6 +248,8 @@ class EscrowEngine:
             exceptions from the AgentGov seam are translated at the anchor.
         """
         cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
+        if cost < 0:
+            raise PlanError(f"settle_cost cannot be negative, got {cost}")
         self.admit(plan)
         self._record(RecordType.PLAN_ADMITTED, plan, plan.content_hash(), note=plan.intent[:80])
 
@@ -279,33 +297,43 @@ class EscrowEngine:
                 state = StageState.ABORTED
             else:
                 state = StageState.VERIFIED
-                # Re-read the breaker immediately before commit. The window
-                # between staging and commit is exactly where a trip matters,
-                # and AgentGov's breaker latches, so this is a stable read.
-                if self._anchor is not None:
-                    self._anchor.assert_scope_live(plan.scope_id)
-                # Write-ahead. The intent lands before the substrate is told to
-                # commit, so a crash in that window leaves COMMIT_INTENT with
-                # no terminal record after it and the effect is discoverable as
-                # possibly-durable. Without it the window is silent: the effect
-                # is on disk and the chain says the plan never got that far.
-                # EscrowChain.unresolved_intents() is the recovery read.
-                self._record(
-                    RecordType.COMMIT_INTENT,
-                    plan,
-                    diff.content_hash(),
-                    stage=handle.stage_id,
-                    note=f"about to commit {diff.blast_radius} rows",
+                # The breaker is re-read immediately before commit, and held
+                # there: the window between staging and commit is exactly
+                # where a trip matters. See LedgerAnchor.guard_commit.
+                guard: AbstractContextManager[None] = (
+                    self._anchor.guard_commit(plan.scope_id)
+                    if self._anchor is not None
+                    else nullcontext()
                 )
-                self._substrate.commit(handle)
-                committed = True
+                with guard:
+                    # Write-ahead. The intent lands before the substrate is
+                    # told to commit, so a crash in that window leaves
+                    # COMMIT_INTENT with no terminal record after it, and
+                    # recover() asks the substrate's commit marker what
+                    # happened. Without it the window is silent: the effect is
+                    # on disk and the chain says the plan never got that far.
+                    armed = bool(getattr(self._substrate, "commit_markers", False))
+                    self._inflight.add(handle.stage_id)
+                    self._record(
+                        RecordType.COMMIT_INTENT,
+                        plan,
+                        diff.content_hash(),
+                        stage=handle.stage_id,
+                        note=f"about to commit {diff.blast_radius} rows"
+                        + (_MARKER_ARMED if armed else ""),
+                    )
+                    self._substrate.commit(handle)
+                    committed = True
                 state = StageState.COMMITTED
+                note = f"{diff.blast_radius} rows committed"
+                raced = self._anchor.halted_after_commit(plan.scope_id) if self._anchor else ""
                 self._record(
                     RecordType.COMMITTED,
                     plan,
                     diff.content_hash(),
                     stage=handle.stage_id,
-                    note=f"{diff.blast_radius} rows committed",
+                    note=f"{note}; {raced}" if raced else note,
+                    best_effort=True,
                 )
         except ScopeHaltedError as exc:
             self._substrate.abort(handle)
@@ -316,8 +344,15 @@ class EscrowEngine:
                 diff.content_hash() if diff is not None else plan.content_hash(),
                 stage=handle.stage_id,
                 note=f"scope halted: {exc}",
+                best_effort=True,
             )
         except Exception:
+            if committed:
+                # The effects are durable; only the record of them failed.
+                # Never write ABORTED over committed effects. The intent stays
+                # open on the chain, and recover() resolves it from the
+                # commit marker.
+                raise
             self._substrate.abort(handle)
             self._record(
                 RecordType.ABORTED,
@@ -325,9 +360,11 @@ class EscrowEngine:
                 plan.content_hash(),
                 stage=handle.stage_id,
                 note="stage failed",
+                best_effort=True,
             )
             raise
         finally:
+            self._inflight.discard(handle.stage_id)
             self._substrate.close(handle)
 
         head = self._chain.head_hash
@@ -351,6 +388,71 @@ class EscrowEngine:
             reasons = "; ".join(v.message for v in result.verdict.blocking)
             raise AdmissionError(f"plan {plan.plan_id} refused: {reasons}", verdict=result.verdict)
         return result
+
+    # -- recovery -----------------------------------------------------------
+
+    def recover(self) -> tuple[EscrowRecord, ...]:
+        """Resolve the commit intents a crashed process left open.
+
+        Call at startup, on a chain resumed from its file. Each
+        ``COMMIT_INTENT`` with no terminal record after it is put to the
+        substrate's commit marker, which was written inside that stage's own
+        transaction: present means the effects committed, absent means they
+        rolled back. The answer is appended as a ``COMMITTED`` or ``ABORTED``
+        record whose note says it was recovered.
+
+        An intent this engine has in flight right now is skipped, and so is
+        one the substrate cannot answer for: an intent written before v0.1.2
+        (no marker was armed), or by a substrate without markers. Those stay
+        open and are logged, for an operator to resolve.
+
+        :returns: The records appended, in chain order.
+        :raises InterlockError: If the substrate or the chain cannot be read
+            or written.
+        """
+        resolve = getattr(self._substrate, "resolve_intent", None)
+        resolved: list[EscrowRecord] = []
+        for intent in self._chain.unresolved_intents():
+            stage_id = intent.stage_id
+            if stage_id is None or stage_id in self._inflight:
+                continue
+            outcome: bool | None = None
+            if callable(resolve) and intent.note.endswith(_MARKER_ARMED):
+                outcome = resolve(stage_id)
+            if outcome is None:
+                logger.warning(
+                    "commit intent for plan %s (stage %s, record %d) cannot be resolved: "
+                    "no commit marker was armed for it. Check the substrate for its "
+                    "effects and resolve it by hand",
+                    intent.plan_id,
+                    stage_id,
+                    intent.sequence,
+                )
+                continue
+            point = self._observe(best_effort=True)
+            record = self._chain.append(
+                RecordType.COMMITTED if outcome else RecordType.ABORTED,
+                plan_id=intent.plan_id,
+                payload_hash=intent.payload_hash,
+                stage_id=stage_id,
+                anchored=point.anchored,
+                agentgov_head_hash=point.head_hash,
+                agentgov_sequence=point.sequence,
+                note=(
+                    f"recovered: commit marker present, stage committed (intent {intent.sequence})"
+                    if outcome
+                    else f"recovered: no commit marker, stage rolled back "
+                    f"(intent {intent.sequence})"
+                ),
+            )
+            logger.warning(
+                "recovered commit intent for plan %s (stage %s): %s",
+                intent.plan_id,
+                stage_id,
+                "committed" if outcome else "rolled back",
+            )
+            resolved.append(record)
+        return tuple(resolved)
 
     # -- internals ----------------------------------------------------------
 
@@ -392,8 +494,17 @@ class EscrowEngine:
         *,
         stage: uuid.UUID | None = None,
         note: str = "",
+        best_effort: bool = False,
     ) -> None:
-        point = self._anchor.observe() if self._anchor is not None else AnchorPoint.unanchored()
+        """Append one record, anchored to AgentGov's current head.
+
+        :param best_effort: Record even if AgentGov cannot be read, as an
+            unanchored record. For the records that report what already
+            happened (a rollback, a durable commit), where refusing to write
+            the record would not undo anything and would leave the chain
+            silent about it.
+        """
+        point = self._observe(best_effort=best_effort)
         self._chain.append(
             record_type,
             plan_id=plan.plan_id,
@@ -405,6 +516,19 @@ class EscrowEngine:
             note=note,
         )
 
+    def _observe(self, *, best_effort: bool) -> AnchorPoint:
+        if self._anchor is None:
+            return AnchorPoint.unanchored()
+        if not best_effort:
+            return self._anchor.observe()
+        try:
+            return self._anchor.observe()
+        except InterlockError:
+            logger.warning(
+                "AgentGov could not be read; writing this record unanchored", exc_info=True
+            )
+            return AnchorPoint.unanchored()
+
     def _reverse_anchor(self, plan: EffectPlan, head: str, cost: Decimal) -> str:
         """Write Interlock's chain head into AgentGov, when co-resident.
 
@@ -415,12 +539,9 @@ class EscrowEngine:
         """
         # Runs after commit, so anything raised here arrives when the effects
         # are already durable and would destroy the caller's StageResult. A
-        # non-positive settle cost cannot anchor at all (see
-        # LedgerAnchor.reverse_anchor), so it is treated as "not configured"
-        # rather than attempted and thrown from the commit path.
+        # zero cost writes a free ANCHOR entry; a negative one was refused
+        # before anything was staged.
         if self._anchor is None or not self._anchor.can_reverse_anchor:
-            return ""
-        if cost <= 0:
             return ""
         try:
             entry = self._anchor.reverse_anchor(plan.scope_id, head, cost=cost)

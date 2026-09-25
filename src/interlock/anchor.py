@@ -10,18 +10,23 @@ Two modes:
 *Audit* opens the ledger with ``read_only=True``. That takes no advisory file
 lock, so it can attach while a governor process is actively writing. A write
 through this handle raises ``ReadOnlyLedgerError``, which is a bug in Interlock
-rather than a condition to handle.
+rather than a condition to handle. The view is refreshed, and what it reads is
+verified, before every head read and every pre-commit breaker check: a
+read-only view is a snapshot until refreshed, and a stale one would let a plan
+commit on a scope the governor halted after Interlock attached.
 
 *Governed* additionally holds a write-capable manager, which lets Interlock
-write its own chain head into the ``memo`` of the ledger entries a plan causes.
-Because ``memo`` is part of AgentGov's own hash payload, that reverse anchor is
-tamper-evident inside AgentGov's chain, and the two chains interlock in both
-directions. This uses only the public ``authorize(memo=)`` / ``capture(memo=)``
-surface.
+write its own chain head into AgentGov's chain. Each reverse anchor is the
+``memo`` of a zero-value ``ANCHOR`` entry, or of the settling spend when the
+plan carries a cost. Because ``memo`` is part of AgentGov's own hash payload,
+that reverse anchor is tamper-evident inside AgentGov's chain, and the two
+chains interlock in both directions. This uses only the public ``anchor()``,
+``authorize(memo=)`` and ``capture(memo=)`` surface.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,6 +47,10 @@ from interlock.types import GENESIS_HASH
 
 __all__ = ["AnchorPoint", "LedgerAnchor"]
 
+logger = logging.getLogger("interlock.anchor")
+
+_REVERSE_ANCHOR_TYPES = frozenset({EntryType.ANCHOR, EntryType.SPEND})
+
 
 @contextmanager
 def _barrier(context: str) -> Iterator[None]:
@@ -54,13 +63,11 @@ def _barrier(context: str) -> Iterator[None]:
     classify more precisely becomes :class:`AnchorError`: the evidence chain
     is unusable, so refuse to operate.
 
-    ``InterlockError`` passes through untouched so a deliberate
-    :class:`ScopeHaltedError` is not reclassified as an anchor failure.
+    Nothing else is caught, so an ``InterlockError`` such as a deliberate
+    :class:`ScopeHaltedError` is never reclassified as an anchor failure.
     """
     try:
         yield
-    except InterlockError:
-        raise
     except AgentGovError as exc:
         raise AnchorError(f"AgentGov refused {context}: {type(exc).__name__}: {exc}") from exc
     except (sqlite3.Error, OSError) as exc:
@@ -150,44 +157,123 @@ class LedgerAnchor:
         return self._governed is not None
 
     def observe(self) -> AnchorPoint:
-        """Read AgentGov's current head position."""
+        """Read AgentGov's current head position.
+
+        An audit view is refreshed first, so the position is the governor's
+        current head, verified, rather than wherever it stood at attach time.
+
+        :raises LedgerUnverifiedError: If what the governor wrote since the
+            last read does not verify.
+        """
         source = self._audit or self._governed
         if source is None:
             return AnchorPoint.unanchored()
+        self._refresh()
         with _barrier("a chain-head read"):
-            entries = source.ledger.entries()
-            return AnchorPoint(
-                anchored=True,
-                head_hash=source.ledger.head_hash,
-                sequence=entries[-1].sequence if entries else 0,
-            )
+            ledger = source.ledger
+            with ledger.lock:
+                return AnchorPoint(anchored=True, head_hash=ledger.head_hash, sequence=len(ledger))
+
+    def _refresh(self) -> None:
+        """Catch the audit view up with the governor, verifying every new entry.
+
+        A no-op without an audit view: a governed manager is the writer and is
+        always current.
+
+        :raises LedgerUnverifiedError: If the new entries do not verify, or the
+            ledger was rewritten under the view. The view then refuses every
+            later read, so the failure repeats rather than clearing itself.
+        :raises AnchorError: If the ledger cannot be read at all.
+        """
+        if self._audit is None:
+            return
+        try:
+            self._audit.refresh()
+        except LedgerIntegrityError as exc:
+            raise LedgerUnverifiedError(
+                f"the AgentGov ledger no longer verifies against what this anchor read "
+                f"before, refusing to operate: {exc}"
+            ) from exc
+        except AgentGovError as exc:
+            raise AnchorError(f"AgentGov refused a refresh: {type(exc).__name__}: {exc}") from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise AnchorError(f"AgentGov ledger unreachable during a refresh: {exc}") from exc
+
+    def _sources(self) -> tuple[BudgetManager, ...]:
+        return tuple(source for source in (self._audit, self._governed) if source is not None)
 
     def assert_scope_live(self, scope_id: str) -> None:
         """Refuse if AgentGov's breaker has tripped for this scope or an ancestor.
 
         Called immediately before commit rather than at admission, because the
-        staging window is where a trip has to be observed. AgentGov's breaker
-        latches, so the read does not race a reset.
+        staging window is where a trip has to be observed. An audit view is
+        refreshed first: a trip the governor wrote after Interlock attached is
+        seen here. Every attached view is checked, so with both an audit path
+        and a governed manager a halt in either refuses the commit.
 
         :raises ScopeHaltedError: If the scope or any ancestor is halted.
+        :raises LedgerUnverifiedError: If the refresh does not verify. Fails
+            closed: a breaker state that cannot be read is not a live scope.
         """
-        source = self._audit or self._governed
-        if source is None:
-            return
-        try:
-            chain = (scope_id, *source.ancestry(scope_id))
-        except AgentGovError:
-            chain = (scope_id,)
-        for candidate in chain:
-            try:
-                halted_by = source.halted_by(candidate)
-            except AgentGovError:
-                continue
-            if halted_by is not None:
+        self._refresh()
+        for source in self._sources():
+            halted = _halted(source, scope_id)
+            if halted is not None:
                 raise ScopeHaltedError(
-                    f"AgentGov has halted {candidate!r} (reported by {halted_by!r}); "
-                    f"refusing to commit staged effects for scope {scope_id!r}"
+                    f"AgentGov has halted {halted}; refusing to commit staged effects "
+                    f"for scope {scope_id!r}"
                 )
+
+    @contextmanager
+    def guard_commit(self, scope_id: str) -> Iterator[None]:
+        """Check the scope is live, and keep it so until the block exits.
+
+        Wrap the substrate commit in this. With a governed manager, the
+        governor's own lock is held from the check through the commit, so a
+        trip in this process lands strictly before the check (and the commit is
+        refused) or strictly after the commit, never between them.
+
+        An audit view is a separate process's database, and no lock spans it
+        and the substrate. The check there reads the governor's committed state
+        immediately before the commit, verified; a trip the governor commits
+        after that read is concurrent with this commit and cannot be excluded.
+        :meth:`halted_after_commit` records it when it happens.
+
+        :raises ScopeHaltedError: If the scope or an ancestor is halted.
+        """
+        if self._governed is None:
+            self.assert_scope_live(scope_id)
+            yield
+            return
+        with _barrier("a commit guard"):
+            lock = self._governed.ledger.lock
+        with lock:
+            self.assert_scope_live(scope_id)
+            yield
+
+    def halted_after_commit(self, scope_id: str) -> str:
+        """Describe a halt that raced a commit through an audit view, if any.
+
+        Only an audit-only anchor can race: :meth:`guard_commit` excludes it
+        for a governed manager. Never raises, because it runs after the
+        substrate has committed.
+
+        :returns: A note for the commit record, or ``""``.
+        """
+        if self._audit is None or self._governed is not None:
+            return ""
+        try:
+            self._refresh()
+            halted = _halted(self._audit, scope_id)
+        except InterlockError:
+            logger.warning("post-commit breaker read failed for %r", scope_id, exc_info=True)
+            return ""
+        if halted is None:
+            return ""
+        return (
+            f"a halt on {halted} was found when AgentGov was re-read immediately "
+            f"after this commit, and was not visible before it"
+        )
 
     def assert_scope_known(self, scope_id: str) -> None:
         """Refuse a plan whose scope AgentGov has never heard of.
@@ -225,6 +311,7 @@ class LedgerAnchor:
         source = self._audit or self._governed
         if source is None:
             return
+        self._refresh()
         try:
             source.verify_integrity()
         except LedgerIntegrityError as exc:
@@ -247,46 +334,79 @@ class LedgerAnchor:
         anchor cannot be edited without breaking AgentGov's own verification.
         That is the upper time bound one-way anchoring does not give.
 
-        :param cost: Amount to settle, representing what the plan cost to
-            produce. MUST be positive: this writes the memo through AgentGov's
-            ``authorize``/``capture`` pair, and AgentGov rejects a
-            non-positive authorization. There is no zero-value entry on that
-            surface to carry a memo, so a reverse anchor always costs
-            something.
-        :returns: The settled entry, or ``None`` when not co-resident.
-        :raises AnchorError: If ``cost`` is not positive. Raised here rather
-            than letting AgentGov's ``ValueError`` surface from inside the
-            commit path, where it arrives after the effects are already
-            durable.
+        :param cost: What the plan cost to produce. Zero (the default) writes
+            a zero-value ``ANCHOR`` entry, which moves no money: the anchor is
+            free. A positive cost is settled through AgentGov's
+            ``authorize``/``capture`` pair and the spend carries the memo.
+        :returns: The anchoring entry, or ``None`` when not co-resident.
+        :raises AnchorError: If ``cost`` is negative. Raised here rather than
+            letting AgentGov's ``ValueError`` surface from inside the commit
+            path, where it arrives after the effects are already durable.
         """
         if self._governed is None:
             return None
         amount = Decimal(cost) if not isinstance(cost, Decimal) else cost
-        if amount <= 0:
+        if amount < 0:
             raise AnchorError(
-                f"reverse anchoring needs a positive settle cost, got {amount}; "
-                f"AgentGov has no zero-value entry that can carry a memo, so "
-                f"pass the plan's real cost or leave settle_cost unset to run "
-                f"with forward anchoring only"
+                f"a reverse anchor's settle cost cannot be negative, got {amount}; "
+                f"pass the plan's real cost, or zero for a free anchor"
             )
         memo = f"interlock:{record_hash[:16]}"
         with _barrier(f"a reverse anchor on scope {scope_id!r}"):
+            if amount == 0:
+                return self._governed.anchor(scope_id, memo)
             authorization = self._governed.authorize(scope_id, amount, memo=memo)
             return self._governed.capture(authorization, amount, memo=memo)
 
     def find_reverse_anchors(self) -> tuple[LedgerEntry, ...]:
-        """Every AgentGov entry carrying an Interlock reverse anchor."""
+        """Every AgentGov entry carrying an Interlock reverse anchor.
+
+        A free anchor is an ``ANCHOR`` entry; a paid one is the settling
+        ``SPEND``. The hold that preceded a paid anchor carries the same memo
+        and is not counted.
+        """
         source = self._audit or self._governed
         if source is None:
             return ()
+        self._refresh()
         with _barrier("an audit-trail read"):
             return tuple(
                 entry
                 for entry in source.audit_trail()
-                if entry.memo.startswith("interlock:") and entry.entry_type is EntryType.SPEND
+                if entry.memo.startswith("interlock:") and entry.entry_type in _REVERSE_ANCHOR_TYPES
             )
 
     def close(self) -> None:
         if self._audit is not None:
             self._audit.close()
             self._audit = None
+
+
+def _halted(source: BudgetManager, scope_id: str) -> str | None:
+    """Describe the first halt on ``scope_id``'s path to its root, if any.
+
+    A scope AgentGov does not know is not halted by it.
+
+    :returns: ``"'scope' (reported by 'tripped scope': reason)"``, or ``None``.
+    """
+    try:
+        path = (scope_id, *source.ancestry(scope_id))
+    except AgentGovError:
+        path = (scope_id,)
+    for candidate in path:
+        try:
+            halted_by = source.halted_by(candidate)
+        except AgentGovError:
+            continue
+        if halted_by is not None:
+            reason = next(
+                (
+                    event.reason
+                    for event in reversed(source.control_events)
+                    if event.scope_id == halted_by and event.event_type == "circuit_tripped"
+                ),
+                "",
+            )
+            because = f": {reason}" if reason else ""
+            return f"{candidate!r} (reported by {halted_by!r}{because})"
+    return None
