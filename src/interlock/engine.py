@@ -37,6 +37,7 @@ substrate's connection can reach; do not rely on this layer for containment.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -45,6 +46,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from interlock.anchor import AnchorPoint, LedgerAnchor
+from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.exceptions import (
     AdmissionError,
@@ -72,6 +74,19 @@ from interlock.types import (
 __all__ = ["EscrowEngine", "StageResult"]
 
 logger = logging.getLogger("interlock.engine")
+
+_GAPS = "unmeasured cascades acknowledged: "
+"""Prefix on a ``STAGE_OPENED`` note naming each foreign-key reach into an
+unobserved table the operator accepted. The stage's diff does not cover those
+rows, and the chain says so for the stage it applies to."""
+
+_TXID = "; txid "
+"""Infix on a ``COMMIT_INTENT`` note carrying the substrate's own transaction
+id, when it has one (PostgreSQL's ``pg_current_xact_id()``). Recovery hands it
+back to the substrate, which can then tell a transaction still running on the
+server from one that rolled back."""
+
+_TXID_PATTERN = re.compile(r"; txid ([0-9]+)(?:;|$)")
 
 _MARKER_ARMED = "; commit marker armed"
 """Suffix on a ``COMMIT_INTENT`` note: the substrate writes a commit marker
@@ -261,7 +276,13 @@ class EscrowEngine:
         committed = False
 
         try:
-            self._record(RecordType.STAGE_OPENED, plan, plan.content_hash(), stage=handle.stage_id)
+            self._record(
+                RecordType.STAGE_OPENED,
+                plan,
+                plan.content_hash(),
+                stage=handle.stage_id,
+                note=_coverage_note(self._substrate),
+            )
             for effect in plan.topological_order():
                 outcomes.append(self._substrate.apply(handle, effect))
             state = StageState.STAGED
@@ -313,6 +334,7 @@ class EscrowEngine:
                     # happened. Without it the window is silent: the effect is
                     # on disk and the chain says the plan never got that far.
                     armed = bool(getattr(self._substrate, "commit_markers", False))
+                    txid = _transaction_id(self._substrate, handle)
                     self._inflight.add(handle.stage_id)
                     self._record(
                         RecordType.COMMIT_INTENT,
@@ -320,6 +342,7 @@ class EscrowEngine:
                         diff.content_hash(),
                         stage=handle.stage_id,
                         note=f"about to commit {diff.blast_radius} rows"
+                        + (f"{_TXID}{txid}" if txid else "")
                         + (_MARKER_ARMED if armed else ""),
                     )
                     self._substrate.commit(handle)
@@ -418,7 +441,8 @@ class EscrowEngine:
                 continue
             outcome: bool | None = None
             if callable(resolve) and intent.note.endswith(_MARKER_ARMED):
-                outcome = resolve(stage_id)
+                txid = _recorded_txid(intent.note)
+                outcome = resolve(stage_id, txid=txid) if txid else resolve(stage_id)
             if outcome is None:
                 logger.warning(
                     "commit intent for plan %s (stage %s, record %d) cannot be resolved: "
@@ -561,3 +585,28 @@ class EscrowEngine:
             )
             return ""
         return entry.entry_hash if entry is not None else ""
+
+
+def _coverage_note(substrate: ShadowSubstrate) -> str:
+    """Name the acknowledged cascade gaps the stage just opened runs with.
+
+    Empty when the substrate reports none, or runs no cascade check.
+    """
+    report = getattr(substrate, "cascade_report", None)
+    if not isinstance(report, CascadeReport) or not report.gaps:
+        return ""
+    return _GAPS + report.describe_gaps()
+
+
+def _transaction_id(substrate: ShadowSubstrate, handle: StageHandle) -> str | None:
+    """The substrate's transaction id for an open stage, when it exposes one."""
+    reader = getattr(substrate, "transaction_id", None)
+    if not callable(reader):
+        return None
+    value = reader(handle)
+    return str(value) if value else None
+
+
+def _recorded_txid(note: str) -> str | None:
+    found = _TXID_PATTERN.search(note)
+    return found.group(1) if found else None

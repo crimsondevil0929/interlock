@@ -44,6 +44,9 @@ dependencies = [
     "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.1.2",
 ]
 
+[project.scripts]
+interlock = "interlock.cli:main_entry"
+
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
 
@@ -57,6 +60,9 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.6.0",
     "mypy>=1.11.0",
+    # The PostgreSQL substrate's integration tests. The runtime dependency is
+    # the `postgres` extra; this puts the driver in every dev environment.
+    "psycopg[binary]>=3.2",
     # scripts/live_stress_test.py only. Not a runtime dependency: nothing in
     # src/ imports it, and the library never talks to a model provider.
     "anthropic>=1.0.0",
@@ -77,12 +83,19 @@ select = ["E", "F", "I", "UP", "B", "N", "S", "RUF"]
 ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101"]
+# Tests build SQL from table names they define themselves, to seed and count
+# fixtures; no value in them comes from outside the test.
+"tests/**/*.py" = ["S101", "S608"]
 # The capture triggers interpolate table and column names because SQL has no
 # parameter binding for identifiers in DDL. Every identifier is validated by
 # substrate._assert_identifier at TableSpec construction and comes from
 # operator configuration, never from the agent.
 "src/interlock/substrate.py" = ["S608"]
+# The same, for the PostgreSQL install DDL and catalog queries: identifiers are
+# validated TableSpec names, and the rest is constant SQL joined together.
+"src/interlock/postgres.py" = ["S608"]
+# The SQLite journal DDL and reads, over the same validated names and constants.
+"src/interlock/reconcile.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.11"

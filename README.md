@@ -357,11 +357,144 @@ AgentGov's latching breaker is re-read immediately before commit, not at admissi
 staging window is where a trip has to be observed, because a halt that does not stop
 in-flight side effects does not stop the effects.
 
+## PostgreSQL
+
+`PostgresSubstrate` stages each plan in a `REPEATABLE READ` transaction and measures it with
+row triggers installed once, so no stage ever alters a busy table. Install as the tables'
+owner, then stage as a separate role granted DML on the observed tables and nothing else:
+
+```bash
+uv pip install 'interlock[postgres]'
+interlock install --config interlock.toml --database postgresql://owner@db/app
+interlock check   --config interlock.toml --database postgresql://interlock_agent@db/app
+```
+
+```toml
+substrate = "postgres"
+schema = "public"
+stage_roles = ["interlock_agent"]   # granted the interlock schema's stage functions
+acknowledge_cascades = []
+
+[[tables]]
+name = "orders"
+columns = ["id", "tenant", "total"]
+tenant_column = "tenant"
+```
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+from interlock import EscrowEngine, PlanBuilder, PostgresSubstrate, TableSpec, default_checkers
+
+substrate = PostgresSubstrate(
+    "postgresql://interlock_agent@db/app",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+)
+engine = EscrowEngine(substrate, checkers=default_checkers(row_limit=8))
+plan = (
+    PlanBuilder("support-agent")
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = %(total)s WHERE id = %(id)s",
+        parameters={"total": 100, "id": 1},
+    )
+    .build()
+)
+result = engine.execute(plan)
+```
+
+What `interlock install` puts in the database: an `interlock` schema holding the stage
+table and four functions, and on each observed table one `AFTER` row trigger plus one
+`TRUNCATE` trigger, both `ENABLE ALWAYS` so `session_replication_role` does not switch them
+off. For a transaction that opened no stage, the trigger logs the write to
+`interlock.unmediated` (see [Unrecorded writes](#unrecorded-writes)). For one that did, it
+writes before and after images into a temporary table that exists only in that session for
+that transaction. Rows are keyed to the stage by `pg_current_xact_id()`, read from a row
+only the stage-opening function can write, not from the `interlock.stage_id` setting,
+which any statement could change; the setting is still set, and the trigger refuses to go
+on when the two disagree.
+
+Every stage checks, before its first effect and with the observed tables locked
+`ROW EXCLUSIVE` so none of it can change underneath:
+
+- each observed table carries Interlock's triggers, enabled always, capturing exactly
+  its `TableSpec`'s columns, and has no inheritance children or partitions (a statement
+  on the parent writes their rows too, through no trigger, and PostgreSQL checks
+  privileges on the parent alone);
+- the stage's role is not a superuser, owns no observed table (an owner can disable a
+  trigger), and can write no other table, directly, through a column grant, or through
+  any role it belongs to. PostgreSQL has no statement authorizer, so the grant is the table
+  boundary; the substrate checks it rather than trusting it. `enforce_table_access=False`
+  trusts it;
+- the cascade check, read from `pg_constraint`.
+
+What differs from SQLite:
+
+- **Placeholders are psycopg's:** `%(name)s`, and `%%` for a literal percent sign.
+- **Only row statements stage:** `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
+  `WITH`, `VALUES`, `TABLE`. Each is sent as a prepared statement, which the server will
+  not split, so `UPDATE ...; COMMIT` fails instead of committing before adjudication.
+- **A cascade gate fires per row.** A delete of a gated row, or an update that changes a
+  gated key, is refused inside the statement and PostgreSQL rolls the statement back,
+  cascade included. SQLite refuses when it prepares the statement.
+- **`NUMERIC` is read as `Decimal`**, exactly.
+- **Bounds are the server's:** `statement_timeout`, `lock_timeout` and
+  `idle_in_transaction_session_timeout` are set for the stage and re-set before every
+  effect, so a statement cannot lift them, and a stage whose client died cannot hold locks
+  past `max_stage_seconds`.
+- **Crash recovery reads the transaction.** The stage's row is its commit marker, and
+  `pg_current_xact_id()` is written into the commit intent, so recovery can tell a
+  transaction the server still has open (a crashed client's, until its session times out)
+  from one that rolled back, and leaves the first open.
+
+What grants cannot see, so the substrate cannot either: a `SECURITY DEFINER` function the
+role may call that writes elsewhere, an extension such as `dblink` that opens another
+connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
+or later; CI runs 16.
+
+## Unrecorded writes
+
+The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
+the agent's own credentials used directly all write observed tables and leave nothing in
+the escrow chain. `interlock reconcile-effects` is the check that closes the loop: nothing
+changes an observed table without a record.
+
+```bash
+interlock install           --config interlock.toml   # once; SQLite needs it for this too
+interlock reconcile-effects --config interlock.toml --chain escrow.jsonl [--after N]
+```
+
+It fails (exit 1) on:
+
+- **an unmediated write:** a row change no stage made. On PostgreSQL the installed trigger
+  logs each one to `interlock.unmediated` inside the writer's own transaction, with the
+  session user, `application_name` and transaction id; a `TRUNCATE` is logged too. On
+  SQLite, `interlock install` adds permanent journal triggers that record every row change
+  in `_interlock_journal`, and each committed stage records the range of journal rows it
+  produced, which is exact because `BEGIN IMMEDIATE` admits one writer at a time. A
+  cascade from a table nobody observes is found row by row;
+- **an unrecorded stage:** one the database committed that no chain records, such as one
+  opened by hand with the stage role's credentials, or by an engine on the default
+  in-memory chain;
+- **a contradicted stage:** recorded as aborted, or under another plan;
+- **an unresolved stage:** committed with only its commit intent in the chain, after a
+  crash in the commit window. Recovery resolves it; `EscrowRuntime` runs recovery at
+  startup;
+- on SQLite, an observed table whose journal trigger is missing.
+
+Each run prints `last entry: N`; pass it back as `--after N` to check only what is new.
+Exit code 5 means a chain failed verification and proves nothing. On PostgreSQL, run it as
+a role named in `audit_roles` at install, which may read Interlock's logs and write
+nothing.
+
+What it cannot see: anyone who can disable the triggers or edit the logs. On PostgreSQL
+that is the tables' owner or a superuser, which logical decoding would close; on SQLite it
+is anyone who can write the file.
+
 ## Scope
 
-**v0.1.x ships one substrate: SQLite.** PostgreSQL is declared as an extra and has no
-driver. One connector at the row-level-diff standard is worth more than several reporting
-only row counts, because a row count is the summary this design exists to replace.
+**Two substrates: SQLite and PostgreSQL.** One connector at the row-level-diff standard is
+worth more than several reporting only row counts, because a row count is the summary this
+design exists to replace.
 
 ### What this is not yet a boundary against
 
@@ -375,20 +508,33 @@ against the shipped code, not inferred.
   any table not in `TableSpec`, plus `ATTACH`/`DETACH`. A statement whose label claims an
   observed table while writing elsewhere never executes; it raises
   `ForbiddenStatementError` naming the table it reached for. Pass
-  `enforce_table_access=False` to restore the v0.1.0 behaviour for a migration.
+  `enforce_table_access=False` to lift the unobserved-table rule for a migration; the rules
+  below stay on.
 
-  **What this still does not cover.** The authorizer fires when SQLite *prepares a
-  statement*. Foreign-key cascades are executed internally and are not prepared, so a
-  cascade into an unobserved table is neither denied here nor visible in the diff — see
-  the next bullet. Grant the connection exactly the observed tables anyway; a
-  database-enforced grant is a boundary, and this is a second one in front of it.
+  The same callback refuses a statement that writes the capture table (which would erase
+  the measurement), the commit-marker table, or transaction control: a `COMMIT` inside a
+  stage used to make every effect before it durable before any checker ran. Grant the
+  connection exactly the observed tables anyway; a database-enforced grant is a boundary,
+  and this is a second one in front of it.
 
-  DDL specifically is refused twice over: `SqliteSubstrate.reject_reason()` reads the
-  statement's leading verb at admission, so `ALTER`/`DROP`/`CREATE`/`TRUNCATE`/`VACUUM`
-  /`ATTACH`/`PRAGMA` and friends are rejected whatever `Effect.kind` claims.
-- **Cascades reach outside the measurement.** A granted `DELETE` on an observed table whose
-  foreign key cascades into an unobserved table destroys those rows and they do not appear
-  in the diff.
+  DDL and transaction control are refused twice over: `SqliteSubstrate.reject_reason()`
+  reads the statement's leading verb at admission, so `ALTER`/`DROP`/`CREATE`/`TRUNCATE`
+  /`VACUUM`/`ATTACH`/`PRAGMA`/`COMMIT`/`SAVEPOINT` and friends are rejected whatever
+  `Effect.kind` claims.
+- **A foreign-key cascade into an unobserved table is refused unless you acknowledge it.**
+  A `DELETE` on `orders` that cascades into an unobserved `order_notes` used to destroy
+  those notes unmeasured. Every stage now reads the foreign-key graph under its write lock
+  and refuses, before a row changes, a delete or a referenced-key update whose `CASCADE`,
+  `SET NULL` or `SET DEFAULT` actions reach an unobserved table, naming the path. The
+  analysis follows chains of actions to any depth and is column-precise: updating
+  `orders.status` is never refused because of a key on `orders.id`. `EscrowRuntime` runs
+  the same check at startup and logs every gated operation. To let a cascade run
+  unmeasured, name the table in `acknowledge_cascades=[...]`; every stage that runs with
+  that gap says so in its `STAGE_OPENED` record. The refusal is enforced three ways, so no
+  single layer is load-bearing: the authorizer refuses the parent operation, the
+  authorizer refuses any foreign-key action SQLite compiles into the table (which is what
+  catches `INSERT OR REPLACE`), and temporary triggers on the table abort any row change
+  there while the stage is open.
 - **One engine stages one substrate.** A plan whose effects name another
   substrate is refused at admission; nothing coordinates two substrates, so a
   plan spanning SQL and a non-transactional sink needs the outbox pattern below.

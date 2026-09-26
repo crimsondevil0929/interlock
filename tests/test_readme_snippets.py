@@ -56,6 +56,10 @@ PROSE_EXEMPT = frozenset(
         "connection.set_authorizer",
         "set_authorizer",
         "uv.sync",
+        # PostgreSQL's own functions, named where the README explains the
+        # PostgreSQL substrate.
+        "pg_current_xact_id",
+        "pg_xact_status",
     }
 )
 

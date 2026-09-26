@@ -336,6 +336,7 @@ postgres = [
 dev = [
     { name = "anthropic" },
     { name = "mypy" },
+    { name = "psycopg", extra = ["binary"] },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -352,6 +353,7 @@ provides-extras = ["postgres"]
 dev = [
     { name = "anthropic", specifier = ">=1.0.0" },
     { name = "mypy", specifier = ">=1.11.0" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
     { name = "ruff", specifier = ">=0.6.0" },

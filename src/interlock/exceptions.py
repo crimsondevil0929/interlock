@@ -24,6 +24,7 @@ __all__ = [
     "StageConflictError",
     "StageError",
     "StageExpiredError",
+    "SubstrateConfigurationError",
     "SubstrateUnavailableError",
     "UncompensatableEffectError",
 ]
@@ -74,6 +75,15 @@ class StageError(InterlockError):
 
 class SubstrateUnavailableError(StageError):
     """The backend could not be reached or a connection could not be bound."""
+
+
+class SubstrateConfigurationError(StageError):
+    """The backend is reachable but not set up so a stage can be measured.
+
+    Interlock is not installed in it, the installation does not match the
+    configured tables, or the stage's role can write somewhere the capture
+    cannot see. Retrying will not help; fix the configuration.
+    """
 
 
 class StageConflictError(StageError):

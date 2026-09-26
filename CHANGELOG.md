@@ -9,6 +9,77 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added
+
+- **The cascade check (2.1).** New `interlock.cascade` reads the foreign-key
+  graph (`PRAGMA foreign_key_list` on SQLite, `pg_constraint` on PostgreSQL)
+  and works out every table a `DELETE` or `UPDATE` on an observed table can
+  reach through `CASCADE`, `SET NULL` or `SET DEFAULT`, to any depth, with the
+  shortest path. It is column-precise for updates, and `RESTRICT` and
+  `NO ACTION` reach nothing. `SqliteSubstrate` runs it when every stage opens,
+  under the write lock, cached on `schema_version`, and refuses an operation
+  whose actions reach an unobserved table, before a row changes, naming the
+  path. `acknowledge_cascades=[...]` lets a named table be cascaded into
+  unmeasured, and the gap is written into that stage's `STAGE_OPENED` record.
+  `EscrowRuntime` runs the check at startup (`cascade_report`), logs every
+  gated operation, and now requires the database to exist.
+
+- **`PostgresSubstrate` (2.2).** Stages run in `REPEATABLE READ` on a
+  dedicated connection with the observed tables locked `ROW EXCLUSIVE`, and
+  `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`
+  set from `max_stage_seconds` and re-set before every effect. Changes are
+  captured by row triggers installed once with `interlock install` (or
+  `interlock.postgres.install`), `ENABLE ALWAYS`, which write to a temporary
+  table only for a transaction that opened a stage; the stage is identified by
+  `pg_current_xact_id()` in `interlock.stages`, and the `interlock.stage_id`
+  setting must agree. The capture table, the stage row and the gates belong to
+  the installing role and are written only through `SECURITY DEFINER`
+  functions, so no statement of the agent's can reach them. Each stage verifies
+  the installed triggers against its `TableSpec`s, that no observed table has
+  inheritance children or partitions, and that its role is not a superuser,
+  owns no observed table, and can write no other table
+  (`SubstrateConfigurationError` otherwise). Only row statements are accepted,
+  each sent as a prepared statement. `NUMERIC` is read as `Decimal`. The
+  stage's row is its commit marker and `pg_current_xact_id()` is written into
+  the commit intent, so `resolve_intent` tells a transaction still open on the
+  server from one that rolled back.
+- **Unrecorded writes (2.3).** `interlock reconcile-effects` fails (exit 1) on
+  any write to an observed table that no chain records: a row change no stage
+  made, a committed stage no chain records, one recorded as aborted or under
+  another plan, or one left with only its commit intent. On PostgreSQL the
+  installed trigger logs every write made outside a stage to
+  `interlock.unmediated`, in the writer's transaction, with its session user,
+  `application_name` and transaction id; `install(audit_roles=)` grants a role
+  read access to the logs and nothing else. On SQLite `interlock install` adds
+  permanent journal triggers writing `_interlock_journal`, and each committed
+  stage records the exact range of journal rows it produced; the authorizer
+  keeps statements away from both tables. `--after` takes the previous run's
+  `last entry`; exit 5 means a chain failed verification.
+- **The `interlock` command**, with `install`, `check` and `reconcile-effects`,
+  reading a TOML configuration file (`interlock.config`).
+- `SubstrateConfigurationError`; `CascadeReport` and `PostgresSubstrate` at the
+  top level. A substrate may expose `transaction_id(handle)`; the engine writes
+  it into `COMMIT_INTENT` and passes it back to `resolve_intent(..., txid=)`.
+- `EffectDiff.column_total` and the value guards read `Decimal` values exactly.
+
+### Fixed
+
+- **A statement could erase the measurement.** The authorizer allowed any write
+  to `_interlock_capture`, so an effect `DELETE FROM _interlock_capture` emptied
+  the diff, and a plan that zeroed every order committed past `BlastRadius(1)`.
+  Only the capture triggers may write it now, with or without
+  `enforce_table_access`.
+- **A statement could commit the stage before adjudication.** `COMMIT` was not
+  a forbidden verb and SQLite's transaction actions were authorized, so an
+  effect `COMMIT` made every earlier effect durable before any checker ran, and
+  every later one autocommitted. `BEGIN`, `COMMIT`, `END`, `ROLLBACK`,
+  `SAVEPOINT` and `RELEASE` are refused at admission and by the authorizer.
+- **The authorizer was off with `enforce_table_access=False`.** It now always
+  runs; the flag lifts only the unobserved-table rule.
+- The README said a foreign-key cascade is not seen by SQLite's authorizer. On
+  current SQLite it is, and it was refused with a message about an unobserved
+  write; the cascade check now refuses it first and says why.
+
 ## [0.1.2] - 2026-09-25
 
 Makes two of v0.1.1's guarantees true. Each fix is tested against a

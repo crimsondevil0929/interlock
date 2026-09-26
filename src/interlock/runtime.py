@@ -35,6 +35,7 @@ from types import TracebackType
 
 from interlock.anchor import LedgerAnchor
 from interlock.builder import PlanBuilder
+from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord
 from interlock.engine import EscrowEngine, StageResult
 from interlock.invariants import InvariantChecker, default_checkers
@@ -71,6 +72,13 @@ class EscrowRuntime:
         locks for its whole life.
     :param enforce_table_access: Deny row mutations outside ``tables`` inside
         SQLite itself. On by default.
+    :param acknowledge_cascades: Unobserved tables a foreign-key action may
+        write, unmeasured. See :class:`SqliteSubstrate`.
+
+    Construction runs the cascade check against the database (see
+    :attr:`cascade_report`), so the database must exist: an operation whose
+    foreign-key actions reach an unobserved table is logged at startup and
+    refused when staged, unless the table is acknowledged.
     """
 
     __slots__ = (
@@ -97,6 +105,7 @@ class EscrowRuntime:
         max_stage_seconds: float = 10.0,
         max_diff_rows: int = 50_000,
         enforce_table_access: bool = True,
+        acknowledge_cascades: Sequence[str] = (),
     ) -> None:
         self._scope_id = scope_id
         self._settle_cost = Decimal(str(settle_cost))
@@ -106,7 +115,11 @@ class EscrowRuntime:
             max_stage_seconds=max_stage_seconds,
             max_diff_rows=max_diff_rows,
             enforce_table_access=enforce_table_access,
+            acknowledge_cascades=acknowledge_cascades,
         )
+        # The cascade check at setup: a misconfigured boundary is reported
+        # when the runtime starts, not when the first delete is refused.
+        self._substrate.check_cascades()
         self._anchor: LedgerAnchor | None = None
         if governed is not None or audit_path is not None:
             self._anchor = LedgerAnchor(audit_path, governed=governed)  # type: ignore[arg-type]
@@ -152,6 +165,12 @@ class EscrowRuntime:
     @property
     def substrate(self) -> SqliteSubstrate:
         return self._substrate
+
+    @property
+    def cascade_report(self) -> CascadeReport | None:
+        """The foreign-key reach out of ``tables``: what is gated, what is
+        acknowledged. Refreshed whenever a stage sees a schema change."""
+        return self._substrate.cascade_report
 
     @property
     def recovered(self) -> tuple[EscrowRecord, ...]:

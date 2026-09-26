@@ -970,7 +970,7 @@ Unresolved, and listed because they are unresolved rather than minor.
 
 ---
 
-# Conformance of `interlock` v0.1.2
+# Conformance of `interlock` (unreleased, v0.2 in progress)
 
 What the shipped package actually does against this document. Verified by
 reading `src/interlock/` and by running adversarial plans against it, not by
@@ -988,6 +988,11 @@ reading the test suite.
 | Commit intent written ahead of the commit and fsynced; a crashed commit resolved exactly from a marker written inside the stage's transaction | `substrate.SqliteSubstrate.commit`, `.resolve_intent`, `engine.EscrowEngine.recover` |
 | Chain resumed from its file and verified before any append; one writer per file | `chain.EscrowChain.__init__` |
 | Writes outside `TableSpec` denied at prepare time | `substrate.SqliteSubstrate._authorize` |
+| Cascade check: foreign-key reach into unobserved tables read from the schema, refused unless acknowledged; the gap recorded per stage | `cascade`, `substrate.SqliteSubstrate.check_cascades`, `engine.EscrowEngine.execute` |
+| The capture table, the commit marker and transaction control are out of a statement's reach | `substrate.SqliteSubstrate._authorize`, `substrate.FORBIDDEN_VERBS` |
+| PostgreSQL substrate: `REPEATABLE READ` stages, row triggers installed once, `statement_timeout` / `lock_timeout` / idle timeout per stage, the capture, marker and gates out of the stage role's reach, installation and grants verified at every stage | `postgres.PostgresSubstrate`, `postgres.install` |
+| A crashed PostgreSQL commit resolved from its marker and `pg_xact_status`, so a transaction the server still holds is not read as rolled back | `postgres.PostgresSubstrate.resolve_intent`, `engine.EscrowEngine.recover` |
+| Unrecorded writes: every row change to an observed table outside a stage is logged (PostgreSQL trigger, SQLite journal), and every committed stage must be recorded as committed in a chain | `reconcile`, `interlock reconcile-effects` |
 | `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
@@ -1001,9 +1006,12 @@ reading the test suite.
 
 - **Diff completeness is scoped to `TableSpec`.** A statement that writes a
   table outside it is denied by SQLite's authorizer when the statement is
-  prepared (unless `enforce_table_access=False`). A foreign-key cascade into an
-  unobserved table is executed internally and never prepared, so it is neither
-  denied nor measured: it does not appear in the diff.
+  prepared (unless `enforce_table_access=False`). A foreign-key action that
+  would reach an unobserved table is refused before a row changes (see
+  `cascade.analyze_cascades`), unless the operator acknowledged that table; an
+  acknowledged cascade runs unmeasured and the stage's `STAGE_OPENED` record
+  names the gap. A schema trigger that writes an unobserved table is denied by
+  the authorizer, like the statement that fired it.
 - **`no_ddl` is enforced on the statement, not on `Effect.kind`.** The
   checker still reads the agent-supplied kind, but `SqliteSubstrate` vets the
   statement's leading verb through `reject_reason()`, which `admit()` calls
@@ -1030,9 +1038,8 @@ reading the test suite.
 
 ## Unimplemented
 
-- **PostgreSQL substrate.** `pyproject.toml` declares a `postgres` extra; there
-  is no driver. Section 4.2's `statement_timeout` / `lock_timeout` / logical
-  decoding requirements are unexercised.
+- **Logical decoding.** Section 4.2's alternative to trigger capture is not
+  used; `PostgresSubstrate` captures with triggers.
 - **`E1-5`: expiry to `ORPHANED`.** `StageState.ORPHANED` and
   `RecordType.ORPHANED` exist and are never assigned. Expiry raises
   `StageExpiredError` from `apply()` and `commit()`; there is no reaper, and
