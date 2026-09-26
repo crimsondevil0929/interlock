@@ -63,7 +63,7 @@ PLANNED -> STAGING -> STAGED -> VERIFIED  -> COMMITTED
                              \-> REJECTED -> ABORTED
 ```
 
-Three properties hold by construction:
+These properties hold by construction:
 
 1. No path from `STAGED` to `COMMITTED` skips adjudication.
 2. `REJECTED` is not overridable in-process. Overriding means submitting a new plan that
@@ -79,7 +79,15 @@ Three properties hold by construction:
    left open and appends `COMMITTED` or `ABORTED`, noted as recovered. `EscrowRuntime`
    runs it at startup whenever it has a `chain_path`. An intent written before v0.1.2,
    or by a substrate without markers, is left open and logged for an operator: its
-   marker's absence proves nothing.
+   marker's absence proves nothing. So is one the server has not decided yet (a client
+   that died mid-`COMMIT` leaves PostgreSQL still committing); a later `recover()`
+   resolves it.
+5. A commit whose answer is lost is resolved the same way, while the process lives. If
+   the connection drops with `COMMIT` in flight, the engine reads the marker at once:
+   the plan is reported committed if it landed, and rolled back only once the server has
+   ended the transaction without it. Until the server decides, `execute()` raises
+   `CommitUnsettledError` and writes no terminal record. Do not retry the plan then: the
+   intent stays open, and `recover()` settles it.
 
 ## Quickstart
 
@@ -792,8 +800,11 @@ What differs from SQLite:
   past `max_stage_seconds`.
 - **Crash recovery reads the transaction.** The stage's row is its commit marker, and
   `pg_current_xact_id()` is written into the commit intent, so recovery can tell a
-  transaction the server still has open (a crashed client's, until its session times out)
-  from one that rolled back, and leaves the first open.
+  transaction the server still has open (a crashed client's, until its session times out,
+  or one still committing when its client died) from one that rolled back, and leaves the
+  first open. A connection lost with `COMMIT` in flight is answered from the same marker.
+  PostgreSQL stops `statement_timeout` before running a commit's deferred triggers, so
+  work there is bounded by the stage's `lock_timeout` and not by its statement bound.
 
 What grants cannot see, so the substrate cannot either: a `SECURITY DEFINER` function the
 role may call that writes elsewhere, an extension such as `dblink` that opens another
@@ -951,7 +962,7 @@ form work. Two consequences worth knowing before you depend on this:
 - **The pin is an agentgov release tag, never a branch.** A resolver cache is keyed on
   name and version, and `@main` is a moving target: interlock 0.1.1 locked an agentgov
   commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
-  0.1.2 pins the agentgov tag `v0.1.2`; this line pins `v0.2.0`, the first release with
+  0.1.2 pinned the agentgov tag `v0.1.2`; 0.2.0 pins `v0.2.0`, the first release with
   `agentgov.receipts`. That tag's package metadata still reports version 0.1.2, so tell
   the two apart by the commit, `6d3cac2`, which `uv.lock` records. Pin a tag or a commit
   for anything reproducible, and use `uv sync --refresh-package agentgov` when you
@@ -965,5 +976,14 @@ uv run pytest -q
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src/ && uv run mypy --strict tests/ demo.py
 ```
+
+The PostgreSQL tests run against a live server: set `INTERLOCK_TEST_POSTGRES_DSN` to a
+role that may create databases and roles, and `INTERLOCK_REQUIRE_POSTGRES=1` to fail
+rather than skip without one. Two suites are release gates.
+`tests/test_crash_consistency.py` kills a real process with `SIGKILL` at every step of a
+PostgreSQL commit, and at random instants, then checks exactly what recovery makes of it.
+`tests/test_tamper_evidence.py` alters every part of the audit trail and checks that
+verification fails exactly there. `INTERLOCK_CRASH_SEED` and `INTERLOCK_CRASH_ROUNDS`
+replay or lengthen the random-instant run.
 
 Apache-2.0.

@@ -55,6 +55,7 @@ from interlock.exceptions import (
     AnchorError,
     ChainIntegrityError,
     ChainInUseError,
+    CommitUnsettledError,
     CyclicPlanError,
     ExtensionError,
     ForbiddenStatementError,
@@ -127,7 +128,7 @@ from interlock.types import (
     Verdict,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 __all__ = [
     "AdmissionError",
@@ -141,6 +142,7 @@ __all__ = [
     "ChainIntegrityError",
     "Channel",
     "ColumnValueGuard",
+    "CommitUnsettledError",
     "Compensation",
     "ConstraintFeedback",
     "CyclicPlanError",

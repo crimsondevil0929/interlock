@@ -1,6 +1,6 @@
 [project]
 name = "interlock"
-version = "0.1.2"
+version = "0.2.0"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,7 +37,7 @@ classifiers = [
 #
 # Pinned to an agentgov release tag, never a branch: `@main` resolved to
 # whatever main was when the lock was cut, which is how interlock 0.1.1 came to
-# lock an agentgov commit that reported itself as 0.1.0. Interlock 0.3 issues
+# lock an agentgov commit that reported itself as 0.1.0. Interlock 0.2.0 issues
 # ARC1 receipts, and agentgov.receipts first shipped in v0.2.0 (6d3cac2, the
 # receipts merge; its package metadata still reports 0.1.2). uv.lock records
 # the exact commit the tag names.

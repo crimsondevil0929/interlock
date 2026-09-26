@@ -22,6 +22,7 @@ import pytest
 
 from interlock import (
     AdmissionError,
+    AgentFeedback,
     BlastRadius,
     ChainIntegrityError,
     ColumnValueGuard,
@@ -43,7 +44,12 @@ from interlock import (
     default_checkers,
 )
 from interlock.chain import RecordType
-from interlock.exceptions import ForbiddenStatementError
+from interlock.exceptions import (
+    CommitUnsettledError,
+    ForbiddenStatementError,
+    StageError,
+    SubstrateUnavailableError,
+)
 from interlock.substrate import FORBIDDEN_VERBS, leading_verb
 from interlock.types import CommitReceipt, InvariantViolation, StageHandle
 
@@ -1082,3 +1088,91 @@ def test_a_refused_plan_writes_no_commit_intent(db: str) -> None:
     assert RecordType.COMMIT_INTENT not in kinds
     assert RecordType.ABORTED in kinds
     assert engine.chain.unresolved_intents() == ()
+
+
+def _probe_plan() -> EffectPlan:
+    return make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 777 WHERE id = 1",
+        ),
+        intent="lost commit probe",
+    )
+
+
+class LosesTheAnswer(SqliteSubstrate):
+    """Commits, or rolls back, and then reports the answer lost, as a
+    connection dropped with COMMIT in flight does."""
+
+    landed = True
+    marker: bool | None = None
+    """What ``resolve_intent`` says; ``None`` defers to the real marker."""
+
+    def commit(self, handle: StageHandle) -> CommitReceipt:
+        if self.landed:
+            super().commit(handle)
+        else:
+            self.abort(handle)
+        raise CommitUnsettledError("the connection was lost with COMMIT sent")
+
+    def resolve_intent(self, stage_id: uuid.UUID) -> bool | None:
+        if type(self).marker is False:
+            raise SubstrateUnavailableError("the database cannot be reached")
+        return super().resolve_intent(stage_id) if type(self).marker is None else None
+
+
+@pytest.mark.parametrize("landed", [True, False])
+def test_a_commit_whose_answer_was_lost_is_settled_by_its_marker(db: str, landed: bool) -> None:
+    """No answer is not a failure. The marker says whether the stage landed,
+    and the engine reports exactly that: committed, or rolled back."""
+    substrate = type("Probe", (LosesTheAnswer,), {"landed": landed})(db, tables=TABLES)
+    engine = EscrowEngine(substrate, checkers=[BlastRadius(50)])
+    if landed:
+        result = engine.execute(_probe_plan())
+        assert result.committed
+        assert "the commit's reply was lost; its commit marker is present" in (
+            engine.chain.records()[-1].note
+        )
+        assert (1, 777.0) in totals(db)
+    else:
+        with pytest.raises(StageError, match="left no commit marker") as raised:
+            engine.execute(_probe_plan())
+        assert not isinstance(raised.value, CommitUnsettledError)
+        assert engine.chain.records()[-1].record_type is RecordType.ABORTED
+        assert (1, 777.0) not in totals(db)
+    assert engine.chain.unresolved_intents() == ()
+
+
+@pytest.mark.parametrize("marker", ["unanswered", "unreachable", "unarmed"])
+def test_a_lost_commit_nobody_can_settle_stays_open_for_recovery(
+    db: str, marker: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the marker cannot answer, the engine writes no terminal record at
+    all, and tells the agent not to retry: the stage may yet have landed."""
+    answers = {"unanswered": True, "unreachable": False, "unarmed": None}
+    substrate = type("Probe", (LosesTheAnswer,), {"marker": answers[marker]})(
+        db, tables=TABLES, commit_markers=marker != "unarmed"
+    )
+    engine = EscrowEngine(substrate, checkers=[BlastRadius(50)])
+    with pytest.raises(CommitUnsettledError) as raised:
+        engine.execute(_probe_plan())
+    feedback = raised.value.feedback
+    assert isinstance(feedback, AgentFeedback) and not feedback.retryable
+    (intent,) = engine.chain.unresolved_intents()
+    assert engine.chain.records()[-1] == intent
+
+    caplog.clear()
+    if marker == "unarmed":
+        assert engine.recover() == ()
+        assert "no commit marker was armed" in caplog.text
+        return
+    type(substrate).marker = True  # the server has still not decided
+    assert engine.recover() == ()
+    assert "is not settled yet; recovery will ask again" in caplog.text
+    assert "no commit marker was armed" not in caplog.text
+    type(substrate).marker = None  # it has now: the real marker answers
+    (record,) = engine.recover()
+    assert record.record_type is RecordType.COMMITTED
+    assert record.stage_id == intent.stage_id
