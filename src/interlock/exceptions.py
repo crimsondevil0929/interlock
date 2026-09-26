@@ -6,6 +6,8 @@ Split by what the caller must do about it, not by where it was raised.
 ``StageError``     the substrate could not stage or commit; retry may help.
 ``AdmissionError`` an invariant refused; nothing was committed, by design.
 ``AnchorError``    the audit chain is unusable; refuse to operate.
+``RecoveryError``  the recovery runtime cannot take this step; stop, or ask
+                   the operator.
 """
 
 from __future__ import annotations
@@ -16,22 +18,36 @@ __all__ = [
     "ChainInUseError",
     "ChainIntegrityError",
     "CyclicPlanError",
+    "ExtensionError",
     "ForbiddenStatementError",
     "InterlockError",
     "LedgerUnverifiedError",
     "PlanError",
+    "RecordIntegrityError",
+    "RecoveryError",
+    "RecoveryExhaustedError",
     "ScopeHaltedError",
     "StageConflictError",
     "StageError",
     "StageExpiredError",
     "SubstrateConfigurationError",
     "SubstrateUnavailableError",
+    "ToolRevokedError",
     "UncompensatableEffectError",
 ]
 
 
 class InterlockError(Exception):
-    """Base for every error this package raises."""
+    """Base for every error this package raises.
+
+    :ivar feedback: What the agent may be told about this error, set by
+        ``EscrowEngine.execute`` before it raises. An
+        :class:`~interlock.feedback.AgentFeedback`. Send that to the agent,
+        never ``str(exc)``, which is written for the operator and can quote
+        other tenants' data.
+    """
+
+    feedback: object | None = None
 
 
 # -- the plan is wrong ------------------------------------------------------
@@ -55,7 +71,18 @@ class ForbiddenStatementError(PlanError):
 
     Raised from admission and again from ``apply``. The second is not
     redundant: a caller using a substrate directly never reaches admission.
+
+    :ivar reason: What kind of refusal, for code to branch on:
+        ``"statement_kind"``, ``"unobserved_table"``, ``"privilege"``,
+        ``"cascade"``, ``"protected"``, ``"transaction_control"``,
+        ``"reach"`` or ``"multiple_statements"``.
+    :ivar table: The table the refusal is about, when there is one.
     """
+
+    def __init__(self, message: str, *, reason: str = "statement_kind", table: str | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.table = table
 
 
 class UncompensatableEffectError(PlanError):
@@ -151,3 +178,63 @@ class ChainInUseError(AnchorError):
     resolve the first writer's in-flight commits as though that writer had
     died. Read a live chain with ``EscrowChain.load``, which claims nothing.
     """
+
+
+class RecordIntegrityError(AnchorError):
+    """A signed record log (:mod:`interlock.records`) failed verification.
+
+    A record was edited, re-linked or dropped, is signed by another key, or
+    is missing where the AgentGov ledger anchors it.
+    """
+
+
+# -- recovery ----------------------------------------------------------------
+
+
+class RecoveryError(InterlockError):
+    """The recovery runtime cannot take this step.
+
+    Raised for a misuse the caller can fix: a transcript edited between
+    steps, a step never answered, a step settled twice, a recovery scope
+    that exists without the records that would say what it already did.
+    """
+
+
+class RecoveryExhaustedError(RecoveryError):
+    """Nothing is left to try.
+
+    The ladder has no rung left for this halt, the policy's step limit is
+    reached, the recovery reserve cannot cover another step, or the recovery
+    scope is itself halted. The halt stands; stop the task.
+
+    :ivar quote: When the reserve ran out and the runtime has a budget guard,
+        the :class:`~interlock.extension.ExtensionRequest` that asks for more:
+        granted, it lets the recovery go on.
+    """
+
+    def __init__(self, message: str, *, quote: object | None = None) -> None:
+        super().__init__(message)
+        self.quote = quote
+
+
+class ExtensionError(InterlockError):
+    """An extension quote cannot be answered as asked.
+
+    It is unknown to this guard, was already granted or declined, has
+    expired, or the scope that would fund it cannot.
+    """
+
+
+class ToolRevokedError(RecoveryError):
+    """A call to a tool the recovery runtime revoked.
+
+    Revocation is enforced here, where the harness runs tools, whatever the
+    model was told: a model that calls a revoked tool anyway gets an error
+    result, not the tool.
+
+    :ivar tool: The revoked tool's name.
+    """
+
+    def __init__(self, tool: str) -> None:
+        self.tool = tool
+        super().__init__(f"tool {tool!r} was revoked for the rest of this task")

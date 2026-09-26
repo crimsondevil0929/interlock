@@ -286,6 +286,134 @@ writes, and the statement goes somewhere else entirely. The substrate denies
 the write inside SQLite before it executes, and it surfaces as a
 `ForbiddenStatementError` like everything else on this path.
 
+### Refusals: two audiences
+
+A refusal has two readers, and they must not get the same record. The operator
+needs everything: which tenants the plan reached, the exact totals, the checker's
+own message. The agent must get none of it. A guard's message is data about other
+tenants, and an injected agent reading refusals is reading a side channel.
+
+So every result carries both. `StageResult.refusal.evidence` is the operator's
+record. `StageResult.feedback` (and `exc.feedback` on any error `execute` raises)
+is what the agent may be told:
+
+```python
+from interlock import EscrowRuntime, TableSpec, TenantIsolation
+
+runtime = EscrowRuntime(
+    "prod.db",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    scope_id="support-agent",
+    checkers=[TenantIsolation(1)],
+)
+result = runtime.execute_sql("UPDATE orders SET total = 0", table="orders", tenant_id="acme")
+
+assert not result.committed
+print(result.feedback.render())  # for the agent
+# The plan was refused and rolled back; nothing changed.
+# - tenant_isolation: the plan changed rows of more tenants than one plan may
+#   (at most 1); its declared tenants are acme. Confine every statement to its
+#   declared tenants.
+assert "globex" in result.refusal.evidence.tenants_touched  # for the operator
+```
+
+Feedback is built so that it cannot carry more than the agent already knew:
+
+- it names only tables the plan's effects name, and tenants they declare. Anything
+  else is "a table the plan does not name", never named or counted;
+- row counts are buckets (`0`, `1`, `2-9`, `10-99`, `100-999`, `1000+`);
+- it carries no aggregate at all: no column total, no fraction of one. The only other
+  number is a built-in checker's configured limit, as a whole percentage;
+- its text comes from fixed templates, and its constraints come in a canonical order,
+  never the order the violations came in.
+
+A checker contributes a typed hint per violation, and the hint is sanitized against the
+plan field by field. A custom checker's hint can name the plan's own tables and tenants
+and pick a kind of guidance. Its numbers and columns are dropped, because nothing can
+tell a row count from a total. Errors are mapped by type, never by message, since a
+database error can quote another tenant's row. Property tests check, over arbitrary
+multi-tenant diffs and adversarial checkers, that renaming anything the plan did not
+name, scaling every amount, or changing other tenants' values leaves the feedback
+byte-identical (see `tests/test_feedback.py`).
+
+### Repair: the part that would pass
+
+A refused plan is often one step away from an acceptable one: nine corrections to one
+tenant's orders and a tenth that reaches another tenant. Refusing all ten is right;
+telling the agent which nine would pass turns a halt into finished work. `repair()`
+finds the largest part of a plan that would be admitted, by experiment. It stages the
+plan once and, inside that one stage, tries candidate sub-plans in savepoints: each is
+run, measured and adjudicated by the same checkers, then rolled back.
+
+```python
+from interlock import EscrowRuntime, TableSpec, TenantIsolation
+
+runtime = EscrowRuntime(
+    "prod.db",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    scope_id="support-agent",
+    checkers=[TenantIsolation(1)],
+)
+plan = (
+    runtime.plan(intent="apply ticket 9001 corrections")
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = 450 WHERE id = 1",
+        tenant_id="acme",
+        effect_id="reprice_1",
+        independent=True,
+    )
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = 250 WHERE id = 2",
+        tenant_id="acme",
+        effect_id="reprice_2",
+        independent=True,
+    )
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = 0 WHERE id = 3",  # globex's order
+        tenant_id="acme",
+        effect_id="reprice_3",
+        independent=True,
+    )
+    .build()
+)
+assert not runtime.execute(plan).committed
+
+repair = runtime.repair(plan)  # advisory: nothing is committed here
+print(repair.feedback.render())  # for the agent
+# Resubmit the largest part of the plan that would be admitted: keep reprice_1,
+# reprice_2; drop reprice_3.
+# - reprice_3: tenant_isolation: the plan changed rows of more tenants than one plan
+#   may (at most 1); its declared tenants are acme. Confine every statement to its
+#   declared tenants.
+assert runtime.execute(repair.proposal).committed
+```
+
+- **Advisory, and re-adjudicated.** The repair stage is always rolled back. The
+  proposal is a new plan whose `repair_of` names the refused one, and it commits only
+  through `execute()`, staged and adjudicated again from scratch, because the database
+  may have moved in between.
+- **Exactly as proposed, and once.** A plan naming itself a repair is admitted only if
+  this engine's chain holds a `REPAIR_PROPOSED` record with its exact content hash, and
+  only until it has committed. A widened or forged "repair" is refused.
+- **No monotonicity assumed.** A debit alone fails a drawdown guard that the debit and
+  its balancing credit pass together. A search that dropped whatever fails on its own
+  would keep a lone credit; this one keeps both and drops only the step that is wrong.
+- **Runnable candidates, largest first.** A step is kept only with everything it
+  depends on. The whole plan is tried, then every such sub-plan one step smaller, and
+  so on, later steps dropped first within a size; the first admitted one is a largest,
+  and `repair.exhaustive` says so. `max_trials` (default 32) bounds the search; when it
+  runs out, a greedy pass keeps each step whose addition is admitted, which is sound but
+  may not be largest. The stage's time bound ends the search too.
+- **Explained without leaking.** Each dropped step says why, from its own trial: the
+  constraints that refused it, sanitized like every other feedback, a dropped
+  dependency, or a statement the substrate refuses outright.
+
+Both substrates have savepoints. A repair's trials all run inside one stage, so the
+stage's locks are held for the whole search.
+
 ## AgentGov integration
 
 Interlock imports [`agentgov`](https://github.com/crimsondevil0929/agentgov) as a
@@ -356,6 +484,227 @@ translated at the anchor boundary, so a caller never has to import
 AgentGov's latching breaker is re-read immediately before commit, not at admission. The
 staging window is where a trip has to be observed, because a halt that does not stop
 in-flight side effects does not stop the effects.
+
+## Receipts
+
+With a `ReceiptIssuer`, every plan the engine adjudicates, committed or refused, gets a
+signed ARC1 receipt in an agentgov `ReceiptLog` (the format is agentgov's
+`docs/RECEIPTS.md`). Anyone holding the issuer's key can then check offline what the
+agent was allowed to do, what it said it would do, what it measurably did, what was
+decided and what it cost:
+
+```python
+from agentgov.receipts import HmacKey, ReceiptLog, verify_bundle
+
+from interlock import EscrowRuntime, ReceiptIssuer, TableSpec, TenantIsolation
+
+key = HmacKey.generate()
+log = ReceiptLog("support-receipts", key, path="receipts.jsonl")
+runtime = EscrowRuntime(
+    "prod.db",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    scope_id="support-agent",
+    checkers=[TenantIsolation(1)],
+    receipts=ReceiptIssuer(log),
+)
+result = runtime.execute_sql(
+    "UPDATE orders SET total = 480 WHERE id = 1", table="orders", tenant_id="acme"
+)
+receipt = result.receipt
+print(receipt.outcome.status.value, receipt.effect.row_count)  # committed 1
+
+bundle = log.bundle(log.index_of(receipt.receipt_id), log.checkpoint())
+assert verify_bundle(bundle, issuer_key=key).passed
+```
+
+What goes into one:
+
+- **Authority:** the AgentGov scope path when an anchor is attached, the trajectory, and
+  a capability naming the observed tables and the tightest `BlastRadius` limit.
+- **Intent and effect:** the plan's content hash and stated footprint; the diff hash the
+  chain's `DIFF_COMPUTED` record carries; a salted commitment over every measured row
+  change, from which one row can be disclosed later without the rest; and a hash of the
+  observed schema, foreign keys included.
+- **Coverage:** the observed tables, and every gap in words: an acknowledged cascade, a
+  substrate that did not read the foreign keys or does not refuse unobserved tables.
+- **Decision:** the verdict hash, each checker with a digest of its configuration, the
+  issuer's policy epoch, and, for a repair, the refused plan's receipt as `repair_of`.
+- **Cost:** the AgentGov transaction that settled the plan. The receipt is issued last,
+  after the reverse anchor, so agentgov's verifier can check the cost against the ledger.
+
+The receipt and the escrow chain name each other: the stage's terminal record carries
+the receipt id, and the receipt's `anchors.escrow` names that record by sequence and
+hash. A receipt that cannot be issued after a commit is logged, not raised; the effects
+stand, and the terminal record names the receipt that should exist. An HMAC receipt
+verifies only for a holder of the key: for third parties, sign with agentgov's
+`Ed25519Signer` (`agentgov[sign]`) and publish the public key.
+
+## Recovery
+
+A halt is correct, and it used to be the end of the task. `RecoveryRuntime` gives a halted
+task a bounded way to finish instead: a few more model calls, each under tighter constraints
+than the one before, paid from a reserve set aside for it, and each recorded and signed
+before it is made.
+
+```python
+from decimal import Decimal
+
+from agentgov import BudgetManager
+from agentgov.cognitive import CognitiveBreaker, CognitivePolicy
+from agentgov.exceptions import AgentThrashingError
+from agentgov.receipts import HmacKey
+
+from interlock import Directive, RecordLog, RecoveryPolicy, RecoveryRuntime, Trip, TripKind
+
+governor = BudgetManager()
+governor.open_root("org", "10.00")
+governor.delegate("org", "support-agent", "5.00")
+policy = RecoveryPolicy(
+    reserve=Decimal("0.50"),  # carved out of support-agent's envelope
+    step_estimate=Decimal("0.05"),  # held for each recovery call
+    directives=(
+        Directive(
+            "no-repeat",
+            "Do not repeat a tool call that has already returned; use the results you have.",
+            frozenset({TripKind.THRASHING}),
+        ),
+    ),
+)
+records = RecordLog(HmacKey.generate(), log_id="support")
+runtime = RecoveryRuntime(
+    governor, "support-agent", policy, records, tools=["lookup", "apply_plan"]
+)
+
+transcript = [
+    {"role": "user", "content": "What is the total of order 1?"},
+    {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "toolu_02", "name": "lookup", "input": {"id": 1}}],
+    },
+]
+breaker = CognitiveBreaker(
+    policy=CognitivePolicy(max_identical_repeats=2), observer=None, manager=governor
+)
+try:
+    for _ in range(2):  # the same lookup, twice: halted before the second runs
+        breaker.observe_call("support-agent", "lookup", kwargs={"id": 1})
+except AgentThrashingError as exc:
+    trip = Trip.of(exc, tool="lookup")
+
+step = runtime.recover(trip, transcript, max_tokens=4096)
+print(step.rung, step.tools)  # revoke_tool ('apply_plan',)
+# Send step.messages (with step.betas) and step.max_tokens, the system prompt and
+# the tools as before; settle what the call cost; refuse revoked tools where they run.
+runtime.settle(step, "0.03")
+runtime.check_tool("apply_plan")
+runtime.close()
+records.verify()
+print(governor.is_halted("support-agent"), len(records))  # True 4
+```
+
+**The ladder** is fixed and deterministic, one rung per step: revoke the tool the halt
+names, then an operator directive from the policy's allowlist, then a lower token ceiling,
+then guidance in fixed words. Constraints come before conversation. Each step takes the
+first rung that can still do something for this kind of halt, and tightening only
+accumulates: a revoked tool stays revoked and the ceiling stays down. When no rung is left,
+or `max_steps` is reached, `recover()` raises `RecoveryExhaustedError` and the halt stands.
+The same halts always take the same steps. A refused plan is left to guidance by default,
+so the agent can correct it; its guidance is the refusal's sanitized feedback, or a repair's
+(see [Repair](#repair-the-part-that-would-pass)).
+
+**History is never edited.** A step returns the transcript it was given, as the same
+objects, with messages appended: error results for tool calls the halt stopped, then the
+rung's notice. The system prompt and the tool definitions are never touched. On Claude
+Opus 5, Opus 5.5, Opus 4.8, Fable and Mythos, a directive goes in an appended
+`{"role": "system"}` message and a revocation in a `tool_removal` block (beta
+`mid-conversation-tool-changes-2026-07-01`, in `step.betas`), the operator channel a user
+turn cannot forge; `Channel.USER` uses user-turn notices for every other model. Either way,
+`check_tool()` refuses a revoked tool where the harness runs it. Each step checks that the
+transcript it is handed extends the one the last step returned, so an edit in between is
+refused, and its record pins the transcript before and after by a running hash
+(`transcript_head`).
+
+**The reserve sits beside the scope, not under it.** A trip halts the tripped scope's
+whole subtree, and recovery exists for a tripped scope, so `{scope}/recovery` is carved out
+of the scope's own envelope (released to its parent and delegated from there). The halted
+scope stays halted; every call made during recovery is billed to the reserve, a step's
+through `recover()` and `settle()`, the task's own through `hold()` and `capture()`. A root
+scope's reserve is a new root funded from the treasury, or `RecoveryPolicy(funding=...)`
+names a scope to delegate it from. `close()` returns what is left to the parent.
+
+**Every act is signed first.** Opening, each step, each settlement and the close are
+`RecordLog` entries: ILOK1, agentgov's canonical JSON under an `ILOK1/record/v1` signing
+prefix, hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
+`check_anchors()` catches a log truncated or rewritten after the fact. A step's record names
+the halt (and a refused plan's ARC1 receipt), the rung and exactly what it did, the hold
+that pays for it, the policy's digest, and the transcript before and after, and is written
+before the step is returned. Persist the log (`RecordLog(..., path=...)`): a runtime
+restarted over it adopts the recovery scope and replays what was revoked and lowered, so a
+restart never loosens a constraint.
+
+## Extension quotes
+
+AgentGov's backstop is blunt on purpose: an authorization that would overdraw a scope
+trips its breaker, and so does a capture that spends it to zero. For a runaway loop that is
+the answer. For a task that is only more expensive than its envelope, it throws away the
+work done. `BudgetGuard.authorize()` asks first: when a call will not fit, it returns a
+signed `ExtensionRequest` instead of placing a hold that would trip the breaker.
+
+```python
+from agentgov import BudgetManager
+from agentgov.receipts import HmacKey
+
+from interlock import BudgetGuard, ExtensionRequest, Milestones, RecordLog
+
+governor = BudgetManager()
+governor.open_root("org", "10.00")
+governor.delegate("org", "support-agent", "5.00")
+guard = BudgetGuard(governor, RecordLog(HmacKey.generate(), log_id="support"))
+
+held = guard.authorize("support-agent", "4.60")  # fits: an ordinary hold
+governor.capture(held, "4.60")
+
+done = Milestones(done=3, total=5, unit="tickets")
+quote = guard.authorize("support-agent", "0.50", milestones=done)
+assert isinstance(quote, ExtensionRequest)  # did not fit: quoted, and nothing tripped
+print(quote.requested, governor.is_halted("support-agent"))  # 3.44 False
+print(quote.render())
+# Extension requested for support-agent: 3.44000000.
+# Spent 4.60000000 (support-agent 4.60000000); held 0.00000000; 0.40000000 left; ...
+# Proof of work: 0 plan(s) committed (0 rows); declared 3 of 5 tickets done.
+# Estimate: 1.53333333 per unit x 2 remaining = 3.06666667, plus 25% margin = 3.84000000 ...
+
+grant = guard.grant(quote, approved_by="ops@example.com")
+print(grant.scope_id, governor.available(grant.scope_id))  # support-agent/ext-1 3.84000000
+```
+
+A quote has three parts, and is a signed `extension.quoted` record anchored in the ledger:
+
+- **Spend to date**, from the ledger: what the task's scopes (the scope, its recovery
+  scope, its extensions) settled net of refunds, what they hold, and what is left.
+- **Proof of work**: with `BudgetGuard(receipts=...)`, the ARC1 receipts of the plans the
+  task committed and the rows they measurably changed, with a checkpoint the receipt log
+  signed for the quote, so each receipt is provable by inclusion
+  (`log.bundle(log.index_of(id), checkpoint)`); the recovery steps it took; and any
+  milestones the harness declares, which are carried as declared, not proven.
+- **An estimated completion cost**, by a named method: cost per declared milestone times
+  those remaining, or with none declared, the call that did not fit; plus a margin,
+  rounded up to the cent. `requested` is that, less what the scope has left.
+
+A quote is answered once, before it expires, by the guard that issued it: `grant()` or
+`decline()`, each a signed record naming the quote. A root scope is topped up in place, and
+if the money running out is what tripped it, its breaker is reset. A delegated scope cannot
+be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along what the old
+scope had left, and the task bills there from then on. A grant the parent cannot make
+changes nothing. A scope halted for any other reason is not quoted: `authorize()` raises
+AgentGov's `CircuitOpenError`, because more money is not the answer to a safety halt.
+
+A `RecoveryRuntime` given the guard quotes for its own reserve the same way: when a step
+will not fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up
+the grant. Quotes are operator evidence; nothing in them is sent to the agent. Granting is
+the operator's act: the guard records `approved_by` but cannot authenticate it, so put
+`grant()` behind the approval you already trust, and never within the agent's reach as a
+tool.
 
 ## PostgreSQL
 
@@ -552,11 +901,21 @@ against the shipped code, not inferred.
   table gains one row per committed stage and is not pruned.
 - **The chain is keyless.** Anyone who can write the chain file can recompute a SHA-256
   chain from start to finish and it will verify. A reverse anchor in a governed AgentGov
-  is the one copy of the head outside the file; signed receipts and an external witness
-  are planned.
-- **Lock footprint.** A stage holds write locks for its whole life. `max_stage_seconds`
-  bounds it. Human review must not happen inside an open stage; abort, present the recorded
+  is one copy of the head outside the file. With [receipts](#receipts) on, each
+  adjudicated plan also gets a signed receipt naming its terminal record, under a key the
+  chain file does not hold; the chain itself stays unsigned.
+- **Lock footprint.** A stage holds write locks for its whole life, a repair search's
+  included. `max_stage_seconds` bounds it. Human review must not happen inside an open stage; abort, present the recorded
   diff, and re-stage on approval, because the substrate may have moved.
+- **Recovery trusts the harness to route its calls.** The runtime holds and records its
+  own steps, refuses a revoked tool when asked, and catches an edited transcript at the
+  next step. It cannot see a harness that bills a recovery call to another scope, runs a
+  tool without calling `check_tool()`, or sends the model something other than
+  `step.messages`.
+- **An extension estimate is arithmetic on what the harness declares.** Cost per declared
+  milestone times those remaining assumes the rest of the work costs what the done work
+  did; with none declared it prices only the call that did not fit. The receipts in a
+  quote's proof of work are verifiable; its milestones are the harness's claim.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
 - **Non-transactional sinks cannot be staged.** An email has no shadow. Those belong in a
@@ -589,13 +948,14 @@ form work. Two consequences worth knowing before you depend on this:
 
 - **Interlock cannot be published to PyPI as-is.** PyPI rejects direct-URL dependencies.
   Publishing means putting `agentgov` on PyPI and pinning a version range instead.
-- **The pin is an agentgov release tag, `v0.1.2`, not a branch.** A resolver cache is
-  keyed on name and version, and `@main` is a moving target: interlock 0.1.1 locked an
-  agentgov commit that reported itself as 0.1.0 and lacked APIs this README relied on.
-  Interlock 0.1.2 needs agentgov 0.1.2, for its verified read-only refresh and its
-  zero-value anchor entries. `uv.lock` records the exact commit the tag names. Pin a
-  tag or a commit for anything reproducible, and use
-  `uv sync --refresh-package agentgov` when you suspect a stale build.
+- **The pin is an agentgov release tag, never a branch.** A resolver cache is keyed on
+  name and version, and `@main` is a moving target: interlock 0.1.1 locked an agentgov
+  commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
+  0.1.2 pins the agentgov tag `v0.1.2`; this line pins `v0.2.0`, the first release with
+  `agentgov.receipts`. That tag's package metadata still reports version 0.1.2, so tell
+  the two apart by the commit, `6d3cac2`, which `uv.lock` records. Pin a tag or a commit
+  for anything reproducible, and use `uv sync --refresh-package agentgov` when you
+  suspect a stale build.
 
 ## Development
 

@@ -11,6 +11,74 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ### Added
 
+- **Two-audience refusals (3.1).** Every `StageResult` carries `feedback`, what
+  the agent may be told, and a refused one carries `refusal`, split into the
+  operator's `evidence` and that feedback; every error `execute()` raises carries
+  `exc.feedback`. Feedback names only the plan's own tables and declared tenants,
+  buckets row counts, and carries no aggregate: no column total, no fraction of
+  one, no count of other tenants. Its text comes from fixed templates, and its
+  constraints come in a canonical order. Checkers offer a typed `FeedbackHint`
+  per violation, sanitized against the plan; a custom checker's numbers and
+  columns are dropped. `ForbiddenStatementError` gains structured `reason` and
+  `table`, so errors map to feedback by type, never by message. New modules
+  `interlock.feedback` and `interlock.adjudication`. Property tests (hypothesis)
+  check that renaming what the plan did not name, scaling every amount, or
+  changing other tenants' values never changes the feedback.
+- **Checked repair (3.2).** `EscrowEngine.repair()` (and `EscrowRuntime.repair()`)
+  finds the largest part of a refused plan that would be admitted, by experiment. It
+  stages the plan once and tries candidate sub-plans, the down-sets of its dependency
+  graph, largest first, in savepoints: each is measured and adjudicated by the same
+  checkers and rolled back. Nothing assumes monotonicity, so a debit is kept with the
+  credit that balances it under a drawdown guard. `max_trials` bounds the search, with
+  a greedy fallback whose result was still admitted. Advisory: the stage always rolls
+  back, and the proposal is a new plan whose `repair_of` names the refused one;
+  `execute()` admits it only exactly as a `REPAIR_PROPOSED` record on the chain says,
+  once, and adjudicates it again from scratch. Each dropped step is explained through
+  the sanitized feedback (`Repair.feedback`). Both substrates gain `savepoint`,
+  `rollback_to` and `release_savepoint`. New module `interlock.repair`.
+- **ARC1 receipts.** With `receipts=ReceiptIssuer(log)`, the engine issues a signed
+  agentgov ARC1 receipt for every plan it adjudicates, committed or refused
+  (`StageResult.receipt`), covering authority, intent, the measured effect (with a
+  salted row commitment and a schema hash), coverage and its gaps, the decision, cost
+  and outcome. A repair's receipt names the refusal's as `decision.repair_of`. The
+  receipt and the stage's terminal record name each other, and the receipt is issued
+  after the reverse anchor, so agentgov's verifier can check it against the ledger. A
+  receipt that fails to issue after a commit is logged, not raised. New module
+  `interlock.receipts`.
+- **Budgeted recovery (3.3).** `RecoveryRuntime` gives a halted task a bounded way to
+  finish: a deterministic ladder, fixed in order (revoke the tool the halt names, an
+  operator directive from the policy's allowlist, a lower token ceiling, then guidance in
+  fixed words), one rung per step, tightening only ever accumulating. Each step appends to
+  the transcript and never edits it, answering tool calls the halt stopped; directives and
+  revocations go in appended `role: "system"` messages and `tool_removal` blocks on the
+  models that take them, or user-turn notices otherwise, and `check_tool()` refuses a
+  revoked tool either way. Recovery is billed to `{scope}/recovery`, a reserve carved out of
+  the scope's envelope and delegated beside it, since a trip halts the tripped scope's
+  subtree. `Trip.of()` reads AgentGov's and Interlock's halts by type, never by message; a
+  halt's own words are recorded and never sent to the agent (property-tested). New modules
+  `interlock.recovery` and `interlock.records`.
+- **ILOK1 signed records.** `RecordLog` is an append-only, hash-linked, signed log for the
+  runtime's own acts, built on agentgov's canonical JSON and signers under an
+  `ILOK1/record/v1` prefix, fsynced, resumed and verified from its file, one writer per
+  file. The runtime anchors every record into the AgentGov ledger, and `check_anchors()`
+  finds a log truncated or rewritten after the fact.
+- **Extension quotes (3.4).** `BudgetGuard.authorize()` checks a scope's balance under the
+  ledger's lock before AgentGov has to refuse, and when a call will not fit returns a signed
+  `ExtensionRequest` instead of tripping the breaker: spend to date from the ledger over the
+  task's scopes; proof of work from the ARC1 receipts of the task's committed plans, with a
+  checkpoint each is provable against, its recovery steps, and declared `Milestones`; and an
+  estimated completion cost by a named method, rounded up to the cent. `grant()` tops up a
+  root (resetting a breaker the money running out tripped) or delegates `{scope}/ext-N`
+  beside a delegated scope, carrying its leftover along; `decline()` records the refusal.
+  Each quote is answered once, before it expires. A scope halted for safety is never
+  quoted. A `RecoveryRuntime` with a guard quotes for its reserve
+  (`RecoveryExhaustedError.quote`) and takes a grant up with `extend()`. New module
+  `interlock.extension`.
+- `RecoveryError`, `RecoveryExhaustedError`, `ToolRevokedError`, `RecordIntegrityError`,
+  `ExtensionError`.
+- `EffectPlan.repair_of`, hashed only when set, so earlier plans keep their hashes;
+  `RecordType.REPAIR_PROPOSED`; `LedgerAnchor.scope_path()`; `BlastRadius.limit`;
+  `table_specs` and `enforces_table_access` on both substrates.
 - **The cascade check (2.1).** New `interlock.cascade` reads the foreign-key
   graph (`PRAGMA foreign_key_list` on SQLite, `pg_constraint` on PostgreSQL)
   and works out every table a `DELETE` or `UPDATE` on an observed table can
@@ -62,8 +130,20 @@ Releases before 0.1.2 are described by their tags and commit history.
   it into `COMMIT_INTENT` and passes it back to `resolve_intent(..., txid=)`.
 - `EffectDiff.column_total` and the value guards read `Decimal` values exactly.
 
+### Changed
+
+- **agentgov is pinned to its `v0.2.0` tag** (commit `6d3cac2`), the first agentgov
+  release with `agentgov.receipts`, which receipts, recovery records and extension quotes
+  need. The tag's package metadata still reports version 0.1.2; `uv.lock` records the
+  commit.
+
 ### Fixed
 
+- **Refusals leaked other tenants' data to the agent.** The reference stress
+  harness returned each blocking violation's message to the model, which for
+  `TenantDrawdownGuard` named other tenants and their exact totals; it also
+  returned the count of tenants touched and the measured tables. It now returns
+  the agent feedback, and the operator's record stays in its attempt log.
 - **A statement could erase the measurement.** The authorizer allowed any write
   to `_interlock_capture`, so an effect `DELETE FROM _interlock_capture` emptied
   the diff, and a plan that zeroed every order committed past `BlastRadius(1)`.

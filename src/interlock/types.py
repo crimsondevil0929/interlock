@@ -224,6 +224,10 @@ class EffectPlan:
     intent: str = ""
     """The agent's own description. Recorded for the audit trail; no checker
     reads it."""
+    repair_of: PlanId | None = None
+    """The refused plan this one repairs, when it is a proposal from
+    :meth:`~interlock.engine.EscrowEngine.repair`. The engine admits such a
+    plan only as proposed: same content, same link."""
 
     def topological_order(self) -> tuple[Effect, ...]:
         """Effects in a deterministic execution order.
@@ -265,15 +269,18 @@ class EffectPlan:
         return sum(c for c in claims if c is not None)
 
     def content_hash(self) -> str:
-        return canonical_hash(
-            [
-                self.plan_id,
-                self.scope_id,
-                self.trajectory_id,
-                iso(self.created_at),
-                [e.content_hash() for e in self.topological_order()],
-            ]
-        )
+        fields: list[object] = [
+            self.plan_id,
+            self.scope_id,
+            self.trajectory_id,
+            iso(self.created_at),
+            [e.content_hash() for e in self.topological_order()],
+        ]
+        # Only when set, so every plan hashed before repairs existed keeps
+        # its hash.
+        if self.repair_of is not None:
+            fields.append(["repair_of", self.repair_of])
+        return canonical_hash(fields)
 
 
 # --------------------------------------------------------------------------

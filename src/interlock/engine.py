@@ -38,14 +38,20 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import uuid
-from collections.abc import Sequence
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
+from agentgov.core import EntryType, LedgerEntry
+
+from interlock.adjudication import Adjudication, adjudicate
 from interlock.anchor import AnchorPoint, LedgerAnchor
+from interlock.builder import new_plan_id
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.exceptions import (
@@ -56,20 +62,30 @@ from interlock.exceptions import (
     InterlockError,
     PlanError,
     ScopeHaltedError,
+    StageError,
+    SubstrateUnavailableError,
     UncompensatableEffectError,
 )
+from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedback_for_error
 from interlock.invariants import InvariantChecker
-from interlock.substrate import ShadowSubstrate
+from interlock.repair import Repair, Trial, dropped_effects, search, subplan
+from interlock.substrate import ShadowSubstrate, _verb_reason
 from interlock.types import (
+    Effect,
     EffectDiff,
+    EffectId,
     EffectOutcome,
     EffectPlan,
-    InvariantViolation,
-    Severity,
+    PlanId,
     StageHandle,
     StageState,
     Verdict,
 )
+
+if TYPE_CHECKING:
+    from agentgov.receipts import ActionReceipt
+
+    from interlock.receipts import ReceiptIssuer
 
 __all__ = ["EscrowEngine", "StageResult"]
 
@@ -93,6 +109,13 @@ _MARKER_ARMED = "; commit marker armed"
 inside this stage's transaction, so :meth:`EscrowEngine.recover` may read the
 marker's absence as "did not commit". The note is inside the record hash."""
 
+_SAVEPOINT = "ilok_repair"
+"""The savepoint a repair search returns to between candidates."""
+
+_REPAIRS_RECEIPT = re.compile(r"; repairs receipt ([0-9a-f-]{36})")
+"""Suffix on a ``REPAIR_PROPOSED`` note naming the refused plan's receipt,
+which the proposal's own receipt will carry as ``repair_of``."""
+
 
 @dataclass(frozen=True, slots=True)
 class StageResult:
@@ -111,12 +134,31 @@ class StageResult:
     chain_head: str
     anchored_to: str
     committed: bool
+    feedback: AgentFeedback | None = None
+    """What the agent may be told. The diff and verdict above are the
+    operator's: they name other tenants and exact totals. See
+    :mod:`interlock.feedback`."""
+    receipt: ActionReceipt | None = None
+    """The signed ARC1 receipt, when the engine issues receipts and the plan
+    was adjudicated. ``None`` also when issuing it failed after a commit, which
+    is logged: the effects stand, and the terminal record names the receipt id
+    that was meant to exist."""
 
     @property
     def blocked_by(self) -> tuple[str, ...]:
         if self.verdict is None:
             return ()
         return tuple(v.invariant for v in self.verdict.blocking)
+
+    @property
+    def refusal(self) -> Refusal | None:
+        """The refusal split by audience, or ``None`` when the plan committed."""
+        if self.committed or self.feedback is None:
+            return None
+        return Refusal(
+            evidence=OperatorEvidence.of(self.plan, diff=self.diff, verdict=self.verdict),
+            feedback=self.feedback,
+        )
 
 
 class EscrowEngine:
@@ -135,11 +177,23 @@ class EscrowEngine:
         when writing the reverse anchor into a governed AgentGov. The default
         of ``"0"`` writes a zero-value ``ANCHOR`` entry: the reverse anchor is
         free. A positive cost is settled, and the spend carries the anchor.
+    :param receipts: Issue a signed ARC1 receipt for every adjudicated plan,
+        committed or refused. See :mod:`interlock.receipts`.
     :raises ValueError: If ``settle_cost`` is negative, or ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`.
     """
 
-    __slots__ = ("_anchor", "_chain", "_checkers", "_inflight", "_settle_cost", "_substrate")
+    __slots__ = (
+        "_anchor",
+        "_chain",
+        "_checkers",
+        "_claims",
+        "_claims_lock",
+        "_inflight",
+        "_receipts",
+        "_settle_cost",
+        "_substrate",
+    )
 
     def __init__(
         self,
@@ -149,8 +203,10 @@ class EscrowEngine:
         chain: EscrowChain | None = None,
         anchor: LedgerAnchor | None = None,
         settle_cost: Decimal | str = "0",
+        receipts: ReceiptIssuer | None = None,
     ) -> None:
         self._substrate = substrate
+        self._receipts = receipts
         self._checkers = tuple(checkers)
         self._chain = chain if chain is not None else EscrowChain()
         if self._chain.read_only:
@@ -165,10 +221,16 @@ class EscrowEngine:
         if self._settle_cost < 0:
             raise ValueError(f"settle_cost cannot be negative, got {self._settle_cost}")
         self._inflight: set[uuid.UUID] = set()
+        self._claims: set[PlanId] = set()
+        self._claims_lock = threading.Lock()
 
     @property
     def chain(self) -> EscrowChain:
         return self._chain
+
+    @property
+    def receipts(self) -> ReceiptIssuer | None:
+        return self._receipts
 
     # -- admission ----------------------------------------------------------
 
@@ -199,7 +261,10 @@ class EscrowEngine:
             for effect in plan.effects:
                 refusal = veto(effect)
                 if refusal is not None:
-                    raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
+                    raise ForbiddenStatementError(
+                        f"effect {effect.effect_id!r} refused: {refusal}",
+                        reason=_verb_reason(effect),
+                    )
 
         capabilities = self._substrate.capabilities
         for effect in plan.effects:
@@ -251,6 +316,8 @@ class EscrowEngine:
 
         A refusal is a normal return with ``committed=False``, not an
         exception. Use :meth:`execute_or_raise` when a refusal should raise.
+        Either way, what the agent may be told is on the result's, or the
+        exception's, ``feedback``.
 
         :param settle_cost: Overrides the engine's configured settle cost for
             this plan only. What a plan cost to produce is a property of the
@@ -259,19 +326,41 @@ class EscrowEngine:
             ``None`` keeps the configured value.
         :returns: The outcome, including the diff and verdict, whether or not
             the plan committed.
-        :raises InterlockError: And only ``InterlockError``. Foreign
-            exceptions from the AgentGov seam are translated at the anchor.
+        :raises InterlockError: And only ``InterlockError``, carrying
+            ``feedback`` for the agent. Foreign exceptions from the AgentGov
+            seam are translated at the anchor.
         """
+        try:
+            with self._repair_claim(plan) as repairs:
+                return self._execute(plan, settle_cost=settle_cost, repairs=repairs)
+        except InterlockError as exc:
+            if exc.feedback is None:
+                exc.feedback = feedback_for_error(plan, exc)
+            raise
+
+    def _execute(
+        self, plan: EffectPlan, *, settle_cost: Decimal | str | None, repairs: str | None
+    ) -> StageResult:
         cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
         if cost < 0:
             raise PlanError(f"settle_cost cannot be negative, got {cost}")
         self.admit(plan)
-        self._record(RecordType.PLAN_ADMITTED, plan, plan.content_hash(), note=plan.intent[:80])
+        self._record(
+            RecordType.PLAN_ADMITTED,
+            plan,
+            plan.content_hash(),
+            note=(f"repair of {plan.repair_of}: " if plan.repair_of else "") + plan.intent[:80],
+        )
+        receipt_id = self._receipts.new_id() if self._receipts is not None else None
+        stamp = f"; receipt {receipt_id}" if receipt_id else ""
+        terminal: EscrowRecord | None = None
+        txid: str | None = None
 
         handle = self._substrate.open(plan)
         outcomes: list[EffectOutcome] = []
         diff: EffectDiff | None = None
         verdict: Verdict | None = None
+        judged: Adjudication | None = None
         state = StageState.STAGING
         committed = False
 
@@ -296,7 +385,8 @@ class EscrowEngine:
                 note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)",
             )
 
-            verdict = self._adjudicate(plan, diff, handle)
+            judged = adjudicate(plan, diff, self._checkers, stage_id=handle.stage_id)
+            verdict = judged.verdict
             blocked = ",".join(v.invariant for v in verdict.blocking)
             self._record(
                 RecordType.VERDICT,
@@ -308,12 +398,12 @@ class EscrowEngine:
 
             if not verdict.admitted:
                 self._substrate.abort(handle)
-                self._record(
+                terminal = self._record(
                     RecordType.ABORTED,
                     plan,
                     verdict.content_hash(),
                     stage=handle.stage_id,
-                    note=f"blocked by {blocked}",
+                    note=f"blocked by {blocked}{stamp}",
                 )
                 state = StageState.ABORTED
             else:
@@ -350,23 +440,23 @@ class EscrowEngine:
                 state = StageState.COMMITTED
                 note = f"{diff.blast_radius} rows committed"
                 raced = self._anchor.halted_after_commit(plan.scope_id) if self._anchor else ""
-                self._record(
+                terminal = self._record(
                     RecordType.COMMITTED,
                     plan,
                     diff.content_hash(),
                     stage=handle.stage_id,
-                    note=f"{note}; {raced}" if raced else note,
+                    note=(f"{note}; {raced}" if raced else note) + stamp,
                     best_effort=True,
                 )
         except ScopeHaltedError as exc:
             self._substrate.abort(handle)
             state = StageState.ABORTED
-            self._record(
+            terminal = self._record(
                 RecordType.ABORTED,
                 plan,
                 diff.content_hash() if diff is not None else plan.content_hash(),
                 stage=handle.stage_id,
-                note=f"scope halted: {exc}",
+                note=f"scope halted: {exc}{stamp if judged is not None else ''}",
                 best_effort=True,
             )
         except Exception:
@@ -391,6 +481,18 @@ class EscrowEngine:
             self._substrate.close(handle)
 
         head = self._chain.head_hash
+        settlement = self._reverse_anchor(plan, head, cost)
+        receipt = None
+        if receipt_id is not None and judged is not None and terminal is not None:
+            receipt = self._issue_receipt(
+                receipt_id,
+                judged,
+                committed=committed,
+                terminal=terminal,
+                settlement=settlement,
+                txid=txid,
+                repair_of=repairs,
+            )
         return StageResult(
             plan=plan,
             state=state,
@@ -398,8 +500,10 @@ class EscrowEngine:
             verdict=verdict,
             outcomes=tuple(outcomes),
             chain_head=head,
-            anchored_to=self._reverse_anchor(plan, head, cost),
+            anchored_to=settlement.entry_hash if settlement is not None else "",
             committed=committed,
+            feedback=judged.feedback(committed=committed) if judged is not None else None,
+            receipt=receipt,
         )
 
     def execute_or_raise(
@@ -408,9 +512,347 @@ class EscrowEngine:
         """As :meth:`execute`, but raise :class:`AdmissionError` on refusal."""
         result = self.execute(plan, settle_cost=settle_cost)
         if result.verdict is not None and not result.verdict.admitted:
+            # The message is the operator's; the agent gets error.feedback.
             reasons = "; ".join(v.message for v in result.verdict.blocking)
-            raise AdmissionError(f"plan {plan.plan_id} refused: {reasons}", verdict=result.verdict)
+            error = AdmissionError(
+                f"plan {plan.plan_id} refused: {reasons}", verdict=result.verdict
+            )
+            error.feedback = result.feedback
+            raise error
         return result
+
+    # -- repair -------------------------------------------------------------
+
+    def repair(self, plan: EffectPlan, *, max_trials: int = 32) -> Repair:
+        """Find the largest part of a refused plan that would be admitted.
+
+        Stages ``plan`` once and, inside that one stage, tries candidate
+        sub-plans in savepoints: every candidate is run, measured and
+        adjudicated by this engine's checkers for real, then rolled back. See
+        :mod:`interlock.repair` for the search and why it assumes nothing
+        about which steps make a plan worse.
+
+        Advisory. The stage is always rolled back and nothing is committed.
+        A proposal is a new plan with ``repair_of`` set; submitting it through
+        :meth:`execute` stages and adjudicates it again from scratch, and
+        :meth:`execute` admits it only exactly as proposed. With receipts on,
+        the whole plan's refusal gets a receipt here, and the proposal's
+        receipt will name it as ``repair_of``.
+
+        Effects the substrate would refuse outright (a DDL statement, a table
+        it does not observe) are dropped before staging, with everything that
+        depends on them.
+
+        :param max_trials: The most candidates staged, the whole plan
+            included. Each costs one statement per effect it keeps.
+        :returns: The proposal, if any, and why each dropped step was dropped.
+        :raises InterlockError: With ``feedback`` for the agent.
+        """
+        try:
+            return self._repair(plan, max_trials=max_trials)
+        except InterlockError as exc:
+            if exc.feedback is None:
+                exc.feedback = feedback_for_error(plan, exc)
+            raise
+
+    def _repair(self, plan: EffectPlan, *, max_trials: int) -> Repair:
+        if max_trials < 1:
+            raise ValueError("a repair needs at least one trial")
+        for method in ("savepoint", "rollback_to"):
+            if not callable(getattr(self._substrate, method, None)):
+                raise StageError(
+                    f"substrate {self._substrate.substrate_id!r} cannot set savepoints, "
+                    f"which a repair search needs"
+                )
+        try:
+            plan.topological_order()
+        except ValueError as exc:
+            raise CyclicPlanError(str(exc)) from exc
+        if self._anchor is not None:
+            self._anchor.assert_scope_known(plan.scope_id)
+
+        inadmissible: dict[EffectId, InterlockError] = {}
+        for effect in plan.effects:
+            problem = self._effect_problem(effect)
+            if problem is not None:
+                inadmissible[effect.effect_id] = problem
+        candidates = _without(plan, set(inadmissible))
+        if not candidates.effects:
+            return Repair(
+                plan=plan,
+                proposal=None,
+                already_admissible=False,
+                kept=(),
+                dropped=dropped_effects(plan, frozenset(), {}, inadmissible),
+                trials=0,
+                exhaustive=True,
+            )
+
+        receipt_id = self._receipts.new_id() if self._receipts is not None else None
+        handle = self._substrate.open(candidates)
+        whole: Adjudication | None = None
+        terminal: EscrowRecord | None = None
+        proposal: EffectPlan | None = None
+        try:
+            self._record(
+                RecordType.STAGE_OPENED,
+                plan,
+                plan.content_hash(),
+                stage=handle.stage_id,
+                note=("repair search; " + _coverage_note(self._substrate)).rstrip("; "),
+            )
+            savepoint = getattr(self._substrate, "savepoint")  # noqa: B009
+            rollback_to = getattr(self._substrate, "rollback_to")  # noqa: B009
+            savepoint(handle, _SAVEPOINT)
+
+            def evaluate(kept: frozenset[EffectId]) -> Trial:
+                sub = subplan(candidates, kept)
+                rollback_to(handle, _SAVEPOINT)
+                try:
+                    for effect in sub.topological_order():
+                        self._substrate.apply(handle, effect)
+                    diff = self._substrate.diff(handle)
+                except SubstrateUnavailableError:
+                    raise
+                except InterlockError as exc:
+                    return Trial(kept=kept, admitted=False, error=exc)
+                judged = adjudicate(sub, diff, self._checkers, stage_id=handle.stage_id)
+                return Trial(kept=kept, admitted=judged.admitted, adjudication=judged)
+
+            result = search(candidates, evaluate, max_trials=max_trials)
+            whole = result.whole.adjudication
+            complete = len(candidates.effects) == len(plan.effects)
+            if whole is not None:
+                self._record(
+                    RecordType.DIFF_COMPUTED,
+                    plan,
+                    whole.diff.content_hash(),
+                    stage=handle.stage_id,
+                    note=f"repair search, whole plan: {whole.diff.blast_radius} rows",
+                )
+                self._record(
+                    RecordType.VERDICT,
+                    plan,
+                    whole.verdict.content_hash(),
+                    stage=handle.stage_id,
+                    note="admitted"
+                    if whole.admitted
+                    else ",".join(v.invariant for v in whole.verdict.blocking),
+                )
+            refused = complete and whole is not None and not whole.admitted
+            if not refused:
+                receipt_id = None
+            stamp = f"; repairs receipt {receipt_id}" if receipt_id else ""
+            already = complete and result.whole.admitted
+            kept = result.kept if not already else None
+            if kept is not None:
+                proposal = EffectPlan(
+                    plan_id=new_plan_id("repair"),
+                    scope_id=plan.scope_id,
+                    trajectory_id=plan.trajectory_id,
+                    created_at=datetime.now(UTC),
+                    effects=tuple(e for e in plan.effects if e.effect_id in kept),
+                    intent=plan.intent,
+                    repair_of=plan.plan_id,
+                )
+                how = "exhaustive" if result.exhaustive else f"stopped: {result.stopped}"
+                self._record(
+                    RecordType.REPAIR_PROPOSED,
+                    plan,
+                    proposal.content_hash(),
+                    stage=handle.stage_id,
+                    note=f"proposal {proposal.plan_id} keeps {len(kept)} of "
+                    f"{len(plan.effects)} effects after {result.trials} trials ({how}){stamp}",
+                )
+            self._substrate.abort(handle)
+            outcome = (
+                "plan admissible as submitted"
+                if already
+                else "proposal recorded"
+                if proposal is not None
+                else "no admissible sub-plan found"
+            )
+            terminal = self._record(
+                RecordType.ABORTED,
+                plan,
+                whole.verdict.content_hash() if whole is not None else plan.content_hash(),
+                stage=handle.stage_id,
+                note=f"repair search rolled back: {outcome}"
+                + (f"; receipt {receipt_id}" if receipt_id else ""),
+            )
+        except Exception:
+            self._substrate.abort(handle)
+            self._record(
+                RecordType.ABORTED,
+                plan,
+                plan.content_hash(),
+                stage=handle.stage_id,
+                note="repair search failed",
+                best_effort=True,
+            )
+            raise
+        finally:
+            self._substrate.close(handle)
+
+        receipt = None
+        if receipt_id is not None and whole is not None and terminal is not None:
+            receipt = self._issue_receipt(
+                receipt_id, whole, committed=False, terminal=terminal, settlement=None
+            )
+        kept_ids = frozenset(e.effect_id for e in proposal.effects) if proposal else frozenset()
+        return Repair(
+            plan=plan,
+            proposal=proposal,
+            already_admissible=already,
+            kept=tuple(e.effect_id for e in proposal.effects) if proposal else (),
+            dropped=() if already else dropped_effects(plan, kept_ids, result.probes, inadmissible),
+            trials=result.trials,
+            exhaustive=result.exhaustive,
+            stopped=result.stopped,
+            whole=whole,
+            receipt=receipt,
+        )
+
+    def _effect_problem(self, effect: Effect) -> InterlockError | None:
+        """Why admission would refuse this one effect, or ``None``."""
+        veto = getattr(self._substrate, "reject_reason", None)
+        if callable(veto):
+            refusal = veto(effect)
+            if refusal is not None:
+                return ForbiddenStatementError(
+                    f"effect {effect.effect_id!r} refused: {refusal}",
+                    reason=_verb_reason(effect),
+                )
+        if effect.compensation is None and (
+            not effect.reversible or self._substrate.capabilities.requires_compensation
+        ):
+            return UncompensatableEffectError(
+                f"effect {effect.effect_id!r} needs a compensation it does not carry"
+            )
+        expected = self._substrate.substrate_id
+        if effect.substrate_id and effect.substrate_id != expected:
+            return PlanError(f"effect {effect.effect_id!r} targets substrate {effect.substrate_id}")
+        observed: frozenset[str] | None = getattr(self._substrate, "observed_tables", None)
+        if observed is not None and effect.table not in observed:
+            return PlanError(
+                f"effect {effect.effect_id!r} targets unobserved table {effect.table!r}"
+            )
+        return None
+
+    @contextmanager
+    def _repair_claim(self, plan: EffectPlan) -> Iterator[str | None]:
+        """Hold a proposal for the one stage that may commit it.
+
+        A plan naming itself a repair is admitted only exactly as this engine
+        proposed it, and only once: one refusal has at most one committed
+        repair, so no two receipts can both claim to be its repair. The claim
+        is held while the proposal is staged, which refuses a concurrent
+        second submission; once the proposal commits, the chain refuses every
+        later one.
+
+        :returns: The refused plan's receipt id, when it has one.
+        """
+        if plan.repair_of is None:
+            yield None
+            return
+        with self._claims_lock:
+            if plan.plan_id in self._claims:
+                raise PlanError(f"repair {plan.plan_id} is being staged already")
+            repairs = self._repair_link(plan)
+            self._claims.add(plan.plan_id)
+        try:
+            yield repairs
+        finally:
+            with self._claims_lock:
+                self._claims.discard(plan.plan_id)
+
+    def _repair_link(self, plan: EffectPlan) -> str | None:
+        """Check that a plan claiming to be a repair is one this engine
+        proposed, and has not committed yet.
+
+        :returns: The refused plan's receipt id, when it has one.
+        :raises PlanError: If no matching proposal is on the chain, or the
+            proposal already committed.
+        """
+        records = self._chain.records()
+        mine = [r for r in records if r.plan_id == plan.plan_id]
+        intents = {r.stage_id for r in mine if r.record_type is RecordType.COMMIT_INTENT}
+        aborted = {r.stage_id for r in mine if r.record_type is RecordType.ABORTED}
+        if intents - aborted:
+            # An intent with no abort after it committed, or may have: a
+            # crashed commit is the substrate's to resolve, not a retry's.
+            raise PlanError(
+                f"repair {plan.plan_id} of {plan.repair_of} already committed; "
+                f"a proposal is admitted once"
+            )
+        digest = plan.content_hash()
+        for record in reversed(records):
+            if (
+                record.record_type is RecordType.REPAIR_PROPOSED
+                and record.plan_id == plan.repair_of
+                and record.payload_hash == digest
+            ):
+                found = _REPAIRS_RECEIPT.search(record.note)
+                return found.group(1) if found else None
+        raise PlanError(
+            f"plan {plan.plan_id} names itself a repair of {plan.repair_of}, but this "
+            f"engine's chain holds no such proposal with its content. A repair is "
+            f"resubmitted exactly as proposed; anything else is a new plan, and "
+            f"must not claim to be one"
+        )
+
+    def _issue_receipt(
+        self,
+        receipt_id: str,
+        judged: Adjudication,
+        *,
+        committed: bool,
+        terminal: EscrowRecord,
+        settlement: LedgerEntry | None,
+        txid: str | None = None,
+        repair_of: str | None = None,
+    ) -> ActionReceipt | None:
+        """Issue the receipt, last, anchored to AgentGov's head as it is now.
+
+        A failure is logged, not raised: after a commit the effects stand,
+        and raising would replace a truthful result with bookkeeping.
+        """
+        assert self._receipts is not None
+        plan = judged.plan
+        try:
+            spent = (
+                settlement.amount
+                if settlement is not None and settlement.entry_type is EntryType.SPEND
+                else Decimal(0)
+            )
+            return self._receipts.issue(
+                receipt_id=receipt_id,
+                plan=plan,
+                diff=judged.diff,
+                verdict=judged.verdict,
+                committed=committed,
+                substrate=self._substrate,
+                checkers=self._checkers,
+                escrow=terminal,
+                agentgov=self._observe(best_effort=True),
+                scope_path=(
+                    self._anchor.scope_path(plan.scope_id)
+                    if self._anchor is not None
+                    else (plan.scope_id,)
+                ),
+                substrate_txid=txid,
+                repair_of=repair_of,
+                ledger_txn_ids=(str(settlement.transaction_id),) if settlement is not None else (),
+                settled=spent,
+            )
+        except Exception:
+            logger.warning(
+                "receipt %s for plan %s could not be issued; the terminal record names it",
+                receipt_id,
+                plan.plan_id,
+                exc_info=True,
+            )
+            return None
 
     # -- recovery -----------------------------------------------------------
 
@@ -480,36 +922,6 @@ class EscrowEngine:
 
     # -- internals ----------------------------------------------------------
 
-    def _adjudicate(self, plan: EffectPlan, diff: EffectDiff, handle: StageHandle) -> Verdict:
-        """Run every checker and union the violations.
-
-        A checker that raises becomes a blocking violation: a predicate that
-        did not finish has not approved anything.
-        """
-        violations: list[InvariantViolation] = []
-        names: list[str] = []
-        for checker in self._checkers:
-            names.append(checker.name)
-            try:
-                violations.extend(checker.check(plan, diff))
-            except Exception as exc:  # a broken checker must never approve
-                logger.exception("invariant %s raised", checker.name)
-                violations.append(
-                    InvariantViolation(
-                        invariant=checker.name,
-                        severity=Severity.BLOCKING,
-                        message=f"checker raised {type(exc).__name__}: {exc}",
-                    )
-                )
-        return Verdict(
-            plan_id=plan.plan_id,
-            stage_id=handle.stage_id,
-            diff_hash=diff.content_hash(),
-            decided_at=datetime.now(UTC),
-            checkers_run=tuple(names),
-            violations=tuple(violations),
-        )
-
     def _record(
         self,
         record_type: RecordType,
@@ -519,7 +931,7 @@ class EscrowEngine:
         stage: uuid.UUID | None = None,
         note: str = "",
         best_effort: bool = False,
-    ) -> None:
+    ) -> EscrowRecord:
         """Append one record, anchored to AgentGov's current head.
 
         :param best_effort: Record even if AgentGov cannot be read, as an
@@ -529,7 +941,7 @@ class EscrowEngine:
             silent about it.
         """
         point = self._observe(best_effort=best_effort)
-        self._chain.append(
+        return self._chain.append(
             record_type,
             plan_id=plan.plan_id,
             payload_hash=payload_hash,
@@ -553,7 +965,7 @@ class EscrowEngine:
             )
             return AnchorPoint.unanchored()
 
-    def _reverse_anchor(self, plan: EffectPlan, head: str, cost: Decimal) -> str:
+    def _reverse_anchor(self, plan: EffectPlan, head: str, cost: Decimal) -> LedgerEntry | None:
         """Write Interlock's chain head into AgentGov, when co-resident.
 
         ``memo`` is inside AgentGov's hash payload, so once written the reverse
@@ -566,7 +978,7 @@ class EscrowEngine:
         # zero cost writes a free ANCHOR entry; a negative one was refused
         # before anything was staged.
         if self._anchor is None or not self._anchor.can_reverse_anchor:
-            return ""
+            return None
         try:
             entry = self._anchor.reverse_anchor(plan.scope_id, head, cost=cost)
         except AnchorError:
@@ -583,8 +995,8 @@ class EscrowEngine:
                 plan.scope_id,
                 exc_info=True,
             )
-            return ""
-        return entry.entry_hash if entry is not None else ""
+            return None
+        return entry
 
 
 def _coverage_note(substrate: ShadowSubstrate) -> str:
@@ -610,3 +1022,12 @@ def _transaction_id(substrate: ShadowSubstrate, handle: StageHandle) -> str | No
 def _recorded_txid(note: str) -> str | None:
     found = _TXID_PATTERN.search(note)
     return found.group(1) if found else None
+
+
+def _without(plan: EffectPlan, dropped: set[EffectId]) -> EffectPlan:
+    """The plan less ``dropped`` and everything that depends on it."""
+    gone = set(dropped)
+    for effect in plan.topological_order():
+        if gone & set(effect.depends_on):
+            gone.add(effect.effect_id)
+    return subplan(plan, frozenset(e.effect_id for e in plan.effects if e.effect_id not in gone))

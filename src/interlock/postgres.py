@@ -65,7 +65,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
-from interlock.substrate import TableSpec, leading_verb
+from interlock.substrate import TableSpec, _verb_reason, leading_verb
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -530,6 +530,16 @@ class PostgresSubstrate:
         """The last cascade check, or ``None`` before the first one."""
         return self._report
 
+    @property
+    def table_specs(self) -> tuple[TableSpec, ...]:
+        """The tables observed, as configured."""
+        return self._tables
+
+    @property
+    def enforces_table_access(self) -> bool:
+        """Whether a write outside the observed tables is refused."""
+        return self._enforce
+
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
         if self._handle is None or self._handle.stage_id != handle.stage_id:
@@ -646,7 +656,9 @@ class PostgresSubstrate:
         self._assert_live(handle)
         refusal = self.reject_reason(effect)
         if refusal is not None:
-            raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
+            raise ForbiddenStatementError(
+                f"effect {effect.effect_id!r} refused: {refusal}", reason=_verb_reason(effect)
+            )
         try:
             # Re-asserted every time: a SELECT can call set_config() and lift
             # them, and a stage bound that the agent can lift is not a bound.
@@ -793,6 +805,33 @@ class PostgresSubstrate:
                 status,
             )
         return None
+
+    def savepoint(self, handle: StageHandle, name: str) -> None:
+        """Mark the stage's state now, to return to with :meth:`rollback_to`.
+
+        The capture table, the stage's own settings and a failed statement's
+        aborted state all roll back with it, so a trial that errors does not
+        end the stage.
+        """
+        self._savepoint_statement(handle, "SAVEPOINT", name)
+
+    def rollback_to(self, handle: StageHandle, name: str) -> None:
+        """Undo everything since :meth:`savepoint` ``name``; the mark stays."""
+        self._savepoint_statement(handle, "ROLLBACK TO SAVEPOINT", name)
+
+    def release_savepoint(self, handle: StageHandle, name: str) -> None:
+        """Forget a mark, keeping what ran since it."""
+        self._savepoint_statement(handle, "RELEASE SAVEPOINT", name)
+
+    def _savepoint_statement(self, handle: StageHandle, verb: str, name: str) -> None:
+        import psycopg
+
+        conn = self._require(handle)
+        _identifier(name)
+        try:
+            conn.execute(f"{verb} {name}")
+        except psycopg.Error as exc:
+            raise StageError(f"{verb} {name} failed: {exc}") from exc
 
     def abort(self, handle: StageHandle) -> None:
         """Roll back. Safe in any state, including after a commit."""
@@ -1038,16 +1077,20 @@ class PostgresSubstrate:
             else:
                 reason = f"{operation.upper()} on {table!r} is not stageable"
             return ForbiddenStatementError(
-                f"{who} refused: {reason}. PostgreSQL rolled the statement back, cascade included"
+                f"{who} refused: {reason}. PostgreSQL rolled the statement back, cascade included",
+                reason="cascade" if operation in ("delete", "update") else "statement_kind",
+                table=table or None,
             )
         if sqlstate == _TAMPERED:
             return ForbiddenStatementError(
-                f"{who} refused: {exc}. The stage marker is set by the substrate alone"
+                f"{who} refused: {exc}. The stage marker is set by the substrate alone",
+                reason="protected",
             )
         if sqlstate == _PRIVILEGE:
             return ForbiddenStatementError(
                 f"{who} refused by the database: {exc}. The stage role's grants are the "
-                f"table boundary on PostgreSQL"
+                f"table boundary on PostgreSQL",
+                reason="privilege",
             )
         if sqlstate in _CONFLICTS:
             return StageConflictError(f"{who} lost to a concurrent writer: {exc}")
@@ -1055,7 +1098,8 @@ class PostgresSubstrate:
             return StageExpiredError(f"{who} ran past the stage's {self._stage_seconds}s bound")
         if "multiple commands" in str(exc):
             return ForbiddenStatementError(
-                f"{who} refused: one effect is one statement, and this carries several"
+                f"{who} refused: one effect is one statement, and this carries several",
+                reason="multiple_statements",
             )
         return StageError(f"{who} failed: {exc}")
 

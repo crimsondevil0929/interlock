@@ -37,11 +37,12 @@ classifiers = [
 #
 # Pinned to an agentgov release tag, never a branch: `@main` resolved to
 # whatever main was when the lock was cut, which is how interlock 0.1.1 came to
-# lock an agentgov commit that reported itself as 0.1.0. Interlock 0.1.2
-# requires agentgov 0.1.2 for BudgetManager.refresh() and
-# BudgetManager.anchor(), and uv.lock records the exact commit the tag names.
+# lock an agentgov commit that reported itself as 0.1.0. Interlock 0.3 issues
+# ARC1 receipts, and agentgov.receipts first shipped in v0.2.0 (6d3cac2, the
+# receipts merge; its package metadata still reports 0.1.2). uv.lock records
+# the exact commit the tag names.
 dependencies = [
-    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.1.2",
+    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.2.0",
 ]
 
 [project.scripts]
@@ -63,6 +64,9 @@ dev = [
     # The PostgreSQL substrate's integration tests. The runtime dependency is
     # the `postgres` extra; this puts the driver in every dev environment.
     "psycopg[binary]>=3.2",
+    # Property tests: the zero-leak guarantee on agent feedback is a property
+    # over every plan and diff, not a list of examples.
+    "hypothesis>=6.100",
     # scripts/live_stress_test.py only. Not a runtime dependency: nothing in
     # src/ imports it, and the library never talks to a model provider.
     "anthropic>=1.0.0",
