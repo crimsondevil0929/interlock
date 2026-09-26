@@ -6,6 +6,8 @@ Split by what the caller must do about it, not by where it was raised.
 ``StageError``     the substrate could not stage or commit; retry may help.
 ``AdmissionError`` an invariant refused; nothing was committed, by design.
 ``AnchorError``    the audit chain is unusable; refuse to operate.
+``RecoveryError``  the recovery runtime cannot take this step; stop, or ask
+                   the operator.
 """
 
 from __future__ import annotations
@@ -20,12 +22,16 @@ __all__ = [
     "InterlockError",
     "LedgerUnverifiedError",
     "PlanError",
+    "RecordIntegrityError",
+    "RecoveryError",
+    "RecoveryExhaustedError",
     "ScopeHaltedError",
     "StageConflictError",
     "StageError",
     "StageExpiredError",
     "SubstrateConfigurationError",
     "SubstrateUnavailableError",
+    "ToolRevokedError",
     "UncompensatableEffectError",
 ]
 
@@ -171,3 +177,47 @@ class ChainInUseError(AnchorError):
     resolve the first writer's in-flight commits as though that writer had
     died. Read a live chain with ``EscrowChain.load``, which claims nothing.
     """
+
+
+class RecordIntegrityError(AnchorError):
+    """A signed record log (:mod:`interlock.records`) failed verification.
+
+    A record was edited, re-linked or dropped, is signed by another key, or
+    is missing where the AgentGov ledger anchors it.
+    """
+
+
+# -- recovery ----------------------------------------------------------------
+
+
+class RecoveryError(InterlockError):
+    """The recovery runtime cannot take this step.
+
+    Raised for a misuse the caller can fix: a transcript edited between
+    steps, a step never answered, a step settled twice, a recovery scope
+    that exists without the records that would say what it already did.
+    """
+
+
+class RecoveryExhaustedError(RecoveryError):
+    """Nothing is left to try.
+
+    The ladder has no rung left for this halt, the policy's step limit is
+    reached, the recovery reserve cannot cover another step, or the recovery
+    scope is itself halted. The halt stands; stop the task.
+    """
+
+
+class ToolRevokedError(RecoveryError):
+    """A call to a tool the recovery runtime revoked.
+
+    Revocation is enforced here, where the harness runs tools, whatever the
+    model was told: a model that calls a revoked tool anyway gets an error
+    result, not the tool.
+
+    :ivar tool: The revoked tool's name.
+    """
+
+    def __init__(self, tool: str) -> None:
+        self.tool = tool
+        super().__init__(f"tool {tool!r} was revoked for the rest of this task")

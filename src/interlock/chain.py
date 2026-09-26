@@ -481,20 +481,30 @@ def _fsync_directory(directory: Path) -> None:
 
 
 class _FileClaim:
-    """An exclusive advisory lock on ``<chain>.lock``, held for a writer's life.
+    """An exclusive advisory lock on ``<file>.lock``, held for a writer's life.
 
     Held by an open file descriptor, so the kernel releases it when the
     holding process exits, ``SIGKILL`` included: a crashed writer leaves a
     stale file, never a stale claim. The holder writes its identity into the
-    file so a refused writer can be told who holds it.
+    file so a refused writer can be told who holds it. The escrow chain and
+    the signed record log (:mod:`interlock.records`) both claim their files
+    this way.
     """
 
-    __slots__ = ("_chain", "_fd", "_path")
+    __slots__ = ("_chain", "_fd", "_hint", "_label", "_path")
 
-    def __init__(self, chain_path: Path) -> None:
+    def __init__(
+        self,
+        chain_path: Path,
+        *,
+        label: str = "escrow chain",
+        hint: str = "Close the other EscrowChain, or read this one with EscrowChain.load()",
+    ) -> None:
         self._chain = chain_path
         self._path = chain_path.with_name(chain_path.name + ".lock")
         self._fd: int | None = None
+        self._label = label
+        self._hint = hint
 
     def acquire(self) -> None:
         try:
@@ -507,9 +517,8 @@ class _FileClaim:
             holder = _read_holder(fd)
             os.close(fd)
             raise ChainInUseError(
-                f"escrow chain {self._chain} is already open for appending{holder}. "
-                f"One chain file has one writer: a second would fork it. Close the "
-                f"other EscrowChain, or read this one with EscrowChain.load()"
+                f"{self._label} {self._chain} is already open for appending{holder}. "
+                f"One {self._label} file has one writer: a second would fork it. {self._hint}"
             ) from exc
         except OSError as exc:
             os.close(fd)

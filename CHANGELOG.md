@@ -45,6 +45,24 @@ Releases before 0.1.2 are described by their tags and commit history.
   after the reverse anchor, so agentgov's verifier can check it against the ledger. A
   receipt that fails to issue after a commit is logged, not raised. New module
   `interlock.receipts`.
+- **Budgeted recovery (3.3).** `RecoveryRuntime` gives a halted task a bounded way to
+  finish: a deterministic ladder, fixed in order (revoke the tool the halt names, an
+  operator directive from the policy's allowlist, a lower token ceiling, then guidance in
+  fixed words), one rung per step, tightening only ever accumulating. Each step appends to
+  the transcript and never edits it, answering tool calls the halt stopped; directives and
+  revocations go in appended `role: "system"` messages and `tool_removal` blocks on the
+  models that take them, or user-turn notices otherwise, and `check_tool()` refuses a
+  revoked tool either way. Recovery is billed to `{scope}/recovery`, a reserve carved out of
+  the scope's envelope and delegated beside it, since a trip halts the tripped scope's
+  subtree. `Trip.of()` reads AgentGov's and Interlock's halts by type, never by message; a
+  halt's own words are recorded and never sent to the agent (property-tested). New modules
+  `interlock.recovery` and `interlock.records`.
+- **ILOK1 signed records.** `RecordLog` is an append-only, hash-linked, signed log for the
+  runtime's own acts, built on agentgov's canonical JSON and signers under an
+  `ILOK1/record/v1` prefix, fsynced, resumed and verified from its file, one writer per
+  file. The runtime anchors every record into the AgentGov ledger, and `check_anchors()`
+  finds a log truncated or rewritten after the fact.
+- `RecoveryError`, `RecoveryExhaustedError`, `ToolRevokedError`, `RecordIntegrityError`.
 - `EffectPlan.repair_of`, hashed only when set, so earlier plans keep their hashes;
   `RecordType.REPAIR_PROPOSED`; `LedgerAnchor.scope_path()`; `BlastRadius.limit`;
   `table_specs` and `enforces_table_access` on both substrates.

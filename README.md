@@ -539,6 +539,109 @@ stand, and the terminal record names the receipt that should exist. An HMAC rece
 verifies only for a holder of the key: for third parties, sign with agentgov's
 `Ed25519Signer` (`agentgov[sign]`) and publish the public key.
 
+## Recovery
+
+A halt is correct, and it used to be the end of the task. `RecoveryRuntime` gives a halted
+task a bounded way to finish instead: a few more model calls, each under tighter constraints
+than the one before, paid from a reserve set aside for it, and each recorded and signed
+before it is made.
+
+```python
+from decimal import Decimal
+
+from agentgov import BudgetManager
+from agentgov.cognitive import CognitiveBreaker, CognitivePolicy
+from agentgov.exceptions import AgentThrashingError
+from agentgov.receipts import HmacKey
+
+from interlock import Directive, RecordLog, RecoveryPolicy, RecoveryRuntime, Trip, TripKind
+
+governor = BudgetManager()
+governor.open_root("org", "10.00")
+governor.delegate("org", "support-agent", "5.00")
+policy = RecoveryPolicy(
+    reserve=Decimal("0.50"),  # carved out of support-agent's envelope
+    step_estimate=Decimal("0.05"),  # held for each recovery call
+    directives=(
+        Directive(
+            "no-repeat",
+            "Do not repeat a tool call that has already returned; use the results you have.",
+            frozenset({TripKind.THRASHING}),
+        ),
+    ),
+)
+records = RecordLog(HmacKey.generate(), log_id="support")
+runtime = RecoveryRuntime(
+    governor, "support-agent", policy, records, tools=["lookup", "apply_plan"]
+)
+
+transcript = [
+    {"role": "user", "content": "What is the total of order 1?"},
+    {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "toolu_02", "name": "lookup", "input": {"id": 1}}],
+    },
+]
+breaker = CognitiveBreaker(
+    policy=CognitivePolicy(max_identical_repeats=2), observer=None, manager=governor
+)
+try:
+    for _ in range(2):  # the same lookup, twice: halted before the second runs
+        breaker.observe_call("support-agent", "lookup", kwargs={"id": 1})
+except AgentThrashingError as exc:
+    trip = Trip.of(exc, tool="lookup")
+
+step = runtime.recover(trip, transcript, max_tokens=4096)
+print(step.rung, step.tools)  # revoke_tool ('apply_plan',)
+# Send step.messages (with step.betas) and step.max_tokens, the system prompt and
+# the tools as before; settle what the call cost; refuse revoked tools where they run.
+runtime.settle(step, "0.03")
+runtime.check_tool("apply_plan")
+runtime.close()
+records.verify()
+print(governor.is_halted("support-agent"), len(records))  # True 4
+```
+
+**The ladder** is fixed and deterministic, one rung per step: revoke the tool the halt
+names, then an operator directive from the policy's allowlist, then a lower token ceiling,
+then guidance in fixed words. Constraints come before conversation. Each step takes the
+first rung that can still do something for this kind of halt, and tightening only
+accumulates: a revoked tool stays revoked and the ceiling stays down. When no rung is left,
+or `max_steps` is reached, `recover()` raises `RecoveryExhaustedError` and the halt stands.
+The same halts always take the same steps. A refused plan is left to guidance by default,
+so the agent can correct it; its guidance is the refusal's sanitized feedback, or a repair's
+(see [Repair](#repair-the-part-that-would-pass)).
+
+**History is never edited.** A step returns the transcript it was given, as the same
+objects, with messages appended: error results for tool calls the halt stopped, then the
+rung's notice. The system prompt and the tool definitions are never touched. On Claude
+Opus 5, Opus 5.5, Opus 4.8, Fable and Mythos, a directive goes in an appended
+`{"role": "system"}` message and a revocation in a `tool_removal` block (beta
+`mid-conversation-tool-changes-2026-07-01`, in `step.betas`), the operator channel a user
+turn cannot forge; `Channel.USER` uses user-turn notices for every other model. Either way,
+`check_tool()` refuses a revoked tool where the harness runs it. Each step checks that the
+transcript it is handed extends the one the last step returned, so an edit in between is
+refused, and its record pins the transcript before and after by a running hash
+(`transcript_head`).
+
+**The reserve sits beside the scope, not under it.** A trip halts the tripped scope's
+whole subtree, and recovery exists for a tripped scope, so `{scope}/recovery` is carved out
+of the scope's own envelope (released to its parent and delegated from there). The halted
+scope stays halted; every call made during recovery is billed to the reserve, a step's
+through `recover()` and `settle()`, the task's own through `hold()` and `capture()`. A root
+scope's reserve is a new root funded from the treasury, or `RecoveryPolicy(funding=...)`
+names a scope to delegate it from. `close()` returns what is left to the parent.
+
+**Every act is signed first.** Opening, each step, each settlement and the close are
+`RecordLog` entries: ILOK1, agentgov's canonical JSON under an `ILOK1/record/v1` signing
+prefix, hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
+`check_anchors()` catches a log truncated or rewritten after the fact. A step's record names
+the halt (and a refused plan's ARC1 receipt), the rung and exactly what it did, the hold
+that pays for it, the policy's digest, and the transcript before and after, and is written
+before the step is returned. Persist the log (`RecordLog(..., path=...)`): a runtime
+restarted over it adopts the recovery scope and replays what was revoked and lowered, so a
+restart never loosens a constraint.
+
 ## PostgreSQL
 
 `PostgresSubstrate` stages each plan in a `REPEATABLE READ` transaction and measures it with
@@ -740,6 +843,11 @@ against the shipped code, not inferred.
 - **Lock footprint.** A stage holds write locks for its whole life, a repair search's
   included. `max_stage_seconds` bounds it. Human review must not happen inside an open stage; abort, present the recorded
   diff, and re-stage on approval, because the substrate may have moved.
+- **Recovery trusts the harness to route its calls.** The runtime holds and records its
+  own steps, refuses a revoked tool when asked, and catches an edited transcript at the
+  next step. It cannot see a harness that bills a recovery call to another scope, runs a
+  tool without calling `check_tool()`, or sends the model something other than
+  `step.messages`.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
 - **Non-transactional sinks cannot be staged.** An email has no shadow. Those belong in a
