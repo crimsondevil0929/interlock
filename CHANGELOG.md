@@ -7,7 +7,15 @@ and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 Releases before 0.1.2 are described by their tags and commit history.
 
-## [Unreleased]
+## [0.2.0] - 2026-09-26
+
+PostgreSQL, signed receipts and recovery, with release gates behind them. A
+PostgreSQL substrate with installed capture triggers, a cascade check and
+reconciliation of unrecorded writes; a signed ARC1 receipt for every adjudicated
+plan; refusals split by audience, checked repair, budgeted recovery from a halt,
+and extension quotes. Crash consistency is tested by killing a real process at
+every step of a commit, and tamper evidence by altering every part of the audit
+trail. Requires agentgov v0.2.0.
 
 ### Added
 

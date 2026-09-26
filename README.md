@@ -962,7 +962,7 @@ form work. Two consequences worth knowing before you depend on this:
 - **The pin is an agentgov release tag, never a branch.** A resolver cache is keyed on
   name and version, and `@main` is a moving target: interlock 0.1.1 locked an agentgov
   commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
-  0.1.2 pins the agentgov tag `v0.1.2`; this line pins `v0.2.0`, the first release with
+  0.1.2 pinned the agentgov tag `v0.1.2`; 0.2.0 pins `v0.2.0`, the first release with
   `agentgov.receipts`. That tag's package metadata still reports version 0.1.2, so tell
   the two apart by the commit, `6d3cac2`, which `uv.lock` records. Pin a tag or a commit
   for anything reproducible, and use `uv sync --refresh-package agentgov` when you

@@ -1,9 +1,9 @@
 # Effect escrow: specification and interface contract
 
-**Status:** specification. `interlock` v0.1.2 implements a subset; see
-[Conformance](#conformance-of-interlock-unreleased-v03-in-progress) at the end of this document for
+**Status:** specification. `interlock` 0.2.0 implements a subset; see
+[Conformance](#conformance-of-interlock-020) at the end of this document for
 what is implemented, what is partial, and what is unimplemented.
-**Applies to:** `interlock` v0.1.2 against `agentgov` v0.1.2.
+**Applies to:** `interlock` 0.2.0 against `agentgov` v0.2.0 (tag, commit `6d3cac2`).
 **Normative language:** MUST, MUST NOT, SHOULD, MAY per RFC 2119.
 
 ---
@@ -970,7 +970,7 @@ Unresolved, and listed because they are unresolved rather than minor.
 
 ---
 
-# Conformance of `interlock` (unreleased, v0.3 in progress)
+# Conformance of `interlock` 0.2.0
 
 What the shipped package actually does against this document. Verified by
 reading `src/interlock/` and by running adversarial plans against it, not by
