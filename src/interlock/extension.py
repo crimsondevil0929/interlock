@@ -35,7 +35,10 @@ ancestor's) is not quoted: :meth:`BudgetGuard.authorize` raises AgentGov's
 safety halt.
 
 Quotes are the operator's evidence. They name amounts and receipts, and none
-of it is for the agent.
+of it is for the agent. Granting is the operator's act: the guard records
+``approved_by`` and cannot authenticate it, so :meth:`BudgetGuard.grant` belongs
+behind whatever approval the operator already trusts, and never within an
+agent's reach as a tool.
 """
 
 from __future__ import annotations

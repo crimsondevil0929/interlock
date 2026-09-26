@@ -701,7 +701,10 @@ AgentGov's `CircuitOpenError`, because more money is not the answer to a safety 
 
 A `RecoveryRuntime` given the guard quotes for its own reserve the same way: when a step
 will not fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up
-the grant. Quotes are operator evidence; nothing in them is sent to the agent.
+the grant. Quotes are operator evidence; nothing in them is sent to the agent. Granting is
+the operator's act: the guard records `approved_by` but cannot authenticate it, so put
+`grant()` behind the approval you already trust, and never within the agent's reach as a
+tool.
 
 ## PostgreSQL
 
