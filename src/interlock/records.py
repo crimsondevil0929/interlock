@@ -109,6 +109,16 @@ class RecordKind(StrEnum):
     RECOVERY_CLOSED = "recovery.closed"
     """The recovery ended; unused reserve returned."""
 
+    EXTENSION_QUOTED = "extension.quoted"
+    """A call did not fit the budget: what was spent, what was done, and what
+    finishing would cost."""
+
+    EXTENSION_GRANTED = "extension.granted"
+    """An operator granted a quote: how much, by whom, and where it was put."""
+
+    EXTENSION_DECLINED = "extension.declined"
+    """An operator declined a quote."""
+
 
 def money(amount: Decimal | int | str) -> str:
     """A decimal amount as ILOK1 writes it: a plain decimal string at the

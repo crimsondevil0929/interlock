@@ -997,6 +997,7 @@ reading the test suite.
 | Checked repair: candidate sub-plans staged in savepoints of one stage, each adjudicated by the same checkers and rolled back, with no monotonicity assumed; the proposal admitted only as recorded, only once, and re-adjudicated from scratch | `repair`, `engine.EscrowEngine.repair`, `engine.EscrowEngine._repair_claim` |
 | A signed ARC1 receipt per adjudicated plan, naming its terminal chain record (which names it back), issued after the reverse anchor so its cost verifies against the ledger; a repair's names the refusal's | `receipts.ReceiptIssuer`, `engine.EscrowEngine._issue_receipt` |
 | Budgeted recovery from a halt: a fixed, deterministic ladder of constraints before guidance; a reserve beside the halted scope; the transcript only ever appended to; every step signed (ILOK1) before it is returned and anchored in the AgentGov ledger | `recovery`, `records` |
+| Budget exhaustion answered with a signed quote instead of a tripped breaker: spend to date from the ledger, proof of work from ARC1 receipts with a checkpoint, an estimate by a named method; answered once by a signed grant or decline; never offered for a safety halt | `extension` |
 | `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |

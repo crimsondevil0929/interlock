@@ -92,6 +92,7 @@ from interlock.repair import RepairFeedback
 
 if TYPE_CHECKING:
     from interlock.engine import StageResult
+    from interlock.extension import BudgetGuard, ExtensionGrant, ExtensionRequest
 
 __all__ = [
     "LADDER",
@@ -104,6 +105,7 @@ __all__ = [
     "Rung",
     "Trip",
     "TripKind",
+    "breaker_reason",
     "spent_out",
     "transcript_head",
 ]
@@ -152,6 +154,19 @@ def spent_out(reason: str) -> bool:
         or reason.startswith("overdraft attempt:")
         or (reason.startswith("settled cost ") and "overdrawn by" in reason)
     )
+
+
+def breaker_reason(governor: BudgetManager, scope_id: str) -> str:
+    """Why ``scope_id``'s breaker last tripped, from AgentGov's control events.
+
+    ``""`` if it never did.
+    """
+    reasons = [
+        event.reason
+        for event in governor.control_events
+        if event.scope_id == scope_id and event.event_type == EntryType.CIRCUIT_TRIPPED.value
+    ]
+    return reasons[-1] if reasons else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +618,12 @@ class RecoveryRuntime:
     harness calls :meth:`check_tool`; before any call, it caps ``max_tokens``
     with :meth:`max_tokens`. Thread-safe.
 
+    With a :class:`~interlock.extension.BudgetGuard`, a reserve that runs out
+    is quoted for instead of simply ending the recovery: the
+    :class:`~interlock.exceptions.RecoveryExhaustedError` carries the quote,
+    :meth:`hold` returns one in place of a hold, and a granted quote is taken
+    up with :meth:`extend`, which moves billing to the scope the grant funded.
+
     :param governor: A write-capable AgentGov manager.
     :param scope_id: The scope whose task this recovers.
     :param records: Where the signed records go. Persist it to keep what was
@@ -610,6 +631,7 @@ class RecoveryRuntime:
     :param tools: The tools the task was granted, which are the ones a step
         may revoke.
     :param trajectory: The task's trajectory, recorded.
+    :param guard: Quotes for more when the reserve runs out.
     :raises RecoveryError: If the reserve cannot be funded, or the recovery
         scope exists without its records.
     """
@@ -623,14 +645,18 @@ class RecoveryRuntime:
         *,
         tools: Iterable[str] = (),
         trajectory: str | None = None,
+        guard: BudgetGuard | None = None,
     ) -> None:
         self._governor = governor
+        self._guard = guard
         self._scope = scope_id
         self._policy = policy
         self._records = records
         self._granted: tuple[str, ...] = tuple(dict.fromkeys(tools))
         self._trajectory = trajectory
         self._recovery = f"{scope_id}/recovery"
+        self._billing = self._recovery
+        self._billed: list[str] = [self._recovery]
         self._lock = threading.RLock()
         self._revoked: list[str] = []
         self._used: set[str] = set()
@@ -658,8 +684,15 @@ class RecoveryRuntime:
 
     @property
     def recovery_scope(self) -> str:
-        """Where every call made during recovery is billed."""
+        """The recovery scope, ``{scope}/recovery``."""
         return self._recovery
+
+    @property
+    def billing_scope(self) -> str:
+        """Where every call made during recovery is billed: the recovery scope,
+        or the scope an extension grant funded beside it."""
+        with self._lock:
+            return self._billing
 
     @property
     def trajectory(self) -> str:
@@ -729,16 +762,37 @@ class RecoveryRuntime:
 
     # -- the task's own calls ------------------------------------------------
 
-    def hold(self, amount: Decimal | str, *, memo: str = "") -> Authorization:
-        """Hold funds in the recovery scope for a call the task makes between steps.
+    def hold(self, amount: Decimal | str, *, memo: str = "") -> Authorization | ExtensionRequest:
+        """Hold funds for a call the task makes between steps, on the billing scope.
 
+        :returns: The hold; with a guard, a quote in its place when the call
+            does not fit.
         :raises agentgov.exceptions.AgentGovError: As ``authorize`` does.
         """
         with self._lock:
             self._check_open()
-        return self._governor.authorize(
-            self._recovery, amount, memo=memo or "call made during recovery"
-        )
+            billing = self._billing
+        memo = memo or "call made during recovery"
+        if self._guard is not None:
+            return self._guard.authorize(billing, amount, memo=memo, task=self._scope)
+        return self._governor.authorize(billing, amount, memo=memo)
+
+    def extend(self, grant: ExtensionGrant) -> None:
+        """Bill the scope a granted quote funded from now on.
+
+        :raises RecoveryError: If the grant funded a scope that is not this
+            recovery's.
+        """
+        with self._lock:
+            self._check_open()
+            scope = grant.scope_id
+            if scope not in self._billed and not scope.startswith(f"{self._recovery}/"):
+                raise RecoveryError(
+                    f"grant {grant.grant_id} funds {scope!r}, not the recovery of {self._scope!r}"
+                )
+            if scope not in self._billed:
+                self._billed.append(scope)
+            self._billing = scope
 
     def capture(self, authorization: Authorization, cost: Decimal | str) -> LedgerEntry:
         """Settle a :meth:`hold` at what the call cost."""
@@ -776,10 +830,14 @@ class RecoveryRuntime:
                 raise RecoveryExhaustedError(
                     f"the policy allows {self._policy.max_steps} recovery steps, and all were taken"
                 )
-            halted = self._governor.halted_by(self._recovery)
+            halted = self._governor.halted_by(self._billing)
             if halted is not None:
+                spent = halted == self._billing and spent_out(
+                    breaker_reason(self._governor, halted)
+                )
                 raise RecoveryExhaustedError(
-                    f"recovery scope {self._recovery!r} is halted by {halted!r}"
+                    f"recovery scope {self._billing!r} is halted by {halted!r}",
+                    quote=self._quote() if spent else None,
                 )
             choice = self._choose(trip, max_tokens)
             if choice is None:
@@ -818,7 +876,8 @@ class RecoveryRuntime:
             except BudgetExceededError as exc:
                 # Recorded by AgentGov before it raised: the money was spent.
                 overran = exc
-                entry = _spend_for(self._governor.audit_trail(self._recovery), step.authorization)
+                held = step.authorization.scope_id
+                entry = _spend_for(self._governor.audit_trail(held), step.authorization)
             self._pending = None
             spent = entry.amount if entry is not None and entry.entry_type is EntryType.SPEND else 0
             record = self._records.append(
@@ -831,7 +890,7 @@ class RecoveryRuntime:
                     "cost": money(spent),
                     "entry": str(entry.entry_id) if entry is not None else None,
                     "overdrawn": overran is not None,
-                    "available": money(self._governor.available(self._recovery)),
+                    "available": money(self._governor.available(step.authorization.scope_id)),
                 },
             )
             self._anchor(record)
@@ -856,18 +915,22 @@ class RecoveryRuntime:
                 voided = self._pending.number
                 self._pending = None
             returned = Decimal(0)
-            if self._governor.node(self._recovery).parent_id is not None:
-                returned = self._governor.release(
-                    self._recovery, memo=f"unused recovery reserve for {self._scope} returned"
-                )
+            spent = Decimal(0)
+            for scope in self._billed:
+                spent += _spent(self._governor.audit_trail(scope))
+                if self._governor.node(scope).parent_id is not None:
+                    returned += self._governor.release(
+                        scope, memo=f"unused recovery reserve for {self._scope} returned"
+                    )
             record = self._records.append(
                 RecordKind.RECOVERY_CLOSED,
                 scope=self._scope,
                 body={
                     "recovery_scope": self._recovery,
+                    "scopes": list(self._billed),
                     "steps": self._taken,
                     "revoked": list(self._revoked),
-                    "spent": money(_spent(self._governor.audit_trail(self._recovery))),
+                    "spent": money(spent),
                     "returned": money(returned),
                     "voided_step": voided,
                 },
@@ -947,19 +1010,26 @@ class RecoveryRuntime:
     def _authorize(self, number: int, rung: Rung) -> Authorization:
         estimate = self._policy.step_estimate
         with self._governor.ledger.lock:
-            available = self._governor.available(self._recovery)
-            if estimate > available:
-                raise RecoveryExhaustedError(
-                    f"the recovery reserve has {available} left, and a step holds {estimate}"
-                )
-            try:
-                return self._governor.authorize(
-                    self._recovery, estimate, memo=f"recovery step {number}: {rung.value}"
-                )
-            except AgentGovError as exc:
-                raise RecoveryExhaustedError(
-                    f"recovery scope {self._recovery!r} refused the hold: {exc}"
-                ) from exc
+            available = self._governor.available(self._billing)
+            if estimate <= available:
+                try:
+                    return self._governor.authorize(
+                        self._billing, estimate, memo=f"recovery step {number}: {rung.value}"
+                    )
+                except AgentGovError as exc:
+                    raise RecoveryExhaustedError(
+                        f"recovery scope {self._billing!r} refused the hold: {exc}"
+                    ) from exc
+        raise RecoveryExhaustedError(
+            f"the recovery reserve has {available} left, and a step holds {estimate}",
+            quote=self._quote(),
+        )
+
+    def _quote(self) -> ExtensionRequest | None:
+        """A quote for more reserve, when the runtime has a guard to ask."""
+        if self._guard is None:
+            return None
+        return self._guard.quote(self._billing, self._policy.step_estimate, task=self._scope)
 
     def _take(
         self,
@@ -1058,6 +1128,7 @@ class RecoveryRuntime:
                     ).hexdigest(),
                 },
                 "hold": {
+                    "scope": authorization.scope_id,
                     "authorization": str(authorization.authorization_id),
                     "amount": money(authorization.amount),
                 },
@@ -1135,6 +1206,13 @@ class RecoveryRuntime:
         settled = {r.body["step"] for r in mine if r.kind == RecordKind.RECOVERY_SETTLED}
         unsettled = 0
         for record in mine:
+            if record.kind == RecordKind.EXTENSION_GRANTED:
+                # A grant moved billing to the scope it funded; keep billing there.
+                target = record.body["scope"]
+                if target == self._recovery or target.startswith(f"{self._recovery}/"):
+                    if target not in self._billed:
+                        self._billed.append(target)
+                    self._billing = target
             if record.kind != RecordKind.RECOVERY_STEP:
                 continue
             body = record.body
@@ -1151,15 +1229,20 @@ class RecoveryRuntime:
             after = body["transcript"]["after"]
             self._last = (after["count"], after["head"])
             unsettled += body["step"] not in settled
-        voided = self._governor.void_stale(
-            0, scope_id=self._recovery, memo="recovery adopted: an unsettled step's hold voided"
-        )
+        voided = [
+            held
+            for scope in self._billed
+            for held in self._governor.void_stale(
+                0, scope_id=scope, memo="recovery adopted: an unsettled step's hold voided"
+            )
+        ]
         return self._open_record(
             None,
             adopted={
                 "steps": self._taken,
                 "unsettled": unsettled,
                 "voided_holds": [str(a.authorization_id) for a in voided],
+                "billing": self._billing,
             },
         )
 

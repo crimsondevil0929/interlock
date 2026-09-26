@@ -18,6 +18,7 @@ __all__ = [
     "ChainInUseError",
     "ChainIntegrityError",
     "CyclicPlanError",
+    "ExtensionError",
     "ForbiddenStatementError",
     "InterlockError",
     "LedgerUnverifiedError",
@@ -205,6 +206,22 @@ class RecoveryExhaustedError(RecoveryError):
     The ladder has no rung left for this halt, the policy's step limit is
     reached, the recovery reserve cannot cover another step, or the recovery
     scope is itself halted. The halt stands; stop the task.
+
+    :ivar quote: When the reserve ran out and the runtime has a budget guard,
+        the :class:`~interlock.extension.ExtensionRequest` that asks for more:
+        granted, it lets the recovery go on.
+    """
+
+    def __init__(self, message: str, *, quote: object | None = None) -> None:
+        super().__init__(message)
+        self.quote = quote
+
+
+class ExtensionError(InterlockError):
+    """An extension quote cannot be answered as asked.
+
+    It is unknown to this guard, was already granted or declined, has
+    expired, or the scope that would fund it cannot.
     """
 
 

@@ -642,6 +642,67 @@ before the step is returned. Persist the log (`RecordLog(..., path=...)`): a run
 restarted over it adopts the recovery scope and replays what was revoked and lowered, so a
 restart never loosens a constraint.
 
+## Extension quotes
+
+AgentGov's backstop is blunt on purpose: an authorization that would overdraw a scope
+trips its breaker, and so does a capture that spends it to zero. For a runaway loop that is
+the answer. For a task that is only more expensive than its envelope, it throws away the
+work done. `BudgetGuard.authorize()` asks first: when a call will not fit, it returns a
+signed `ExtensionRequest` instead of placing a hold that would trip the breaker.
+
+```python
+from agentgov import BudgetManager
+from agentgov.receipts import HmacKey
+
+from interlock import BudgetGuard, ExtensionRequest, Milestones, RecordLog
+
+governor = BudgetManager()
+governor.open_root("org", "10.00")
+governor.delegate("org", "support-agent", "5.00")
+guard = BudgetGuard(governor, RecordLog(HmacKey.generate(), log_id="support"))
+
+held = guard.authorize("support-agent", "4.60")  # fits: an ordinary hold
+governor.capture(held, "4.60")
+
+done = Milestones(done=3, total=5, unit="tickets")
+quote = guard.authorize("support-agent", "0.50", milestones=done)
+assert isinstance(quote, ExtensionRequest)  # did not fit: quoted, and nothing tripped
+print(quote.requested, governor.is_halted("support-agent"))  # 3.44 False
+print(quote.render())
+# Extension requested for support-agent: 3.44000000.
+# Spent 4.60000000 (support-agent 4.60000000); held 0.00000000; 0.40000000 left; ...
+# Proof of work: 0 plan(s) committed (0 rows); declared 3 of 5 tickets done.
+# Estimate: 1.53333333 per unit x 2 remaining = 3.06666667, plus 25% margin = 3.84000000 ...
+
+grant = guard.grant(quote, approved_by="ops@example.com")
+print(grant.scope_id, governor.available(grant.scope_id))  # support-agent/ext-1 3.84000000
+```
+
+A quote has three parts, and is a signed `extension.quoted` record anchored in the ledger:
+
+- **Spend to date**, from the ledger: what the task's scopes (the scope, its recovery
+  scope, its extensions) settled net of refunds, what they hold, and what is left.
+- **Proof of work**: with `BudgetGuard(receipts=...)`, the ARC1 receipts of the plans the
+  task committed and the rows they measurably changed, with a checkpoint the receipt log
+  signed for the quote, so each receipt is provable by inclusion
+  (`log.bundle(log.index_of(id), checkpoint)`); the recovery steps it took; and any
+  milestones the harness declares, which are carried as declared, not proven.
+- **An estimated completion cost**, by a named method: cost per declared milestone times
+  those remaining, or with none declared, the call that did not fit; plus a margin,
+  rounded up to the cent. `requested` is that, less what the scope has left.
+
+A quote is answered once, before it expires, by the guard that issued it: `grant()` or
+`decline()`, each a signed record naming the quote. A root scope is topped up in place, and
+if the money running out is what tripped it, its breaker is reset. A delegated scope cannot
+be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along what the old
+scope had left, and the task bills there from then on. A grant the parent cannot make
+changes nothing. A scope halted for any other reason is not quoted: `authorize()` raises
+AgentGov's `CircuitOpenError`, because more money is not the answer to a safety halt.
+
+A `RecoveryRuntime` given the guard quotes for its own reserve the same way: when a step
+will not fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up
+the grant. Quotes are operator evidence; nothing in them is sent to the agent.
+
 ## PostgreSQL
 
 `PostgresSubstrate` stages each plan in a `REPEATABLE READ` transaction and measures it with
@@ -848,6 +909,10 @@ against the shipped code, not inferred.
   next step. It cannot see a harness that bills a recovery call to another scope, runs a
   tool without calling `check_tool()`, or sends the model something other than
   `step.messages`.
+- **An extension estimate is arithmetic on what the harness declares.** Cost per declared
+  milestone times those remaining assumes the rest of the work costs what the done work
+  did; with none declared it prices only the call that did not fit. The receipts in a
+  quote's proof of work are verifiable; its milestones are the harness's claim.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
 - **Non-transactional sinks cannot be staged.** An email has no shadow. Those belong in a

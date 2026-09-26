@@ -62,7 +62,20 @@ Releases before 0.1.2 are described by their tags and commit history.
   `ILOK1/record/v1` prefix, fsynced, resumed and verified from its file, one writer per
   file. The runtime anchors every record into the AgentGov ledger, and `check_anchors()`
   finds a log truncated or rewritten after the fact.
-- `RecoveryError`, `RecoveryExhaustedError`, `ToolRevokedError`, `RecordIntegrityError`.
+- **Extension quotes (3.4).** `BudgetGuard.authorize()` checks a scope's balance under the
+  ledger's lock before AgentGov has to refuse, and when a call will not fit returns a signed
+  `ExtensionRequest` instead of tripping the breaker: spend to date from the ledger over the
+  task's scopes; proof of work from the ARC1 receipts of the task's committed plans, with a
+  checkpoint each is provable against, its recovery steps, and declared `Milestones`; and an
+  estimated completion cost by a named method, rounded up to the cent. `grant()` tops up a
+  root (resetting a breaker the money running out tripped) or delegates `{scope}/ext-N`
+  beside a delegated scope, carrying its leftover along; `decline()` records the refusal.
+  Each quote is answered once, before it expires. A scope halted for safety is never
+  quoted. A `RecoveryRuntime` with a guard quotes for its reserve
+  (`RecoveryExhaustedError.quote`) and takes a grant up with `extend()`. New module
+  `interlock.extension`.
+- `RecoveryError`, `RecoveryExhaustedError`, `ToolRevokedError`, `RecordIntegrityError`,
+  `ExtensionError`.
 - `EffectPlan.repair_of`, hashed only when set, so earlier plans keep their hashes;
   `RecordType.REPAIR_PROPOSED`; `LedgerAnchor.scope_path()`; `BlastRadius.limit`;
   `table_specs` and `enforces_table_access` on both substrates.

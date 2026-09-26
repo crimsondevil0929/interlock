@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 from agentgov import BudgetManager
 from agentgov.cognitive import CognitiveBreaker, CognitivePolicy
+from agentgov.core import Authorization
 from agentgov.exceptions import (
     AgentThrashingError,
     CircuitOpenError,
@@ -498,6 +499,7 @@ def test_each_step_holds_then_settles_in_the_recovery_scope() -> None:
     assert gov.available("support-agent/recovery") == Decimal("0.90")
     hold = step.record.body["hold"]
     assert hold == {
+        "scope": "support-agent/recovery",
         "authorization": str(step.authorization.authorization_id),
         "amount": "0.10000000",
     }
@@ -545,6 +547,7 @@ def test_the_halted_scope_stays_halted_while_recovery_spends() -> None:
     step = runtime.recover(thrash(), history(), max_tokens=4096)
     runtime.settle(step, "0.03")
     held = runtime.hold("0.05")
+    assert isinstance(held, Authorization)
     runtime.capture(held, "0.02")
     assert gov.is_halted("support-agent") and not gov.is_halted("support-agent/recovery")
     with pytest.raises(CircuitOpenError):
@@ -689,6 +692,7 @@ def test_a_restart_adopts_the_recovery_and_keeps_what_it_tightened(tmp_path: Pat
         "steps": 4,
         "unsettled": 1,
         "voided_holds": [str(unsettled.authorization.authorization_id)],
+        "billing": "support-agent/recovery",
     }
     with pytest.raises(ToolRevokedError):
         second.check_tool("lookup")
@@ -885,6 +889,7 @@ def refusal_recovers_through_its_repair(
 
     # The task's last call is billed to the recovery scope too.
     last = runtime.hold("0.10")
+    assert isinstance(last, Authorization)
     runtime.capture(last, "0.02")
     closed = runtime.close()
     assert closed is not None and Decimal(closed.body["spent"]) == Decimal("0.07")
