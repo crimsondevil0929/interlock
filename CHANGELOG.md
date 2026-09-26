@@ -129,6 +129,27 @@ Releases before 0.1.2 are described by their tags and commit history.
   top level. A substrate may expose `transaction_id(handle)`; the engine writes
   it into `COMMIT_INTENT` and passes it back to `resolve_intent(..., txid=)`.
 - `EffectDiff.column_total` and the value guards read `Decimal` values exactly.
+- **Release gates: crash consistency and tamper evidence.**
+  `tests/test_crash_consistency.py` starts a real process (`tests/crash_child.py`)
+  with the whole production stack on PostgreSQL (a durable escrow chain, a governed
+  ledger, a witnessed ARC1 receipt log) and kills it with `SIGKILL` at each step of a
+  commit: mid-stage, with the intent on disk, with `COMMIT` in flight on the server,
+  after it returned, after `COMMITTED`, after the reverse anchor, halfway through
+  writing a record, and halfway through recovery itself. It checks exactly what
+  recovery makes of each. The same rule holds for a hung client (bounded by the stage's
+  idle timeout), for a connection that loses the `COMMIT` or its reply, and for a soak
+  that kills at random instants and checks the whole history. That rule: the chain says
+  `COMMITTED` exactly when the database committed, `ABORTED` exactly when it rolled back,
+  and nothing while the server has not decided.
+  `tests/test_tamper_evidence.py` alters every part of the audit trail and checks that
+  verification fails at exactly that check, receipt, row or line: disclosed rows, a
+  receipt's row commitment (against forgers holding one key more at each step), a
+  committed row in the database, deleted checkpoints and receipts, forged receipt,
+  checkpoint and witness signatures, inclusion proofs, a settled cost, and the keyless
+  escrow chain against the signed receipts and ledger anchors that name it.
+- `CommitUnsettledError` (a `StageError`): the connection was lost with `COMMIT` in
+  flight and the server has not decided. The intent stays open, and the plan must not be
+  retried.
 
 ### Changed
 
@@ -139,6 +160,21 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ### Fixed
 
+- **A commit whose reply was lost was recorded as aborted.** When the connection dropped
+  with `COMMIT` in flight after PostgreSQL had committed, `execute()` appended `ABORTED`
+  ("stage failed") over the commit intent and raised `StageError`. The chain then said
+  the plan never happened while its rows and commit marker were in the database.
+  `reconcile-effects` flagged the stage as "committed in the database, recorded as
+  aborted", recovery could not repair it (the intent was closed), and a caller that
+  retried applied the plan twice. `PostgresSubstrate.commit` now tells a lost
+  connection (`CommitUnsettledError`) from an error the server sent (`StageError`, which
+  still means rolled back). The engine then reads the stage's commit marker at once:
+  committed, rolled back, or, while the server has not decided, left open with no
+  terminal record. Found by the new crash tests.
+- **Recovery blamed an undecided commit on a missing marker.** When the server was still
+  running a dead client's transaction, `recover()` logged that "no commit marker was
+  armed" and asked for a hand resolution, which could contradict what the server did
+  next. It now says the intent is not settled yet and will be asked again.
 - **Refusals leaked other tenants' data to the agent.** The reference stress
   harness returned each blocking violation's message to the model, which for
   `TenantDrawdownGuard` named other tenants and their exact totals; it also

@@ -992,6 +992,7 @@ reading the test suite.
 | The capture table, the commit marker and transaction control are out of a statement's reach | `substrate.SqliteSubstrate._authorize`, `substrate.FORBIDDEN_VERBS` |
 | PostgreSQL substrate: `REPEATABLE READ` stages, row triggers installed once, `statement_timeout` / `lock_timeout` / idle timeout per stage, the capture, marker and gates out of the stage role's reach, installation and grants verified at every stage | `postgres.PostgresSubstrate`, `postgres.install` |
 | A crashed PostgreSQL commit resolved from its marker and `pg_xact_status`, so a transaction the server still holds is not read as rolled back | `postgres.PostgresSubstrate.resolve_intent`, `engine.EscrowEngine.recover` |
+| A commit whose connection is lost with `COMMIT` in flight resolved from its marker at once: reported committed, rolled back, or left open with no terminal record (`CommitUnsettledError`) while the server has not decided | `postgres.PostgresSubstrate.commit`, `engine.EscrowEngine._settle_lost_commit` |
 | Unrecorded writes: every row change to an observed table outside a stage is logged (PostgreSQL trigger, SQLite journal), and every committed stage must be recorded as committed in a chain | `reconcile`, `interlock reconcile-effects` |
 | Refusals split by audience: operator evidence in full; agent feedback limited to the plan's own tables and tenants, bucketed counts, no aggregates, fixed templates, canonical order | `feedback`, `adjudication`, `engine.StageResult.feedback` |
 | Checked repair: candidate sub-plans staged in savepoints of one stage, each adjudicated by the same checkers and rolled back, with no monotonicity assumed; the proposal admitted only as recorded, only once, and re-adjudicated from scratch | `repair`, `engine.EscrowEngine.repair`, `engine.EscrowEngine._repair_claim` |
@@ -1032,7 +1033,9 @@ reading the test suite.
   at startup) resolves every open intent from the substrate's commit marker.
   An intent written before v0.1.2, or by a substrate without markers, carries
   no armed marker and stays open for an operator. The marker table is not
-  pruned.
+  pruned. `tests/test_crash_consistency.py` kills a real process with
+  `SIGKILL` at each step of a PostgreSQL commit, and at random instants, and
+  checks what recovery appends against the database.
 - **The pre-commit breaker check across processes.** In audit mode no lock
   spans the governor's database and the substrate, so a trip the governor
   commits between the check and the commit cannot be excluded. When one is
@@ -1042,6 +1045,9 @@ reading the test suite.
   governed AgentGov is one copy of its head outside the file; with receipts on,
   each adjudicated plan's signed receipt names its terminal record, under a key
   the file does not hold. The chain's own records stay unsigned.
+  `tests/test_tamper_evidence.py` rewrites the chain and checks that both catch
+  it, from the first rewritten record on. No packaged command checks those
+  links yet.
 
 ## Unimplemented
 
@@ -1050,7 +1056,10 @@ reading the test suite.
 - **`E1-5`: expiry to `ORPHANED`.** `StageState.ORPHANED` and
   `RecordType.ORPHANED` exist and are never assigned. Expiry raises
   `StageExpiredError` from `apply()` and `commit()`; there is no reaper, and
-  `diff()` does not check expiry at all.
+  `diff()` does not check expiry at all. A stage whose process dies before
+  its commit intent is left with no terminal record. It never committed (no
+  intent, no commit), and the crash tests check that its rows and marker are
+  absent, but nothing records it as orphaned or aborted.
 - **`COMPENSATED` and the compensation path.** `Compensation` is validated at
   admission and never executed. `RecordType.COMPENSATED` is never appended.
 - **`schema_allowlist`.** `TableAllowlist` operates on table names;
