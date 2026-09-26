@@ -126,6 +126,19 @@ class StageExpiredError(StageError):
     """
 
 
+class CommitUnsettledError(StageError):
+    """The connection was lost with ``COMMIT`` in flight, and the server has
+    not decided yet whether the stage committed.
+
+    **Do not retry the plan.** The server may still commit it. The chain holds
+    the stage's commit intent and no terminal record, and
+    :meth:`~interlock.EscrowEngine.recover` resolves it from the commit
+    marker once the server has decided. A commit whose reply alone was lost
+    is not this error: its marker already answers, and the plan is reported
+    as committed.
+    """
+
+
 # -- an invariant said no ---------------------------------------------------
 
 

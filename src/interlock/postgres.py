@@ -57,6 +57,7 @@ from interlock.cascade import (
     read_postgres_foreign_keys,
 )
 from interlock.exceptions import (
+    CommitUnsettledError,
     ForbiddenStatementError,
     InterlockError,
     StageConflictError,
@@ -724,9 +725,14 @@ class PostgresSubstrate:
     def commit(self, handle: StageHandle) -> CommitReceipt:
         """Make the staged work durable, with its ``interlock.stages`` row.
 
-        :raises StageError: If the transaction had already failed. PostgreSQL
-            answers ``COMMIT`` on a failed transaction with a rollback, not an
-            error, so the answer is checked.
+        :raises StageError: If the transaction had already failed, or the
+            server refused the commit. PostgreSQL answers ``COMMIT`` on a
+            failed transaction with a rollback, not an error, so the answer is
+            checked.
+        :raises CommitUnsettledError: If the connection was lost with the
+            ``COMMIT`` sent. The server may have committed, may still be
+            committing, or may have rolled back; no answer came back to say
+            which, so the stage's marker has to (see :meth:`resolve_intent`).
         """
         import psycopg
         from psycopg.pq import TransactionStatus
@@ -742,6 +748,13 @@ class PostgresSubstrate:
         try:
             cursor = conn.execute("COMMIT")
         except psycopg.Error as exc:
+            if conn.broken or conn.closed:
+                # No answer, as opposed to an error the server sent: that one
+                # means it rolled back. This means nothing either way.
+                raise CommitUnsettledError(
+                    f"stage {handle.stage_id}: the connection was lost with COMMIT sent, so "
+                    f"whether it committed is the server's to say ({exc})"
+                ) from exc
             raise StageError(f"commit failed: {exc}") from exc
         if cursor.statusmessage != "COMMIT":
             raise StageError(f"commit was answered with {cursor.statusmessage!r}")

@@ -24,7 +24,10 @@ Two properties hold by construction:
    left open and appends what actually happened. The intent records that the
    marker was armed; an intent without that (written before v0.1.2, or by a
    substrate with no marker) is left open for an operator rather than
-   resolved by guesswork.
+   resolved by guesswork. A commit whose answer is lost while the process
+   lives (the connection drops with ``COMMIT`` in flight) is put to the same
+   marker at once, and left open, not guessed, while the server has not
+   decided.
 
 Scope: adjudication reads the measured diff, and the diff covers exactly the
 tables the substrate was configured to observe. ``admit`` checks
@@ -57,6 +60,7 @@ from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.exceptions import (
     AdmissionError,
     AnchorError,
+    CommitUnsettledError,
     CyclicPlanError,
     ForbiddenStatementError,
     InterlockError,
@@ -329,6 +333,10 @@ class EscrowEngine:
         :raises InterlockError: And only ``InterlockError``, carrying
             ``feedback`` for the agent. Foreign exceptions from the AgentGov
             seam are translated at the anchor.
+        :raises CommitUnsettledError: If the connection was lost with
+            ``COMMIT`` in flight and the server has not decided yet. Do not
+            retry the plan: its intent stays open, and :meth:`recover`
+            settles it.
         """
         try:
             with self._repair_claim(plan) as repairs:
@@ -363,6 +371,7 @@ class EscrowEngine:
         judged: Adjudication | None = None
         state = StageState.STAGING
         committed = False
+        lost_reply = False
 
         try:
             self._record(
@@ -435,10 +444,19 @@ class EscrowEngine:
                         + (f"{_TXID}{txid}" if txid else "")
                         + (_MARKER_ARMED if armed else ""),
                     )
-                    self._substrate.commit(handle)
+                    try:
+                        self._substrate.commit(handle)
+                    except CommitUnsettledError as lost:
+                        # The COMMIT went out and no answer came back. The
+                        # marker says what the server did; it returns only
+                        # if the stage committed.
+                        self._settle_lost_commit(handle.stage_id, txid, armed=armed, lost=lost)
+                        lost_reply = True
                     committed = True
                 state = StageState.COMMITTED
                 note = f"{diff.blast_radius} rows committed"
+                if lost_reply:
+                    note += "; the commit's reply was lost; its commit marker is present"
                 raced = self._anchor.halted_after_commit(plan.scope_id) if self._anchor else ""
                 terminal = self._record(
                     RecordType.COMMITTED,
@@ -459,12 +477,12 @@ class EscrowEngine:
                 note=f"scope halted: {exc}{stamp if judged is not None else ''}",
                 best_effort=True,
             )
-        except Exception:
-            if committed:
-                # The effects are durable; only the record of them failed.
-                # Never write ABORTED over committed effects. The intent stays
-                # open on the chain, and recover() resolves it from the
-                # commit marker.
+        except Exception as exc:
+            if committed or isinstance(exc, CommitUnsettledError):
+                # The effects are durable, and only the record of them failed;
+                # or the server may still commit them. Never write ABORTED
+                # over either. The intent stays open on the chain, and
+                # recover() resolves it from the commit marker.
                 raise
             self._substrate.abort(handle)
             self._record(
@@ -869,7 +887,10 @@ class EscrowEngine:
         An intent this engine has in flight right now is skipped, and so is
         one the substrate cannot answer for: an intent written before v0.1.2
         (no marker was armed), or by a substrate without markers. Those stay
-        open and are logged, for an operator to resolve.
+        open and are logged, for an operator to resolve. So does one the
+        substrate cannot answer for *yet*: a client that died with its
+        ``COMMIT`` in flight leaves the server still committing, and an absent
+        marker then means nothing. It stays open, and a later run resolves it.
 
         :returns: The records appended, in chain order.
         :raises InterlockError: If the substrate or the chain cannot be read
@@ -882,9 +903,26 @@ class EscrowEngine:
             if stage_id is None or stage_id in self._inflight:
                 continue
             outcome: bool | None = None
+            answerable = False
             if callable(resolve) and intent.note.endswith(_MARKER_ARMED):
+                answerable = True
                 txid = _recorded_txid(intent.note)
                 outcome = resolve(stage_id, txid=txid) if txid else resolve(stage_id)
+            if outcome is None and answerable:
+                # The marker was armed, and the substrate could not say yet:
+                # the server is still running the transaction (a dead
+                # client's COMMIT can still land), or the marker was removed.
+                # Either way the answer is the substrate's to give, not ours.
+                logger.warning(
+                    "commit intent for plan %s (stage %s, record %d) is not settled yet; "
+                    "recovery will ask again on its next run. The substrate cannot say "
+                    "whether the stage committed (see its warning): resolving it by hand "
+                    "now could contradict what the server does next",
+                    intent.plan_id,
+                    stage_id,
+                    intent.sequence,
+                )
+                continue
             if outcome is None:
                 logger.warning(
                     "commit intent for plan %s (stage %s, record %d) cannot be resolved: "
@@ -951,6 +989,42 @@ class EscrowEngine:
             agentgov_sequence=point.sequence,
             note=note,
         )
+
+    def _settle_lost_commit(
+        self,
+        stage_id: uuid.UUID,
+        txid: str | None,
+        *,
+        armed: bool,
+        lost: CommitUnsettledError,
+    ) -> None:
+        """Ask the commit marker what the server did with a commit whose
+        answer never arrived.
+
+        Returns only when the stage committed. Called right away, so a server
+        still committing (or not yet done ending the session) is common;
+        that answer is "not yet", and :meth:`recover` asks again later.
+
+        :raises StageError: If the marker is absent and the server has ended
+            the transaction: it rolled back.
+        :raises CommitUnsettledError: ``lost``, when the substrate cannot say
+            yet, has no marker, or cannot be reached.
+        """
+        resolve = getattr(self._substrate, "resolve_intent", None)
+        if not armed or not callable(resolve):
+            raise lost
+        outcome: bool | None = None
+        try:
+            outcome = resolve(stage_id, txid=txid) if txid else resolve(stage_id)
+        except InterlockError:
+            logger.warning("stage %s: its commit marker could not be read", stage_id, exc_info=True)
+        if outcome is None:
+            raise lost
+        if not outcome:
+            raise StageError(
+                f"commit failed: the connection was lost and stage {stage_id} left no "
+                f"commit marker; the server rolled it back"
+            ) from lost
 
     def _observe(self, *, best_effort: bool) -> AnchorPoint:
         if self._anchor is None:
