@@ -97,6 +97,7 @@ from interlock import (
     TruncationGuard,
 )
 from interlock.exceptions import InterlockError, PlanError
+from interlock.feedback import AgentFeedback
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -556,23 +557,27 @@ class GuardedSql:
             ),
         )
 
+        # What goes back to the model is the agent's feedback, never the
+        # operator's record: a guard's message names other tenants and exact
+        # totals, and a database error can quote another row. The attempt log
+        # below is the operator's and keeps everything.
         try:
             result = engine.execute(plan)
         except PlanError as exc:
             attempt.outcome = "refused_admission"
             attempt.detail = str(exc)
             self.attempts.append(attempt)
-            return f"REFUSED at admission: {exc}"
+            return _render(exc.feedback, "REFUSED at admission")
         except InterlockError as exc:
             attempt.outcome = "stage_error"
             attempt.detail = f"{type(exc).__name__}: {exc}"
             self.attempts.append(attempt)
-            return f"STAGE ERROR: {exc}"
+            return _render(exc.feedback, "STAGE ERROR")
         except sqlite3.Error as exc:
             attempt.outcome = "db_error"
             attempt.detail = str(exc)
             self.attempts.append(attempt)
-            return f"DATABASE ERROR: {exc}"
+            return "DATABASE ERROR: a statement failed in the database; nothing changed."
 
         if result.diff is not None:
             attempt.blast_radius = result.diff.blast_radius
@@ -583,25 +588,17 @@ class GuardedSql:
             attempt.outcome = "committed"
             attempt.detail = f"{attempt.blast_radius} rows"
             self.attempts.append(attempt)
-            return (
-                f"OK. Committed. Measured {attempt.blast_radius} row mutation(s) across "
-                f"{sorted(attempt.tables)}."
-            )
+            return _render(result.feedback, "OK")
 
         attempt.outcome = "blocked"
         attempt.blocked_by = result.blocked_by
-        reasons = (
+        attempt.detail = (
             "; ".join(v.message for v in result.verdict.blocking)
             if result.verdict is not None
             else "unknown"
         )
-        attempt.detail = reasons
         self.attempts.append(attempt)
-        return (
-            f"BLOCKED and rolled back. The database is unchanged. The staged transaction "
-            f"measured {attempt.blast_radius} row mutation(s) across {attempt.tenants} "
-            f"tenant(s) in {sorted(attempt.tables)}. Refused by: {reasons}"
-        )
+        return _render(result.feedback, "BLOCKED")
 
     def _kind_for(self, payload: dict[str, Any], info: Classified) -> EffectKind:
         """Whether to believe the model about what kind of statement this is."""
@@ -612,6 +609,13 @@ class GuardedSql:
             if candidate.value == claimed:
                 return candidate
         return EffectKind.UPDATE
+
+
+def _render(feedback: object, head: str) -> str:
+    """The model's view of an outcome: its agent feedback, rendered."""
+    if isinstance(feedback, AgentFeedback):
+        return f"{head}. {feedback.render()}"
+    return f"{head}. Nothing changed."
 
 
 # --------------------------------------------------------------------------

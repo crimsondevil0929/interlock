@@ -11,6 +11,30 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ### Added
 
+- **Two-audience refusals (3.1).** Every `StageResult` carries `feedback`, what
+  the agent may be told, and a refused one carries `refusal`, split into the
+  operator's `evidence` and that feedback; every error `execute()` raises carries
+  `exc.feedback`. Feedback names only the plan's own tables and declared tenants,
+  buckets row counts, and carries no aggregate: no column total, no fraction of
+  one, no count of other tenants. Its text comes from fixed templates, and its
+  constraints come in a canonical order. Checkers offer a typed `FeedbackHint`
+  per violation, sanitized against the plan; a custom checker's numbers and
+  columns are dropped. `ForbiddenStatementError` gains structured `reason` and
+  `table`, so errors map to feedback by type, never by message. New modules
+  `interlock.feedback` and `interlock.adjudication`. Property tests (hypothesis)
+  check that renaming what the plan did not name, scaling every amount, or
+  changing other tenants' values never changes the feedback.
+
+### Fixed
+
+- **Refusals leaked other tenants' data to the agent.** The reference stress
+  harness returned each blocking violation's message to the model, which for
+  `TenantDrawdownGuard` named other tenants and their exact totals; it also
+  returned the count of tenants touched and the measured tables. It now returns
+  the agent feedback, and the operator's record stays in its attempt log.
+
+### Added
+
 - **The cascade check (2.1).** New `interlock.cascade` reads the foreign-key
   graph (`PRAGMA foreign_key_list` on SQLite, `pg_constraint` on PostgreSQL)
   and works out every table a `DELETE` or `UPDATE` on an observed table can

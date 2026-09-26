@@ -68,6 +68,7 @@ from interlock.exceptions import (
     SubstrateUnavailableError,
     UncompensatableEffectError,
 )
+from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEvidence, Refusal
 from interlock.invariants import (
     BlastRadius,
     ColumnValueGuard,
@@ -103,6 +104,7 @@ __version__ = "0.1.2"
 
 __all__ = [
     "AdmissionError",
+    "AgentFeedback",
     "AnchorError",
     "AnchorPoint",
     "BlastRadius",
@@ -111,6 +113,7 @@ __all__ = [
     "ChainIntegrityError",
     "ColumnValueGuard",
     "Compensation",
+    "ConstraintFeedback",
     "CyclicPlanError",
     "Effect",
     "EffectDiff",
@@ -129,11 +132,13 @@ __all__ = [
     "LedgerUnverifiedError",
     "NoDelete",
     "NoSchemaChange",
+    "OperatorEvidence",
     "PlanBuilder",
     "PlanError",
     "PlanId",
     "PostgresSubstrate",
     "RecordType",
+    "Refusal",
     "RowDelta",
     "ScopeHaltedError",
     "Severity",

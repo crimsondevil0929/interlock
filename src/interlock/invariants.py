@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
+from interlock.feedback import FeedbackHint, Guidance
 from interlock.types import (
     EffectDiff,
     EffectKind,
@@ -30,6 +31,7 @@ from interlock.types import (
 )
 
 __all__ = [
+    "BUILT_IN_CHECKERS",
     "BlastRadius",
     "ColumnValueGuard",
     "InvariantChecker",
@@ -56,6 +58,14 @@ class InvariantChecker(Protocol):
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
         """Evaluate. An empty tuple means satisfied."""
         ...
+
+
+# A checker may also implement ``hint(plan, diff, violation) -> FeedbackHint``:
+# what the agent may be told about one of its violations. The hint is
+# sanitized against the plan before the agent sees it (see
+# :mod:`interlock.feedback`), and a custom checker's numbers are dropped. A
+# checker without one is reported to the agent as an operator constraint,
+# with nothing else.
 
 
 class BlastRadius:
@@ -94,6 +104,16 @@ class BlastRadius:
             ),
         )
 
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        return FeedbackHint(
+            kind=Guidance.ROW_LIMIT,
+            tables=tuple(sorted(diff.tables_touched)),
+            measured=diff.blast_radius,
+            limit=self._limit,
+        )
+
 
 class TenantIsolation:
     """Refuse a plan that reaches across tenants.
@@ -128,6 +148,17 @@ class TenantIsolation:
             ),
         )
 
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # The tenants touched go in for the sanitizer to cut down to the ones
+        # the plan declared; how many there were never leaves this method.
+        return FeedbackHint(
+            kind=Guidance.TENANT_SCOPE,
+            tenants=tuple(sorted(diff.tenant_ids)),
+            limit=self._max_tenants,
+        )
+
 
 class TableAllowlist:
     """Restrict the tables a plan may touch.
@@ -160,6 +191,13 @@ class TableAllowlist:
                     "allowed": ",".join(sorted(self._allowed)),
                 },
             ),
+        )
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        return FeedbackHint(
+            kind=Guidance.TABLE_SCOPE, tables=tuple(sorted(diff.tables_touched - self._allowed))
         )
 
 
@@ -199,6 +237,15 @@ class NoDelete:
                 ),
                 evidence={"tables": ",".join(offenders), "rows": str(count)},
             ),
+        )
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        offenders = {d.table for d in diff.deltas if d.operation == "delete"} - self._granted
+        count = sum(1 for d in diff.deltas if d.operation == "delete" and d.table in offenders)
+        return FeedbackHint(
+            kind=Guidance.NO_DELETE, tables=tuple(sorted(offenders)), measured=count
         )
 
 
@@ -251,6 +298,19 @@ class ColumnValueGuard:
                     "drop_fraction": f"{drop:.4f}",
                 },
             ),
+        )
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # The limit, which is policy. Never the totals or the fall, which are
+        # the data: from its own change and the fall an agent could work out
+        # the table's total.
+        return FeedbackHint(
+            kind=Guidance.VALUE_DROP,
+            tables=(self._table,),
+            columns=(self._column,),
+            percent=_percent(self._max_drop),
         )
 
 
@@ -313,6 +373,26 @@ class TenantDrawdownGuard:
             )
         return tuple(violations)
 
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        tenant = violation.evidence.get("tenant", "")
+        if tenant == "<untenanted>":
+            # Rows with no tenant are one bucket: a table-level fall.
+            return FeedbackHint(
+                kind=Guidance.VALUE_DROP,
+                tables=(self._table,),
+                columns=(self._column,),
+                percent=_percent(self._max_drop),
+            )
+        return FeedbackHint(
+            kind=Guidance.TENANT_DRAWDOWN,
+            tables=(self._table,),
+            columns=(self._column,),
+            tenants=(tenant,),
+            percent=_percent(self._max_drop),
+        )
+
 
 class TruncationGuard:
     """Refuse a diff that hit the row cap.
@@ -339,6 +419,11 @@ class TruncationGuard:
                 evidence={"measured_rows": str(diff.blast_radius)},
             ),
         )
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        return FeedbackHint(kind=Guidance.TRUNCATED, measured=diff.blast_radius)
 
 
 class StatedFootprint:
@@ -389,6 +474,16 @@ class StatedFootprint:
             ),
         )
 
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # ``limit`` carries the plan's own stated count for this kind.
+        return FeedbackHint(
+            kind=Guidance.STATED_FOOTPRINT,
+            measured=diff.blast_radius,
+            limit=plan.stated_rows,
+        )
+
 
 class NoSchemaChange:
     """Refuse effects declared as DDL.
@@ -418,6 +513,11 @@ class NoSchemaChange:
             ),
         )
 
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        return FeedbackHint(kind=Guidance.SCHEMA_CHANGE)
+
 
 def default_checkers(
     *,
@@ -441,3 +541,25 @@ def default_checkers(
         NoSchemaChange(),
         StatedFootprint(),
     )
+
+
+def _percent(fraction: Decimal) -> int:
+    """A configured fractional limit as a whole percentage, for feedback."""
+    return int((fraction * 100).to_integral_value())
+
+
+BUILT_IN_CHECKERS: frozenset[type] = frozenset(
+    {
+        BlastRadius,
+        TenantIsolation,
+        TableAllowlist,
+        NoDelete,
+        ColumnValueGuard,
+        TenantDrawdownGuard,
+        TruncationGuard,
+        StatedFootprint,
+        NoSchemaChange,
+    }
+)
+"""The checkers whose feedback hints are trusted with numbers. Exact types:
+a subclass can override ``hint`` and is treated like any custom checker."""

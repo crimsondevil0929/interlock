@@ -65,7 +65,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
-from interlock.substrate import TableSpec, leading_verb
+from interlock.substrate import TableSpec, _verb_reason, leading_verb
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -646,7 +646,9 @@ class PostgresSubstrate:
         self._assert_live(handle)
         refusal = self.reject_reason(effect)
         if refusal is not None:
-            raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
+            raise ForbiddenStatementError(
+                f"effect {effect.effect_id!r} refused: {refusal}", reason=_verb_reason(effect)
+            )
         try:
             # Re-asserted every time: a SELECT can call set_config() and lift
             # them, and a stage bound that the agent can lift is not a bound.
@@ -1038,16 +1040,20 @@ class PostgresSubstrate:
             else:
                 reason = f"{operation.upper()} on {table!r} is not stageable"
             return ForbiddenStatementError(
-                f"{who} refused: {reason}. PostgreSQL rolled the statement back, cascade included"
+                f"{who} refused: {reason}. PostgreSQL rolled the statement back, cascade included",
+                reason="cascade" if operation in ("delete", "update") else "statement_kind",
+                table=table or None,
             )
         if sqlstate == _TAMPERED:
             return ForbiddenStatementError(
-                f"{who} refused: {exc}. The stage marker is set by the substrate alone"
+                f"{who} refused: {exc}. The stage marker is set by the substrate alone",
+                reason="protected",
             )
         if sqlstate == _PRIVILEGE:
             return ForbiddenStatementError(
                 f"{who} refused by the database: {exc}. The stage role's grants are the "
-                f"table boundary on PostgreSQL"
+                f"table boundary on PostgreSQL",
+                reason="privilege",
             )
         if sqlstate in _CONFLICTS:
             return StageConflictError(f"{who} lost to a concurrent writer: {exc}")
@@ -1055,7 +1061,8 @@ class PostgresSubstrate:
             return StageExpiredError(f"{who} ran past the stage's {self._stage_seconds}s bound")
         if "multiple commands" in str(exc):
             return ForbiddenStatementError(
-                f"{who} refused: one effect is one statement, and this carries several"
+                f"{who} refused: one effect is one statement, and this carries several",
+                reason="multiple_statements",
             )
         return StageError(f"{who} failed: {exc}")
 

@@ -63,6 +63,9 @@ dev = [
     # The PostgreSQL substrate's integration tests. The runtime dependency is
     # the `postgres` extra; this puts the driver in every dev environment.
     "psycopg[binary]>=3.2",
+    # Property tests: the zero-leak guarantee on agent feedback is a property
+    # over every plan and diff, not a list of examples.
+    "hypothesis>=6.100",
     # scripts/live_stress_test.py only. Not a runtime dependency: nothing in
     # src/ imports it, and the library never talks to a model provider.
     "anthropic>=1.0.0",

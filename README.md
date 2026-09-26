@@ -286,6 +286,56 @@ writes, and the statement goes somewhere else entirely. The substrate denies
 the write inside SQLite before it executes, and it surfaces as a
 `ForbiddenStatementError` like everything else on this path.
 
+### Refusals: two audiences
+
+A refusal has two readers, and they must not get the same record. The operator
+needs everything: which tenants the plan reached, the exact totals, the checker's
+own message. The agent must get none of it. A guard's message is data about other
+tenants, and an injected agent reading refusals is reading a side channel.
+
+So every result carries both. `StageResult.refusal.evidence` is the operator's
+record. `StageResult.feedback` (and `exc.feedback` on any error `execute` raises)
+is what the agent may be told:
+
+```python
+from interlock import EscrowRuntime, TableSpec, TenantIsolation
+
+runtime = EscrowRuntime(
+    "prod.db",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    scope_id="support-agent",
+    checkers=[TenantIsolation(1)],
+)
+result = runtime.execute_sql("UPDATE orders SET total = 0", table="orders", tenant_id="acme")
+
+assert not result.committed
+print(result.feedback.render())  # for the agent
+# The plan was refused and rolled back; nothing changed.
+# - tenant_isolation: the plan changed rows of more tenants than one plan may
+#   (at most 1); its declared tenants are acme. Confine every statement to its
+#   declared tenants.
+assert "globex" in result.refusal.evidence.tenants_touched  # for the operator
+```
+
+Feedback is built so that it cannot carry more than the agent already knew:
+
+- it names only tables the plan's effects name, and tenants they declare. Anything
+  else is "a table the plan does not name", never named or counted;
+- row counts are buckets (`0`, `1`, `2-9`, `10-99`, `100-999`, `1000+`);
+- it carries no aggregate at all: no column total, no fraction of one. The only other
+  number is a built-in checker's configured limit, as a whole percentage;
+- its text comes from fixed templates, and its constraints come in a canonical order,
+  never the order the violations came in.
+
+A checker contributes a typed hint per violation, and the hint is sanitized against the
+plan field by field. A custom checker's hint can name the plan's own tables and tenants
+and pick a kind of guidance. Its numbers and columns are dropped, because nothing can
+tell a row count from a total. Errors are mapped by type, never by message, since a
+database error can quote another tenant's row. Property tests check, over arbitrary
+multi-tenant diffs and adversarial checkers, that renaming anything the plan did not
+name, scaling every amount, or changing other tenants' values leaves the feedback
+byte-identical (see `tests/test_feedback.py`).
+
 ## AgentGov integration
 
 Interlock imports [`agentgov`](https://github.com/crimsondevil0929/agentgov) as a

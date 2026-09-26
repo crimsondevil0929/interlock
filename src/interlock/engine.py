@@ -42,9 +42,9 @@ import uuid
 from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from decimal import Decimal
 
+from interlock.adjudication import Adjudication, adjudicate
 from interlock.anchor import AnchorPoint, LedgerAnchor
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
@@ -58,14 +58,13 @@ from interlock.exceptions import (
     ScopeHaltedError,
     UncompensatableEffectError,
 )
+from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedback_for_error
 from interlock.invariants import InvariantChecker
-from interlock.substrate import ShadowSubstrate
+from interlock.substrate import ShadowSubstrate, _verb_reason
 from interlock.types import (
     EffectDiff,
     EffectOutcome,
     EffectPlan,
-    InvariantViolation,
-    Severity,
     StageHandle,
     StageState,
     Verdict,
@@ -111,12 +110,26 @@ class StageResult:
     chain_head: str
     anchored_to: str
     committed: bool
+    feedback: AgentFeedback | None = None
+    """What the agent may be told. The diff and verdict above are the
+    operator's: they name other tenants and exact totals. See
+    :mod:`interlock.feedback`."""
 
     @property
     def blocked_by(self) -> tuple[str, ...]:
         if self.verdict is None:
             return ()
         return tuple(v.invariant for v in self.verdict.blocking)
+
+    @property
+    def refusal(self) -> Refusal | None:
+        """The refusal split by audience, or ``None`` when the plan committed."""
+        if self.committed or self.feedback is None:
+            return None
+        return Refusal(
+            evidence=OperatorEvidence.of(self.plan, diff=self.diff, verdict=self.verdict),
+            feedback=self.feedback,
+        )
 
 
 class EscrowEngine:
@@ -199,7 +212,10 @@ class EscrowEngine:
             for effect in plan.effects:
                 refusal = veto(effect)
                 if refusal is not None:
-                    raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
+                    raise ForbiddenStatementError(
+                        f"effect {effect.effect_id!r} refused: {refusal}",
+                        reason=_verb_reason(effect),
+                    )
 
         capabilities = self._substrate.capabilities
         for effect in plan.effects:
@@ -251,6 +267,8 @@ class EscrowEngine:
 
         A refusal is a normal return with ``committed=False``, not an
         exception. Use :meth:`execute_or_raise` when a refusal should raise.
+        Either way, what the agent may be told is on the result's, or the
+        exception's, ``feedback``.
 
         :param settle_cost: Overrides the engine's configured settle cost for
             this plan only. What a plan cost to produce is a property of the
@@ -259,9 +277,18 @@ class EscrowEngine:
             ``None`` keeps the configured value.
         :returns: The outcome, including the diff and verdict, whether or not
             the plan committed.
-        :raises InterlockError: And only ``InterlockError``. Foreign
-            exceptions from the AgentGov seam are translated at the anchor.
+        :raises InterlockError: And only ``InterlockError``, carrying
+            ``feedback`` for the agent. Foreign exceptions from the AgentGov
+            seam are translated at the anchor.
         """
+        try:
+            return self._execute(plan, settle_cost=settle_cost)
+        except InterlockError as exc:
+            if exc.feedback is None:
+                exc.feedback = feedback_for_error(plan, exc)
+            raise
+
+    def _execute(self, plan: EffectPlan, *, settle_cost: Decimal | str | None) -> StageResult:
         cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
         if cost < 0:
             raise PlanError(f"settle_cost cannot be negative, got {cost}")
@@ -272,6 +299,7 @@ class EscrowEngine:
         outcomes: list[EffectOutcome] = []
         diff: EffectDiff | None = None
         verdict: Verdict | None = None
+        judged: Adjudication | None = None
         state = StageState.STAGING
         committed = False
 
@@ -296,7 +324,8 @@ class EscrowEngine:
                 note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)",
             )
 
-            verdict = self._adjudicate(plan, diff, handle)
+            judged = adjudicate(plan, diff, self._checkers, stage_id=handle.stage_id)
+            verdict = judged.verdict
             blocked = ",".join(v.invariant for v in verdict.blocking)
             self._record(
                 RecordType.VERDICT,
@@ -400,6 +429,7 @@ class EscrowEngine:
             chain_head=head,
             anchored_to=self._reverse_anchor(plan, head, cost),
             committed=committed,
+            feedback=judged.feedback(committed=committed) if judged is not None else None,
         )
 
     def execute_or_raise(
@@ -408,8 +438,13 @@ class EscrowEngine:
         """As :meth:`execute`, but raise :class:`AdmissionError` on refusal."""
         result = self.execute(plan, settle_cost=settle_cost)
         if result.verdict is not None and not result.verdict.admitted:
+            # The message is the operator's; the agent gets error.feedback.
             reasons = "; ".join(v.message for v in result.verdict.blocking)
-            raise AdmissionError(f"plan {plan.plan_id} refused: {reasons}", verdict=result.verdict)
+            error = AdmissionError(
+                f"plan {plan.plan_id} refused: {reasons}", verdict=result.verdict
+            )
+            error.feedback = result.feedback
+            raise error
         return result
 
     # -- recovery -----------------------------------------------------------
@@ -479,36 +514,6 @@ class EscrowEngine:
         return tuple(resolved)
 
     # -- internals ----------------------------------------------------------
-
-    def _adjudicate(self, plan: EffectPlan, diff: EffectDiff, handle: StageHandle) -> Verdict:
-        """Run every checker and union the violations.
-
-        A checker that raises becomes a blocking violation: a predicate that
-        did not finish has not approved anything.
-        """
-        violations: list[InvariantViolation] = []
-        names: list[str] = []
-        for checker in self._checkers:
-            names.append(checker.name)
-            try:
-                violations.extend(checker.check(plan, diff))
-            except Exception as exc:  # a broken checker must never approve
-                logger.exception("invariant %s raised", checker.name)
-                violations.append(
-                    InvariantViolation(
-                        invariant=checker.name,
-                        severity=Severity.BLOCKING,
-                        message=f"checker raised {type(exc).__name__}: {exc}",
-                    )
-                )
-        return Verdict(
-            plan_id=plan.plan_id,
-            stage_id=handle.stage_id,
-            diff_hash=diff.content_hash(),
-            decided_at=datetime.now(UTC),
-            checkers_run=tuple(names),
-            violations=tuple(violations),
-        )
 
     def _record(
         self,

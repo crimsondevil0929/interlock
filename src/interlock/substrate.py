@@ -378,7 +378,7 @@ class SqliteSubstrate:
         self._markers = commit_markers
         self._internal = False
         self._target: str | None = None
-        self._denied: str | None = None
+        self._denied: tuple[str, str, str | None] | None = None
         self._report: CascadeReport | None = None
         self._report_version: int | None = None
         self._conn: sqlite3.Connection | None = None
@@ -546,7 +546,9 @@ class SqliteSubstrate:
         self._assert_live(handle)
         refusal = self.reject_reason(effect)
         if refusal is not None:
-            raise ForbiddenStatementError(f"effect {effect.effect_id!r} refused: {refusal}")
+            raise ForbiddenStatementError(
+                f"effect {effect.effect_id!r} refused: {refusal}", reason=_verb_reason(effect)
+            )
         self._denied = None
         self._target = None
         try:
@@ -555,14 +557,17 @@ class SqliteSubstrate:
             denied = self._denied
             self._denied = None
             if denied is not None:
+                text, reason, table = denied
                 raise ForbiddenStatementError(
-                    f"effect {effect.effect_id!r} refused: {denied}"
+                    f"effect {effect.effect_id!r} refused: {text}", reason=reason, table=table
                 ) from exc
             if _SENTINEL in str(exc):
                 raise ForbiddenStatementError(
                     f"effect {effect.effect_id!r} refused: {exc}. A foreign-key action "
                     f"reached a table the cascade check gates; the statement was "
-                    f"aborted before the row changed"
+                    f"aborted before the row changed",
+                    reason="cascade",
+                    table=self._target,
                 ) from exc
             if "no name" in str(exc) and effect.parameters:
                 raise StageError(
@@ -817,12 +822,14 @@ class SqliteSubstrate:
             return self._deny(
                 f"statement attempts transaction control ({arg1 or 'SAVEPOINT'}). The "
                 f"stage's transaction belongs to the substrate: a COMMIT inside it makes "
-                f"the effects durable before they are measured or adjudicated"
+                f"the effects durable before they are measured or adjudicated",
+                "transaction_control",
             )
         if action in _REACH_ACTIONS:
             return self._deny(
                 f"statement attempts {_REACH_ACTIONS[action]} on {arg1 or ''!r}, which "
-                f"reaches outside the database being measured"
+                f"reaches outside the database being measured",
+                "reach",
             )
         if action not in _WRITE_ACTIONS:
             return sqlite3.SQLITE_OK
@@ -837,7 +844,8 @@ class SqliteSubstrate:
                 return sqlite3.SQLITE_OK
             return self._deny(
                 f"statement attempts {verb} on the capture table {table!r}, which "
-                f"holds the stage's measurement"
+                f"holds the stage's measurement",
+                "protected",
             )
         if key == JOURNAL_TABLE:
             # Written by the journal triggers alone, like the capture table:
@@ -847,11 +855,13 @@ class SqliteSubstrate:
                 return sqlite3.SQLITE_OK
             return self._deny(
                 f"statement attempts {verb} on the journal table {table!r}, which "
-                f"only the journal triggers write"
+                f"only the journal triggers write",
+                "protected",
             )
         if key == STAGE_JOURNAL_TABLE:
             return self._deny(
-                f"statement attempts {verb} on {table!r}, which only the substrate writes"
+                f"statement attempts {verb} on {table!r}, which only the substrate writes",
+                "protected",
             )
         if key == _MARKER_TABLE:
             # Written by commit() alone. A statement the agent authored that
@@ -859,7 +869,8 @@ class SqliteSubstrate:
             # committed.
             return self._deny(
                 f"statement attempts {verb} on the commit-marker table {table!r}, "
-                f"which only the substrate writes"
+                f"which only the substrate writes",
+                "protected",
             )
         # sqlite_* internal tables are touched by the engine itself, never by
         # a statement the agent authored; denying them breaks SQLite.
@@ -869,13 +880,15 @@ class SqliteSubstrate:
         gate = self._report.gates().get(key) if self._report is not None else None
         if gate is not None and self._report is not None:
             if action == sqlite3.SQLITE_DELETE and gate.delete:
-                return self._deny(self._report.refusal(table, "delete"))
+                return self._deny(self._report.refusal(table, "delete"), "cascade", table)
             if action == sqlite3.SQLITE_UPDATE:
                 column = (arg2 or "").lower()
                 if gate.blocks_update_of(column) or (
                     column in _ROWID_ALIASES and (gate.update_columns or gate.update_any)
                 ):
-                    return self._deny(self._report.refusal(table, "update", arg2 or ""))
+                    return self._deny(
+                        self._report.refusal(table, "update", arg2 or ""), "cascade", table
+                    )
 
         if trigger_name is None:
             # SQLite has no multi-table DML: the first unnamed write in a
@@ -890,7 +903,9 @@ class SqliteSubstrate:
                     f"statement's foreign-key action attempts {verb} on {table!r}, "
                     f"which this substrate does not observe; the rows it changed there "
                     f"would not appear in the diff. Observe the table, or accept the "
-                    f"unmeasured write with acknowledge_cascades"
+                    f"unmeasured write with acknowledge_cascades",
+                    "cascade",
+                    self._target,
                 )
 
         if key in self._folded or not self._enforce:
@@ -899,14 +914,16 @@ class SqliteSubstrate:
             f"statement attempts {verb} on {table!r}, which this substrate does not "
             f"observe. A write there would execute, commit, and measure as an empty "
             f"diff that every invariant passes. Observed tables: "
-            f"{', '.join(sorted(self._by_name)) or '<none>'}"
+            f"{', '.join(sorted(self._by_name)) or '<none>'}",
+            "unobserved_table",
+            table,
         )
 
-    def _deny(self, reason: str) -> int:
+    def _deny(self, text: str, reason: str, table: str | None = None) -> int:
         # The first denial is the one that names the statement's real problem;
         # SQLite may call back again while unwinding the prepare.
         if self._denied is None:
-            self._denied = reason
+            self._denied = (text, reason, table)
         return sqlite3.SQLITE_DENY
 
     def _install_capture(self, conn: sqlite3.Connection) -> None:
@@ -970,3 +987,15 @@ def _journal_position(conn: sqlite3.Connection) -> int | None:
         "SELECT seq FROM main.sqlite_sequence WHERE name = ?", (JOURNAL_TABLE,)
     ).fetchone()
     return int(row[0]) if row is not None else 0
+
+
+_CONTROL_VERBS = frozenset({"begin", "commit", "end", "rollback", "savepoint", "release"})
+
+
+def _verb_reason(effect: Effect) -> str:
+    """The structured reason for a refusal read from a statement's leading verb."""
+    return (
+        "transaction_control"
+        if leading_verb(effect.statement) in _CONTROL_VERBS
+        else ("statement_kind")
+    )

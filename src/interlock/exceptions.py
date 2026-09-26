@@ -31,7 +31,16 @@ __all__ = [
 
 
 class InterlockError(Exception):
-    """Base for every error this package raises."""
+    """Base for every error this package raises.
+
+    :ivar feedback: What the agent may be told about this error, set by
+        ``EscrowEngine.execute`` before it raises. An
+        :class:`~interlock.feedback.AgentFeedback`. Send that to the agent,
+        never ``str(exc)``, which is written for the operator and can quote
+        other tenants' data.
+    """
+
+    feedback: object | None = None
 
 
 # -- the plan is wrong ------------------------------------------------------
@@ -55,7 +64,18 @@ class ForbiddenStatementError(PlanError):
 
     Raised from admission and again from ``apply``. The second is not
     redundant: a caller using a substrate directly never reaches admission.
+
+    :ivar reason: What kind of refusal, for code to branch on:
+        ``"statement_kind"``, ``"unobserved_table"``, ``"privilege"``,
+        ``"cascade"``, ``"protected"``, ``"transaction_control"``,
+        ``"reach"`` or ``"multiple_statements"``.
+    :ivar table: The table the refusal is about, when there is one.
     """
+
+    def __init__(self, message: str, *, reason: str = "statement_kind", table: str | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.table = table
 
 
 class UncompensatableEffectError(PlanError):

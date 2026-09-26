@@ -993,6 +993,7 @@ reading the test suite.
 | PostgreSQL substrate: `REPEATABLE READ` stages, row triggers installed once, `statement_timeout` / `lock_timeout` / idle timeout per stage, the capture, marker and gates out of the stage role's reach, installation and grants verified at every stage | `postgres.PostgresSubstrate`, `postgres.install` |
 | A crashed PostgreSQL commit resolved from its marker and `pg_xact_status`, so a transaction the server still holds is not read as rolled back | `postgres.PostgresSubstrate.resolve_intent`, `engine.EscrowEngine.recover` |
 | Unrecorded writes: every row change to an observed table outside a stage is logged (PostgreSQL trigger, SQLite journal), and every committed stage must be recorded as committed in a chain | `reconcile`, `interlock reconcile-effects` |
+| Refusals split by audience: operator evidence in full; agent feedback limited to the plan's own tables and tenants, bucketed counts, no aggregates, fixed templates, canonical order | `feedback`, `adjudication`, `engine.StageResult.feedback` |
 | `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
