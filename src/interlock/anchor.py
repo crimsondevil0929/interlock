@@ -275,6 +275,21 @@ class LedgerAnchor:
             f"after this commit, and was not visible before it"
         )
 
+    def scope_path(self, scope_id: str) -> tuple[str, ...]:
+        """The AgentGov scope path from the root down to ``scope_id``.
+
+        ``(scope_id,)`` when no ledger is attached or AgentGov does not know
+        the scope: a receipt names at least the scope the plan claimed.
+        """
+        source = self._audit or self._governed
+        if source is None:
+            return (scope_id,)
+        try:
+            with _barrier("a scope-path read"):
+                return tuple(reversed(source.ancestry(scope_id)))
+        except AnchorError:
+            return (scope_id,)
+
     def assert_scope_known(self, scope_id: str) -> None:
         """Refuse a plan whose scope AgentGov has never heard of.
 

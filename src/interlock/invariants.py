@@ -85,6 +85,10 @@ class BlastRadius:
         self._limit = limit
 
     @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
     def name(self) -> str:
         return "blast_radius"
 

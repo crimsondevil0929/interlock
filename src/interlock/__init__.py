@@ -83,6 +83,8 @@ from interlock.invariants import (
     default_checkers,
 )
 from interlock.postgres import PostgresSubstrate
+from interlock.receipts import ReceiptIssuer
+from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.types import (
@@ -115,6 +117,7 @@ __all__ = [
     "Compensation",
     "ConstraintFeedback",
     "CyclicPlanError",
+    "DroppedEffect",
     "Effect",
     "EffectDiff",
     "EffectId",
@@ -137,8 +140,11 @@ __all__ = [
     "PlanError",
     "PlanId",
     "PostgresSubstrate",
+    "ReceiptIssuer",
     "RecordType",
     "Refusal",
+    "Repair",
+    "RepairFeedback",
     "RowDelta",
     "ScopeHaltedError",
     "Severity",

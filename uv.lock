@@ -10,7 +10,7 @@ resolution-markers = [
 [[package]]
 name = "agentgov"
 version = "0.1.2"
-source = { git = "https://github.com/crimsondevil0929/agentgov?rev=v0.1.2#8f634afe4a149b36a1ba4b646932b557a82b8b6b" }
+source = { git = "https://github.com/crimsondevil0929/agentgov?rev=6d3cac212c5a4e01a2981f26a466c87e8942f975#6d3cac212c5a4e01a2981f26a466c87e8942f975" }
 
 [[package]]
 name = "annotated-types"
@@ -433,7 +433,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=v0.1.2" },
+    { name = "agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=6d3cac212c5a4e01a2981f26a466c87e8942f975" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres"]

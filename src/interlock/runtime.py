@@ -39,6 +39,8 @@ from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord
 from interlock.engine import EscrowEngine, StageResult
 from interlock.invariants import InvariantChecker, default_checkers
+from interlock.receipts import ReceiptIssuer
+from interlock.repair import Repair
 from interlock.substrate import SqliteSubstrate, TableSpec
 from interlock.types import EffectKind, EffectPlan
 
@@ -74,6 +76,8 @@ class EscrowRuntime:
         SQLite itself. On by default.
     :param acknowledge_cascades: Unobserved tables a foreign-key action may
         write, unmeasured. See :class:`SqliteSubstrate`.
+    :param receipts: Issue a signed ARC1 receipt for every adjudicated plan,
+        committed or refused. See :mod:`interlock.receipts`.
 
     Construction runs the cascade check against the database (see
     :attr:`cascade_report`), so the database must exist: an operation whose
@@ -106,6 +110,7 @@ class EscrowRuntime:
         max_diff_rows: int = 50_000,
         enforce_table_access: bool = True,
         acknowledge_cascades: Sequence[str] = (),
+        receipts: ReceiptIssuer | None = None,
     ) -> None:
         self._scope_id = scope_id
         self._settle_cost = Decimal(str(settle_cost))
@@ -137,6 +142,7 @@ class EscrowRuntime:
                     chain=self._chain,
                     anchor=self._anchor,
                     settle_cost=self._settle_cost,
+                    receipts=receipts,
                 )
                 self._recovered = self._engine.recover() if chain_path is not None else ()
             except BaseException:
@@ -186,6 +192,12 @@ class EscrowRuntime:
     def execute(self, plan: EffectPlan, *, settle_cost: Decimal | str | None = None) -> StageResult:
         """Stage, measure, adjudicate and commit or roll back one plan."""
         return self._engine.execute(plan, settle_cost=settle_cost)
+
+    def repair(self, plan: EffectPlan, *, max_trials: int = 32) -> Repair:
+        """The largest part of a refused plan that would be admitted, found by
+        staging candidates in savepoints. Advisory: nothing is committed. See
+        :meth:`EscrowEngine.repair`."""
+        return self._engine.repair(plan, max_trials=max_trials)
 
     def execute_sql(
         self,

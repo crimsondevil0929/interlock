@@ -1,7 +1,7 @@
 # Effect escrow: specification and interface contract
 
 **Status:** specification. `interlock` v0.1.2 implements a subset; see
-[Conformance](#conformance-of-interlock-v012) at the end of this document for
+[Conformance](#conformance-of-interlock-unreleased-v03-in-progress) at the end of this document for
 what is implemented, what is partial, and what is unimplemented.
 **Applies to:** `interlock` v0.1.2 against `agentgov` v0.1.2.
 **Normative language:** MUST, MUST NOT, SHOULD, MAY per RFC 2119.
@@ -970,7 +970,7 @@ Unresolved, and listed because they are unresolved rather than minor.
 
 ---
 
-# Conformance of `interlock` (unreleased, v0.2 in progress)
+# Conformance of `interlock` (unreleased, v0.3 in progress)
 
 What the shipped package actually does against this document. Verified by
 reading `src/interlock/` and by running adversarial plans against it, not by
@@ -994,6 +994,8 @@ reading the test suite.
 | A crashed PostgreSQL commit resolved from its marker and `pg_xact_status`, so a transaction the server still holds is not read as rolled back | `postgres.PostgresSubstrate.resolve_intent`, `engine.EscrowEngine.recover` |
 | Unrecorded writes: every row change to an observed table outside a stage is logged (PostgreSQL trigger, SQLite journal), and every committed stage must be recorded as committed in a chain | `reconcile`, `interlock reconcile-effects` |
 | Refusals split by audience: operator evidence in full; agent feedback limited to the plan's own tables and tenants, bucketed counts, no aggregates, fixed templates, canonical order | `feedback`, `adjudication`, `engine.StageResult.feedback` |
+| Checked repair: candidate sub-plans staged in savepoints of one stage, each adjudicated by the same checkers and rolled back, with no monotonicity assumed; the proposal admitted only as recorded, only once, and re-adjudicated from scratch | `repair`, `engine.EscrowEngine.repair`, `engine.EscrowEngine._repair_claim` |
+| A signed ARC1 receipt per adjudicated plan, naming its terminal chain record (which names it back), issued after the reverse anchor so its cost verifies against the ledger; a repair's names the refusal's | `receipts.ReceiptIssuer`, `engine.EscrowEngine._issue_receipt` |
 | `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
 | `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
 | `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
@@ -1035,7 +1037,9 @@ reading the test suite.
   observed immediately after the commit, the `COMMITTED` record says so.
 - **The escrow chain is keyless.** Anyone who can write the file can recompute
   the chain from start to finish and it verifies. A reverse anchor in a
-  governed AgentGov is the only copy of its head outside the file.
+  governed AgentGov is one copy of its head outside the file; with receipts on,
+  each adjudicated plan's signed receipt names its terminal record, under a key
+  the file does not hold. The chain's own records stay unsigned.
 
 ## Unimplemented
 

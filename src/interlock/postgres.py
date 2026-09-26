@@ -530,6 +530,16 @@ class PostgresSubstrate:
         """The last cascade check, or ``None`` before the first one."""
         return self._report
 
+    @property
+    def table_specs(self) -> tuple[TableSpec, ...]:
+        """The tables observed, as configured."""
+        return self._tables
+
+    @property
+    def enforces_table_access(self) -> bool:
+        """Whether a write outside the observed tables is refused."""
+        return self._enforce
+
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
         if self._handle is None or self._handle.stage_id != handle.stage_id:
@@ -795,6 +805,33 @@ class PostgresSubstrate:
                 status,
             )
         return None
+
+    def savepoint(self, handle: StageHandle, name: str) -> None:
+        """Mark the stage's state now, to return to with :meth:`rollback_to`.
+
+        The capture table, the stage's own settings and a failed statement's
+        aborted state all roll back with it, so a trial that errors does not
+        end the stage.
+        """
+        self._savepoint_statement(handle, "SAVEPOINT", name)
+
+    def rollback_to(self, handle: StageHandle, name: str) -> None:
+        """Undo everything since :meth:`savepoint` ``name``; the mark stays."""
+        self._savepoint_statement(handle, "ROLLBACK TO SAVEPOINT", name)
+
+    def release_savepoint(self, handle: StageHandle, name: str) -> None:
+        """Forget a mark, keeping what ran since it."""
+        self._savepoint_statement(handle, "RELEASE SAVEPOINT", name)
+
+    def _savepoint_statement(self, handle: StageHandle, verb: str, name: str) -> None:
+        import psycopg
+
+        conn = self._require(handle)
+        _identifier(name)
+        try:
+            conn.execute(f"{verb} {name}")
+        except psycopg.Error as exc:
+            raise StageError(f"{verb} {name} failed: {exc}") from exc
 
     def abort(self, handle: StageHandle) -> None:
         """Roll back. Safe in any state, including after a commit."""

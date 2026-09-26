@@ -24,17 +24,30 @@ Releases before 0.1.2 are described by their tags and commit history.
   `interlock.feedback` and `interlock.adjudication`. Property tests (hypothesis)
   check that renaming what the plan did not name, scaling every amount, or
   changing other tenants' values never changes the feedback.
-
-### Fixed
-
-- **Refusals leaked other tenants' data to the agent.** The reference stress
-  harness returned each blocking violation's message to the model, which for
-  `TenantDrawdownGuard` named other tenants and their exact totals; it also
-  returned the count of tenants touched and the measured tables. It now returns
-  the agent feedback, and the operator's record stays in its attempt log.
-
-### Added
-
+- **Checked repair (3.2).** `EscrowEngine.repair()` (and `EscrowRuntime.repair()`)
+  finds the largest part of a refused plan that would be admitted, by experiment. It
+  stages the plan once and tries candidate sub-plans, the down-sets of its dependency
+  graph, largest first, in savepoints: each is measured and adjudicated by the same
+  checkers and rolled back. Nothing assumes monotonicity, so a debit is kept with the
+  credit that balances it under a drawdown guard. `max_trials` bounds the search, with
+  a greedy fallback whose result was still admitted. Advisory: the stage always rolls
+  back, and the proposal is a new plan whose `repair_of` names the refused one;
+  `execute()` admits it only exactly as a `REPAIR_PROPOSED` record on the chain says,
+  once, and adjudicates it again from scratch. Each dropped step is explained through
+  the sanitized feedback (`Repair.feedback`). Both substrates gain `savepoint`,
+  `rollback_to` and `release_savepoint`. New module `interlock.repair`.
+- **ARC1 receipts.** With `receipts=ReceiptIssuer(log)`, the engine issues a signed
+  agentgov ARC1 receipt for every plan it adjudicates, committed or refused
+  (`StageResult.receipt`), covering authority, intent, the measured effect (with a
+  salted row commitment and a schema hash), coverage and its gaps, the decision, cost
+  and outcome. A repair's receipt names the refusal's as `decision.repair_of`. The
+  receipt and the stage's terminal record name each other, and the receipt is issued
+  after the reverse anchor, so agentgov's verifier can check it against the ledger. A
+  receipt that fails to issue after a commit is logged, not raised. New module
+  `interlock.receipts`.
+- `EffectPlan.repair_of`, hashed only when set, so earlier plans keep their hashes;
+  `RecordType.REPAIR_PROPOSED`; `LedgerAnchor.scope_path()`; `BlastRadius.limit`;
+  `table_specs` and `enforces_table_access` on both substrates.
 - **The cascade check (2.1).** New `interlock.cascade` reads the foreign-key
   graph (`PRAGMA foreign_key_list` on SQLite, `pg_constraint` on PostgreSQL)
   and works out every table a `DELETE` or `UPDATE` on an observed table can
@@ -86,8 +99,20 @@ Releases before 0.1.2 are described by their tags and commit history.
   it into `COMMIT_INTENT` and passes it back to `resolve_intent(..., txid=)`.
 - `EffectDiff.column_total` and the value guards read `Decimal` values exactly.
 
+### Changed
+
+- **agentgov is pinned to a commit, for now.** Receipts need `agentgov.receipts`,
+  which is on agentgov's main (`6d3cac2`) and in no release; that commit still reports
+  version 0.1.2. A release of interlock must first re-pin to an agentgov tag that
+  contains it.
+
 ### Fixed
 
+- **Refusals leaked other tenants' data to the agent.** The reference stress
+  harness returned each blocking violation's message to the model, which for
+  `TenantDrawdownGuard` named other tenants and their exact totals; it also
+  returned the count of tenants touched and the measured tables. It now returns
+  the agent feedback, and the operator's record stays in its attempt log.
 - **A statement could erase the measurement.** The authorizer allowed any write
   to `_interlock_capture`, so an effect `DELETE FROM _interlock_capture` emptied
   the diff, and a plan that zeroed every order committed past `BlastRadius(1)`.

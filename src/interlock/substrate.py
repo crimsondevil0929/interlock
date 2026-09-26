@@ -201,6 +201,10 @@ class ShadowSubstrate(Protocol):
     def close(self, handle: StageHandle) -> None: ...
 
 
+# A driver may also implement ``savepoint(handle, name)``,
+# ``rollback_to(handle, name)`` and ``release_savepoint(handle, name)``, which
+# ``EscrowEngine.repair`` needs to try candidate sub-plans inside one stage.
+#
 # A driver may also implement ``resolve_intent(stage_id) -> bool | None``: did
 # that stage's transaction commit? ``EscrowEngine.recover`` asks it about every
 # commit intent a crashed process left open, and leaves the intent open when
@@ -412,6 +416,16 @@ class SqliteSubstrate:
     def cascade_report(self) -> CascadeReport | None:
         """The last cascade check, or ``None`` before the first one."""
         return self._report
+
+    @property
+    def table_specs(self) -> tuple[TableSpec, ...]:
+        """The tables observed, as configured."""
+        return self._tables
+
+    @property
+    def enforces_table_access(self) -> bool:
+        """Whether a write outside the observed tables is refused."""
+        return self._enforce
 
     def check_cascades(self) -> CascadeReport:
         """Read the foreign-key graph and report every reach out of ``tables``.
@@ -703,6 +717,33 @@ class SqliteSubstrate:
             ) from exc
         finally:
             conn.close()
+
+    def savepoint(self, handle: StageHandle, name: str) -> None:
+        """Mark the stage's state now, to return to with :meth:`rollback_to`.
+
+        The capture table is rolled back with everything else, so after a
+        return :meth:`diff` measures only what ran since the mark.
+
+        :raises ValueError: If ``name`` is not a plain identifier.
+        """
+        self._savepoint_statement(handle, "SAVEPOINT", name)
+
+    def rollback_to(self, handle: StageHandle, name: str) -> None:
+        """Undo everything since :meth:`savepoint` ``name``; the mark stays."""
+        self._savepoint_statement(handle, "ROLLBACK TO", name)
+
+    def release_savepoint(self, handle: StageHandle, name: str) -> None:
+        """Forget a mark, keeping what ran since it."""
+        self._savepoint_statement(handle, "RELEASE", name)
+
+    def _savepoint_statement(self, handle: StageHandle, verb: str, name: str) -> None:
+        conn = self._require(handle)
+        _assert_identifier(name)
+        try:
+            with self._substrate_statements():
+                conn.execute(f"{verb} {name}")
+        except sqlite3.Error as exc:
+            raise StageError(f"{verb} {name} failed: {exc}") from exc
 
     def abort(self, handle: StageHandle) -> None:
         """Roll back. Safe in any state, including after a commit."""

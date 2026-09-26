@@ -336,6 +336,84 @@ multi-tenant diffs and adversarial checkers, that renaming anything the plan did
 name, scaling every amount, or changing other tenants' values leaves the feedback
 byte-identical (see `tests/test_feedback.py`).
 
+### Repair: the part that would pass
+
+A refused plan is often one step away from an acceptable one: nine corrections to one
+tenant's orders and a tenth that reaches another tenant. Refusing all ten is right;
+telling the agent which nine would pass turns a halt into finished work. `repair()`
+finds the largest part of a plan that would be admitted, by experiment. It stages the
+plan once and, inside that one stage, tries candidate sub-plans in savepoints: each is
+run, measured and adjudicated by the same checkers, then rolled back.
+
+```python
+from interlock import EscrowRuntime, TableSpec, TenantIsolation
+
+runtime = EscrowRuntime(
+    "prod.db",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    scope_id="support-agent",
+    checkers=[TenantIsolation(1)],
+)
+plan = (
+    runtime.plan(intent="apply ticket 9001 corrections")
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = 450 WHERE id = 1",
+        tenant_id="acme",
+        effect_id="reprice_1",
+        independent=True,
+    )
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = 250 WHERE id = 2",
+        tenant_id="acme",
+        effect_id="reprice_2",
+        independent=True,
+    )
+    .update(
+        table="orders",
+        statement="UPDATE orders SET total = 0 WHERE id = 3",  # globex's order
+        tenant_id="acme",
+        effect_id="reprice_3",
+        independent=True,
+    )
+    .build()
+)
+assert not runtime.execute(plan).committed
+
+repair = runtime.repair(plan)  # advisory: nothing is committed here
+print(repair.feedback.render())  # for the agent
+# Resubmit the largest part of the plan that would be admitted: keep reprice_1,
+# reprice_2; drop reprice_3.
+# - reprice_3: tenant_isolation: the plan changed rows of more tenants than one plan
+#   may (at most 1); its declared tenants are acme. Confine every statement to its
+#   declared tenants.
+assert runtime.execute(repair.proposal).committed
+```
+
+- **Advisory, and re-adjudicated.** The repair stage is always rolled back. The
+  proposal is a new plan whose `repair_of` names the refused one, and it commits only
+  through `execute()`, staged and adjudicated again from scratch, because the database
+  may have moved in between.
+- **Exactly as proposed, and once.** A plan naming itself a repair is admitted only if
+  this engine's chain holds a `REPAIR_PROPOSED` record with its exact content hash, and
+  only until it has committed. A widened or forged "repair" is refused.
+- **No monotonicity assumed.** A debit alone fails a drawdown guard that the debit and
+  its balancing credit pass together. A search that dropped whatever fails on its own
+  would keep a lone credit; this one keeps both and drops only the step that is wrong.
+- **Runnable candidates, largest first.** A step is kept only with everything it
+  depends on. The whole plan is tried, then every such sub-plan one step smaller, and
+  so on, later steps dropped first within a size; the first admitted one is a largest,
+  and `repair.exhaustive` says so. `max_trials` (default 32) bounds the search; when it
+  runs out, a greedy pass keeps each step whose addition is admitted, which is sound but
+  may not be largest. The stage's time bound ends the search too.
+- **Explained without leaking.** Each dropped step says why, from its own trial: the
+  constraints that refused it, sanitized like every other feedback, a dropped
+  dependency, or a statement the substrate refuses outright.
+
+Both substrates have savepoints. A repair's trials all run inside one stage, so the
+stage's locks are held for the whole search.
+
 ## AgentGov integration
 
 Interlock imports [`agentgov`](https://github.com/crimsondevil0929/agentgov) as a
@@ -406,6 +484,60 @@ translated at the anchor boundary, so a caller never has to import
 AgentGov's latching breaker is re-read immediately before commit, not at admission. The
 staging window is where a trip has to be observed, because a halt that does not stop
 in-flight side effects does not stop the effects.
+
+## Receipts
+
+With a `ReceiptIssuer`, every plan the engine adjudicates, committed or refused, gets a
+signed ARC1 receipt in an agentgov `ReceiptLog` (the format is agentgov's
+`docs/RECEIPTS.md`). Anyone holding the issuer's key can then check offline what the
+agent was allowed to do, what it said it would do, what it measurably did, what was
+decided and what it cost:
+
+```python
+from agentgov.receipts import HmacKey, ReceiptLog, verify_bundle
+
+from interlock import EscrowRuntime, ReceiptIssuer, TableSpec, TenantIsolation
+
+key = HmacKey.generate()
+log = ReceiptLog("support-receipts", key, path="receipts.jsonl")
+runtime = EscrowRuntime(
+    "prod.db",
+    tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    scope_id="support-agent",
+    checkers=[TenantIsolation(1)],
+    receipts=ReceiptIssuer(log),
+)
+result = runtime.execute_sql(
+    "UPDATE orders SET total = 480 WHERE id = 1", table="orders", tenant_id="acme"
+)
+receipt = result.receipt
+print(receipt.outcome.status.value, receipt.effect.row_count)  # committed 1
+
+bundle = log.bundle(log.index_of(receipt.receipt_id), log.checkpoint())
+assert verify_bundle(bundle, issuer_key=key).passed
+```
+
+What goes into one:
+
+- **Authority:** the AgentGov scope path when an anchor is attached, the trajectory, and
+  a capability naming the observed tables and the tightest `BlastRadius` limit.
+- **Intent and effect:** the plan's content hash and stated footprint; the diff hash the
+  chain's `DIFF_COMPUTED` record carries; a salted commitment over every measured row
+  change, from which one row can be disclosed later without the rest; and a hash of the
+  observed schema, foreign keys included.
+- **Coverage:** the observed tables, and every gap in words: an acknowledged cascade, a
+  substrate that did not read the foreign keys or does not refuse unobserved tables.
+- **Decision:** the verdict hash, each checker with a digest of its configuration, the
+  issuer's policy epoch, and, for a repair, the refused plan's receipt as `repair_of`.
+- **Cost:** the AgentGov transaction that settled the plan. The receipt is issued last,
+  after the reverse anchor, so agentgov's verifier can check the cost against the ledger.
+
+The receipt and the escrow chain name each other: the stage's terminal record carries
+the receipt id, and the receipt's `anchors.escrow` names that record by sequence and
+hash. A receipt that cannot be issued after a commit is logged, not raised; the effects
+stand, and the terminal record names the receipt that should exist. An HMAC receipt
+verifies only for a holder of the key: for third parties, sign with agentgov's
+`Ed25519Signer` (`agentgov[sign]`) and publish the public key.
 
 ## PostgreSQL
 
@@ -602,10 +734,11 @@ against the shipped code, not inferred.
   table gains one row per committed stage and is not pruned.
 - **The chain is keyless.** Anyone who can write the chain file can recompute a SHA-256
   chain from start to finish and it will verify. A reverse anchor in a governed AgentGov
-  is the one copy of the head outside the file; signed receipts and an external witness
-  are planned.
-- **Lock footprint.** A stage holds write locks for its whole life. `max_stage_seconds`
-  bounds it. Human review must not happen inside an open stage; abort, present the recorded
+  is one copy of the head outside the file. With [receipts](#receipts) on, each
+  adjudicated plan also gets a signed receipt naming its terminal record, under a key the
+  chain file does not hold; the chain itself stays unsigned.
+- **Lock footprint.** A stage holds write locks for its whole life, a repair search's
+  included. `max_stage_seconds` bounds it. Human review must not happen inside an open stage; abort, present the recorded
   diff, and re-stage on approval, because the substrate may have moved.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
@@ -639,13 +772,15 @@ form work. Two consequences worth knowing before you depend on this:
 
 - **Interlock cannot be published to PyPI as-is.** PyPI rejects direct-URL dependencies.
   Publishing means putting `agentgov` on PyPI and pinning a version range instead.
-- **The pin is an agentgov release tag, `v0.1.2`, not a branch.** A resolver cache is
-  keyed on name and version, and `@main` is a moving target: interlock 0.1.1 locked an
+- **The pin is an exact agentgov revision, never a branch.** A resolver cache is keyed
+  on name and version, and `@main` is a moving target: interlock 0.1.1 locked an
   agentgov commit that reported itself as 0.1.0 and lacked APIs this README relied on.
-  Interlock 0.1.2 needs agentgov 0.1.2, for its verified read-only refresh and its
-  zero-value anchor entries. `uv.lock` records the exact commit the tag names. Pin a
-  tag or a commit for anything reproducible, and use
-  `uv sync --refresh-package agentgov` when you suspect a stale build.
+  Interlock 0.1.2 pins the agentgov tag `v0.1.2`. This unreleased line needs
+  `agentgov.receipts`, which is on agentgov's main and in no tag yet, so it pins the
+  commit that merged it (`6d3cac2`), which still reports itself as 0.1.2; a release
+  re-pins to an agentgov tag. `uv.lock` records the exact commit. Pin a tag or a commit
+  for anything reproducible, and use `uv sync --refresh-package agentgov` when you
+  suspect a stale build.
 
 ## Development
 

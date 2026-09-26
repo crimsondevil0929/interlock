@@ -58,6 +58,10 @@ class RecordType(Enum):
     ABORTED = "aborted"
     ORPHANED = "orphaned"
     COMPENSATED = "compensated"
+    REPAIR_PROPOSED = "repair_proposed"
+    """A repair search found a smaller plan that would be admitted. The payload
+    is the proposal's content hash, the plan id the refused plan's. The engine
+    admits a plan naming itself a repair only if this record matches it."""
 
 
 _TERMINAL = frozenset(
