@@ -174,6 +174,28 @@ def test_builder_refuses_an_empty_plan() -> None:
         PlanBuilder(scope_id="agent").build()
 
 
+@pytest.mark.parametrize("statement", ["", "   ", "\n\t"])
+def test_an_empty_statement_is_refused_at_construction(statement: str) -> None:
+    """Regression: nothing downstream rejects a statement with no verb at all.
+
+    reject_reason() reads the leading verb, finds none, and does not refuse
+    it; SQLite happily executes ''. Before this, an empty (or whitespace-only)
+    statement staged, measured nothing, and committed as a silent no-op --
+    exactly what a template that produced an empty string by mistake would
+    look like from the outside, with no diagnostic anywhere in the pipeline.
+    """
+    with pytest.raises(PlanError, match="empty"):
+        PlanBuilder(scope_id="agent").update(table="orders", statement=statement).build()
+
+
+def test_an_empty_statement_is_refused_on_a_hand_built_effect() -> None:
+    """The same guard applies to Effect directly, not only through PlanBuilder."""
+    from interlock import Effect, EffectId, EffectKind
+
+    with pytest.raises(PlanError, match="empty"):
+        Effect(effect_id=EffectId("e1"), kind=EffectKind.UPDATE, target="orders", statement="  ")
+
+
 def test_builder_refuses_a_naive_timestamp() -> None:
     from datetime import datetime
 

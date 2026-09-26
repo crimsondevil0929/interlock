@@ -1,6 +1,6 @@
 [project]
 name = "interlock"
-version = "0.2.0"
+version = "0.2.1"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,6 +50,20 @@ interlock = "interlock.cli:main_entry"
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
+
+# DEV ONLY, and not meant to survive this branch: points `uv sync`/`uv lock` at
+# a sibling ../agentgov checkout instead of the pinned git tag above, so a fix
+# on both repos can be tested together before agentgov cuts the tag that
+# `dependencies` will actually pin to. A uv source is workspace configuration,
+# not written into built distribution metadata (see the comment above
+# `dependencies`), so this has no effect on a built wheel -- only on `uv`
+# commands run inside a checkout that has this file uncommented.
+#
+# Remove this section once agentgov's fix is tagged (e.g. v0.2.1) and
+# `dependencies` above is repinned to it; until then this is how you iterate
+# on interlock and agentgov side by side without publishing anything.
+[tool.uv.sources]
+agentgov = { path = "../agentgov", editable = true }
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]

@@ -112,8 +112,21 @@ __all__ = [
 
 logger = logging.getLogger("interlock.recovery")
 
-TOOL_CHANGES_BETA: Final = "mid-conversation-tool-changes-2026-07-01"
-"""The beta a ``tool_removal`` block needs, on the Claude models that take it."""
+TOOL_CHANGES_BETA: Final = "inline-tools-2026-09-15"
+"""The beta a ``tool_removal`` block needs, on the Claude models that take it.
+
+Was ``mid-conversation-tool-changes-2026-07-01`` through 0.2.0. An adversarial
+audit sending a real ``Channel.SYSTEM`` step (the default) against the live
+Anthropic API got a 400 naming this string instead: the feature was renamed
+server-side at some point after 0.2.0 shipped, silently breaking the one
+default recovery path this constant serves. There is no version negotiation
+here -- if the API renames this beta again, this constant goes stale again in
+exactly the same way, silently, until someone hits it against live traffic.
+Confirm the current name against Anthropic's API changelog before relying on
+``Channel.SYSTEM`` in production, and consider `Channel.USER` (no beta
+required) unless the ``tool_removal`` channel's stronger guarantee -- an
+operator instruction a user turn cannot forge -- is load-bearing for you.
+"""
 
 _REASON_LIMIT = 512
 _DIRECTIVE_ID = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}")
@@ -584,8 +597,30 @@ class RecoveryStep:
     definitions exactly as before. Then :meth:`RecoveryRuntime.settle` the
     step with what the call cost.
 
+    **Read this before writing an enforcement loop around a rung's tool
+    fields.** ``tools`` and ``tool`` name opposite things, and the README's
+    own quickstart comment (``step.rung, step.tools  # revoke_tool
+    ('apply_plan',)``) reads, next to a rung literally called
+    "revoke_tool", exactly like "``tools`` is what got revoked." It is not.
+    Use :attr:`granted_tools` and :attr:`revoked_tool` instead of ``tools``
+    and ``tool`` directly; they are exactly the same values under names that
+    cannot be misread:
+
+    - :attr:`granted_tools` (``tools``): every tool still available after
+      this step -- the survivors, not the casualty.
+    - :attr:`revoked_tool` (``tool``): the one tool *this step* revoked, only
+      set when ``rung is Rung.REVOKE_TOOL``, ``None`` otherwise. A tool
+      revoked by an *earlier* step is not repeated here; it is simply absent
+      from every later step's ``granted_tools``. :meth:`RecoveryRuntime.check_tool`
+      and :attr:`RecoveryRuntime.revoked` are the source of truth for "is this
+      tool currently allowed at all" across the whole recovery, not this
+      per-step field.
+
     :ivar messages: The transcript as given, followed by ``appended``.
-    :ivar tools: The tools still granted after this step.
+    :ivar tools: The tools still granted after this step. Prefer
+        :attr:`granted_tools`.
+    :ivar tool: The single tool *this step* revoked, or ``None``. Prefer
+        :attr:`revoked_tool`.
     :ivar record: The signed ``recovery.step`` record, already written.
     """
 
@@ -602,6 +637,18 @@ class RecoveryStep:
     record: SignedRecord
     tool: str | None = None
     directive: str | None = None
+
+    @property
+    def granted_tools(self) -> tuple[str, ...]:
+        """Alias for :attr:`tools`, named so "still granted, not revoked"
+        cannot be misread at a call site."""
+        return self.tools
+
+    @property
+    def revoked_tool(self) -> str | None:
+        """Alias for :attr:`tool`: the one tool this step revoked, when
+        ``rung`` is :attr:`Rung.REVOKE_TOOL`. ``None`` for every other rung."""
+        return self.tool
 
 
 class RecoveryRuntime:
