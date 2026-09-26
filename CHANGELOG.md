@@ -132,10 +132,10 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ### Changed
 
-- **agentgov is pinned to a commit, for now.** Receipts need `agentgov.receipts`,
-  which is on agentgov's main (`6d3cac2`) and in no release; that commit still reports
-  version 0.1.2. A release of interlock must first re-pin to an agentgov tag that
-  contains it.
+- **agentgov is pinned to its `v0.2.0` tag** (commit `6d3cac2`), the first agentgov
+  release with `agentgov.receipts`, which receipts, recovery records and extension quotes
+  need. The tag's package metadata still reports version 0.1.2; `uv.lock` records the
+  commit.
 
 ### Fixed
 

@@ -35,16 +35,14 @@ classifiers = [
 # published there while this line stands. Publishing means putting agentgov on
 # PyPI and pinning a version range here instead.
 #
-# Pinned to an exact agentgov commit, never a branch: `@main` resolved to
+# Pinned to an agentgov release tag, never a branch: `@main` resolved to
 # whatever main was when the lock was cut, which is how interlock 0.1.1 came to
-# lock an agentgov commit that reported itself as 0.1.0.
-#
-# PRE-RELEASE PIN. Interlock 0.3 issues ARC1 receipts, which exist only on
-# agentgov's main (6d3cac2, the receipts merge) and in no tag yet; that
-# commit still reports version 0.1.2. Before interlock 0.3 is released,
-# agentgov must tag a release containing it and this line must name that tag.
+# lock an agentgov commit that reported itself as 0.1.0. Interlock 0.3 issues
+# ARC1 receipts, and agentgov.receipts first shipped in v0.2.0 (6d3cac2, the
+# receipts merge; its package metadata still reports 0.1.2). uv.lock records
+# the exact commit the tag names.
 dependencies = [
-    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@6d3cac212c5a4e01a2981f26a466c87e8942f975",
+    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.2.0",
 ]
 
 [project.scripts]
