@@ -998,8 +998,9 @@ form work. Two consequences worth knowing before you depend on this:
   commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
   0.1.2 pinned the agentgov tag `v0.1.2`; 0.2.0 pins `v0.2.0`, the first release with
   `agentgov.receipts`. That tag's package metadata still reports version 0.1.2, so tell
-  the two apart by the commit, `6d3cac2`, which `uv.lock` records. Pin a tag or a commit
-  for anything reproducible, and use `uv sync --refresh-package agentgov` when you
+  the two apart by the commit, `6d3cac2`, which `uv.lock` records. 0.2.1 pins agentgov's
+  `v0.2.1` (`35788dd`), whose package metadata correctly reports 0.2.1. Pin a tag or a
+  commit for anything reproducible, and use `uv sync --refresh-package agentgov` when you
   suspect a stale build.
 
 **Developing on both repos at once.** Because the dependency is git-pinned, `uv sync` (or

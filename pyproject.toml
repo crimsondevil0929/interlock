@@ -39,10 +39,13 @@ classifiers = [
 # whatever main was when the lock was cut, which is how interlock 0.1.1 came to
 # lock an agentgov commit that reported itself as 0.1.0. Interlock 0.2.0 issues
 # ARC1 receipts, and agentgov.receipts first shipped in v0.2.0 (6d3cac2, the
-# receipts merge; its package metadata still reports 0.1.2). uv.lock records
-# the exact commit the tag names.
+# receipts merge; its package metadata still reports 0.1.2). Interlock 0.2.1
+# needs agentgov 0.2.1's AgentThrashingError/CircuitOpenError and witness
+# fixes, and pins v0.2.1 (35788dd, whose package metadata correctly reports
+# 0.2.1 -- the mismatch that made 0.2.0's commit worth naming separately does
+# not recur here). uv.lock records the exact commit the tag names.
 dependencies = [
-    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.2.0",
+    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.2.1",
 ]
 
 [project.scripts]
@@ -50,20 +53,6 @@ interlock = "interlock.cli:main_entry"
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
-
-# DEV ONLY, and not meant to survive this branch: points `uv sync`/`uv lock` at
-# a sibling ../agentgov checkout instead of the pinned git tag above, so a fix
-# on both repos can be tested together before agentgov cuts the tag that
-# `dependencies` will actually pin to. A uv source is workspace configuration,
-# not written into built distribution metadata (see the comment above
-# `dependencies`), so this has no effect on a built wheel -- only on `uv`
-# commands run inside a checkout that has this file uncommented.
-#
-# Remove this section once agentgov's fix is tagged (e.g. v0.2.1) and
-# `dependencies` above is repinned to it; until then this is how you iterate
-# on interlock and agentgov side by side without publishing anything.
-[tool.uv.sources]
-agentgov = { path = "../agentgov", editable = true }
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
