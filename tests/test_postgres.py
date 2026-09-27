@@ -347,7 +347,10 @@ def eng_report(eng: EscrowEngine) -> Any:
         "ALTER TABLE orders DISABLE TRIGGER interlock_capture",
         "CREATE TABLE x (id int)",
         "PREPARE p AS SELECT 1",
-        "",
+        # "" (no verb at all) used to be covered here too, but Effect itself
+        # now refuses an empty statement at construction (PlanError, before
+        # any substrate sees it) -- one() can no longer even build this case.
+        # See test_ergonomics.py::test_an_empty_statement_is_refused_at_construction.
     ],
 )
 def test_anything_but_a_row_statement_is_refused_at_admission(pg: Pg, statement: str) -> None:

@@ -9,8 +9,8 @@ resolution-markers = [
 
 [[package]]
 name = "agentgov"
-version = "0.1.2"
-source = { git = "https://github.com/crimsondevil0929/agentgov?rev=v0.2.0#6d3cac212c5a4e01a2981f26a466c87e8942f975" }
+version = "0.2.1"
+source = { git = "https://github.com/crimsondevil0929/agentgov?rev=v0.2.1#35788dd1f5a9a6b0a3d7804f6e7ac179ca55196c" }
 
 [[package]]
 name = "annotated-types"
@@ -267,8 +267,8 @@ name = "httpcore2"
 version = "2.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11", marker = "python_full_version < '3.12' or python_full_version >= '3.15' or sys_platform != 'emscripten'" },
-    { name = "truststore", marker = "python_full_version < '3.12' or python_full_version >= '3.15' or sys_platform != 'emscripten'" },
+    { name = "h11" },
+    { name = "truststore" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/15/8c/e925b1c92018abb3a1863ce1549d76d2381e334d21d65d4ac8f65dabd78a/httpcore2-2.13.0.tar.gz", hash = "sha256:2adc8be4fb285fbcd6d894298db3b52c177e74b6674eda3a76bd36be3292a3db", size = 67740, upload-time = "2026-09-14T14:18:04.717Z" }
 wheels = [
@@ -409,7 +409,7 @@ wheels = [
 
 [[package]]
 name = "interlock"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "agentgov" },
@@ -433,7 +433,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=v0.2.0" },
+    { name = "agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=v0.2.1" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres"]

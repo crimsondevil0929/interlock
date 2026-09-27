@@ -40,11 +40,26 @@ __all__ = [
 class InterlockError(Exception):
     """Base for every error this package raises.
 
-    :ivar feedback: What the agent may be told about this error, set by
-        ``EscrowEngine.execute`` before it raises. An
+    :ivar feedback: What the agent may be told about this error. An
         :class:`~interlock.feedback.AgentFeedback`. Send that to the agent,
         never ``str(exc)``, which is written for the operator and can quote
         other tenants' data.
+
+        **This applies to every ``InterlockError``, not only a refused
+        plan's checker violations.** ``EscrowEngine.execute()`` and
+        ``EscrowEngine.repair()`` populate ``feedback`` (via
+        :func:`~interlock.feedback.feedback_for_error`) on *any*
+        ``InterlockError`` they catch before re-raising it, including a
+        ``StageError`` or ``ForbiddenStatementError`` from a statement that
+        failed against the database -- reading the exception's type and
+        structured fields only, never its message, so a raw driver error
+        (which can quote a column, table or value from the failing
+        statement) never reaches ``feedback.render()``. It stays ``None``
+        only for an exception raised by calling a substrate directly,
+        bypassing the engine entirely (see ``ForbiddenStatementError``
+        below): there is nothing to catch it and fill it in. A harness that
+        might see ``None`` should treat that case the same as any other
+        error outcome, not fall back to ``str(exc)``.
     """
 
     feedback: object | None = None
@@ -70,7 +85,11 @@ class ForbiddenStatementError(PlanError):
     reading the diff passes.
 
     Raised from admission and again from ``apply``. The second is not
-    redundant: a caller using a substrate directly never reaches admission.
+    redundant: a caller using a substrate directly never reaches admission --
+    and also does not reach ``EscrowEngine``'s catch clause, so ``feedback``
+    is ``None`` on that path (see ``InterlockError.feedback``). Raised
+    through ``EscrowEngine.execute()``/``repair()``, ``feedback`` is always
+    populated, safely.
 
     :ivar reason: What kind of refusal, for code to branch on:
         ``"statement_kind"``, ``"unobserved_table"``, ``"privilege"``,
@@ -97,7 +116,15 @@ class UncompensatableEffectError(PlanError):
 
 
 class StageError(InterlockError):
-    """The staging substrate failed."""
+    """The staging substrate failed.
+
+    ``str(exc)`` is the operator's record and can quote the failing
+    statement, an offending column or table name, or driver-specific detail.
+    Raised through ``EscrowEngine.execute()``/``repair()``, ``feedback`` is a
+    fixed, generic "a statement failed in the database" -- see
+    ``InterlockError.feedback``. Send ``feedback``, never ``str(exc)``, to
+    an agent that will see the result.
+    """
 
 
 class SubstrateUnavailableError(StageError):

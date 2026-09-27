@@ -7,6 +7,61 @@ and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 Releases before 0.1.2 are described by their tags and commit history.
 
+## [Unreleased]
+
+## [0.2.1] - 2026-09-26
+
+Four fixes found by an adversarial DX audit that drove real Claude traffic through
+`RecoveryRuntime`, the repair/resubmit loop, and the substrate error path. Requires
+agentgov v0.2.1 (fixes `AgentThrashingError`'s exception hierarchy and a witness
+file's torn-line handling; see agentgov's changelog).
+
+### Fixed
+
+- **`RecoveryStep.tools` reads, at a glance, exactly backwards.** It has always meant
+  "the tools still granted after this step," but the README's own quickstart prints it
+  right next to a rung called `revoke_tool` (`step.rung, step.tools  # revoke_tool
+  ('apply_plan',)`), and the obvious reading -- build an enforcement check around
+  whatever's in `step.tools` -- checks the tool that is still allowed and misses the one
+  that was actually revoked. Added `RecoveryStep.granted_tools` and `.revoked_tool` as
+  clearly-named aliases for `.tools` and `.tool`, documented the trap directly on the
+  class, and fixed the README's own quickstart, which had exactly this bug baked into
+  its `check_tool()` call.
+- **The default recovery channel's beta flag was stale against the live API.**
+  `TOOL_CHANGES_BETA` was `mid-conversation-tool-changes-2026-07-01`; sending a real
+  `Channel.SYSTEM` step against the current Anthropic API gets a 400 asking for
+  `inline-tools-2026-09-15` instead. Updated the constant and documented that it is a
+  snapshot of the API surface, not a permanent value, since nothing here detects the
+  next rename automatically.
+- **The README didn't say `step.betas` needs the beta SDK endpoint.** "Send
+  `step.messages` (with `step.betas`)" reads like `client.messages.create(betas=...)`,
+  which raises a plain `TypeError` in the `anthropic` SDK; it has to be
+  `client.beta.messages.create(...)`. Documented in the Recovery section.
+- **An empty (or whitespace-only) `Effect.statement` staged, measured nothing, and
+  committed as a silent no-op.** Nothing downstream rejects it: there is no leading
+  verb for `reject_reason()` to refuse, and SQLite executes `''` without complaint.
+  Most often the sign of a template that produced an empty string rather than a
+  genuinely empty step. `Effect.__post_init__` now raises `PlanError` on construction,
+  which also catches it through `PlanBuilder`.
+
+### Clarified
+
+- **`demo.py`'s agent is scripted, not live.** No model is called anywhere in it; the
+  injected plan it "detects" is a hardcoded `EffectPlan`. That was always the intent
+  (a controlled comparison, not a live demo) but wasn't said plainly, and an audit
+  found that a real, current Claude model declines the exact injection shown, across
+  several framings. The README now says so and points to
+  [`scripts/live_stress_test.py`](scripts/live_stress_test.py) -- a real model against
+  a real substrate, previously unmentioned in the README -- for that question instead.
+- **`InterlockError.feedback` already covers `StageError`/`ForbiddenStatementError`,
+  not only checker refusals**, via `feedback_for_error()`, reading the exception's type
+  and structured fields rather than its message. This was not obvious from the
+  docstrings and the audit's own harness initially missed it, comparing `str(exc)`
+  (which does leak driver detail, by design -- it's the operator's record) against
+  nothing rather than against `exc.feedback.render()` (which doesn't). Strengthened the
+  docstrings on `InterlockError`, `StageError` and `ForbiddenStatementError` instead of
+  adding a second, redundant sanitization mechanism.
+
 ## [0.2.0] - 2026-09-26
 
 PostgreSQL, signed receipts and recovery, with release gates behind them. A

@@ -41,6 +41,18 @@ why this runs inside the deployment rather than at the model provider.
 The demo is also a control for model quality: the agent loops zero times, costs $0.0012,
 and emits valid SQL on the first attempt. The damage is not a model-quality failure.
 
+**`demo.py`'s agent is scripted, not live.** `injected_plan` (a function local to
+`demo.py`, not part of the package) and the rest of Act 2's
+input are hardcoded `EffectPlan`s in `demo.py` itself; no model is called anywhere in that
+file. That is deliberate -- it isolates one variable (does the *escrow* stop this plan?)
+from another (would a *real* model produce it?) -- but it means demo.py cannot answer the
+second question, and an adversarial audit of this project found that a real, current
+Claude model declines the exact injected instruction shown above, across several
+realistic framings of the same prompt injection. For the first question answered against
+a real model instead of a scripted stand-in, see [`scripts/live_stress_test.py`](scripts/live_stress_test.py):
+eight scenarios, a real `anthropic.Anthropic` client, real governed spend, and verdicts the
+script itself says are not reproducible, because what the model chooses to do is not.
+
 ## What it measures
 
 The diff is read **from the substrate**, never reconstructed from the plan. The two are
@@ -562,7 +574,15 @@ from agentgov.cognitive import CognitiveBreaker, CognitivePolicy
 from agentgov.exceptions import AgentThrashingError
 from agentgov.receipts import HmacKey
 
-from interlock import Directive, RecordLog, RecoveryPolicy, RecoveryRuntime, Trip, TripKind
+from interlock import (
+    Directive,
+    RecordLog,
+    RecoveryPolicy,
+    RecoveryRuntime,
+    ToolRevokedError,
+    Trip,
+    TripKind,
+)
 
 governor = BudgetManager()
 governor.open_root("org", "10.00")
@@ -600,11 +620,15 @@ except AgentThrashingError as exc:
     trip = Trip.of(exc, tool="lookup")
 
 step = runtime.recover(trip, transcript, max_tokens=4096)
-print(step.rung, step.tools)  # revoke_tool ('apply_plan',)
-# Send step.messages (with step.betas) and step.max_tokens, the system prompt and
-# the tools as before; settle what the call cost; refuse revoked tools where they run.
+print(step.rung, step.granted_tools, step.revoked_tool)  # revoke_tool ('apply_plan',) lookup
+# Send step.messages (through the beta endpoint with step.betas when non-empty,
+# the plain one otherwise) and step.max_tokens, the system prompt and the tools
+# as before; settle what the call cost; refuse a revoked tool where you run it:
 runtime.settle(step, "0.03")
-runtime.check_tool("apply_plan")
+try:
+    runtime.check_tool("lookup")  # the tool the halt named, and this step revoked
+except ToolRevokedError:
+    pass  # refuse the call here instead of running it
 runtime.close()
 records.verify()
 print(governor.is_halted("support-agent"), len(records))  # True 4
@@ -625,12 +649,22 @@ objects, with messages appended: error results for tool calls the halt stopped, 
 rung's notice. The system prompt and the tool definitions are never touched. On Claude
 Opus 5, Opus 5.5, Opus 4.8, Fable and Mythos, a directive goes in an appended
 `{"role": "system"}` message and a revocation in a `tool_removal` block (beta
-`mid-conversation-tool-changes-2026-07-01`, in `step.betas`), the operator channel a user
+`inline-tools-2026-09-15`, in `step.betas`), the operator channel a user
 turn cannot forge; `Channel.USER` uses user-turn notices for every other model. Either way,
 `check_tool()` refuses a revoked tool where the harness runs it. Each step checks that the
 transcript it is handed extends the one the last step returned, so an edit in between is
 refused, and its record pins the transcript before and after by a running hash
 (`transcript_head`).
+
+**A non-empty `step.betas` has to go through the beta endpoint**, not the plain one: with
+the `anthropic` Python SDK that is `client.beta.messages.create(..., betas=step.betas)`,
+never `client.messages.create(betas=...)` (which raises a plain `TypeError` — that
+constructor does not take a `betas` keyword at all). `step.betas` is empty under
+`Channel.USER`, so a harness that only ever runs on a `Channel.USER` model never needs the
+beta endpoint. `TOOL_CHANGES_BETA` (`interlock.recovery`) names the one exact string this
+release sends; treat it as a snapshot of Anthropic's current API surface, not a permanent
+constant — an audit against live traffic already caught it drifting once (see the
+docstring), and nothing here detects the next rename automatically.
 
 **The reserve sits beside the scope, not under it.** A trip halts the tripped scope's
 whole subtree, and recovery exists for a tripped scope, so `{scope}/recovery` is carved out
@@ -964,9 +998,27 @@ form work. Two consequences worth knowing before you depend on this:
   commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
   0.1.2 pinned the agentgov tag `v0.1.2`; 0.2.0 pins `v0.2.0`, the first release with
   `agentgov.receipts`. That tag's package metadata still reports version 0.1.2, so tell
-  the two apart by the commit, `6d3cac2`, which `uv.lock` records. Pin a tag or a commit
-  for anything reproducible, and use `uv sync --refresh-package agentgov` when you
+  the two apart by the commit, `6d3cac2`, which `uv.lock` records. 0.2.1 pins agentgov's
+  `v0.2.1` (`35788dd`), whose package metadata correctly reports 0.2.1. Pin a tag or a
+  commit for anything reproducible, and use `uv sync --refresh-package agentgov` when you
   suspect a stale build.
+
+**Developing on both repos at once.** Because the dependency is git-pinned, `uv sync` (or
+`uv add --editable`) in a plain interlock checkout always fetches agentgov from GitHub --
+a sibling `../agentgov` checkout on disk is not consulted on its own, so edits there have
+no effect until you say so explicitly. To point `uv` at it instead, add to interlock's
+`pyproject.toml`:
+
+```toml
+[tool.uv.sources]
+agentgov = { path = "../agentgov", editable = true }
+```
+
+then `uv lock && uv sync`. This is workspace configuration, not written into built
+distribution metadata (the direct-reference `dependencies` entry above is what ships), so
+it is safe to keep on a local branch while iterating and drop before merging. Remember to
+revert it (and rerun `uv lock`) once you are done, or a later `uv sync` on that branch
+keeps resolving against your local checkout instead of the pinned tag.
 
 ## Development
 

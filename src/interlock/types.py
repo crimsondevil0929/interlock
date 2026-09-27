@@ -27,6 +27,8 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Final, NewType
 
+from interlock.exceptions import PlanError
+
 __all__ = [
     "AUDIT_VERSION",
     "GENESIS_HASH",
@@ -163,6 +165,12 @@ class Effect:
     :ivar stated_rows: What the agent claims this will touch, recorded so the
         claim can be compared against the measurement. Never trusted, and
         optional: an agent that omits it disables ``StatedFootprint``.
+    :raises PlanError: If ``statement`` is empty or whitespace-only. Nothing
+        downstream (``reject_reason``, the leading-verb check) rejects a
+        statement with no verb at all, so an empty one used to stage,
+        measure nothing, and commit silently -- most often the sign of a
+        template that produced an empty string rather than a genuinely
+        empty step.
     """
 
     effect_id: EffectId
@@ -175,6 +183,17 @@ class Effect:
     reversible: bool = True
     compensation: Compensation | None = None
     stated_rows: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.statement.strip():
+            raise PlanError(
+                f"effect {self.effect_id!r} has an empty (or whitespace-only) "
+                f"statement. There is no SQL verb here for the substrate to "
+                f"reject, so this would stage, measure nothing, and commit as a "
+                f"silent no-op -- often the sign of a template that produced an "
+                f"empty string rather than a genuinely empty step. Drop the "
+                f"effect from the plan if doing nothing is what you mean."
+            )
 
     @property
     def table(self) -> str:
