@@ -403,7 +403,16 @@ wheels = [
 ]
 
 [[package]]
-name = "interlock"
+name = "interlock-agentgov"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/8d/d7a99d4c4fae8533ba4aec294922b017029c6dfc1c4d6d3da217f56c6801/interlock_agentgov-0.3.0.tar.gz", hash = "sha256:6d82e06697455d993a0d155188dc19139682c5c93c5c14fd7bb394680d39d71b", size = 604728, upload-time = "2026-09-28T03:29:37.368Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/55/b8/920337f7e9c4aec94b9721f766a12d4ea98ff439a4cc0605d5441fca6fbb/interlock_agentgov-0.3.0-py3-none-any.whl", hash = "sha256:9c6bd362d8242cde518034d56b6f105bec9a238c2445979fd130cc519e354500", size = 207493, upload-time = "2026-09-28T03:29:35.306Z" },
+]
+
+[[package]]
+name = "interlock-escrow"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
@@ -442,15 +451,6 @@ dev = [
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
     { name = "ruff", specifier = ">=0.6.0" },
-]
-
-[[package]]
-name = "interlock-agentgov"
-version = "0.3.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c8/8d/d7a99d4c4fae8533ba4aec294922b017029c6dfc1c4d6d3da217f56c6801/interlock_agentgov-0.3.0.tar.gz", hash = "sha256:6d82e06697455d993a0d155188dc19139682c5c93c5c14fd7bb394680d39d71b", size = 604728, upload-time = "2026-09-28T03:29:37.368Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/b8/920337f7e9c4aec94b9721f766a12d4ea98ff439a4cc0605d5441fca6fbb/interlock_agentgov-0.3.0-py3-none-any.whl", hash = "sha256:9c6bd362d8242cde518034d56b6f105bec9a238c2445979fd130cc519e354500", size = 207493, upload-time = "2026-09-28T03:29:35.306Z" },
 ]
 
 [[package]]
