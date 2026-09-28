@@ -8,6 +8,11 @@ witness cosigns. It resolves whatever a crashed predecessor left open, as a
 restarted process does, runs the scenario's plans, and at the scenario's kill
 point prints one JSON line saying where it stopped. Then it waits.
 
+The ledger is a SQLite file settled after each commit, or, with
+``ledger_dsn``, a ledger shared through PostgreSQL in the back office's own
+database, settled by claim and settle (``same_transaction=True``): a hold
+before the stage, a claim in the stage's own ``COMMIT``, redeemed after it.
+
 The parent ends it with ``SIGKILL``. No ``finally`` runs and nothing is
 flushed or closed, so what the parent finds is what a crash at that point
 leaves behind.
@@ -15,13 +20,17 @@ leaves behind.
 Kill points, in the order a plan reaches them:
 
 =============  ===============================================================
+``reserved``   shared ledger: the plan's hold is placed; no stage opened yet
 ``apply``      the stage's transaction is open, ``effect`` effects applied
 ``intent``     ``COMMIT_INTENT`` is on disk; ``COMMIT`` not yet sent
+``claimed``    shared ledger: the settlement claim is written into the stage's
+               transaction, uncommitted; ``COMMIT`` not yet sent
 ``commit``     about to send ``COMMIT``: the child says so, then sends it, and
                the parent kills it while the server is still committing
 ``committed``  ``COMMIT`` returned; ``COMMITTED`` not yet appended
 ``recorded``   ``COMMITTED`` appended; no reverse anchor, no receipt
 ``anchored``   the reverse anchor settled in the ledger; no receipt yet
+``redeemed``   shared ledger: the claim is booked into the chain; no receipt yet
 ``torn``       half of a ``record``-type line written, the rest never
 ``recovered``  startup recovery appended its first record
 =============  ===============================================================
@@ -45,7 +54,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from agentgov import BudgetManager
-from agentgov.core import LedgerEntry
+from agentgov.core import Authorization, LedgerEntry, SettlementClaim
 from agentgov.receipts import CheckpointPolicy, FileWitness, HmacKey, ReceiptLog
 
 from interlock import (
@@ -202,6 +211,8 @@ class Substrate(PostgresSubstrate):
         return outcome
 
     def commit(self, handle: StageHandle) -> CommitReceipt:
+        if self._kill.due("claimed", handle.plan_id):
+            stop("claimed", **self.context(handle))
         if self._kill.due("commit", handle.plan_id):
             say("committing", **self.context(handle))
         receipt = super().commit(handle)
@@ -274,14 +285,19 @@ class Anchor(LedgerAnchor):
 
     __slots__ = ("_kill",)
 
-    def __init__(self, governed: BudgetManager, kill: Kill) -> None:
-        super().__init__(governed=governed)
+    def __init__(self, governed: BudgetManager, kill: Kill, *, same_transaction: bool) -> None:
+        super().__init__(governed=governed, same_transaction=same_transaction)
         self._kill = kill
 
     def reverse_anchor(
-        self, scope_id: str, record_hash: str, *, cost: Decimal | str = "0"
+        self,
+        scope_id: str,
+        record_hash: str,
+        *,
+        cost: Decimal | str = "0",
+        reservation: Authorization | None = None,
     ) -> LedgerEntry | None:
-        entry = super().reverse_anchor(scope_id, record_hash, cost=cost)
+        entry = super().reverse_anchor(scope_id, record_hash, cost=cost, reservation=reservation)
         if self._kill.at == "anchored":
             stop(
                 "anchored",
@@ -289,6 +305,22 @@ class Anchor(LedgerAnchor):
                 entry=entry.entry_hash if entry is not None else None,
                 memo=entry.memo if entry is not None else None,
             )
+        return entry
+
+    def reserve(self, plan_id: str, scope_id: str, cost: Decimal) -> Authorization | None:
+        reservation = super().reserve(plan_id, scope_id, cost)
+        if self._kill.due("reserved", plan_id):
+            stop(
+                "reserved",
+                plan_id=plan_id,
+                hold=str(reservation.authorization_id) if reservation is not None else None,
+            )
+        return reservation
+
+    def redeem(self, claim: SettlementClaim) -> LedgerEntry | None:
+        entry = super().redeem(claim)
+        if self._kill.at == "redeemed":
+            stop("redeemed", memo=entry.memo if entry is not None else None)
         return entry
 
 
@@ -313,7 +345,12 @@ def build(scenario: Mapping[str, Any], kill: Kill) -> EscrowEngine:
         lock_timeout_seconds=float(scenario.get("lock_seconds", 2.0)),
     )
     chain = Chain(str(scenario["chain"]), kill)
-    governor = BudgetManager.open_sqlite(str(scenario["ledger"]))
+    ledger_dsn = scenario.get("ledger_dsn")
+    governor = (
+        BudgetManager.open_postgres(str(ledger_dsn))
+        if ledger_dsn
+        else BudgetManager.open_sqlite(str(scenario["ledger"]))
+    )
     log_key = HmacKey(bytes.fromhex(str(scenario["log_key"])))
     witness = FileWitness(
         str(scenario["witness"]),
@@ -332,7 +369,7 @@ def build(scenario: Mapping[str, Any], kill: Kill) -> EscrowEngine:
         substrate,
         checkers=checkers(),
         chain=chain,
-        anchor=Anchor(governor, kill),
+        anchor=Anchor(governor, kill, same_transaction=bool(ledger_dsn)),
         settle_cost=str(scenario.get("settle", "0.25")),
         receipts=ReceiptIssuer(log, row_secret=bytes.fromhex(str(scenario["row_secret"]))),
     )

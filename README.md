@@ -505,6 +505,73 @@ AgentGov's latching breaker is re-read immediately before commit, not at admissi
 staging window is where a trip has to be observed, because a halt that does not stop
 in-flight side effects does not stop the effects.
 
+### Settling with the commit: claim and settle (PostgreSQL)
+
+Across processes, the governed mode above leaves two gaps: a trip another process commits
+between the breaker check and the commit, and a crash between the commit and the reverse
+anchor, which leaves effects with no settlement. Both close when the ledger lives in the
+same PostgreSQL database as the observed tables (`BudgetManager.open_postgres`, agentgov
+v0.3):
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+from agentgov import BudgetManager
+
+from interlock import EscrowEngine, LedgerAnchor, PostgresSubstrate, TableSpec, default_checkers
+
+governor = BudgetManager.open_postgres("postgresql://owner@db/app")  # the tables' owner
+governor.store.grant_join("interlock_agent")  # once: the stage role may claim, and no more
+engine = EscrowEngine(
+    PostgresSubstrate(
+        "postgresql://interlock_agent@db/app",
+        tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    ),
+    checkers=default_checkers(row_limit=8),
+    anchor=LedgerAnchor(governed=governor, same_transaction=True),
+    settle_cost="0.25",
+)
+```
+
+Each plan is settled in three steps:
+
+1. **Reserve.** Before the stage opens, the governor places a hold for the plan's cost, in
+   its own transaction. A scope that is halted or cannot pay refuses the plan here, before
+   anything is staged, and an overdraft trips its breaker.
+2. **Claim.** At commit the stage takes the ledger's writer lock inside its own
+   transaction, the governor catches up with every other governor and checks the breaker,
+   and a settlement claim keyed to the hold is written into the stage. The claim commits in
+   the stage's `COMMIT`, with the effects and the commit marker, or not at all, and no trip
+   in any process can land between the check and the commit.
+3. **Settle.** After the commit the claim is redeemed into AgentGov's chain: the hold's
+   release and the spend, which names the plan's `COMMIT_INTENT` record.
+
+The claim reads nothing of the chain, so the stage's `REPEATABLE READ` snapshot, however
+many ledger commits old, conflicts with nothing: a busy ledger never stops a plan from
+committing. Measured with four engines racing for one account while a governor wrote the
+ledger back to back, every plan committed, and every retry was the engines' own race for
+the account's row, as many as with no ledger traffic at all.
+
+No crash can leave effects without their claim, or a claim without its effects. A process
+that dies after its commit leaves the claim pending, and `recover()` books it (any
+governor may book any pending claim: one exists only for a stage that committed). A plan
+that did not commit leaves at most its hold, which `recover()` releases once the chain says
+the plan can no longer commit. `tests/test_crash_consistency.py` runs every kill point
+against this mode, including after the hold, mid-claim, and after the commit but before
+the claim is booked.
+
+- **The stage's role cannot write the ledger or claim anything.** It gets no privilege on
+  the ledger's tables, only `EXECUTE` on one `SECURITY DEFINER` function that records a
+  claim, and only with a token derived from a secret the role cannot read and from the
+  transaction's own id. A statement in an agent's plan runs as that role, and can neither
+  write the ledger, forge a claim, nor reuse a governor's token.
+- **Booked, a settlement stands whatever happened since.** A claim whose hold an operator
+  voided is booked as a spend on its own; one that overdraws the scope is booked and trips
+  the breaker. Its effects already happened.
+- **A refused plan is charged against its hold**, after its stage, as before, naming its
+  terminal record. A plan whose stage fails releases its hold.
+- **A stage stuck in `COMMIT` holds the ledger** until the server decides: no governor can
+  write meanwhile, bounded by the stage's `lock_timeout`.
+
 ## Receipts
 
 With a `ReceiptIssuer`, every plan the engine adjudicates, committed or refused, gets a
