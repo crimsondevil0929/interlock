@@ -10,26 +10,7 @@ resolution-markers = [
 [[package]]
 name = "agentgov"
 version = "0.2.1"
-source = { editable = "../agentgov" }
-
-[package.metadata]
-requires-dist = [
-    { name = "cryptography", marker = "extra == 'sign'", specifier = ">=42" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
-    { name = "streamlit", marker = "extra == 'ui'", specifier = ">=1.63" },
-]
-provides-extras = ["ui", "sign", "postgres"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "anthropic", specifier = ">=1.0.0" },
-    { name = "cryptography", specifier = ">=42" },
-    { name = "mypy", specifier = ">=1.11.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
-    { name = "pytest", specifier = ">=8.0.0" },
-    { name = "pytest-cov", specifier = ">=5.0.0" },
-    { name = "ruff", specifier = ">=0.6.0" },
-]
+source = { git = "https://github.com/crimsondevil0929/agentgov?rev=v0.3.0#19b27b0c23e0dfbe997d518a376911489a02fc7f" }
 
 [[package]]
 name = "annotated-types"
@@ -428,7 +409,7 @@ wheels = [
 
 [[package]]
 name = "interlock"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "agentgov" },
@@ -452,7 +433,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agentgov", editable = "../agentgov" },
+    { name = "agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=v0.3.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres"]

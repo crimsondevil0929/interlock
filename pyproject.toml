@@ -1,6 +1,6 @@
 [project]
 name = "interlock"
-version = "0.2.1"
+version = "0.3.0"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,26 +35,14 @@ classifiers = [
 # published there while this line stands. Publishing means putting agentgov on
 # PyPI and pinning a version range here instead.
 #
-# Pinned to an agentgov release tag, never a branch: `@main` resolved to
-# whatever main was when the lock was cut, which is how interlock 0.1.1 came to
-# lock an agentgov commit that reported itself as 0.1.0. Interlock 0.2.0 issues
-# ARC1 receipts, and agentgov.receipts first shipped in v0.2.0 (6d3cac2, the
-# receipts merge; its package metadata still reports 0.1.2). Interlock 0.2.1
-# needs agentgov 0.2.1's AgentThrashingError/CircuitOpenError and witness
-# fixes, and pins v0.2.1 (35788dd, whose package metadata correctly reports
-# 0.2.1 -- the mismatch that made 0.2.0's commit worth naming separately does
-# not recur here). uv.lock records the exact commit the tag names.
+# Pinned to an agentgov release tag, never a branch: `@main` resolves to
+# whatever main was when the lock was cut, leading to version drift.
+# Interlock 0.3.0 requires agentgov 0.3.0 for the Postgres Fleet Ledger
+# and the Claim and Settle shared-transaction architecture.
+# uv.lock records the exact commit the tag names.
 dependencies = [
-    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.2.1",
+    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.3.0",
 ]
-
-# LOCAL DEVELOPMENT ONLY -- drop before merging. Points uv at the sibling
-# agentgov checkout on feat/v0.3.0-fleet-ledger (PostgresStore), which has no
-# release tag yet. Workspace configuration, not written into built metadata:
-# the direct reference above is still what ships. Once agentgov v0.3.0 is
-# tagged, repin the direct reference to it and delete this table.
-[tool.uv.sources]
-agentgov = { path = "../agentgov", editable = true }
 
 [project.scripts]
 interlock = "interlock.cli:main_entry"
