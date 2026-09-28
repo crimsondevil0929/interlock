@@ -179,7 +179,7 @@ jobs:
           z = zipfile.ZipFile(glob.glob('dist/*.whl')[0])
           name = [n for n in z.namelist() if n.endswith('METADATA')][0]
           meta = z.read(name).decode()
-          assert 'Requires-Dist: agentgov @ git+' in meta, meta
+          assert 'Requires-Dist: interlock-agentgov' in meta, meta
           print('wheel metadata carries the direct reference')
           "
           uv venv /tmp/bare
