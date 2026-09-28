@@ -1,5 +1,5 @@
 [project]
-name = "interlock"
+name = "interlock-escrow"
 version = "0.3.0"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
@@ -23,25 +23,8 @@ classifiers = [
     "Topic :: Security",
     "Typing :: Typed",
 ]
-# agentgov is consumed read-only, as an audit dependency. See src/interlock/anchor.py.
-#
-# A PEP 508 direct reference rather than a [tool.uv.sources] entry. uv sources
-# are workspace configuration and are not written into built distribution
-# metadata, so a wheel built from one declares a bare `agentgov` requirement
-# that resolves against PyPI. A direct reference travels in the metadata, so
-# `pip install git+...interlock` and installing the built artifact both work.
-#
-# The cost is that PyPI rejects direct-URL dependencies, so interlock cannot be
-# published there while this line stands. Publishing means putting agentgov on
-# PyPI and pinning a version range here instead.
-#
-# Pinned to an agentgov release tag, never a branch: `@main` resolves to
-# whatever main was when the lock was cut, leading to version drift.
-# Interlock 0.3.0 requires agentgov 0.3.0 for the Postgres Fleet Ledger
-# and the Claim and Settle shared-transaction architecture.
-# uv.lock records the exact commit the tag names.
 dependencies = [
-    "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.3.0",
+    "interlock-agentgov>=0.3.0",
 ]
 
 [project.scripts]
@@ -51,8 +34,8 @@ interlock = "interlock.cli:main_entry"
 postgres = ["psycopg[binary]>=3.2"]
 
 [build-system]
-requires = ["uv_build>=0.12.10,<0.13.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
@@ -108,3 +91,14 @@ strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
+
+# Explicitly tell the build system where the module is
+[tool.uv_build]
+packages = ["src/interlock"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/interlock"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["interlock*"]
