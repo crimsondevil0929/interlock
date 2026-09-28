@@ -28,6 +28,18 @@ rule over the whole history.
 A process can also lose its commit's outcome without dying: the connection
 drops with ``COMMIT`` in flight. A TCP hop that loses exactly the ``COMMIT``,
 or exactly its reply, checks the same rule for the engine that lived.
+
+Every test runs twice, once per ledger:
+
+- ``sqlite-ledger``: the governor is a SQLite file, and a plan's cost is
+  settled after its commit, in the governor's own transaction;
+- ``shared-ledger``: the governor is a ledger shared through PostgreSQL, in
+  the back office's own database, joined to the stage's transaction
+  (``LedgerAnchor(same_transaction=True)``). The settlement is written into
+  the stage before its ``COMMIT``, and the kill points include the moment
+  after that write and before the ``COMMIT`` goes out. The rule then has a
+  second half, checked after every kill: a stage's settled spend is in the
+  ledger exactly when its effects and commit marker are in the database.
 """
 
 from __future__ import annotations
@@ -59,6 +71,8 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 from agentgov import BudgetManager  # noqa: E402
 from agentgov.core import EntryType  # noqa: E402
+from agentgov.exceptions import StorageError  # noqa: E402
+from agentgov.postgres import PostgresStore  # noqa: E402
 from agentgov.receipts import (  # noqa: E402
     ActionReceipt,
     FileWitness,
@@ -79,6 +93,7 @@ from interlock import (  # noqa: E402
     ReceiptIssuer,
     StageState,
 )
+from interlock.anchor import HOLD_MEMO  # noqa: E402
 from interlock.chain import EscrowRecord, RecordType  # noqa: E402
 from interlock.exceptions import (  # noqa: E402
     ChainInUseError,
@@ -359,17 +374,57 @@ class Restarted:
 class Crash:
     pg: Pg
     workdir: Path
+    shared: bool = False
+    """The governor is a ledger shared through PostgreSQL, joined to each
+    stage's transaction, rather than a SQLite file settled after each commit."""
     log_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     witness_key: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     row_secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
     children: list[Child] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        governor = BudgetManager.open_sqlite(str(self.ledger))
+        governor = self.open_governor()
         try:
             governor.open_root(SCOPE, "1000")
+            if self.shared:
+                # The stage role may carry the ledger's writes in its own
+                # transaction, through the joined functions, and nothing else.
+                store = governor.store
+                assert isinstance(store, PostgresStore)
+                store.grant_join(self.pg.role)
         finally:
             governor.close()
+
+    def open_governor(self, **kwargs: Any) -> BudgetManager:
+        """The governor a process opens: the shared ledger, as its owner, or
+        the SQLite file."""
+        if self.shared:
+            return BudgetManager.open_postgres(self.pg.admin, **kwargs)
+        return BudgetManager.open_sqlite(str(self.ledger), **kwargs)
+
+    def settlement(self) -> tuple[int, int, int]:
+        """Shared ledger, read as committed now: settled reverse-anchor spends,
+        pending settlement claims, and open plan holds."""
+        with BudgetManager.open_postgres(self.pg.admin, read_only=True) as governor:
+            spends = [
+                e
+                for e in governor.audit_trail()
+                if e.entry_type is EntryType.SPEND and e.memo.startswith("interlock:")
+            ]
+            holds = [
+                h for h in governor.stale_authorizations(0) if h.entry.memo.startswith(HOLD_MEMO)
+            ]
+            return len(spends), len(governor.pending_claims()), len(holds)
+
+    def ledger_is_locked(self) -> bool:
+        """Whether some transaction holds the shared ledger's writer lock: a
+        governor cannot open for writing within a short wait."""
+        try:
+            BudgetManager.open_postgres(self.pg.admin, lock_timeout=0.3).close()
+        except StorageError as exc:
+            assert "waiting for the writer lock" in str(exc), exc
+            return True
+        return False
 
     @property
     def chain(self) -> Path:
@@ -401,6 +456,7 @@ class Crash:
             "dsn": dsn or self.pg.agent,
             "chain": str(self.chain),
             "ledger": str(self.ledger),
+            "ledger_dsn": self.pg.admin if self.shared else None,
             "receipts": str(self.receipts),
             "witness": str(self.witness_file),
             "log_key": self.log_key.hex(),
@@ -427,7 +483,7 @@ class Crash:
         outlived it: the kernel releases an ``flock`` when the process dies.
         """
         chain = EscrowChain(self.chain)
-        governor = BudgetManager.open_sqlite(str(self.ledger))
+        governor = self.open_governor()
         log_key = HmacKey(self.log_key)
         witness = FileWitness(
             self.witness_file,
@@ -442,7 +498,7 @@ class Crash:
             ),
             checkers=checkers(),
             chain=chain,
-            anchor=LedgerAnchor(governed=governor),
+            anchor=LedgerAnchor(governed=governor, same_transaction=self.shared),
             settle_cost="0.25",
             receipts=ReceiptIssuer(log, row_secret=self.row_secret),
         )
@@ -454,9 +510,9 @@ class Crash:
                 child.kill()
 
 
-@pytest.fixture
-def crash(pg: Pg, tmp_path: Path) -> Iterator[Crash]:
-    env = Crash(pg, tmp_path)
+@pytest.fixture(params=[False, True], ids=["sqlite-ledger", "shared-ledger"])
+def crash(request: pytest.FixtureRequest, pg: Pg, tmp_path: Path) -> Iterator[Crash]:
+    env = Crash(pg, tmp_path, shared=bool(request.param))
     try:
         yield env
     finally:
@@ -507,9 +563,41 @@ def check_history(env: Crash, opened: Restarted, plans: Iterable[Refund]) -> set
             assert entry.memo.removeprefix("interlock:") in heads, entry
     for hold in opened.governor.ledger.open_holds():
         assert hold.memo.removeprefix("interlock:") in heads, hold
+    if env.shared:
+        check_settlements(opened, records)
 
     check_receipts(env, opened, records)
     return committed
+
+
+def check_settlements(opened: Restarted, records: Sequence[EscrowRecord]) -> None:
+    """Shared ledger, after recovery: a stage's settled spend exists exactly
+    when its effects do, and nothing is left owed or reserved.
+
+    A stage's claim commits in its own transaction, and redeemed, its spend
+    names the stage's ``COMMIT_INTENT`` record. So for every such intent: one
+    spend naming it if the chain says the stage committed (which
+    ``check_history`` has already matched against the stage's commit marker
+    and rows), and none if it did not. Recovery books every pending claim and
+    releases the hold of every plan that did not commit.
+    """
+    committed = {r.stage_id for r in records if r.record_type is CO}
+    spends = Counter(
+        e.memo.removeprefix("interlock:")
+        for e in opened.governor.audit_trail()
+        if e.entry_type is EntryType.SPEND and e.memo.startswith("interlock:")
+    )
+    claimed = [r for r in records if r.record_type is CI and "; settlement claimed" in r.note]
+    assert claimed or not committed, "a stage committed without claiming its settlement"
+    for intent in claimed:
+        expected = 1 if intent.stage_id in committed else 0
+        found = spends.get(intent.record_hash[:16], 0)
+        assert found == expected, (
+            f"stage {intent.stage_id}: {found} settled spend(s) naming its intent, "
+            f"{'committed' if expected else 'not committed'}"
+        )
+    assert opened.governor.pending_claims() == (), "a claim left unbooked"
+    assert opened.governor.stale_authorizations(0) == (), "a hold left reserved"
 
 
 def check_receipts(env: Crash, opened: Restarted, records: Sequence[EscrowRecord]) -> None:
@@ -565,7 +653,7 @@ class Case:
     @property
     def open_transaction(self) -> bool:
         """Whether the stage's transaction was still open at the kill."""
-        return not self.committed
+        return not self.committed and self.at != "reserved"
 
     @property
     def id(self) -> str:
@@ -589,8 +677,52 @@ CASES = [
     Case("torn", committed=True, chain=(*STAGED, CI), recovered=CO, record="committed"),
 ]
 
+SHARED_CASES = [
+    # The hold is placed; no stage opened. It stays reserved until recovery
+    # releases it.
+    Case("reserved", committed=False, chain=(PA,), recovered=None),
+    Case("apply", committed=False, chain=(PA, SO), recovered=None, effect=2),
+    # The ledger joined, the breaker checked, the intent on disk; the claim
+    # not yet written, and the COMMIT never sent.
+    Case("intent", committed=False, chain=(*STAGED, CI), recovered=AB),
+    # Mid-claim: the claim is written into the stage's own transaction, and
+    # the COMMIT never sent. The server rolls both back.
+    Case("claimed", committed=False, chain=(*STAGED, CI), recovered=AB),
+    # COMMIT returned: effects, marker and claim are all durable; the claim
+    # is owed, not yet booked.
+    Case("committed", committed=True, chain=(*STAGED, CI), recovered=CO),
+    Case("recorded", committed=True, chain=(*STAGED, CI, CO), recovered=None),
+    # The claim booked into the chain; no receipt yet.
+    Case("redeemed", committed=True, chain=(*STAGED, CI, CO), recovered=None),
+    Case("torn", committed=False, chain=STAGED, recovered=None, record="commit_intent"),
+    Case("torn", committed=True, chain=(*STAGED, CI), recovered=CO, record="committed"),
+]
+"""No ``anchored`` point: a committed plan is settled by redeeming its claim
+(``redeemed``), not by a reverse anchor written after the commit."""
 
-@pytest.mark.parametrize("case", CASES, ids=[c.id for c in CASES])
+HOLDS_THE_LEDGER = frozenset({"intent", "claimed", "torn-commit_intent"})
+"""Shared-ledger kill points inside the joined commit: the stage's
+transaction holds the ledger's writer lock."""
+
+
+def settlement_at_the_kill(case: Case) -> tuple[int, int, int]:
+    """Shared ledger, what a kill at ``case`` leaves committed: settled
+    spends, pending claims, open holds. A claim exactly when the effects are
+    (until it is booked); the hold reserved until it is settled."""
+    if case.at == "redeemed":
+        return 1, 0, 0
+    return 0, (1 if case.committed else 0), 1
+
+
+KILL_POINTS = [(False, c) for c in CASES] + [(True, c) for c in SHARED_CASES]
+
+
+@pytest.mark.parametrize(
+    ("crash", "case"),
+    KILL_POINTS,
+    indirect=["crash"],
+    ids=[f"{'shared' if shared else 'sqlite'}-ledger-{c.id}" for shared, c in KILL_POINTS],
+)
 def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
     crash: Crash, case: Case, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -607,6 +739,13 @@ def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
         # Staged, not committed: invisible to everyone else, and locked.
         assert Books.read(crash.pg) == Books.after([], [])
         assert row_locked(crash.pg)
+    if crash.shared:
+        # Inside the joined commit, the stage holds the ledger: no governor
+        # anywhere can write, so none can trip the scope after the check.
+        assert crash.ledger_is_locked() is (case.id in HOLDS_THE_LEDGER)
+        # The claim is visible exactly when the stage's COMMIT has returned:
+        # an uncommitted claim is no more visible than uncommitted effects.
+        assert crash.settlement() == settlement_at_the_kill(case)
     with pytest.raises(ChainInUseError, match=f"held by pid {child.pid}"):
         EscrowChain(crash.chain)
 
@@ -614,6 +753,12 @@ def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
     crash.settle()
     assert not row_locked(crash.pg)
     assert one(crash.pg.admin, "SELECT count(*) FROM pg_prepared_xacts") == 0
+    if crash.shared:
+        # The rule's second half, before anything resumes: effects leak
+        # nowhere without their claim, a claim nowhere without its effects,
+        # and a plan that did not commit leaves only its hold, reserved.
+        assert crash.settlement() == settlement_at_the_kill(case)
+        assert not crash.ledger_is_locked(), "the server released it with the session"
 
     # What the crash left, before anything resumes a file.
     data = crash.chain.read_bytes()
@@ -624,8 +769,8 @@ def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
         assert len(data) - (data.rfind(b"\n") + 1) == int(stop.raw["written"])
     intents = [r for r in left if r.record_type is CI]
     books = Books.read(crash.pg)
-    stage = next(r.stage_id for r in left if r.record_type is SO)
-    assert (str(stage) in books.markers) is case.committed
+    stage = next((r.stage_id for r in left if r.record_type is SO), None)
+    assert (stage is not None and str(stage) in books.markers) is case.committed
     if case.committed:
         assert books == Books.after([first], books.markers)
     else:
@@ -653,6 +798,10 @@ def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
             note = COMMITTED_NOTE if case.recovered is CO else ABORTED_NOTE
             assert record.note == note.format(intent.sequence)
             assert record.anchored
+        if crash.shared:
+            # Recovery booked the claim a committed stage left, and released
+            # the hold of a plan that did not commit.
+            assert crash.settlement() == ((1 if case.committed else 0), 0, 0)
         assert opened.engine.recover() == ()
 
         # Nothing the dead process started issued a receipt; the terminal
@@ -667,7 +816,13 @@ def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
             for e in opened.governor.audit_trail()
             if e.memo.startswith("interlock:") and e.entry_type in REVERSE_ANCHORS
         ]
-        if case.at == "anchored":
+        if crash.shared and case.committed:
+            # Claimed in the stage's own commit; booked naming the intent.
+            (anchor,) = anchors
+            (intent,) = intents
+            assert anchor.entry_type is EntryType.SPEND and anchor.amount == Decimal("0.25")
+            assert anchor.memo == f"interlock:{intent.record_hash[:16]}"
+        elif case.at == "anchored":
             (anchor,) = anchors
             assert anchor.entry_type is EntryType.SPEND and anchor.amount == Decimal("0.25")
             assert anchor.memo == f"interlock:{terminal.record_hash[:16]}"
@@ -739,9 +894,18 @@ def test_a_kill_during_commit_is_resolved_as_the_server_decided(
         eventually(lambda: waiting_on_gate(crash.pg, sent.backend_pid), "COMMIT to reach the gate")
         child.kill()
 
+        if crash.shared and server == "finishes the commit":
+            # The dead client's stage is still committing, and holds the
+            # shared ledger's writer lock until the server decides: no
+            # governor can open for writing, so no process can resume, or
+            # act on a guess, until then. The server decides first.
+            assert status(crash.pg, sent.txid) == "in progress"
+            assert crash.ledger_is_locked()
+            assert crash.settlement() == (0, 0, 1), "no claim until the server commits"
+            gate.execute("SELECT pg_advisory_unlock(%s)", (GATE,))
         opened = crash.restart()
         try:
-            if server == "finishes the commit":
+            if server == "finishes the commit" and not crash.shared:
                 # The client is dead and the server is still committing. The
                 # marker is not visible yet, and "absent" is not "rolled back".
                 assert status(crash.pg, sent.txid) == "in progress"

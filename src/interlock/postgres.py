@@ -541,6 +541,18 @@ class PostgresSubstrate:
         """Whether a write outside the observed tables is refused."""
         return self._enforce
 
+    def connection(self, handle: StageHandle) -> psycopg.Connection[Any]:
+        """The open stage's connection, for a governor to join its transaction.
+
+        What runs on it runs inside the stage, as the stage's role, and commits
+        or rolls back with the effects. Only the engine's commit path uses it,
+        after every effect has been applied and adjudicated (see
+        :meth:`interlock.anchor.LedgerAnchor.joined_commit`).
+
+        :raises StageError: If ``handle`` is not the stage open here.
+        """
+        return self._require(handle)
+
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
         if self._handle is None or self._handle.stage_id != handle.stage_id:

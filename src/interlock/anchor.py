@@ -22,34 +22,79 @@ plan carries a cost. Because ``memo`` is part of AgentGov's own hash payload,
 that reverse anchor is tamper-evident inside AgentGov's chain, and the two
 chains interlock in both directions. This uses only the public ``anchor()``,
 ``authorize(memo=)`` and ``capture(memo=)`` surface.
+
+*Same transaction* (``same_transaction=True``) is governed mode over a ledger
+shared through PostgreSQL (``BudgetManager.open_postgres``) in the same
+database the stages run in. A plan is settled by *claim and settle*:
+
+1. **Reserve.** Before its stage opens, the governor places a hold for the
+   plan's cost, in its own transaction (:meth:`LedgerAnchor.reserve`). The
+   hold's memo names the plan, so recovery can find it.
+2. **Claim.** At commit the governor joins the stage's own transaction
+   (:meth:`LedgerAnchor.joined_commit`): the ledger's writer lock is taken
+   inside it, the governor catches up and checks the breaker, and a
+   settlement claim keyed to the hold is written into the stage. The claim
+   commits in the stage's ``COMMIT``, with the effects and the commit marker,
+   or not at all, and no trip anywhere can land between the check and it.
+3. **Settle.** After the commit the claim is redeemed into the chain: the
+   hold's release and the spend, which names the plan's commit intent
+   (:meth:`LedgerAnchor.redeem`). A process that dies first leaves the claim
+   pending, and recovery redeems it.
+
+The claim reads nothing of the chain, so a stage's ``REPEATABLE READ``
+snapshot, taken when it opened, however many ledger commits ago, conflicts
+with nothing: however busy the ledger, the plan commits. No crash can leave
+effects without their claim, or a claim without its effects; a plan that did
+not commit leaves at most its hold, which recovery releases.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from agentgov.core import BudgetManager, EntryType, LedgerEntry
-from agentgov.exceptions import AgentGovError, LedgerIntegrityError, UnknownScopeError
+from agentgov.core import (
+    Authorization,
+    BudgetManager,
+    EntryType,
+    JoinedTransaction,
+    LedgerEntry,
+    SettlementClaim,
+)
+from agentgov.exceptions import (
+    AgentGovError,
+    BudgetError,
+    CircuitBreakerError,
+    DoubleSpendError,
+    LedgerConflictError,
+    LedgerIntegrityError,
+    UnknownScopeError,
+)
+from agentgov.storage import JoinableStore
 
 from interlock.exceptions import (
     AnchorError,
     InterlockError,
     LedgerUnverifiedError,
     ScopeHaltedError,
+    StageConflictError,
 )
 from interlock.types import GENESIS_HASH
 
-__all__ = ["AnchorPoint", "LedgerAnchor"]
+__all__ = ["HOLD_MEMO", "AnchorPoint", "JoinedCommit", "LedgerAnchor"]
 
 logger = logging.getLogger("interlock.anchor")
 
 _REVERSE_ANCHOR_TYPES = frozenset({EntryType.ANCHOR, EntryType.SPEND})
+
+HOLD_MEMO = "interlock-hold:"
+"""Prefix of a reservation's memo, followed by the plan id. Recovery finds a
+plan's hold by it."""
 
 
 @contextmanager
@@ -100,10 +145,17 @@ class LedgerAnchor:
         ``verify_anchors`` has nothing to check.
     :param governed: An already-open, write-capable ``BudgetManager`` for
         co-resident deployments. Supplying it enables reverse anchoring.
+    :param same_transaction: Write the breaker check, the reverse anchor and
+        the settled cost inside the stage's own transaction. ``governed`` must
+        be a governor opened with ``BudgetManager.open_postgres`` on the
+        database the stages run in, and the stage's role must be granted
+        joined writes (``PostgresStore.grant_join``).
     :raises LedgerUnverifiedError: If ``audit_path`` names nothing, names
         something that is not an AgentGov ledger, or names one whose chain
         does not verify. Every unusable-ledger path raises this and nothing
         else, so a caller can fail closed on one exception type.
+    :raises ValueError: If ``same_transaction`` is set without a governor
+        that can join a transaction.
 
     No method on this class raises an ``agentgov`` exception. Every foreign
     error is translated into :class:`~interlock.exceptions.AnchorError` or
@@ -111,15 +163,23 @@ class LedgerAnchor:
     is catchable with ``except InterlockError``.
     """
 
-    __slots__ = ("_audit", "_governed")
+    __slots__ = ("_audit", "_governed", "_same_transaction")
 
     def __init__(
         self,
         audit_path: str | Path | None = None,
         *,
         governed: BudgetManager | None = None,
+        same_transaction: bool = False,
     ) -> None:
+        if same_transaction and (governed is None or not isinstance(governed.store, JoinableStore)):
+            raise ValueError(
+                "same_transaction needs a governed BudgetManager over a ledger that can "
+                "join the stage's transaction: BudgetManager.open_postgres on the database "
+                "the stages run in"
+            )
         self._governed = governed
+        self._same_transaction = same_transaction
         self._audit: BudgetManager | None = None
         if audit_path is None:
             return
@@ -156,6 +216,11 @@ class LedgerAnchor:
     def can_reverse_anchor(self) -> bool:
         return self._governed is not None
 
+    @property
+    def joins_transaction(self) -> bool:
+        """Whether commits run through :meth:`joined_commit`."""
+        return self._same_transaction
+
     def observe(self) -> AnchorPoint:
         """Read AgentGov's current head position.
 
@@ -175,20 +240,24 @@ class LedgerAnchor:
                 return AnchorPoint(anchored=True, head_hash=ledger.head_hash, sequence=len(ledger))
 
     def _refresh(self) -> None:
-        """Catch the audit view up with the governor, verifying every new entry.
+        """Catch the attached views up with the ledger, verifying every new entry.
 
-        A no-op without an audit view: a governed manager is the writer and is
-        always current.
+        The audit view follows the governor. A governed manager over a
+        single-writer ledger is the writer and always current, so its refresh
+        is a no-op; over a ledger shared through PostgreSQL, other governors
+        write too, and it follows them.
 
         :raises LedgerUnverifiedError: If the new entries do not verify, or the
             ledger was rewritten under the view. The view then refuses every
             later read, so the failure repeats rather than clearing itself.
         :raises AnchorError: If the ledger cannot be read at all.
         """
-        if self._audit is None:
-            return
+        for source in self._sources():
+            self._refresh_one(source)
+
+    def _refresh_one(self, source: BudgetManager) -> None:
         try:
-            self._audit.refresh()
+            source.refresh()
         except LedgerIntegrityError as exc:
             raise LedgerUnverifiedError(
                 f"the AgentGov ledger no longer verifies against what this anchor read "
@@ -251,6 +320,138 @@ class LedgerAnchor:
             self.assert_scope_live(scope_id)
             yield
 
+    def reserve(self, plan_id: str, scope_id: str, cost: Decimal) -> Authorization | None:
+        """Place the hold a plan's claim will settle against, before its stage
+        opens. Same-transaction mode; ``None`` for a free plan.
+
+        In the governor's own transaction, so it is visible to every stage
+        opened after it, and checks the breaker and the budget as any
+        authorization does: a plan that cannot pay is refused before it
+        stages anything.
+
+        :raises ScopeHaltedError: If the scope is halted or cannot pay
+            ``cost``. An overdraft trips the breaker, durably.
+        :raises AnchorError: If AgentGov refused the hold for another reason.
+        """
+        governed = self._governed
+        if governed is None or not self._same_transaction or cost <= 0:
+            return None
+        try:
+            return governed.authorize(scope_id, cost, memo=f"{HOLD_MEMO}{plan_id}")
+        except (CircuitBreakerError, BudgetError) as exc:
+            raise ScopeHaltedError(
+                f"scope {scope_id!r} cannot reserve this plan's cost of {cost}, so it is not "
+                f"staged: {type(exc).__name__}: {exc}"
+            ) from exc
+        except AgentGovError as exc:
+            raise AnchorError(
+                f"AgentGov refused the reservation on scope {scope_id!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    def release(self, reservation: Authorization | None) -> None:
+        """Void a reservation whose plan did not commit. Best effort: a hold
+        left behind is released by recovery, and never double-spent."""
+        if reservation is None or self._governed is None:
+            return
+        try:
+            self._governed.void(reservation, memo="plan did not commit")
+        except DoubleSpendError:
+            return  # already settled or voided
+        except AgentGovError:
+            logger.warning(
+                "hold %s could not be released now; recovery will",
+                reservation.authorization_id,
+                exc_info=True,
+            )
+
+    @contextmanager
+    def joined_commit(self, scope_id: str, connection: object) -> Iterator[JoinedCommit]:
+        """Join the stage's transaction for its commit. Same-transaction mode.
+
+        On entry the ledger's writer lock is taken inside the stage's
+        transaction, the governor catches up with every other governor's
+        commits, and the breaker is checked: the scope is live, and stays so
+        until the stage commits or rolls back, fleet-wide. Inside the block,
+        :meth:`JoinedCommit.claim` records the plan's settlement claim in the
+        stage's transaction. Commit the stage inside the block; redeem the
+        claim after it (:meth:`redeem`).
+
+        Nothing here reads the chain through the stage's snapshot, so however
+        many ledger commits landed while the plan was staged, nothing
+        conflicts.
+
+        :param connection: The stage's connection
+            (``PostgresSubstrate.connection``).
+        :raises StageConflictError: If the writer lock was not granted within
+            the stage's lock bound. Nothing was written; run the plan again.
+        :raises ScopeHaltedError: If the scope or an ancestor is halted.
+        :raises AnchorError: If the ledger cannot be joined or read.
+        """
+        governed = self._governed
+        if governed is None or not self._same_transaction:
+            raise AnchorError("joined_commit needs an anchor built with same_transaction=True")
+        with ExitStack() as stack:
+            try:
+                transaction = stack.enter_context(governed.joined(connection))
+            except LedgerConflictError as exc:
+                # A halt is final, and a retry would only find it again:
+                # refuse the plan rather than invite one.
+                self.assert_scope_live(scope_id)
+                raise StageConflictError(
+                    f"the AgentGov ledger's writer lock was not granted in time: {exc}"
+                ) from exc
+            except AgentGovError as exc:
+                raise AnchorError(
+                    f"AgentGov could not join the stage's transaction: {type(exc).__name__}: {exc}"
+                ) from exc
+            self.assert_scope_live(scope_id)
+            yield JoinedCommit(transaction, scope_id)
+
+    def redeem(self, claim: SettlementClaim) -> LedgerEntry | None:
+        """Book a committed claim into the chain, right after its commit.
+
+        :returns: The settling entry, or ``None`` when another governor booked
+            it first.
+        :raises AnchorError: If AgentGov could not book it now. The claim stays
+            pending, and recovery books it.
+        """
+        governed = self._governed
+        if governed is None:
+            return None
+        with _barrier(f"redeeming settlement claim {claim.claim_id}"):
+            booked = governed.redeem(claim)
+        return booked[0] if booked else None
+
+    def settle_pending(self, releasable: Iterable[str]) -> tuple[LedgerEntry, ...]:
+        """After a crash: book every pending claim, and release the holds of
+        ``releasable`` plans.
+
+        Any governor may book any pending claim, since a claim exists only for
+        a stage that committed. A hold is released only for a plan the caller
+        knows can no longer commit (its chain says it ended, or never reached
+        its commit intent): never another engine's plan, which may be staging
+        right now.
+
+        :param releasable: Ids of plans whose holds may be voided.
+        :returns: The entries booked for pending claims.
+        :raises AnchorError: If AgentGov cannot be written.
+        """
+        governed = self._governed
+        if governed is None or not self._same_transaction:
+            return ()
+        plans = frozenset(releasable)
+        with _barrier("settling pending claims after recovery"):
+            booked = governed.redeem()
+            governed.refresh()
+            for hold in governed.stale_authorizations(0):
+                memo = hold.entry.memo
+                if memo.startswith(HOLD_MEMO) and memo.removeprefix(HOLD_MEMO) in plans:
+                    self.release(hold)
+        for entry in booked:
+            logger.warning("recovered a pending settlement claim: %s", entry.memo)
+        return booked
+
     def halted_after_commit(self, scope_id: str) -> str:
         """Describe a halt that raced a commit through an audit view, if any.
 
@@ -305,6 +506,9 @@ class LedgerAnchor:
         """
         if self._governed is None:
             return
+        # A scope another governor of a shared ledger opened is known once
+        # this one has followed it.
+        self._refresh()
         try:
             self._governed.node(scope_id)
         except UnknownScopeError as exc:
@@ -342,6 +546,7 @@ class LedgerAnchor:
         record_hash: str,
         *,
         cost: Decimal | str = "0",
+        reservation: Authorization | None = None,
     ) -> LedgerEntry | None:
         """Write an Interlock chain head into AgentGov's chain.
 
@@ -353,6 +558,9 @@ class LedgerAnchor:
             a zero-value ``ANCHOR`` entry, which moves no money: the anchor is
             free. A positive cost is settled through AgentGov's
             ``authorize``/``capture`` pair and the spend carries the memo.
+        :param reservation: The plan's hold, placed before it staged
+            (:meth:`reserve`). The cost is then captured against it rather than
+            authorized anew.
         :returns: The anchoring entry, or ``None`` when not co-resident.
         :raises AnchorError: If ``cost`` is negative. Raised here rather than
             letting AgentGov's ``ValueError`` surface from inside the commit
@@ -368,6 +576,8 @@ class LedgerAnchor:
             )
         memo = f"interlock:{record_hash[:16]}"
         with _barrier(f"a reverse anchor on scope {scope_id!r}"):
+            if reservation is not None:
+                return self._governed.capture(reservation, amount, memo=memo)
             if amount == 0:
                 return self._governed.anchor(scope_id, memo)
             authorization = self._governed.authorize(scope_id, amount, memo=memo)
@@ -395,6 +605,32 @@ class LedgerAnchor:
         if self._audit is not None:
             self._audit.close()
             self._audit = None
+
+
+class JoinedCommit:
+    """The ledger's part in one stage's commit. Yielded by
+    :meth:`LedgerAnchor.joined_commit`."""
+
+    __slots__ = ("_scope_id", "_transaction")
+
+    def __init__(self, transaction: JoinedTransaction, scope_id: str) -> None:
+        self._transaction = transaction
+        self._scope_id = scope_id
+
+    def claim(
+        self, record_hash: str, *, cost: Decimal, reservation: Authorization | None
+    ) -> SettlementClaim:
+        """Record the plan's settlement claim in the stage's transaction.
+
+        Durable exactly when the stage's effects are. Redeemed, its spend
+        names ``record_hash``, the plan's commit intent, and settles against
+        ``reservation``.
+
+        :raises AnchorError: If AgentGov refused the claim.
+        """
+        memo = f"interlock:{record_hash[:16]}"
+        with _barrier(f"a settlement claim on scope {self._scope_id!r}"):
+            return self._transaction.claim(self._scope_id, cost, memo=memo, hold=reservation)
 
 
 def _halted(source: BudgetManager, scope_id: str) -> str | None:

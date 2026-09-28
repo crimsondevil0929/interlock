@@ -48,6 +48,14 @@ dependencies = [
     "agentgov @ git+https://github.com/crimsondevil0929/agentgov@v0.2.1",
 ]
 
+# LOCAL DEVELOPMENT ONLY -- drop before merging. Points uv at the sibling
+# agentgov checkout on feat/v0.3.0-fleet-ledger (PostgresStore), which has no
+# release tag yet. Workspace configuration, not written into built metadata:
+# the direct reference above is still what ships. Once agentgov v0.3.0 is
+# tagged, repin the direct reference to it and delete this table.
+[tool.uv.sources]
+agentgov = { path = "../agentgov", editable = true }
+
 [project.scripts]
 interlock = "interlock.cli:main_entry"
 

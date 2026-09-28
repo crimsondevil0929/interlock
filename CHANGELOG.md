@@ -9,6 +9,39 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+Requires agentgov's shared ledger (`feat/v0.3.0-fleet-ledger`, not yet tagged);
+`pyproject.toml` points at a sibling checkout until it is, and must be repinned to the
+release tag before this merges.
+
+### Added
+
+- **Settlement with the commit: claim and settle
+  (`LedgerAnchor(same_transaction=True)`).** With the AgentGov ledger shared through
+  PostgreSQL in the same database as the observed tables, a plan's hold is placed before
+  its stage opens; at commit the governor joins the stage's transaction, checks the breaker
+  under the ledger's writer lock taken inside it, and writes a settlement claim keyed to
+  the hold into the stage, so effects, commit marker and claim commit in one `COMMIT` or
+  not at all; after the commit the claim is redeemed into AgentGov's chain, the spend
+  naming the plan's `COMMIT_INTENT` record, whose note says `settlement claimed`. The claim
+  reads nothing of the chain, so a stage conflicts with no ledger traffic, however busy.
+  A scope that cannot pay, or is halted, refuses the plan before it stages. A refused plan
+  is charged against its hold; a failed stage releases it. `EscrowEngine.recover()` books
+  every pending claim and releases the holds of its plans that can no longer commit.
+  `PostgresSubstrate.connection()` exposes the stage's connection to the anchor;
+  `EscrowEngine` refuses a same-transaction anchor over a substrate without one.
+- **Crash consistency for the shared ledger.** Every test in
+  `tests/test_crash_consistency.py` now runs against a SQLite ledger and a shared
+  PostgreSQL one. New kill points stop after the hold is placed (`reserved`), after the
+  claim is written into the stage and before `COMMIT` is sent (`claimed`), and after the
+  claim is booked (`redeemed`). At every kill a claim exists exactly when the effects do,
+  and a plan that did not commit leaves only its hold; after recovery nothing is left
+  owed or reserved, and a stage's settled spend exists exactly when its effects do.
+
+### Changed
+
+- **A governed anchor over a shared ledger follows the other governors** before it reads
+  the ledger's head or a scope, as an audit view always has.
+
 ## [0.2.1] - 2026-09-26
 
 Four fixes found by an adversarial DX audit that drove real Claude traffic through

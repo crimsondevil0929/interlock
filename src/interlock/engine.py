@@ -50,10 +50,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from agentgov.core import EntryType, LedgerEntry
+from agentgov.core import Authorization, EntryType, LedgerEntry, SettlementClaim
 
 from interlock.adjudication import Adjudication, adjudicate
-from interlock.anchor import AnchorPoint, LedgerAnchor
+from interlock.anchor import AnchorPoint, JoinedCommit, LedgerAnchor
 from interlock.builder import new_plan_id
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
@@ -112,6 +112,12 @@ _MARKER_ARMED = "; commit marker armed"
 """Suffix on a ``COMMIT_INTENT`` note: the substrate writes a commit marker
 inside this stage's transaction, so :meth:`EscrowEngine.recover` may read the
 marker's absence as "did not commit". The note is inside the record hash."""
+
+_SETTLEMENT_CLAIMED = "; settlement claimed"
+"""Infix on a ``COMMIT_INTENT`` note: the plan's settlement claim is written
+inside the stage's own transaction, so it commits with the effects or not at
+all, and its spend will name this record. Precedes the marker suffix, which
+recovery reads."""
 
 _SAVEPOINT = "ilok_repair"
 """The savepoint a repair search returns to between candidates."""
@@ -195,6 +201,7 @@ class EscrowEngine:
         "_claims_lock",
         "_inflight",
         "_receipts",
+        "_reserving",
         "_settle_cost",
         "_substrate",
     )
@@ -218,6 +225,15 @@ class EscrowEngine:
                 "EscrowChain.load() returns a read-only snapshot; pass EscrowChain(path) "
                 "to resume appending to the file"
             )
+        if (
+            anchor is not None
+            and anchor.joins_transaction
+            and not callable(getattr(substrate, "connection", None))
+        ):
+            raise ValueError(
+                f"a same-transaction anchor joins the stage's own transaction, and substrate "
+                f"{substrate.substrate_id!r} has none to join; use PostgresSubstrate"
+            )
         self._anchor = anchor
         self._settle_cost = (
             settle_cost if isinstance(settle_cost, Decimal) else Decimal(settle_cost)
@@ -225,6 +241,7 @@ class EscrowEngine:
         if self._settle_cost < 0:
             raise ValueError(f"settle_cost cannot be negative, got {self._settle_cost}")
         self._inflight: set[uuid.UUID] = set()
+        self._reserving: set[PlanId] = set()
         self._claims: set[PlanId] = set()
         self._claims_lock = threading.Lock()
 
@@ -345,6 +362,8 @@ class EscrowEngine:
             if exc.feedback is None:
                 exc.feedback = feedback_for_error(plan, exc)
             raise
+        finally:
+            self._reserving.discard(plan.plan_id)
 
     def _execute(
         self, plan: EffectPlan, *, settle_cost: Decimal | str | None, repairs: str | None
@@ -364,7 +383,15 @@ class EscrowEngine:
         terminal: EscrowRecord | None = None
         txid: str | None = None
 
-        handle = self._substrate.open(plan)
+        # Claim and settle: the hold is placed before the stage opens, so the
+        # stage's snapshot can see it, and a plan its scope cannot pay for is
+        # refused before it stages anything.
+        reservation = self._reserve(plan, cost)
+        try:
+            handle = self._substrate.open(plan)
+        except BaseException:
+            self._release(reservation)
+            raise
         outcomes: list[EffectOutcome] = []
         diff: EffectDiff | None = None
         verdict: Verdict | None = None
@@ -372,6 +399,7 @@ class EscrowEngine:
         state = StageState.STAGING
         committed = False
         lost_reply = False
+        claim: SettlementClaim | None = None
 
         try:
             self._record(
@@ -419,13 +447,20 @@ class EscrowEngine:
                 state = StageState.VERIFIED
                 # The breaker is re-read immediately before commit, and held
                 # there: the window between staging and commit is exactly
-                # where a trip matters. See LedgerAnchor.guard_commit.
-                guard: AbstractContextManager[None] = (
-                    self._anchor.guard_commit(plan.scope_id)
-                    if self._anchor is not None
-                    else nullcontext()
-                )
-                with guard:
+                # where a trip matters. See LedgerAnchor.guard_commit. In
+                # same-transaction mode the ledger joins the stage's own
+                # transaction instead (LedgerAnchor.joined_commit): the check
+                # holds fleet-wide, and the settlement claim commits with the
+                # effects.
+                joined = self._joined_connection(handle)
+                guard: AbstractContextManager[JoinedCommit | None]
+                if self._anchor is not None and joined is not None:
+                    guard = self._anchor.joined_commit(plan.scope_id, joined)
+                elif self._anchor is not None:
+                    guard = self._anchor.guard_commit(plan.scope_id)
+                else:
+                    guard = nullcontext()
+                with guard as ledger:
                     # Write-ahead. The intent lands before the substrate is
                     # told to commit, so a crash in that window leaves
                     # COMMIT_INTENT with no terminal record after it, and
@@ -435,15 +470,21 @@ class EscrowEngine:
                     armed = bool(getattr(self._substrate, "commit_markers", False))
                     txid = _transaction_id(self._substrate, handle)
                     self._inflight.add(handle.stage_id)
-                    self._record(
+                    intent = self._record(
                         RecordType.COMMIT_INTENT,
                         plan,
                         diff.content_hash(),
                         stage=handle.stage_id,
                         note=f"about to commit {diff.blast_radius} rows"
                         + (f"{_TXID}{txid}" if txid else "")
+                        + (_SETTLEMENT_CLAIMED if ledger is not None else "")
                         + (_MARKER_ARMED if armed else ""),
                     )
+                    # Joined: the claim is durable exactly when the effects
+                    # and their commit marker are. Redeemed, its spend names
+                    # the intent, the record in front of the COMMIT it rode in.
+                    if ledger is not None:
+                        claim = ledger.claim(intent.record_hash, cost=cost, reservation=reservation)
                     try:
                         self._substrate.commit(handle)
                     except CommitUnsettledError as lost:
@@ -493,13 +534,22 @@ class EscrowEngine:
                 note="stage failed",
                 best_effort=True,
             )
+            self._release(reservation)
             raise
         finally:
             self._inflight.discard(handle.stage_id)
             self._substrate.close(handle)
 
         head = self._chain.head_hash
-        settlement = self._reverse_anchor(plan, head, cost)
+        if claim is not None and committed:
+            # Claim and settle: book the claim the stage committed.
+            settlement = self._redeem(plan, claim)
+        else:
+            # Every other path settles after the stage, in AgentGov's own
+            # transaction: a plan not joined to the ledger, and one that did
+            # not commit (whose cost to produce was spent all the same,
+            # captured against its reservation when it has one).
+            settlement = self._reverse_anchor(plan, head, cost, reservation)
         receipt = None
         if receipt_id is not None and judged is not None and terminal is not None:
             receipt = self._issue_receipt(
@@ -892,6 +942,12 @@ class EscrowEngine:
         ``COMMIT`` in flight leaves the server still committing, and an absent
         marker then means nothing. It stays open, and a later run resolves it.
 
+        With a same-transaction anchor it then settles what the crash left in
+        the ledger: every pending settlement claim is booked (a claim exists
+        only for a stage that committed), and the hold of every plan in this
+        chain that can no longer commit is released. A plan whose intent is
+        still open keeps its hold.
+
         :returns: The records appended, in chain order.
         :raises InterlockError: If the substrate or the chain cannot be read
             or written.
@@ -956,6 +1012,14 @@ class EscrowEngine:
                 "committed" if outcome else "rolled back",
             )
             resolved.append(record)
+        if self._anchor is not None and self._anchor.joins_transaction:
+            # Claim and settle: book every claim a committed stage left
+            # pending, and release the holds of this chain's plans that can no
+            # longer commit. A plan with an open intent may still commit, and
+            # one this engine is running now may still claim: theirs stay.
+            still_open = {r.plan_id for r in self._chain.unresolved_intents()} | self._reserving
+            known = {r.plan_id for r in self._chain.records()}
+            self._anchor.settle_pending(known - still_open)
         return tuple(resolved)
 
     # -- internals ----------------------------------------------------------
@@ -1026,6 +1090,12 @@ class EscrowEngine:
                 f"commit marker; the server rolled it back"
             ) from lost
 
+    def _joined_connection(self, handle: StageHandle) -> object | None:
+        """The stage connection the ledger joins, in same-transaction mode."""
+        if self._anchor is None or not self._anchor.joins_transaction:
+            return None
+        return _stage_connection(self._substrate, handle)
+
     def _observe(self, *, best_effort: bool) -> AnchorPoint:
         if self._anchor is None:
             return AnchorPoint.unanchored()
@@ -1039,7 +1109,56 @@ class EscrowEngine:
             )
             return AnchorPoint.unanchored()
 
-    def _reverse_anchor(self, plan: EffectPlan, head: str, cost: Decimal) -> LedgerEntry | None:
+    def _reserve(self, plan: EffectPlan, cost: Decimal) -> Authorization | None:
+        """Place the plan's hold, in same-transaction mode, before it stages.
+
+        A plan its scope cannot pay for, or whose scope is halted, is refused
+        here, and the chain records that it ended before staging.
+        """
+        if self._anchor is None or not self._anchor.joins_transaction:
+            return None
+        try:
+            reservation = self._anchor.reserve(plan.plan_id, plan.scope_id, cost)
+        except InterlockError as exc:
+            self._record(
+                RecordType.ABORTED,
+                plan,
+                plan.content_hash(),
+                note=f"refused before staging: {exc}",
+                best_effort=True,
+            )
+            raise
+        if reservation is not None:
+            self._reserving.add(plan.plan_id)
+        return reservation
+
+    def _release(self, reservation: Authorization | None) -> None:
+        if reservation is not None and self._anchor is not None:
+            self._anchor.release(reservation)
+
+    def _redeem(self, plan: EffectPlan, claim: SettlementClaim) -> LedgerEntry | None:
+        """Book the claim the stage just committed. Runs after commit, so a
+        failure degrades to a pending claim, which recovery books."""
+        assert self._anchor is not None
+        try:
+            return self._anchor.redeem(claim)
+        except AnchorError:
+            logger.warning(
+                "settlement claim %s for plan %s could not be booked now; it stays pending "
+                "and recovery books it",
+                claim.claim_id,
+                plan.plan_id,
+                exc_info=True,
+            )
+            return None
+
+    def _reverse_anchor(
+        self,
+        plan: EffectPlan,
+        head: str,
+        cost: Decimal,
+        reservation: Authorization | None = None,
+    ) -> LedgerEntry | None:
         """Write Interlock's chain head into AgentGov, when co-resident.
 
         ``memo`` is inside AgentGov's hash payload, so once written the reverse
@@ -1054,7 +1173,9 @@ class EscrowEngine:
         if self._anchor is None or not self._anchor.can_reverse_anchor:
             return None
         try:
-            entry = self._anchor.reverse_anchor(plan.scope_id, head, cost=cost)
+            entry = self._anchor.reverse_anchor(
+                plan.scope_id, head, cost=cost, reservation=reservation
+            )
         except AnchorError:
             # Degrade rather than raise. By here the substrate has already
             # committed, so raising would replace a truthful StageResult about
@@ -1082,6 +1203,12 @@ def _coverage_note(substrate: ShadowSubstrate) -> str:
     if not isinstance(report, CascadeReport) or not report.gaps:
         return ""
     return _GAPS + report.describe_gaps()
+
+
+def _stage_connection(substrate: ShadowSubstrate, handle: StageHandle) -> object | None:
+    """The open stage's connection, when the substrate has one to join."""
+    reader = getattr(substrate, "connection", None)
+    return reader(handle) if callable(reader) else None
 
 
 def _transaction_id(substrate: ShadowSubstrate, handle: StageHandle) -> str | None:
