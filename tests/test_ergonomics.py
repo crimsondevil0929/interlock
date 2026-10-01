@@ -490,3 +490,14 @@ def test_builder_kinds_map_to_effect_kinds() -> None:
         EffectKind.UPDATE,
         EffectKind.DELETE,
     ]
+
+
+def test_the_package_reports_the_version_it_is_published_as() -> None:
+    """``interlock.__version__`` is the release's, not the one before it."""
+    import tomllib
+
+    import interlock
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    published = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert interlock.__version__ == published
