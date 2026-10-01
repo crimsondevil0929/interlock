@@ -58,6 +58,14 @@ Releases before 0.1.2 are described by their tags and commit history.
   gain `max_attempts`, `backoff_base_seconds`, `backoff_cap_seconds` and
   `unknown_outcome` (`"redeliver"`, at least once; `"dead-letter"`, at most once); the
   configuration gains `[relay]`.
+- **`CrossEffectAgreement`: a request must say what its rows say.** A pure checker that
+  holds a field of an outbound request, read back from the outbox, to the rows the same plan
+  wrote, as measured: the sum of a column over inserted rows (`measure="inserted"`), its net
+  change over every row written (`"net"`), or one exact value every row holds (`"value"`),
+  optionally pairing each request with its own rows (`key=`). Strict both ways: a request
+  with no rows, or rows with no request, is refused. A refund request for 5000.00 beside the
+  refund row the plan inserted for 50.00 is refused before commit, and nothing is written or
+  sent; the agent is told the rule (`cross_effect_agreement`), never the amounts.
 - **Relay crash consistency (Epic 2, phase 4).** `tests/test_relay_crash.py` kills a relay
   process with SIGKILL at each point of the delivery path, for a sink that honours keys, one
   that does not, and one that dead-letters, and checks the exact outcome; a duplicate
@@ -83,6 +91,11 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 Every plan, effect and diff hash computed before outbound requests is unchanged: the new
 fields enter a hash only when present (pinned in `tests/test_outbound.py`).
+
+### Fixed
+
+- **`interlock.__version__` reads `0.3.0`,** the version published to PyPI; it still read
+  `0.2.1`. A test now holds it to `pyproject.toml`.
 
 ## [0.3.0] - 2026-09-27
 

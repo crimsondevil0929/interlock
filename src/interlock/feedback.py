@@ -120,6 +120,8 @@ class Guidance(StrEnum):
     SCOPE_HALTED = "scope_halted"
     UNAVAILABLE = "unavailable"
     OUTBOUND_REQUEST = "outbound_request"
+    # Raised by a checker over the measured diff and the outbox.
+    OUTBOUND_AGREEMENT = "outbound_agreement"
 
 
 _LABELS: Final[Mapping[Guidance, str]] = {
@@ -145,6 +147,7 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.SCOPE_HALTED: "scope_halted",
     Guidance.UNAVAILABLE: "unavailable",
     Guidance.OUTBOUND_REQUEST: "outbound_request",
+    Guidance.OUTBOUND_AGREEMENT: "cross_effect_agreement",
 }
 """The public name of each kind. Derived from the kind, never from a checker's
 own ``name``, which can embed configuration (``column_value_guard:orders.total``)
@@ -356,6 +359,10 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     Guidance.OUTBOUND_REQUEST: lambda c: (
         "an outbound request names a sink or operation that is not registered, or its "
         "payload breaks that operation's rules (schema, size, credentials, compensation)."
+    ),
+    Guidance.OUTBOUND_AGREEMENT: lambda c: (
+        f"an outbound request disagrees with {_column(c)} as this plan wrote it. A request "
+        f"must carry what the rows it goes with record: make the two agree, or drop both."
     ),
 }
 

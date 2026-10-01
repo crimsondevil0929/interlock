@@ -262,6 +262,7 @@ blocking violation: fail closed.
 | `NoSchemaChange` | effects declared as DDL |
 | `TruncationGuard` | a diff that hit the row cap |
 | `StatedFootprint` | the agent's claim against the measurement |
+| `CrossEffectAgreement` | an outbound request against the rows it rides with ([outbox](#outbound-requests-the-transactional-outbox)) |
 
 `TenantDrawdownGuard` exists because `ColumnValueGuard` sums the column across
 the whole diff, and a sum is the wrong denominator on a multi-tenant
@@ -912,63 +913,158 @@ role may call that writes elsewhere, an extension such as `dblink` that opens an
 connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
 or later; CI runs 16.
 
-## Outbound requests
+## Outbound requests: the transactional outbox
 
-An email, a refund through a payment API, a webhook: none of them can be staged, and none
-can be rolled back. So on PostgreSQL Interlock stages the *request* instead, and a separate
-relay makes the call after the plan commits ([`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md)).
+An email, a refund through a payment API, a webhook: a plan often has to call something
+besides its database, and none of those calls can be staged, measured or rolled back. An
+agent that makes the call itself has made it before anything could check it, which is how
+an instruction injected through a tool result gets out.
 
-1. `PlanBuilder.enqueue()` puts the request in the plan beside its SQL effects. The engine
-   admits it only against the operator's `SinkRegistry`: a registered sink and operation, a
-   payload under the sink's size bound that matches the operation's JSON Schema, no field
-   named like a credential, and the compensation the operation registers, if any.
-2. The stage writes it to `interlock.outbox` in its own transaction, through a function
-   gated by a token only the substrate holds. The checkers read it back from there, and it
-   commits with the plan's rows and stage marker, or not at all.
-3. The plan pays at commit: its settle cost and each request's `cost_per_call`, in one
-   settlement. The hold placed before staging covers both; a refused plan pays only its
-   settle cost, since its requests never commit.
-4. `interlock relay`, a separate process under its own database role and the only holder of
-   the sinks' credentials, delivers the committed requests.
+So Interlock does not let the plan make the call. It uses the **transactional outbox**
+pattern: the plan *enqueues a request* for the call, beside its SQL effects, and the request
+is handled like a row (PostgreSQL only; the design, and the proofs, are in
+[`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md)).
+
+1. **Enqueue.** `PlanBuilder.enqueue()` adds the request to the plan. Admission holds it to
+   the operator's `SinkRegistry`: a registered sink and operation, a payload that matches
+   the operation's JSON Schema and fits the sink's size bound, no field named like a
+   credential, and the compensation the operation registers, if any.
+2. **Stage.** The stage writes the request to `interlock.outbox` in its own transaction,
+   through a function gated by a token only the substrate holds. The checkers read it back
+   from there, beside the measured rows. It commits with the rows and the stage marker, or
+   not at all: a refused or failed plan leaves no request behind.
+3. **Pay.** The plan pays at commit, in the settlement that commits with it: its settle
+   cost and each request's `cost_per_call`. The hold placed before staging covers both; a
+   refused plan pays only its settle cost, since its requests never commit.
+4. **Deliver.** `interlock relay`, a separate process under its own database role and the
+   only holder of the sinks' credentials, reads committed requests and makes the calls, at
+   least once.
+
+### Configuring a sink
+
+Sinks are declared in `interlock.toml` beside the tables. `interlock install` mirrors them
+into the database, which then refuses a request for any sink or operation it does not
+hold. A sink has no URL and no credential here: those belong to the relay.
 
 ```toml
-relay_roles = ["interlock_relay"]     # install grants them the relay functions, nothing else
+substrate = "postgres"
+stage_roles = ["interlock_agent"]
+relay_roles = ["interlock_relay"]     # granted read access and the relay functions, nothing else
 
 [[sinks]]
 name = "payments"
-cost_per_call = "0.0005"
-idempotency = "header"                # the sink deduplicates on Idempotency-Key
-unknown_outcome = "redeliver"         # or "dead-letter": at most once
+cost_per_call = "0.0005"              # a decimal string, charged at commit
+idempotency = "header"                # the sink deduplicates on Idempotency-Key; "none" if not
+unknown_outcome = "redeliver"         # or "dead-letter": a call that may have acted is not repeated
+not_after_seconds = 900               # delivered within this, or not at all
 max_attempts = 10
+backoff_base_seconds = 1              # doubling, with jitter, up to the cap
+backoff_cap_seconds = 600
 
 [[sinks.operations]]
 name = "refund"
-compensation = "refund.reverse"
+schema = "schemas/payments-refund.json"   # a JSON Schema subset, relative to this file
+compensation = "none-possible"            # or the operation that undoes this one
+```
 
-[[sinks.operations]]
-name = "refund.reverse"
+```bash
+interlock install --config interlock.toml --database postgresql://owner@db/app
+```
 
+### Enqueueing a request, and checking it against its rows
+
+<!-- readme-test: skip reason="needs a live PostgreSQL server" -->
+```python
+from interlock import (
+    BlastRadius,
+    CrossEffectAgreement,
+    EscrowEngine,
+    PlanBuilder,
+    PostgresSubstrate,
+)
+from interlock.config import load_config
+
+config = load_config("interlock.toml")
+engine = EscrowEngine(
+    PostgresSubstrate("postgresql://interlock_agent@db/app", tables=config.tables),
+    checkers=[
+        BlastRadius(10),
+        # The refund the payment API is asked for is the refund the plan recorded.
+        CrossEffectAgreement(
+            "payments",
+            "refund",
+            field="amount",
+            table="refunds",
+            column="amount",
+            key=("order_item", "order_item_id"),
+        ),
+    ],
+    sinks=config.sink_registry(),
+)
+plan = (
+    PlanBuilder("support-agent")
+    .insert(
+        table="refunds",
+        statement=(
+            "INSERT INTO refunds (id, order_item_id, amount) VALUES (%(id)s, %(item)s, %(a)s)"
+        ),
+        parameters={"id": 9100, "item": 5000, "a": "50.00"},
+    )
+    .enqueue(sink="payments", operation="refund", payload={"order_item": 5000, "amount": "50.00"})
+    .build()
+)
+result = engine.execute(plan)
+```
+
+A row diff alone has a blind spot: every row can be valid and every request well-formed,
+and the two can still contradict each other. `CrossEffectAgreement` closes it. If a tool
+result talks the agent into asking the payment API for 5000.00 while the refund row it
+inserts says 50.00, the plan is refused before it commits: no row, no request, nothing for
+the relay to send. Both halves are measured, the request read back from the outbox and the
+rows from the stage's capture, so the check judges exactly what would be sent and what
+would be committed. `measure="net"` holds a request to the change in a balance it moves,
+and `measure="value"` to one exact value such as a currency. The rule is strict both
+ways: a refund call with no refund row, or a refund row with no call, is refused too. The
+agent is told which rule it broke, never the amounts.
+
+### Running the relay
+
+```toml
 [relay]
-database = "postgresql://interlock_relay@db/app"
-ledger = "postgresql://interlock_relay@db/app"    # AgentGov, read-only, for the breaker
+database = "postgresql://interlock_relay@db/app"   # a relay role; or INTERLOCK_RELAY_DATABASE
+ledger = "postgresql://interlock_relay@db/app"     # AgentGov, read-only, for the breaker
+lease_seconds = 60                                 # at least twice timeout_seconds
+timeout_seconds = 10
+workers = 4
 
 [[relay.endpoints]]
 sink = "payments"
 url = "https://api.payments.example"
-routes = { refund = "POST /v1/refunds", "refund.reverse" = "POST /v1/refunds/reverse" }
-header_env = { Authorization = "PAYMENTS_AUTHORIZATION" }    # the value is in the environment
+routes = { refund = "POST /v1/refunds" }                    # every operation the sink registers
+header_env = { Authorization = "PAYMENTS_AUTHORIZATION" }   # the value is read from the environment
 ```
 
 ```bash
-interlock relay --config interlock.toml --workers 4     # until SIGTERM; --once drains and exits
+export PAYMENTS_AUTHORIZATION="Bearer ..."     # in the relay's environment, nowhere else
+interlock relay --config interlock.toml        # runs until SIGTERM; --once drains and exits
+
+# As the installer: inspect, verify, and act on what the relay could not deliver.
 interlock outbox status  --config interlock.toml --database postgresql://owner@db/app
+interlock outbox list    --state dead --config interlock.toml --database postgresql://owner@db/app
 interlock outbox verify  --config interlock.toml --database postgresql://owner@db/app
 interlock outbox release --scope support-agent --actor alice --config interlock.toml ...
 ```
 
+Run as many relays as throughput needs, on as many hosts: they share the work through
+`FOR UPDATE SKIP LOCKED` and never wait on each other. On SIGTERM a relay finishes the call
+in hand, records it, and exits. `interlock outbox show <message>` prints a message's
+delivery log; `requeue` sends a dead message back with a fresh budget of attempts, and
+`cancel` drops one.
+
 A relay reads AgentGov's ledger and never writes it: over a ledger shared through
 PostgreSQL, grant its role `USAGE` on the `agentgov` schema and `SELECT` on its tables,
-nothing more. Over a SQLite ledger, name the file; it is opened read-only.
+nothing more. Over a SQLite ledger, name the file; it is opened read-only. Without AgentGov
+at all, set `breaker = "none"`, explicitly: a relay never runs without a breaker by default.
 
 What the relay guarantees, each with a test that fails without it:
 
@@ -1116,8 +1212,8 @@ against the shipped code, not inferred.
   external effects is deliberately weaker, and stated as such: the **request** is measured,
   adjudicated and made durable exactly when the rest of the plan is; its **delivery** is
   at-least-once, recorded, and bounded; what the external system then does is not measured
-  at all. See [Outbound requests](#outbound-requests). SQLite has no outbox and refuses an
-  outbound request.
+  at all. See [Outbound requests](#outbound-requests-the-transactional-outbox). SQLite has
+  no outbox and refuses an outbound request.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
 

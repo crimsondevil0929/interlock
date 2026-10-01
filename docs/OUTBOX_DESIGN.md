@@ -2,9 +2,10 @@
 
 **Status: phases 0 to 4 built** (see §12): requests are admitted, staged in the
 outbox, charged at commit, and delivered by the relay, which is proven against crashes
-at every point of its path. Not built yet: the outbound checkers and rate windows of
-§5.2 and §5.3, compensation and operator records in the escrow chain (§8), delivery
-receipts (§9), and SQLite (Phase 6). Where a section describes what was built, it says
+at every point of its path; and a request is checked against the rows it rides with
+(`CrossEffectAgreement`, §5.2). Not built yet: the other outbound checkers and the rate
+windows of §5.2 and §5.3, compensation and operator records in the escrow chain (§8),
+delivery receipts (§9), and SQLite (Phase 6). Where a section describes what was built, it says
 so; where the build departed from the design, the section was changed to match it. This
 document turns the outbox sketch in
 [`ESCROW_SPEC.md` §4.4](ESCROW_SPEC.md#44-non-transactional-sinks) (requirements
@@ -406,7 +407,7 @@ row the relay will send is the row checked.
 | `PayloadAmountCap(sink, operation, path, max, per_tenant=)` | A money field (JSON path, decimal string) exceeds a cap. `Decimal`, never float, as `ColumnValueGuard` is. |
 | `RecipientAllowlist(sink, operation, path, domains=)` | An email or webhook recipient falls outside the allowed domains or a tenant's own contacts. |
 | `OutboundTenantIsolation()` | A request's `tenant_id`, or a tenant field in its payload, differs from the plan's declared tenants, or from the tenants of the rows it accompanies. |
-| `CrossEffectAgreement(sink, operation, path, table, column)` | The request disagrees with the rows it rides with: the Stripe refund amount is not the `refunds.amount` the same plan inserted, or the email quotes a total the `orders` row does not hold. **The flagship.** An injected "refund $5,000" beside a row that says $50 is caught by arithmetic, not judgement. |
+| `CrossEffectAgreement(sink, operation, field=, table=, column=, measure=, key=)` | The request disagrees with the rows it rides with: the Stripe refund amount is not the `refunds.amount` the same plan inserted, or the email quotes a total the `orders` row does not hold. **The flagship.** An injected "refund $5,000" beside a row that says $50 is caught by arithmetic, not judgement. *Built:* `field` is a dotted path into the payload; `measure` is `"inserted"` (the sum of the column over inserted rows), `"net"` (its net change over every row written) or `"value"` (one exact value every written row holds); `key=(payload_field, column)` pairs each request with its own rows. Strict both ways: a request with no rows, or rows with no request, is refused. |
 | `OutboundRateLimit(sink, window, max, per="tenant")` | Committed requests in the window, plus this plan's, would exceed the limit (§5.3). |
 
 Every checker offers a typed `FeedbackHint`, sanitised as today: feedback names
@@ -753,7 +754,9 @@ including tests.
 ### Phase 2: checkers and windows (1 wk) — budget built; checkers and windows not
 
 *As built, Phase 2 was narrowed to the budget (§5.4): the sum reserved, priced,
-checked and charged at commit. The checkers of §5.2 and the windows of §5.3 remain.*
+checked and charged at commit; then `CrossEffectAgreement`, the flagship of §5.2,
+was built after the relay. The other checkers of §5.2 and the windows of §5.3
+remain.*
 
 
 - The seven checkers of §5.2, with feedback hints and property tests that their

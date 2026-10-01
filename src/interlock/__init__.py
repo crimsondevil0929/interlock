@@ -90,6 +90,7 @@ from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEviden
 from interlock.invariants import (
     BlastRadius,
     ColumnValueGuard,
+    CrossEffectAgreement,
     InvariantChecker,
     NoDelete,
     NoSchemaChange,
@@ -160,6 +161,7 @@ __all__ = [
     "CommitUnsettledError",
     "Compensation",
     "ConstraintFeedback",
+    "CrossEffectAgreement",
     "CyclicPlanError",
     "Delivery",
     "DeliveryResult",

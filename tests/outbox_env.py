@@ -8,6 +8,8 @@ Three sinks, one per delivery guarantee the relay can give:
 - ``sms`` does not, and redelivers an unknown outcome: at least once, and a
   lost call can act twice.
 - ``pager`` does not, and dead-letters an unknown outcome: at most once.
+
+And ``payments``, which honours keys, for refunds checked against their rows.
 """
 
 from __future__ import annotations
@@ -59,12 +61,14 @@ RELAY_SINKS: tuple[SinkSpec, ...] = (
         unknown_outcome=DEAD_LETTER,
         **_FAST,
     ),
+    SinkSpec("payments", (OperationSpec("refund"),), cost_per_call=Decimal("0.01"), **_FAST),
 )
 REGISTRY = SinkRegistry(RELAY_SINKS)
 ROUTES: Mapping[str, Mapping[str, str]] = {
     "mail": {"send": "POST /mail/send"},
     "sms": {"send": "POST /sms/send"},
     "pager": {"page": "POST /pager/page"},
+    "payments": {"refund": "POST /payments/refund"},
 }
 
 
@@ -141,7 +145,7 @@ class Outbox:
 
     def sink(self, name: str, *, honour_keys: bool | None = None) -> FakeSink:
         if name not in self.sinks:
-            keys = (name == "mail") if honour_keys is None else honour_keys
+            keys = (name in ("mail", "payments")) if honour_keys is None else honour_keys
             self.sinks[name] = FakeSink(honour_keys=keys)
         return self.sinks[name]
 
