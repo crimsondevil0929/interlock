@@ -1068,8 +1068,14 @@ reading the test suite.
   effects name a substrate other than the engine's, so such a plan is rejected
   rather than misrouted, but nothing coordinates two substrates.
 - **`distribution_shift`.** No historical store, no MAD computation.
-- **Transactional outbox and relay** (section 4.4). `EffectKind.ENQUEUE` is
-  defined and carries no behaviour.
+- **Transactional outbox and relay** (section 4.4): partial. On PostgreSQL an
+  `ENQUEUE` effect is written to `interlock.outbox` inside the stage, through a
+  function gated by a per-stage token, and commits with the stage's rows and
+  marker or not at all. Its idempotency key derives from `(plan_id, effect_id)`
+  (E4-2). Its compensation is part of the request, so it is hashed into the plan
+  the chain records at admission and committed in the outbox row with the do
+  (E4-3). There is no relay yet (E4-1), so nothing is delivered, and no
+  compensation is applied (E4-4, E4-5). SQLite refuses the effect.
 - **Deterministic replay.** Nothing captures or re-injects substrate-assigned
   values (`now()`, sequences, `random()`), so a recorded verdict cannot be
   re-derived by re-running the plan.

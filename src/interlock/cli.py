@@ -129,6 +129,8 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
                 schema=config.schema,
                 stage_roles=config.stage_roles,
                 audit_roles=config.audit_roles,
+                sinks=config.sinks,
+                relay_roles=config.relay_roles,
             )
             report = analyze_cascades(
                 read_postgres_foreign_keys(conn, config.schema),
@@ -144,6 +146,11 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
         print(f"granted to stage role: {role}", file=out)
     for role in config.audit_roles:
         print(f"granted to audit role: {role}", file=out)
+    for sink in config.sinks:
+        operations = ", ".join(op.name for op in sink.operations)
+        print(f"registered sink: {sink.name} ({operations})", file=out)
+    for role in config.relay_roles:
+        print(f"granted to relay role: {role}", file=out)
     _print_report(report, out)
     return EXIT_OK
 

@@ -9,9 +9,48 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-Requires agentgov's shared ledger (`feat/v0.3.0-fleet-ledger`, not yet tagged);
-`pyproject.toml` points at a sibling checkout until it is, and must be repinned to the
-release tag before this merges.
+### Added
+
+- **Outbound requests, staged in a transactional outbox (Epic 2, phases 0 and 1; see
+  `docs/OUTBOX_DESIGN.md`).** `PlanBuilder.enqueue(sink=, operation=, payload=, ...)` adds
+  an `EffectKind.ENQUEUE` effect carrying an `OutboundRequest`, whose payload is frozen and
+  hashed over its ARC1 canonical bytes. `EscrowEngine(sinks=SinkRegistry(...))` admits a
+  request only for a registered sink and operation, under the sink's size bound, with no
+  credential-like field, matching the operation's JSON Schema (a strict subset; anything
+  else is refused at registration), and carrying the compensation the operation registers,
+  or none when the operator declares it `"none-possible"` (E4-3). On PostgreSQL the request
+  is written to `interlock.outbox` inside the stage through `interlock.enqueue`, a function
+  gated by a per-stage token only the substrate holds; the database re-checks the sink, the
+  operation, the size and the payload hash over the bytes sent. It is measured into
+  `EffectDiff.outbound`, committed with the plan's rows and marker or not at all, recorded
+  in the receipt's row commitment (`interlock.receipts.receipt_rows`) and noted on
+  `COMMIT_INTENT` (`; outbound N`). Its idempotency key is `outbound_key(plan_id,
+  effect_id)`, unique in the outbox, so a plan's request commits at most once. Nothing is
+  delivered yet: the relay is phase 3. SQLite refuses the effect.
+- **`[[sinks]]` and `relay_roles` in `interlock.toml`,** which `interlock install` mirrors
+  into `interlock.sinks` (a sink no longer listed is disabled, not deleted) and grants: the
+  relay role reads the outbox and appends attempts, and changes delivery state only.
+- **Crash consistency with an outbox.** Every refund in `tests/test_crash_consistency.py`
+  also enqueues its email; at every kill point, in both ledger modes, a request is in the
+  outbox exactly when its plan's stage marker is.
+
+### Changed
+
+- **`INSTALL_VERSION` is `"2"`.** `interlock install` over version 1 upgrades in place, in
+  one transaction: `interlock.stages` gains `enqueue_hash`, `begin_stage` its token
+  argument, and the outbox tables their append-only triggers (enabled `ALWAYS`). A stage
+  refuses to open over a version-1 installation, over an outbox whose append-only triggers
+  are missing or disabled, and for a stage role that can write any `interlock` table.
+- **`EffectPlan.stated_rows` ignores `ENQUEUE` effects,** which write no observed row, so a
+  plan with a request still gets `StatedFootprint`'s check.
+
+Every plan, effect and diff hash computed before outbound requests is unchanged: the new
+fields enter a hash only when present (pinned in `tests/test_outbound.py`).
+
+## [0.3.0] - 2026-09-27
+
+Requires agentgov 0.3.0 (`interlock-agentgov` on PyPI), whose PostgreSQL fleet ledger
+the same-transaction mode joins. Published to PyPI as `interlock-escrow`.
 
 ### Added
 

@@ -1030,10 +1030,13 @@ against the shipped code, not inferred.
   quote's proof of work are verifiable; its milestones are the harness's claim.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
-- **Non-transactional sinks cannot be staged.** An email has no shadow. Those belong in a
-  transactional outbox written inside the stage and delivered by a separate relay, with the
-  compensation serialized before the outbox row commits. `EffectKind.ENQUEUE` is defined
-  and carries no behaviour.
+- **Non-transactional sinks cannot be staged, only enqueued, and nothing delivers yet.** An
+  email has no shadow. `PlanBuilder.enqueue()` adds an `EffectKind.ENQUEUE` effect: an
+  outbound request to a registered sink, which on PostgreSQL is written to
+  `interlock.outbox` inside the stage, measured into the diff, and committed with the plan's
+  rows or not at all (see [`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md)). The relay that
+  delivers committed requests, at least once under an idempotency key, is not built yet, so
+  a committed request waits in the outbox. SQLite has no outbox and refuses the effect.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
 

@@ -64,6 +64,7 @@ from interlock.exceptions import (
     CyclicPlanError,
     ForbiddenStatementError,
     InterlockError,
+    OutboundRequestError,
     PlanError,
     ScopeHaltedError,
     StageError,
@@ -72,12 +73,14 @@ from interlock.exceptions import (
 )
 from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedback_for_error
 from interlock.invariants import InvariantChecker
+from interlock.outbound import SinkRegistry
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
 from interlock.substrate import ShadowSubstrate, _verb_reason
 from interlock.types import (
     Effect,
     EffectDiff,
     EffectId,
+    EffectKind,
     EffectOutcome,
     EffectPlan,
     PlanId,
@@ -112,6 +115,10 @@ _MARKER_ARMED = "; commit marker armed"
 """Suffix on a ``COMMIT_INTENT`` note: the substrate writes a commit marker
 inside this stage's transaction, so :meth:`EscrowEngine.recover` may read the
 marker's absence as "did not commit". The note is inside the record hash."""
+
+_OUTBOUND = "; outbound "
+"""Infix on a ``COMMIT_INTENT`` note: how many outbound requests the stage
+wrote to the outbox, which commit with it."""
 
 _SETTLEMENT_CLAIMED = "; settlement claimed"
 """Infix on a ``COMMIT_INTENT`` note: the plan's settlement claim is written
@@ -189,6 +196,9 @@ class EscrowEngine:
         free. A positive cost is settled, and the spend carries the anchor.
     :param receipts: Issue a signed ARC1 receipt for every adjudicated plan,
         committed or refused. See :mod:`interlock.receipts`.
+    :param sinks: The sinks outbound requests (``ENQUEUE`` effects) may name.
+        Without it, a plan with an outbound request is refused at admission.
+        See :mod:`interlock.outbound`.
     :raises ValueError: If ``settle_cost`` is negative, or ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`.
     """
@@ -203,6 +213,7 @@ class EscrowEngine:
         "_receipts",
         "_reserving",
         "_settle_cost",
+        "_sinks",
         "_substrate",
     )
 
@@ -215,8 +226,10 @@ class EscrowEngine:
         anchor: LedgerAnchor | None = None,
         settle_cost: Decimal | str = "0",
         receipts: ReceiptIssuer | None = None,
+        sinks: SinkRegistry | None = None,
     ) -> None:
         self._substrate = substrate
+        self._sinks = sinks
         self._receipts = receipts
         self._checkers = tuple(checkers)
         self._chain = chain if chain is not None else EscrowChain()
@@ -263,6 +276,9 @@ class EscrowEngine:
             itself. Read from the SQL, not from ``Effect.kind``.
         :raises UncompensatableEffectError: If an irreversible effect arrived
             without a serialized undo.
+        :raises OutboundRequestError: If an ``ENQUEUE`` effect's request is not
+            admissible: this substrate has no outbox, the engine has no sink
+            registry, or the request breaks the registry's rules.
         :raises PlanError: If an effect's declared ``target`` names a substrate
             other than the one this engine holds, or a table that substrate
             does not observe. Both checks read the label, not the statement: a
@@ -274,12 +290,21 @@ class EscrowEngine:
         except ValueError as exc:
             raise CyclicPlanError(str(exc)) from exc
 
+        # An outbound request carries no statement: it answers to the sink
+        # registry instead, and to a substrate that can stage it at all.
+        for effect in plan.effects:
+            if effect.kind is EffectKind.ENQUEUE:
+                problem = self._outbound_problem(effect)
+                if problem is not None:
+                    raise problem
+        statements = [e for e in plan.effects if e.kind is not EffectKind.ENQUEUE]
+
         # The substrate vets the statement text. Done at admission so a plan
         # it would refuse never opens a connection or takes a write lock; the
         # substrate re-checks in apply() for callers who skip the engine.
         veto = getattr(self._substrate, "reject_reason", None)
         if callable(veto):
-            for effect in plan.effects:
+            for effect in statements:
                 refusal = veto(effect)
                 if refusal is not None:
                     raise ForbiddenStatementError(
@@ -288,7 +313,7 @@ class EscrowEngine:
                     )
 
         capabilities = self._substrate.capabilities
-        for effect in plan.effects:
+        for effect in statements:
             if not effect.reversible and effect.compensation is None:
                 raise UncompensatableEffectError(
                     f"effect {effect.effect_id!r} is irreversible and carries no "
@@ -317,7 +342,7 @@ class EscrowEngine:
 
         observed: frozenset[str] | None = getattr(self._substrate, "observed_tables", None)
         if observed is not None:
-            unseen = sorted({e.table for e in plan.effects} - observed)
+            unseen = sorted({e.table for e in statements} - observed)
             if unseen:
                 raise PlanError(
                     f"plan targets unobserved table(s): {', '.join(unseen)}; "
@@ -477,6 +502,7 @@ class EscrowEngine:
                         stage=handle.stage_id,
                         note=f"about to commit {diff.blast_radius} rows"
                         + (f"{_TXID}{txid}" if txid else "")
+                        + (f"{_OUTBOUND}{len(diff.outbound)}" if diff.outbound else "")
                         + (_SETTLEMENT_CLAIMED if ledger is not None else "")
                         + (_MARKER_ARMED if armed else ""),
                     )
@@ -783,6 +809,8 @@ class EscrowEngine:
 
     def _effect_problem(self, effect: Effect) -> InterlockError | None:
         """Why admission would refuse this one effect, or ``None``."""
+        if effect.kind is EffectKind.ENQUEUE:
+            return self._outbound_problem(effect)
         veto = getattr(self._substrate, "reject_reason", None)
         if callable(veto):
             refusal = veto(effect)
@@ -805,6 +833,29 @@ class EscrowEngine:
             return PlanError(
                 f"effect {effect.effect_id!r} targets unobserved table {effect.table!r}"
             )
+        return None
+
+    def _outbound_problem(self, effect: Effect) -> InterlockError | None:
+        """Why admission would refuse this ``ENQUEUE`` effect, or ``None``."""
+        assert effect.request is not None  # Effect enforces it for ENQUEUE
+        if not self._substrate.capabilities.outbound:
+            return OutboundRequestError(
+                f"effect {effect.effect_id!r} is an outbound request, and substrate "
+                f"{self._substrate.substrate_id!r} has no transactional outbox to stage it in",
+                reason="substrate",
+                sink=effect.request.sink,
+            )
+        if self._sinks is None:
+            return OutboundRequestError(
+                f"effect {effect.effect_id!r} is an outbound request, and this engine has no "
+                f"sink registry: build it with sinks=SinkRegistry(...)",
+                reason="no_registry",
+                sink=effect.request.sink,
+            )
+        try:
+            self._sinks.check(effect.request)
+        except OutboundRequestError as exc:
+            return exc
         return None
 
     @contextmanager

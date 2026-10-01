@@ -22,8 +22,12 @@ Every money column is ``NUMERIC(12,2)``.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import timedelta
+from decimal import Decimal
+from typing import Any
 
 from interlock import TableSpec
+from interlock.outbound import OperationSpec, SinkSpec
 
 BACK_OFFICE_DDL: tuple[str, ...] = (
     "CREATE TABLE tenants (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
@@ -202,3 +206,34 @@ def insert_sql(table: str, width: int, placeholder: str) -> str:
 
 def seed_rows() -> Sequence[tuple[str, tuple[tuple[object, ...], ...]]]:
     return BACK_OFFICE_ROWS
+
+
+MAIL_SEND_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "to": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$", "maxLength": 254},
+        "subject": {"type": "string", "maxLength": 200},
+        "body": {"type": "string"},
+    },
+    "required": ["to", "subject"],
+    "additionalProperties": False,
+}
+
+TEST_SINKS: tuple[SinkSpec, ...] = (
+    SinkSpec(
+        "mail",
+        operations=(OperationSpec("send", schema=MAIL_SEND_SCHEMA),),
+        cost_per_call=Decimal("0.002"),
+        max_payload_bytes=4096,
+    ),
+    SinkSpec(
+        "payments",
+        operations=(
+            OperationSpec("refund", compensation="refund.reverse"),
+            OperationSpec("refund.reverse"),
+        ),
+        not_after=timedelta(hours=1),
+    ),
+)
+"""The sinks the PostgreSQL fixture installs: a notification that nothing can
+undo, and a payment whose undo is registered with it."""

@@ -43,6 +43,7 @@ from interlock.exceptions import (
     CyclicPlanError,
     ForbiddenStatementError,
     InterlockError,
+    OutboundRequestError,
     PlanError,
     ScopeHaltedError,
     StageConflictError,
@@ -118,6 +119,7 @@ class Guidance(StrEnum):
     EXPIRED = "expired"
     SCOPE_HALTED = "scope_halted"
     UNAVAILABLE = "unavailable"
+    OUTBOUND_REQUEST = "outbound_request"
 
 
 _LABELS: Final[Mapping[Guidance, str]] = {
@@ -142,6 +144,7 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.EXPIRED: "stage_expired",
     Guidance.SCOPE_HALTED: "scope_halted",
     Guidance.UNAVAILABLE: "unavailable",
+    Guidance.OUTBOUND_REQUEST: "outbound_request",
 }
 """The public name of each kind. Derived from the kind, never from a checker's
 own ``name``, which can embed configuration (``column_value_guard:orders.total``)
@@ -350,6 +353,10 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     Guidance.EXPIRED: lambda c: "the plan took longer than a stage allows. Split the work.",
     Guidance.SCOPE_HALTED: lambda c: "the agent's scope is halted; no plan will be staged.",
     Guidance.UNAVAILABLE: lambda c: "the database could not be reached.",
+    Guidance.OUTBOUND_REQUEST: lambda c: (
+        "an outbound request names a sink or operation that is not registered, or its "
+        "payload breaks that operation's rules (schema, size, credentials, compensation)."
+    ),
 }
 
 
@@ -549,6 +556,8 @@ def feedback_for_error(plan: EffectPlan, error: BaseException) -> AgentFeedback:
         kind = _REASON_GUIDANCE.get(error.reason, Guidance.STATEMENT_KIND)
         tables = (error.table,) if error.table else ()
         hint = FeedbackHint(kind=kind, tables=tables)
+    elif isinstance(error, OutboundRequestError):
+        hint = FeedbackHint(kind=Guidance.OUTBOUND_REQUEST)
     elif isinstance(error, ScopeHaltedError):
         hint = FeedbackHint(kind=Guidance.SCOPE_HALTED)
     elif isinstance(error, CyclicPlanError | UncompensatableEffectError | PlanError):

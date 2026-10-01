@@ -31,15 +31,18 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from interlock.exceptions import PlanError
 from interlock.types import (
+    OUTBOX_TARGET,
     Compensation,
     Effect,
     EffectId,
     EffectKind,
     EffectPlan,
+    OutboundRequest,
     PlanId,
 )
 
@@ -128,24 +131,11 @@ class PlanBuilder:
         :raises PlanError: On an unnamed placeholder, or on ``after`` naming an
             effect this builder has not seen.
         """
-        if after is not None and independent:
-            raise PlanError("pass either after= or independent=, not both")
+        if kind is EffectKind.ENQUEUE:
+            raise PlanError("add an outbound request with enqueue(), not add()")
+        depends = self._dependencies(after, independent)
         params = dict(parameters or {})
         _assert_named_placeholders(statement, params)
-
-        if independent:
-            depends: tuple[EffectId, ...] = ()
-        elif after is not None:
-            known = {e.effect_id for e in self._effects}
-            unknown = [d for d in after if d not in known]
-            if unknown:
-                raise PlanError(
-                    f"after= names effect(s) this builder has not added: "
-                    f"{', '.join(map(str, unknown))}"
-                )
-            depends = tuple(after)
-        else:
-            depends = (self._effects[-1].effect_id,) if self._effects else ()
 
         self._effects.append(
             Effect(
@@ -174,6 +164,78 @@ class PlanBuilder:
     def delete(self, **kwargs: object) -> PlanBuilder:
         """Append a ``DELETE`` effect. See :meth:`add`."""
         return self.add(EffectKind.DELETE, **kwargs)  # type: ignore[arg-type]
+
+    def enqueue(
+        self,
+        *,
+        sink: str,
+        operation: str,
+        payload: Mapping[str, Any],
+        tenant_id: str | None = None,
+        not_after: timedelta | None = None,
+        compensation: OutboundRequest | None = None,
+        effect_id: EffectId | None = None,
+        after: Sequence[EffectId] | None = None,
+        independent: bool = False,
+    ) -> PlanBuilder:
+        """Append an outbound request: a call to an external system, made by
+        the relay after the plan commits, never by the agent.
+
+        The request is written to the transactional outbox inside the stage,
+        adjudicated with the rows, and committed with them or not at all. See
+        ``docs/OUTBOX_DESIGN.md``.
+
+        :param sink: A sink the engine's :class:`~interlock.outbound.SinkRegistry`
+            registers.
+        :param payload: The request body, in the ARC1 canonical JSON domain:
+            no floats; money as decimal strings.
+        :param compensation: The request that undoes this one, when the sink's
+            operation has one.
+        :param after: As for :meth:`add`. Dependencies order delivery: this
+            request waits for every earlier request it depends on.
+        :raises PlanError: On a payload outside the canonical domain.
+        """
+        request = OutboundRequest(
+            sink=sink,
+            operation=operation,
+            payload=payload,
+            not_after=not_after,
+            compensation=compensation,
+        )
+        self._effects.append(
+            Effect(
+                effect_id=effect_id or new_effect_id(),
+                kind=EffectKind.ENQUEUE,
+                target=OUTBOX_TARGET,
+                statement="",
+                depends_on=self._dependencies(after, independent),
+                tenant_id=tenant_id,
+                # The outbox row rolls back with the stage; the call it leads
+                # to cannot be rolled back once made. Its undo is the
+                # request's compensation, governed by the sink registry.
+                reversible=False,
+                request=request,
+            )
+        )
+        return self
+
+    def _dependencies(
+        self, after: Sequence[EffectId] | None, independent: bool
+    ) -> tuple[EffectId, ...]:
+        if after is not None and independent:
+            raise PlanError("pass either after= or independent=, not both")
+        if independent:
+            return ()
+        if after is not None:
+            known = {e.effect_id for e in self._effects}
+            unknown = [d for d in after if d not in known]
+            if unknown:
+                raise PlanError(
+                    f"after= names effect(s) this builder has not added: "
+                    f"{', '.join(map(str, unknown))}"
+                )
+            return tuple(after)
+        return (self._effects[-1].effect_id,) if self._effects else ()
 
     # -- inspection ------------------------------------------------------
 

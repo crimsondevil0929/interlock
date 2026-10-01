@@ -54,10 +54,11 @@ from interlock.exceptions import (  # noqa: E402
     ScopeHaltedError,
     StageConflictError,
 )
+from interlock.outbound import SinkRegistry  # noqa: E402
 from interlock.types import EffectDiff, EffectPlan, StageHandle  # noqa: E402
 from tests.conftest import OBSERVED, Pg  # noqa: E402
 from tests.crash_child import ACKNOWLEDGED, SCOPE, Refund, checkers  # noqa: E402
-from tests.schemas import specs  # noqa: E402
+from tests.schemas import TEST_SINKS, specs  # noqa: E402
 
 SETTLE = Decimal("0.25")
 
@@ -105,6 +106,9 @@ def engine(pg: Pg, gov: BudgetManager, *, during: Callable[[], None] | None = No
         chain=EscrowChain(),
         anchor=LedgerAnchor(governed=gov, same_transaction=True),
         settle_cost=SETTLE,
+        # Each refund also enqueues its email: the outbox row commits in the
+        # same transaction as the ledger claim and the stage marker.
+        sinks=SinkRegistry(TEST_SINKS),
     )
 
 
@@ -374,6 +378,14 @@ def test_racing_engines_all_commit_under_a_busy_ledger(
     assert refunds == {9100 + n for n in range(len(plans))}
     assert balance == Decimal("500.00") + len(plans)
     assert markers == len(plans)
+    # Conflicts were retried as the same plan: each retry staged its email
+    # again, under the same idempotency key, and only the commit kept one.
+    with psycopg.connect(pg.admin) as conn:
+        queued = conn.execute(
+            "SELECT o.plan_id FROM interlock.outbox o JOIN interlock.stages s USING (stage_id) "
+            "WHERE o.plan_id = s.plan_id"
+        ).fetchall()
+    assert sorted(str(r[0]) for r in queued) == sorted(p.plan_id for p in plans)
     spends = settled(ledger)
     assert len(spends) == markers, "one settlement per committed stage, none without one"
     assert len({s.memo for s in spends}) == len(spends)

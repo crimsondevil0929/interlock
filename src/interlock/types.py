@@ -22,16 +22,22 @@ import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Final, NewType
+
+from agentgov.exceptions import MalformedReceiptError
+from agentgov.receipts.canonical import canonical_bytes
 
 from interlock.exceptions import PlanError
 
 __all__ = [
     "AUDIT_VERSION",
     "GENESIS_HASH",
+    "MAX_NOT_AFTER",
+    "OUTBOX_TARGET",
     "CommitReceipt",
     "Compensation",
     "Effect",
@@ -41,6 +47,8 @@ __all__ = [
     "EffectOutcome",
     "EffectPlan",
     "InvariantViolation",
+    "OutboundDelta",
+    "OutboundRequest",
     "PlanId",
     "RowDelta",
     "Severity",
@@ -50,6 +58,7 @@ __all__ = [
     "Verdict",
     "canonical_hash",
     "iso",
+    "outbound_key",
 ]
 
 PlanId = NewType("PlanId", str)
@@ -152,6 +161,132 @@ class Compensation:
     idempotency_key: str = ""
 
 
+OUTBOX_TARGET: Final = "interlock.outbox"
+"""The target of every ``ENQUEUE`` effect: the table its request is written
+to, inside the stage. The request's own destination is its ``sink``."""
+
+MAX_NOT_AFTER: Final = timedelta(days=7)
+"""The longest a committed request may wait to be delivered. A request older
+than that is a stale obligation for an operator, not something to send."""
+
+
+def _frozen(value: Any) -> Any:
+    """A deep, read-only copy of a decoded JSON value."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _frozen(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_frozen(item) for item in value)
+    return value
+
+
+def _has_nul(value: Any) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, Mapping):
+        return any("\x00" in key or _has_nul(item) for key, item in value.items())
+    if isinstance(value, tuple | list):
+        return any(_has_nul(item) for item in value)
+    return False
+
+
+def outbound_key(plan_id: str, effect_id: str) -> str:
+    """The idempotency key of a plan's outbound request.
+
+    Fixed at plan time from ``(plan_id, effect_id)`` (E4-2), so every attempt
+    to deliver it, by any relay, after any crash, carries the same key, and a
+    sink that honours keys absorbs the duplicates. A plan run again after a
+    conflict keeps its key; a repair is a new plan, and gets a new one.
+    """
+    return canonical_hash(["outbound", plan_id, effect_id])
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundRequest:
+    """A call to an external system, proposed by the agent.
+
+    Never made by the agent, which holds no credentials for it. An ``ENQUEUE``
+    effect carries one; the stage writes it to the transactional outbox, the
+    checkers read it back from there, and a relay delivers it after the stage
+    commits.
+
+    :ivar sink: An operator-registered sink name (``"stripe"``), never a URL.
+    :ivar operation: One of the sink's registered operations.
+    :ivar payload: The request body. The ARC1 canonical JSON domain: strings,
+        integers within ±(2**53 - 1), booleans, null, arrays and objects.
+        Floats are refused; money travels as decimal strings. Frozen on
+        construction, so it cannot change after it is hashed.
+    :ivar not_after: How long after staging the request may still be
+        delivered. ``None`` takes the sink's default.
+    :ivar compensation: The request that undoes this one, when the sink's
+        operation has one (E4-3). Serialized with the plan, before the effect
+        is staged.
+    :raises PlanError: If the payload is outside the canonical domain, holds a
+        NUL character (which PostgreSQL's ``jsonb`` refuses), or
+        ``not_after`` is not positive or exceeds :data:`MAX_NOT_AFTER`.
+    """
+
+    sink: str
+    operation: str
+    payload: Mapping[str, Any]
+    not_after: timedelta | None = None
+    compensation: OutboundRequest | None = None
+    _canonical: bytes = field(default=b"", init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, Mapping):
+            raise PlanError(f"an outbound request's payload is a JSON object, not {self.payload!r}")
+        try:
+            canonical = canonical_bytes(self.payload)
+        except MalformedReceiptError as exc:
+            raise PlanError(f"outbound payload for {self.sink}.{self.operation}: {exc}") from exc
+        if _has_nul(self.payload):
+            raise PlanError(
+                f"outbound payload for {self.sink}.{self.operation} holds a NUL character, "
+                f"which the outbox cannot store"
+            )
+        if self.not_after is not None and not timedelta(0) < self.not_after <= MAX_NOT_AFTER:
+            raise PlanError(
+                f"not_after must be positive and at most {MAX_NOT_AFTER}, got {self.not_after}"
+            )
+        # The bytes hashed are the bytes sent: nothing re-encodes the payload
+        # between here and the outbox.
+        object.__setattr__(self, "_canonical", canonical)
+        object.__setattr__(self, "payload", _frozen(self.payload))
+
+    @property
+    def canonical_payload(self) -> bytes:
+        """The payload's RFC 8785 canonical UTF-8 bytes, as written to the outbox."""
+        return self._canonical
+
+    @property
+    def payload_hash(self) -> str:
+        """SHA-256 of :attr:`canonical_payload`, hex. The database recomputes it."""
+        return hashlib.sha256(self._canonical).hexdigest()
+
+    def to_json(self) -> dict[str, Any]:
+        """The request as a JSON-able document, for the outbox's compensation column."""
+        document: dict[str, Any] = {
+            "sink": self.sink,
+            "operation": self.operation,
+            "payload_hash": self.payload_hash,
+            "payload": json.loads(self._canonical),
+        }
+        if self.not_after is not None:
+            document["not_after_seconds"] = int(self.not_after.total_seconds())
+        return document
+
+    def content_hash(self) -> str:
+        return canonical_hash(
+            [
+                self.sink,
+                self.operation,
+                self.payload_hash,
+                None if self.not_after is None else int(self.not_after.total_seconds()),
+                None if self.compensation is None else self.compensation.content_hash(),
+            ]
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Effect:
     """One intended mutation.
@@ -165,12 +300,16 @@ class Effect:
     :ivar stated_rows: What the agent claims this will touch, recorded so the
         claim can be compared against the measurement. Never trusted, and
         optional: an agent that omits it disables ``StatedFootprint``.
+    :ivar request: For an ``ENQUEUE`` effect, the outbound request it
+        proposes, in place of a statement. ``None`` for every other kind.
     :raises PlanError: If ``statement`` is empty or whitespace-only. Nothing
         downstream (``reject_reason``, the leading-verb check) rejects a
         statement with no verb at all, so an empty one used to stage,
         measure nothing, and commit silently -- most often the sign of a
         template that produced an empty string rather than a genuinely
-        empty step.
+        empty step. For an ``ENQUEUE`` effect it is the reverse: a request,
+        and no statement, parameters or SQL compensation, targeting
+        :data:`OUTBOX_TARGET`.
     """
 
     effect_id: EffectId
@@ -183,8 +322,37 @@ class Effect:
     reversible: bool = True
     compensation: Compensation | None = None
     stated_rows: int | None = None
+    request: OutboundRequest | None = None
 
     def __post_init__(self) -> None:
+        if self.kind is EffectKind.ENQUEUE:
+            problems = [
+                problem
+                for problem, present in (
+                    ("no outbound request", self.request is None),
+                    ("a statement", bool(self.statement.strip())),
+                    ("statement parameters", bool(self.parameters)),
+                    (
+                        "a SQL compensation (an outbound request's undo is its "
+                        "request.compensation)",
+                        self.compensation is not None,
+                    ),
+                    (f"a target other than {OUTBOX_TARGET!r}", self.target != OUTBOX_TARGET),
+                    ("stated_rows (it writes no observed row)", self.stated_rows is not None),
+                )
+                if present
+            ]
+            if problems:
+                raise PlanError(
+                    f"ENQUEUE effect {self.effect_id!r} has {', '.join(problems)}: an ENQUEUE "
+                    f"effect carries an outbound request and nothing else"
+                )
+            return
+        if self.request is not None:
+            raise PlanError(
+                f"effect {self.effect_id!r} is {self.kind.value}, and only an ENQUEUE effect "
+                f"carries an outbound request"
+            )
         if not self.statement.strip():
             raise PlanError(
                 f"effect {self.effect_id!r} has an empty (or whitespace-only) "
@@ -207,18 +375,20 @@ class Effect:
         return head if sep else ""
 
     def content_hash(self) -> str:
-        return canonical_hash(
-            [
-                self.effect_id,
-                self.kind.value,
-                self.target,
-                self.statement,
-                sorted((k, str(v)) for k, v in self.parameters.items()),
-                list(self.depends_on),
-                self.tenant_id,
-                self.reversible,
-            ]
-        )
+        fields: list[object] = [
+            self.effect_id,
+            self.kind.value,
+            self.target,
+            self.statement,
+            sorted((k, str(v)) for k, v in self.parameters.items()),
+            list(self.depends_on),
+            self.tenant_id,
+            self.reversible,
+        ]
+        # Only when set, so every effect hashed before the outbox keeps its hash.
+        if self.request is not None:
+            fields.append(["request", self.request.content_hash()])
+        return canonical_hash(fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,8 +451,12 @@ class EffectPlan:
 
     @property
     def stated_rows(self) -> int | None:
-        """The agent's own total claim, when every effect declared one."""
-        claims = [e.stated_rows for e in self.effects]
+        """The agent's own total claim, when every effect declared one.
+
+        Over the statements only: an outbound request writes no observed row,
+        so it has no claim to omit.
+        """
+        claims = [e.stated_rows for e in self.effects if e.kind is not EffectKind.ENQUEUE]
         if any(c is None for c in claims):
             return None
         return sum(c for c in claims if c is not None)
@@ -336,12 +510,39 @@ class RowDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class OutboundDelta:
+    """One outbound request as the stage wrote it to the outbox.
+
+    Read back from the database, not copied from the plan, like a
+    :class:`RowDelta`: what the checkers see is what the relay will send.
+
+    :ivar message_id: The outbox row's id. Minted per stage, so it is left out
+        of :meth:`EffectDiff.content_hash`, which must replay.
+    :ivar depends_on: The plan's ``ENQUEUE`` effects that must be delivered
+        before this one: its dependencies, followed through SQL effects.
+    """
+
+    message_id: uuid.UUID
+    effect_id: EffectId
+    sink: str
+    operation: str
+    tenant_id: str | None
+    payload: Mapping[str, Any]
+    payload_hash: str
+    idempotency_key: str
+    depends_on: tuple[EffectId, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class EffectDiff:
     """The delta a stage would commit, as measured by the substrate.
 
     :ivar truncated: Set when the row cap was reached. The diff is then a
         prefix of the real delta, and any predicate that needs completeness
         must fail closed against it. See ``invariants.TruncationGuard``.
+    :ivar outbound: The outbound requests the stage wrote to the outbox, in
+        the order it wrote them. Not rows of an observed table, so not in
+        ``deltas`` or the blast radius.
     """
 
     plan_id: PlanId
@@ -350,6 +551,7 @@ class EffectDiff:
     computed_at: datetime
     deltas: tuple[RowDelta, ...]
     truncated: bool = False
+    outbound: tuple[OutboundDelta, ...] = ()
 
     @property
     def rows_inserted(self) -> int:
@@ -442,7 +644,29 @@ class EffectDiff:
             [d.table, d.primary_key, d.operation, d.before, d.after, d.tenant_id]
             for d in sorted(self.deltas, key=lambda d: (d.table, d.primary_key, d.operation))
         ]
-        return canonical_hash([self.plan_id, self.substrate_id, self.truncated, rows])
+        fields: list[object] = [self.plan_id, self.substrate_id, self.truncated, rows]
+        # Only when present, so every diff hashed before the outbox keeps its
+        # hash. The payload is covered by its hash; the message id is not
+        # covered at all, since it is minted per stage and would break replay.
+        if self.outbound:
+            fields.append(
+                [
+                    "outbound",
+                    [
+                        [
+                            o.effect_id,
+                            o.sink,
+                            o.operation,
+                            o.tenant_id,
+                            o.payload_hash,
+                            o.idempotency_key,
+                            list(o.depends_on),
+                        ]
+                        for o in sorted(self.outbound, key=lambda o: o.effect_id)
+                    ],
+                ]
+            )
+        return canonical_hash(fields)
 
 
 def _as_decimal(value: object) -> Decimal:
@@ -534,6 +758,9 @@ class SubstrateCapabilities:
     requires_compensation: bool
     max_stage_seconds: float = 10.0
     max_diff_rows: int = 50_000
+    outbound: bool = False
+    """Stages ``ENQUEUE`` effects into a transactional outbox, committed with
+    the rest of the stage."""
 
 
 @dataclass(frozen=True, slots=True)

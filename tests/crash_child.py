@@ -69,6 +69,7 @@ from interlock import (
     TenantIsolation,
 )
 from interlock.chain import EscrowRecord, RecordType
+from interlock.outbound import SinkRegistry
 from interlock.types import (
     GENESIS_HASH,
     CommitReceipt,
@@ -80,7 +81,7 @@ from interlock.types import (
     StageHandle,
 )
 from tests.conftest import OBSERVED
-from tests.schemas import specs
+from tests.schemas import TEST_SINKS, specs
 
 SCOPE = "support-agent"
 LOG_ID = "crash-receipts"
@@ -90,12 +91,14 @@ ACKNOWLEDGED = ("shipment_events", "ledger_entries")
 
 @dataclass(frozen=True)
 class Refund:
-    """One refund: a refund row, the customer's credit, the item's count.
+    """One refund: a refund row, the customer's credit, the item's count, and
+    the email telling the customer.
 
-    Three tables in one plan, so a crash can only ever leave all three or
-    none. The refund row's key is unique per plan and the item's ``qty`` rises
-    by one per committed refund, so the database says exactly which plans
-    committed, and how many times.
+    Three tables and the outbox in one plan, so a crash can only ever leave
+    all four or none. The refund row's key is unique per plan and the item's
+    ``qty`` rises by one per committed refund, so the database says exactly
+    which plans committed, and how many times; the email's idempotency key is
+    unique per plan too, so the outbox says the same.
     """
 
     plan_id: str
@@ -103,6 +106,8 @@ class Refund:
     amount: Decimal
     globex: bool = False
     """Also credit globex's account: refused by tenant isolation."""
+    outbound: bool = True
+    """Also enqueue the customer's email."""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -110,6 +115,7 @@ class Refund:
             "refund_id": self.refund_id,
             "amount": str(self.amount),
             "globex": self.globex,
+            "outbound": self.outbound,
         }
 
     @classmethod
@@ -119,6 +125,7 @@ class Refund:
             refund_id=int(raw["refund_id"]),
             amount=Decimal(str(raw["amount"])),
             globex=bool(raw.get("globex", False)),
+            outbound=bool(raw.get("outbound", True)),
         )
 
     def plan(self) -> EffectPlan:
@@ -147,6 +154,19 @@ class Refund:
                 stated_rows=1,
             )
         )
+        if self.outbound:
+            builder.enqueue(
+                sink="mail",
+                operation="send",
+                payload={
+                    "to": "customer@acme.test",
+                    "subject": f"refund {self.plan_id}",
+                    "body": f"We refunded {self.amount}.",
+                },
+                tenant_id="acme",
+                effect_id=EffectId("notify"),
+                after=[EffectId("refund_row")],
+            )
         if self.globex:
             builder.update(
                 table="accounts",
@@ -154,6 +174,7 @@ class Refund:
                 tenant_id="globex",
                 effect_id=EffectId("globex"),
                 stated_rows=1,
+                after=[EffectId("count")],
             )
         return builder.build()
 
@@ -372,6 +393,7 @@ def build(scenario: Mapping[str, Any], kill: Kill) -> EscrowEngine:
         anchor=Anchor(governor, kill, same_transaction=bool(ledger_dsn)),
         settle_cost=str(scenario.get("settle", "0.25")),
         receipts=ReceiptIssuer(log, row_secret=bytes.fromhex(str(scenario["row_secret"]))),
+        sinks=SinkRegistry(TEST_SINKS),
     )
 
 

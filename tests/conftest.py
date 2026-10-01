@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.schemas import BACK_OFFICE_DDL, BACK_OFFICE_ROWS, insert_sql, specs
+from tests.schemas import BACK_OFFICE_DDL, BACK_OFFICE_ROWS, TEST_SINKS, insert_sql, specs
 
 POSTGRES_DSN_VAR = "INTERLOCK_TEST_POSTGRES_DSN"
 REQUIRE_POSTGRES_VAR = "INTERLOCK_REQUIRE_POSTGRES"
@@ -131,8 +131,9 @@ def drop_role(cluster: str, database: str, name: str) -> None:
 
 @pytest.fixture
 def pg(pg_admin_dsn: str, pg_back_office: str) -> Iterator[Pg]:
-    """The back office with Interlock installed as its owner, and a stage role
-    granted DML on the observed tables and SELECT on the rest."""
+    """The back office with Interlock installed as its owner, the test sinks
+    registered, and a stage role granted DML on the observed tables and SELECT
+    on the rest."""
     import psycopg
     from psycopg.conninfo import make_conninfo
 
@@ -142,7 +143,7 @@ def pg(pg_admin_dsn: str, pg_back_office: str) -> Iterator[Pg]:
     create_role(pg_admin_dsn, role)
     try:
         with psycopg.connect(pg_back_office, autocommit=True) as conn:
-            install(conn, specs(*OBSERVED), stage_roles=[role])
+            install(conn, specs(*OBSERVED), stage_roles=[role], sinks=TEST_SINKS)
             conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {', '.join(OBSERVED)} TO {role}")
             conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}")
         yield Pg(

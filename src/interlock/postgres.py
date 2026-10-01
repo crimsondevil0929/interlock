@@ -42,13 +42,17 @@ percent sign.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import secrets
 import uuid
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
+
+from agentgov.receipts.canonical import canonical_bytes, loads_strict
 
 from interlock.cascade import (
     CascadeReport,
@@ -60,22 +64,29 @@ from interlock.exceptions import (
     CommitUnsettledError,
     ForbiddenStatementError,
     InterlockError,
+    OutboundRequestError,
     StageConflictError,
     StageError,
     StageExpiredError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
+from interlock.outbound import SinkSpec
 from interlock.substrate import TableSpec, _verb_reason, leading_verb
 from interlock.types import (
     CommitReceipt,
     Effect,
     EffectDiff,
+    EffectId,
+    EffectKind,
     EffectOutcome,
     EffectPlan,
+    OutboundDelta,
     RowDelta,
     StageHandle,
     SubstrateCapabilities,
+    _frozen,
+    outbound_key,
 )
 
 if TYPE_CHECKING:
@@ -90,7 +101,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "1"
+INSTALL_VERSION: Final = "2"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -112,6 +123,10 @@ _GATED: Final = "IL001"
 _TAMPERED: Final = "IL002"
 _CONFLICTS: Final = frozenset({"40001", "40P01", "55P03"})
 """Serialization failure, deadlock, lock not available: another writer won."""
+_OUTBOUND: Final = "IL004"
+"""The outbox refused a request: an unregistered or disabled sink, an operation
+it does not install, a payload over its bound or not matching its hash."""
+_UNIQUE: Final = "23505"
 _CANCELLED: Final = "57014"
 _PRIVILEGE: Final = "42501"
 _NOT_INSTALLED: Final = frozenset({"42883", "42P01", "3F000"})
@@ -119,7 +134,13 @@ _NOT_INSTALLED: Final = frozenset({"42883", "42P01", "3F000"})
 
 
 _FUNCTIONS: Final = r"""
-CREATE OR REPLACE FUNCTION interlock.begin_stage(p_stage uuid, p_plan text, p_gates jsonb)
+-- Version 1 took three arguments. A function is identified by its argument
+-- types, so the old one would survive CREATE OR REPLACE as an overload.
+DROP FUNCTION IF EXISTS interlock.begin_stage(uuid, text, jsonb);
+
+CREATE OR REPLACE FUNCTION interlock.begin_stage(
+    p_stage uuid, p_plan text, p_gates jsonb, p_enqueue_hash bytea DEFAULT NULL
+)
 RETURNS xid8
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -139,10 +160,135 @@ BEGIN
         before jsonb,
         after jsonb
     ) ON COMMIT DROP;
-    INSERT INTO interlock.stages (stage_id, plan_id, xid, gates)
-    VALUES (p_stage, p_plan, x, p_gates);
+    -- p_enqueue_hash is the sha256 of a token only the substrate holds; it
+    -- authorizes this stage's writes to the outbox (interlock.enqueue).
+    INSERT INTO interlock.stages (stage_id, plan_id, xid, gates, enqueue_hash)
+    VALUES (p_stage, p_plan, x, p_gates, p_enqueue_hash);
     PERFORM pg_catalog.set_config('interlock.stage_id', p_stage::text, true);
     RETURN x;
+END
+$fn$;
+
+-- Writes one outbound request, and its delivery state, into the outbox, in
+-- the stage's own transaction: it commits with the stage's effects and its
+-- marker, or not at all. Only with the stage's token: every agent statement
+-- runs in this transaction as this role, and none of them may enqueue.
+CREATE OR REPLACE FUNCTION interlock.enqueue(
+    p_token bytea,
+    p_message uuid,
+    p_effect text,
+    p_seq integer,
+    p_depends text[],
+    p_sink text,
+    p_operation text,
+    p_tenant text,
+    p_payload text,
+    p_payload_hash text,
+    p_idempotency_key text,
+    p_compensation text,
+    p_not_after_seconds integer
+)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    stage uuid;
+    plan text;
+    expected bytea;
+    sink_ops text[];
+    sink_bytes integer;
+    sink_seconds integer;
+    bytes bytea := pg_catalog.convert_to(p_payload, 'UTF8');
+    -- One instant: not_after is exactly its window past enqueued_at.
+    enqueued timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    SELECT s.stage_id, s.plan_id, s.enqueue_hash INTO stage, plan, expected
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL OR expected IS NULL
+       OR pg_catalog.sha256(p_token) IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'interlock: this transaction''s stage did not authorize an enqueue'
+            USING ERRCODE = 'IL002';
+    END IF;
+    SELECT k.operations, k.max_payload_bytes, k.not_after_seconds
+      INTO sink_ops, sink_bytes, sink_seconds
+      FROM interlock.sinks k
+     WHERE k.name = p_sink AND k.enabled;
+    IF sink_ops IS NULL THEN
+        RAISE EXCEPTION 'interlock: no enabled sink named % is installed', p_sink
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'unregistered_sink', 'sink', p_sink)::text;
+    END IF;
+    IF NOT (p_operation = ANY (sink_ops)) THEN
+        RAISE EXCEPTION 'interlock: sink % installs no operation %', p_sink, p_operation
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'unregistered_operation', 'sink', p_sink)::text;
+    END IF;
+    IF pg_catalog.octet_length(bytes) > sink_bytes THEN
+        RAISE EXCEPTION 'interlock: payload of % bytes exceeds sink %''s bound of %',
+            pg_catalog.octet_length(bytes), p_sink, sink_bytes
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'payload_size', 'sink', p_sink)::text;
+    END IF;
+    -- Recomputed here, over the exact bytes sent: what the checkers
+    -- adjudicate and the relay sends is the payload the plan hashed.
+    IF pg_catalog.encode(pg_catalog.sha256(bytes), 'hex') <> p_payload_hash THEN
+        RAISE EXCEPTION 'interlock: payload does not match its hash'
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'payload_hash', 'sink', p_sink)::text;
+    END IF;
+    INSERT INTO interlock.outbox (
+        message_id, stage_id, plan_id, effect_id, seq, depends_on, sink, operation,
+        tenant_id, payload, payload_hash, idempotency_key, compensation, not_after,
+        enqueued_at
+    ) VALUES (
+        p_message, stage, plan, p_effect, p_seq, coalesce(p_depends, '{}'), p_sink,
+        p_operation, p_tenant, p_payload::jsonb, p_payload_hash, p_idempotency_key,
+        p_compensation::jsonb,
+        enqueued + pg_catalog.make_interval(secs => coalesce(p_not_after_seconds, sink_seconds)),
+        enqueued
+    );
+    INSERT INTO interlock.outbox_state (message_id) VALUES (p_message);
+END
+$fn$;
+
+-- This stage's outbound requests, as written, for the diff.
+CREATE OR REPLACE FUNCTION interlock.stage_outbox(p_limit bigint)
+RETURNS TABLE (
+    out_message uuid, out_effect text, out_depends text[], out_sink text,
+    out_operation text, out_tenant text, out_payload text, out_payload_hash text,
+    out_idempotency_key text
+)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    RETURN QUERY
+        SELECT o.message_id, o.effect_id, o.depends_on, o.sink, o.operation, o.tenant_id,
+               o.payload::text, o.payload_hash, o.idempotency_key
+          FROM interlock.outbox AS o
+          JOIN interlock.stages AS s ON s.stage_id = o.stage_id
+         WHERE s.xid = pg_catalog.pg_current_xact_id()
+         ORDER BY o.seq
+         LIMIT p_limit;
+END
+$fn$;
+
+-- The request the checkers adjudicated, and the record of every attempt to
+-- deliver it, are never edited. Delivery state lives in outbox_state.
+CREATE OR REPLACE FUNCTION interlock.outbox_append_only()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    RAISE EXCEPTION 'interlock: % is append-only; % refused', TG_TABLE_NAME, TG_OP
+        USING ERRCODE = 'IL002';
 END
 $fn$;
 
@@ -309,22 +455,142 @@ CREATE TABLE IF NOT EXISTS interlock.installation (
     installed_at timestamptz NOT NULL DEFAULT now()
 );
 REVOKE ALL ON interlock.installation FROM PUBLIC;
+
+-- Version 2: the transactional outbox (docs/OUTBOX_DESIGN.md).
+ALTER TABLE interlock.stages ADD COLUMN IF NOT EXISTS enqueue_hash bytea;
+
+-- The registry, mirrored from configuration. No endpoints, no credentials.
+CREATE TABLE IF NOT EXISTS interlock.sinks (
+    name              text PRIMARY KEY,
+    operations        text[] NOT NULL,
+    cost_per_call     text NOT NULL,
+    idempotency       text NOT NULL CHECK (idempotency IN ('header', 'none')),
+    max_payload_bytes integer NOT NULL CHECK (max_payload_bytes > 0),
+    not_after_seconds integer NOT NULL CHECK (not_after_seconds > 0),
+    config_hash       text NOT NULL,
+    enabled           boolean NOT NULL DEFAULT true
+);
+REVOKE ALL ON interlock.sinks FROM PUBLIC;
+
+-- The obligation: the request the checkers adjudicated. Append-only.
+CREATE TABLE IF NOT EXISTS interlock.outbox (
+    message_id      uuid PRIMARY KEY,
+    stage_id        uuid NOT NULL REFERENCES interlock.stages (stage_id),
+    plan_id         text NOT NULL,
+    effect_id       text NOT NULL,
+    seq             integer NOT NULL,
+    depends_on      text[] NOT NULL DEFAULT '{}',
+    sink            text NOT NULL REFERENCES interlock.sinks (name),
+    operation       text NOT NULL,
+    tenant_id       text,
+    payload         jsonb NOT NULL,
+    payload_hash    text NOT NULL,
+    idempotency_key text NOT NULL UNIQUE,
+    compensation    jsonb,
+    not_after       timestamptz NOT NULL,
+    enqueued_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (stage_id, effect_id)
+);
+REVOKE ALL ON interlock.outbox FROM PUBLIC;
+
+-- Delivery state: the one outbox table the relay may change.
+CREATE TABLE IF NOT EXISTS interlock.outbox_state (
+    message_id      uuid PRIMARY KEY REFERENCES interlock.outbox (message_id),
+    state           text NOT NULL DEFAULT 'pending'
+                    CHECK (state IN ('pending', 'leased', 'held', 'delivered', 'dead',
+                                     'cancelled')),
+    attempts        integer NOT NULL DEFAULT 0,
+    lease_owner     text,
+    lease_expires   timestamptz,
+    next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    reason          text
+);
+CREATE INDEX IF NOT EXISTS outbox_ready ON interlock.outbox_state (next_attempt_at)
+    WHERE state IN ('pending', 'leased');
+REVOKE ALL ON interlock.outbox_state FROM PUBLIC;
+
+-- Every delivery attempt, hash-linked per message. Append-only.
+CREATE TABLE IF NOT EXISTS interlock.outbox_attempts (
+    message_id      uuid NOT NULL REFERENCES interlock.outbox (message_id),
+    attempt         integer NOT NULL CHECK (attempt > 0),
+    relay_id        text NOT NULL,
+    started_at      timestamptz NOT NULL,
+    finished_at     timestamptz,
+    outcome         text NOT NULL
+                    CHECK (outcome IN ('delivered', 'retryable', 'permanent', 'unknown',
+                                       'expired', 'held')),
+    status_code     integer,
+    response_digest text,
+    error           text,
+    prev_hash       text NOT NULL,
+    attempt_hash    text NOT NULL,
+    PRIMARY KEY (message_id, attempt)
+);
+REVOKE ALL ON interlock.outbox_attempts FROM PUBLIC;
 """
 
+_APPEND_ONLY: Final = r"""
+DROP TRIGGER IF EXISTS outbox_append_only ON interlock.outbox;
+CREATE TRIGGER outbox_append_only BEFORE UPDATE OR DELETE ON interlock.outbox
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS outbox_append_only_truncate ON interlock.outbox;
+CREATE TRIGGER outbox_append_only_truncate BEFORE TRUNCATE ON interlock.outbox
+    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
+ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only,
+    ENABLE ALWAYS TRIGGER outbox_append_only_truncate;
+DROP TRIGGER IF EXISTS attempts_append_only ON interlock.outbox_attempts;
+CREATE TRIGGER attempts_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_attempts
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS attempts_append_only_truncate ON interlock.outbox_attempts;
+CREATE TRIGGER attempts_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_attempts
+    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
+ALTER TABLE interlock.outbox_attempts ENABLE ALWAYS TRIGGER attempts_append_only,
+    ENABLE ALWAYS TRIGGER attempts_append_only_truncate;
+"""
+
+_APPEND_ONLY_TRIGGERS: Final = (
+    ("outbox", "outbox_append_only"),
+    ("outbox", "outbox_append_only_truncate"),
+    ("outbox_attempts", "attempts_append_only"),
+    ("outbox_attempts", "attempts_append_only_truncate"),
+)
+"""What keeps a committed request, and its delivery history, as it was written."""
+
+_ENQUEUE_CALL: Final = (
+    "interlock.enqueue(%s, %s, %s, %s, %s::text[], %s, %s, %s, %s, %s, %s, %s, %s)"
+)
+
+_ENQUEUE: Final = (
+    "interlock.enqueue(bytea, uuid, text, integer, text[], text, text, text, text, text, "
+    "text, text, integer)"
+)
+
 _PRIVATE_FUNCTIONS: Final = (
-    "interlock.begin_stage(uuid, text, jsonb)",
+    "interlock.begin_stage(uuid, text, jsonb, bytea)",
     "interlock.capture()",
     "interlock.stage_capture(bigint)",
     "interlock.resolve(uuid, xid8)",
+    _ENQUEUE,
+    "interlock.stage_outbox(bigint)",
+    "interlock.outbox_append_only()",
 )
 """Every function defaults to ``EXECUTE`` for ``PUBLIC``. Revoked from all:
 anyone who could call ``begin_stage`` could open a stage, so their writes would
 be captured into their own session instead of treated as unmediated."""
 
 _STAGE_FUNCTIONS: Final = (
-    "interlock.begin_stage(uuid, text, jsonb)",
+    "interlock.begin_stage(uuid, text, jsonb, bytea)",
     "interlock.stage_capture(bigint)",
     "interlock.resolve(uuid, xid8)",
+    _ENQUEUE,
+    "interlock.stage_outbox(bigint)",
+)
+
+_OUTBOX_TABLES: Final = (
+    "interlock.sinks",
+    "interlock.outbox",
+    "interlock.outbox_state",
+    "interlock.outbox_attempts",
 )
 
 
@@ -335,6 +601,8 @@ def install(
     schema: str = "public",
     stage_roles: Iterable[str] = (),
     audit_roles: Iterable[str] = (),
+    sinks: Iterable[SinkSpec] = (),
+    relay_roles: Iterable[str] = (),
 ) -> None:
     """Install Interlock's schema, functions and triggers. Idempotent.
 
@@ -349,24 +617,40 @@ def install(
         needs from the ``interlock`` schema and nothing else; grant it DML on
         the observed tables yourself.
     :param audit_roles: Roles that run ``interlock reconcile-effects``. Each
-        may read ``interlock.stages``, ``interlock.unmediated`` and
-        ``interlock.installation``, and write nothing.
+        may read ``interlock.stages``, ``interlock.unmediated``,
+        ``interlock.installation`` and the outbox tables, and write nothing.
+    :param sinks: The sinks outbound requests may name, mirrored into
+        ``interlock.sinks`` without endpoints or credentials. A sink installed
+        before and no longer listed is disabled, not deleted: requests already
+        in the outbox name it.
+    :param relay_roles: Roles the outbox relay runs as. Each may read the
+        outbox and the sinks, update delivery state, and append attempts. It
+        may not change a request, or write anything else.
     :raises ValueError: On a schema or role name that is not a plain
         identifier.
+
+    Version 2 adds the transactional outbox (``docs/OUTBOX_DESIGN.md``).
+    Installing it over version 1 upgrades in place, in the same transaction:
+    ``interlock.stages`` gains ``enqueue_hash``, and ``begin_stage`` its fourth
+    argument.
     """
     from psycopg import sql
 
     _identifier(schema)
     roles = list(stage_roles)
     auditors = list(audit_roles)
-    for role in (*roles, *auditors):
+    relays = list(relay_roles)
+    for role in (*roles, *auditors, *relays):
         _identifier(role)
     wanted = {spec.name.lower(): spec for spec in tables}
+    registry = list(sinks)
     with conn.transaction():
         conn.execute(_SCHEMA)
         conn.execute(_FUNCTIONS)
+        conn.execute(_APPEND_ONLY)
         for signature in _PRIVATE_FUNCTIONS:
             conn.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+        _install_sinks(conn, registry)
         previous = [
             str(row[0]) for row in conn.execute("SELECT tbl FROM interlock.installation").fetchall()
         ]
@@ -421,8 +705,41 @@ def install(
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
             conn.execute(
                 "GRANT SELECT ON interlock.stages, interlock.unmediated, "
-                f"interlock.installation TO {role}"
+                f"interlock.installation, {', '.join(_OUTBOX_TABLES)} TO {role}"
             )
+        for role in relays:
+            conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
+            conn.execute(f"GRANT SELECT ON interlock.sinks, interlock.outbox TO {role}")
+            conn.execute(f"GRANT SELECT, UPDATE ON interlock.outbox_state TO {role}")
+            conn.execute(f"GRANT SELECT, INSERT ON interlock.outbox_attempts TO {role}")
+
+
+def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> None:
+    """Mirror the registry into ``interlock.sinks``: what ``enqueue`` checks."""
+    for sink in sinks:
+        conn.execute(
+            "INSERT INTO interlock.sinks (name, operations, cost_per_call, idempotency, "
+            "max_payload_bytes, not_after_seconds, config_hash, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, true) ON CONFLICT (name) DO UPDATE SET "
+            "operations = EXCLUDED.operations, cost_per_call = EXCLUDED.cost_per_call, "
+            "idempotency = EXCLUDED.idempotency, "
+            "max_payload_bytes = EXCLUDED.max_payload_bytes, "
+            "not_after_seconds = EXCLUDED.not_after_seconds, "
+            "config_hash = EXCLUDED.config_hash, enabled = true",
+            (
+                sink.name,
+                [op.name for op in sink.operations],
+                str(sink.cost_per_call),
+                sink.idempotency,
+                sink.max_payload_bytes,
+                int(sink.not_after.total_seconds()),
+                sink.config_hash(),
+            ),
+        )
+    conn.execute(
+        "UPDATE interlock.sinks SET enabled = false WHERE NOT (name = ANY (%s))",
+        ([sink.name for sink in sinks],),
+    )
 
 
 def _identifier(name: str) -> None:
@@ -460,10 +777,14 @@ class PostgresSubstrate:
         "_handle",
         "_lock_seconds",
         "_max_rows",
+        "_outbound_effects",
         "_report",
         "_schema",
+        "_seq",
         "_stage_seconds",
         "_tables",
+        "_token",
+        "_upstream",
         "_xid",
     )
 
@@ -501,6 +822,7 @@ class PostgresSubstrate:
         self._conn: psycopg.Connection[Any] | None = None
         self._handle: StageHandle | None = None
         self._xid: str | None = None
+        self._reset_outbound()
 
     @property
     def substrate_id(self) -> str:
@@ -515,6 +837,7 @@ class PostgresSubstrate:
             requires_compensation=False,
             max_stage_seconds=self._stage_seconds,
             max_diff_rows=self._max_rows,
+            outbound=True,
         )
 
     @property
@@ -553,6 +876,12 @@ class PostgresSubstrate:
         """
         return self._require(handle)
 
+    def _reset_outbound(self) -> None:
+        self._token: bytes | None = None
+        self._seq = 0
+        self._upstream: dict[EffectId, frozenset[EffectId]] = {}
+        self._outbound_effects: set[EffectId] = set()
+
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
         if self._handle is None or self._handle.stage_id != handle.stage_id:
@@ -590,9 +919,15 @@ class PostgresSubstrate:
     def reject_reason(self, effect: Effect) -> str | None:
         """Refuse anything but a row statement, read from the statement.
 
+        An ``ENQUEUE`` effect carries a request, not a statement, and is
+        vetted against the sink registry instead (and by ``interlock.enqueue``
+        when it is written).
+
         :param effect: The effect to vet.
         :returns: A refusal reason, or ``None`` when it may be staged.
         """
+        if effect.kind is EffectKind.ENQUEUE:
+            return None
         verb = leading_verb(effect.statement)
         if verb in STAGEABLE_VERBS:
             return None
@@ -620,6 +955,10 @@ class PostgresSubstrate:
             )
         conn = self._connect()
         stage_id = uuid.uuid4()
+        # Authorizes this stage's writes to the outbox. Held here and sent only
+        # as a bound parameter of the substrate's own enqueue calls; the stage
+        # row keeps its hash, which the stage role cannot read.
+        token = secrets.token_bytes(32)
         try:
             conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
             conn.execute(self._timeouts())
@@ -631,8 +970,13 @@ class PostgresSubstrate:
                 self._verify_grants(conn)
             report = self._cascades(conn)
             row = conn.execute(
-                "SELECT interlock.begin_stage(%s, %s, %s::jsonb)::text",
-                (stage_id, plan.plan_id, json.dumps(_gates(report))),
+                "SELECT interlock.begin_stage(%s, %s, %s::jsonb, %s)::text",
+                (
+                    stage_id,
+                    plan.plan_id,
+                    json.dumps(_gates(report)),
+                    hashlib.sha256(token).digest(),
+                ),
             ).fetchone()
         except psycopg.Error as exc:
             conn.close()
@@ -653,6 +997,8 @@ class PostgresSubstrate:
         self._conn = conn
         self._handle = handle
         self._xid = str(row[0]) if row is not None else None
+        self._reset_outbound()
+        self._token = token
         return handle
 
     def apply(self, handle: StageHandle, effect: Effect) -> EffectOutcome:
@@ -667,26 +1013,115 @@ class PostgresSubstrate:
 
         conn = self._require(handle)
         self._assert_live(handle)
-        refusal = self.reject_reason(effect)
-        if refusal is not None:
-            raise ForbiddenStatementError(
-                f"effect {effect.effect_id!r} refused: {refusal}", reason=_verb_reason(effect)
+        if effect.kind is EffectKind.ENQUEUE:
+            outcome = self._enqueue(conn, handle, effect)
+        else:
+            refusal = self.reject_reason(effect)
+            if refusal is not None:
+                raise ForbiddenStatementError(
+                    f"effect {effect.effect_id!r} refused: {refusal}", reason=_verb_reason(effect)
+                )
+            try:
+                # Re-asserted every time: a SELECT can call set_config() and
+                # lift them, and a stage bound that the agent can lift is not a
+                # bound.
+                conn.execute(self._timeouts())
+                # prepare=True sends the statement with the extended protocol,
+                # which the server refuses to split: "UPDATE ...; COMMIT" fails
+                # instead of committing the stage before adjudication.
+                cursor = conn.execute(effect.statement, dict(effect.parameters), prepare=True)
+            except psycopg.Error as exc:
+                raise self._statement_error(effect, exc) from exc
+            outcome = EffectOutcome(
+                effect_id=effect.effect_id,
+                rows_affected=max(cursor.rowcount, 0),
+                applied_at=datetime.now(UTC),
             )
-        try:
-            # Re-asserted every time: a SELECT can call set_config() and lift
-            # them, and a stage bound that the agent can lift is not a bound.
-            conn.execute(self._timeouts())
-            # prepare=True sends the statement with the extended protocol,
-            # which the server refuses to split: "UPDATE ...; COMMIT" fails
-            # instead of committing the stage before adjudication.
-            cursor = conn.execute(effect.statement, dict(effect.parameters), prepare=True)
-        except psycopg.Error as exc:
-            raise self._statement_error(effect, exc) from exc
-        return EffectOutcome(
-            effect_id=effect.effect_id,
-            rows_affected=max(cursor.rowcount, 0),
-            applied_at=datetime.now(UTC),
+        self._upstream[effect.effect_id] = self._requests_before(effect)
+        if effect.kind is EffectKind.ENQUEUE:
+            self._outbound_effects.add(effect.effect_id)
+        return outcome
+
+    def _requests_before(self, effect: Effect) -> frozenset[EffectId]:
+        """The plan's outbound requests ``effect`` depends on, directly or
+        through SQL effects: what the relay must deliver before it.
+
+        The engine applies effects in topological order, so every dependency
+        has been applied, and recorded, before its dependant.
+        """
+        found: set[EffectId] = set()
+        for dependency in effect.depends_on:
+            if dependency in self._outbound_effects:
+                found.add(dependency)
+            else:
+                found |= self._upstream.get(dependency, frozenset())
+        return frozenset(found)
+
+    def _enqueue(
+        self, conn: psycopg.Connection[Any], handle: StageHandle, effect: Effect
+    ) -> EffectOutcome:
+        """Write one outbound request to the outbox, in the stage's transaction.
+
+        Through ``interlock.enqueue``, with this stage's token. The function
+        recomputes the payload's hash over the exact bytes sent, and refuses
+        a sink or operation the database does not have enabled.
+        """
+        import psycopg
+
+        request = effect.request
+        if request is None or self._token is None:
+            raise StageError(f"effect {effect.effect_id!r} cannot be enqueued outside a stage")
+        self._seq += 1
+        compensation = (
+            None
+            if request.compensation is None
+            else canonical_bytes(request.compensation.to_json()).decode("utf-8")
         )
+        try:
+            conn.execute(self._timeouts())
+            conn.execute(
+                f"SELECT {_ENQUEUE_CALL}",
+                (
+                    self._token,
+                    uuid.uuid4(),
+                    effect.effect_id,
+                    self._seq,
+                    sorted(self._requests_before(effect)),
+                    request.sink,
+                    request.operation,
+                    effect.tenant_id,
+                    request.canonical_payload.decode("utf-8"),
+                    request.payload_hash,
+                    outbound_key(handle.plan_id, effect.effect_id),
+                    compensation,
+                    None if request.not_after is None else int(request.not_after.total_seconds()),
+                ),
+                prepare=True,
+            )
+        except psycopg.Error as exc:
+            raise self._enqueue_error(effect, exc) from exc
+        return EffectOutcome(
+            effect_id=effect.effect_id, rows_affected=1, applied_at=datetime.now(UTC)
+        )
+
+    def _enqueue_error(self, effect: Effect, exc: Exception) -> InterlockError:
+        sqlstate = getattr(exc, "sqlstate", None)
+        sink = effect.request.sink if effect.request is not None else None
+        if sqlstate == _OUTBOUND:
+            detail = _json_detail(getattr(getattr(exc, "diag", None), "message_detail", None))
+            return OutboundRequestError(
+                f"effect {effect.effect_id!r} refused by the outbox: {exc}",
+                reason=str(detail.get("reason", "unregistered_sink")),
+                sink=sink,
+            )
+        if sqlstate == _UNIQUE:
+            return OutboundRequestError(
+                f"effect {effect.effect_id!r}: this plan's request is already in the outbox "
+                f"(its idempotency key is taken); a request commits at most once",
+                reason="duplicate",
+                sink=sink,
+            )
+        return self._statement_error(effect, exc)
 
     def diff(self, handle: StageHandle) -> EffectDiff:
         """Read the measured delta out of the stage's capture table.
@@ -704,7 +1139,40 @@ class PostgresSubstrate:
             ).fetchall()
         except psycopg.Error as exc:
             raise StageError(f"could not read the stage's capture: {exc}") from exc
-        truncated = len(rows) > self._max_rows
+        try:
+            requests = conn.execute(
+                "SELECT out_message, out_effect, out_depends, out_sink, out_operation, "
+                "out_tenant, out_payload, out_payload_hash, out_idempotency_key "
+                "FROM interlock.stage_outbox(%s)",
+                (self._max_rows + 1,),
+            ).fetchall()
+        except psycopg.Error as exc:
+            raise StageError(f"could not read the stage's outbox: {exc}") from exc
+        truncated = len(rows) > self._max_rows or len(requests) > self._max_rows
+        outbound = tuple(
+            OutboundDelta(
+                message_id=message,
+                effect_id=EffectId(str(effect_id)),
+                sink=str(sink),
+                operation=str(operation),
+                tenant_id=None if tenant is None else str(tenant),
+                payload=_frozen(loads_strict(str(payload))),
+                payload_hash=str(payload_hash),
+                idempotency_key=str(key),
+                depends_on=tuple(EffectId(str(d)) for d in depends or ()),
+            )
+            for (
+                message,
+                effect_id,
+                depends,
+                sink,
+                operation,
+                tenant,
+                payload,
+                payload_hash,
+                key,
+            ) in requests[: self._max_rows]
+        )
         deltas: list[RowDelta] = []
         for table, key, raw_before, raw_after in rows[: self._max_rows]:
             spec = self._by_name.get(str(table).lower())
@@ -732,6 +1200,7 @@ class PostgresSubstrate:
             computed_at=datetime.now(UTC),
             deltas=tuple(deltas),
             truncated=truncated,
+            outbound=outbound,
         )
 
     def commit(self, handle: StageHandle) -> CommitReceipt:
@@ -882,6 +1351,7 @@ class PostgresSubstrate:
         self._conn = None
         self._handle = None
         self._xid = None
+        self._reset_outbound()
 
     # -- internals ------------------------------------------------------------
 
@@ -989,6 +1459,33 @@ class PostgresSubstrate:
                 )
             if truncate is None or truncate[2] != "A" or truncate[3] != _TRUNCATE_TRIGGER_TYPE:
                 problems.append(f"{key}: {_TRUNCATE_TRIGGER} is missing or not ENABLE ALWAYS")
+        outbox = conn.execute("SELECT to_regclass('interlock.outbox') IS NOT NULL").fetchone()
+        if outbox is None or not outbox[0]:
+            raise SubstrateConfigurationError(
+                "Interlock in this database was installed by an older version, without "
+                "the outbox. Run `interlock install` to upgrade it in place"
+            )
+        guards = {
+            (str(r[0]), str(r[1])): (str(r[2]), str(r[3]))
+            for r in conn.execute(
+                """
+                SELECT c.relname::text, t.tgname::text, t.tgenabled::text,
+                       pn.nspname::text || '.' || p.proname::text
+                  FROM pg_catalog.pg_trigger t
+                  JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+                  JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+                  JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
+                 WHERE n.nspname = 'interlock' AND c.relname IN ('outbox', 'outbox_attempts')
+                """
+            ).fetchall()
+        }
+        for table, trigger in _APPEND_ONLY_TRIGGERS:
+            if guards.get((table, trigger)) != ("A", "interlock.outbox_append_only"):
+                problems.append(
+                    f"interlock.{table}: {trigger} is missing or not ENABLE ALWAYS, so a "
+                    f"committed request could be rewritten before the relay sends it"
+                )
         if problems:
             raise SubstrateConfigurationError(
                 "Interlock's triggers do not match this substrate's tables, so a stage "
@@ -1058,6 +1555,27 @@ class PostgresSubstrate:
             """,
             (self._schema, sorted(self._folded)),
         ).fetchall()
+        internal = conn.execute(
+            members
+            + """
+            SELECT DISTINCT c.relname::text
+              FROM pg_catalog.pg_class c
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              CROSS JOIN member_of m
+             WHERE n.nspname = 'interlock' AND c.relkind IN ('r', 'p', 'v')
+               AND (pg_catalog.has_table_privilege(
+                        m.oid, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')
+                    OR pg_catalog.has_any_column_privilege(m.oid, c.oid, 'INSERT, UPDATE'))
+             ORDER BY 1
+            """
+        ).fetchall()
+        if internal:
+            raise SubstrateConfigurationError(
+                f"the stage's role ({roles}) can write Interlock's own table(s) "
+                f"{', '.join('interlock.' + str(r[0]) for r in internal)}; a stage writes "
+                f"them only through the installed functions, which check its token. Revoke "
+                f"the grant"
+            )
         if writable:
             names = ", ".join(
                 name if schema == self._schema else f"{schema}.{name}"
@@ -1074,8 +1592,8 @@ class PostgresSubstrate:
         sqlstate = getattr(exc, "sqlstate", None)
         if sqlstate in _NOT_INSTALLED:
             return SubstrateConfigurationError(
-                f"Interlock is not installed in this database, or not for this role: {exc}. "
-                f"Run `interlock install`"
+                f"Interlock is not installed in this database, is installed by an older "
+                f"version, or not for this role: {exc}. Run `interlock install`"
             )
         if sqlstate == _PRIVILEGE:
             return SubstrateConfigurationError(

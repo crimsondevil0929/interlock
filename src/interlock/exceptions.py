@@ -22,6 +22,7 @@ __all__ = [
     "ForbiddenStatementError",
     "InterlockError",
     "LedgerUnverifiedError",
+    "OutboundRequestError",
     "PlanError",
     "RecordIntegrityError",
     "RecoveryError",
@@ -110,6 +111,29 @@ class UncompensatableEffectError(PlanError):
     Raised at admission, not at commit: the undo has to exist before the effect
     is staged.
     """
+
+
+class OutboundRequestError(PlanError):
+    """An outbound request (an ``ENQUEUE`` effect) is not admissible.
+
+    Raised at admission, against the sink registry, and again by the database
+    when the stage writes the request to the outbox. ``str(exc)`` is the
+    operator's record and can name payload fields; the agent's feedback names
+    only the reason.
+
+    :ivar reason: What was wrong, for code to branch on:
+        ``"substrate"`` (this substrate has no outbox), ``"no_registry"``,
+        ``"unregistered_sink"``, ``"unregistered_operation"``,
+        ``"payload_type"``, ``"payload_size"``, ``"credential_field"``,
+        ``"payload_schema"``, ``"compensation"``, ``"not_after"``,
+        ``"payload_hash"`` or ``"duplicate"``.
+    :ivar sink: The sink the request names, when there is one.
+    """
+
+    def __init__(self, message: str, *, reason: str, sink: str | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.sink = sink
 
 
 # -- the substrate is unhappy ----------------------------------------------

@@ -100,6 +100,7 @@ from interlock.exceptions import (  # noqa: E402
     CommitUnsettledError,
     StageError,
 )
+from interlock.outbound import SinkRegistry  # noqa: E402
 from interlock.reconcile import Reconciliation, StageFinding, reconcile_postgres  # noqa: E402
 from tests.conftest import OBSERVED, Pg  # noqa: E402
 from tests.crash_child import (  # noqa: E402
@@ -110,7 +111,7 @@ from tests.crash_child import (  # noqa: E402
     Refund,
     checkers,
 )
-from tests.schemas import BACK_OFFICE_ROWS, specs  # noqa: E402
+from tests.schemas import BACK_OFFICE_ROWS, TEST_SINKS, specs  # noqa: E402
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX")
 
@@ -296,6 +297,9 @@ def snapshot(env: Pg) -> dict[str, list[tuple[Any, ...]]]:
         tables["interlock.unmediated"] = conn.execute(
             "SELECT id, tbl, pk FROM interlock.unmediated ORDER BY 1"
         ).fetchall()
+        tables["interlock.outbox"] = conn.execute(
+            "SELECT message_id, stage_id, plan_id, idempotency_key FROM interlock.outbox ORDER BY 1"
+        ).fetchall()
         return tables
 
 
@@ -308,6 +312,8 @@ class Books:
     globex: Decimal
     refunds: dict[int, Decimal]
     markers: frozenset[str]
+    outbox: frozenset[str]
+    """The plans with a request in the outbox."""
 
     @classmethod
     def read(cls, env: Pg) -> Books:
@@ -329,11 +335,21 @@ class Books:
                 markers=frozenset(
                     str(r[0]) for r in conn.execute("SELECT stage_id::text FROM interlock.stages")
                 ),
+                outbox=frozenset(
+                    str(r[0])
+                    for r in conn.execute(
+                        # Each request's stage committed its marker (the
+                        # foreign key), and is the stage of the same plan.
+                        "SELECT o.plan_id FROM interlock.outbox o "
+                        "JOIN interlock.stages s USING (stage_id) WHERE o.plan_id = s.plan_id"
+                    )
+                ),
             )
 
     @classmethod
     def after(cls, committed: Iterable[Refund], markers: Iterable[str]) -> Books:
-        """The books if exactly ``committed`` committed, each exactly once."""
+        """The books if exactly ``committed`` committed, each exactly once,
+        and each committed plan's request is in the outbox exactly once."""
         done = list(committed)
         return cls(
             balance=Decimal("500.00") + sum((r.amount for r in done), Decimal(0)),
@@ -341,6 +357,7 @@ class Books:
             globex=Decimal("900.00"),
             refunds={r.refund_id: r.amount for r in done},
             markers=frozenset(markers),
+            outbox=frozenset(r.plan_id for r in done if r.outbound),
         )
 
 
@@ -501,6 +518,7 @@ class Crash:
             anchor=LedgerAnchor(governed=governor, same_transaction=self.shared),
             settle_cost="0.25",
             receipts=ReceiptIssuer(log, row_secret=self.row_secret),
+            sinks=SinkRegistry(TEST_SINKS),
         )
         return Restarted(chain, governor, log, witness, engine)
 

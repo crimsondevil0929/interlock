@@ -73,12 +73,14 @@ from agentgov.receipts.schema import DisclosedRow, Signature
 
 from interlock import EscrowChain, LedgerAnchor, PlanBuilder, ReceiptIssuer, StageResult
 from interlock.chain import EscrowRecord, RecordType
+from interlock.outbound import SinkRegistry
+from interlock.receipts import receipt_rows
 from interlock.reconcile import install_sqlite_journal, reconcile_postgres, reconcile_sqlite
 from interlock.types import EffectDiff, EffectPlan
 from tests.conftest import Pg, build_sqlite_back_office
 from tests.crash_child import Refund
 from tests.plans import pg_engine, sqlite_engine, support_batch, transfer
-from tests.schemas import specs
+from tests.schemas import TEST_SINKS, specs
 
 LOG_ID = "audit-receipts"
 WITNESS_ID = "audit-witness"
@@ -245,15 +247,7 @@ class History:
         """The row commitment an auditor rebuilds from the measured rows and
         the issuer's row secret. It must be the one the receipt carries."""
         entry = self.entries[index]
-        commitment = commit_rows(
-            [
-                RowChange.from_values(
-                    d.table, d.primary_key, before=d.before, after=d.after, tenant=d.tenant_id
-                )
-                for d in entry.diff.deltas
-            ],
-            secret=self.row_secret,
-        )
+        commitment = commit_rows(receipt_rows(entry.diff), secret=self.row_secret)
         assert commitment.root == entry.receipt.effect.row_root
         assert commitment.count == entry.receipt.effect.row_count
         return commitment
@@ -931,24 +925,22 @@ def test_receipts_issued_over_postgresql_are_as_tamper_evident(pg: Pg, tmp_path:
             anchor=LedgerAnchor(governed=governor),
             settle_cost="0.25",
             receipts=ReceiptIssuer(log, row_secret=secret),
+            sinks=SinkRegistry(TEST_SINKS),
         )
         result = engine.execute(Refund("refund-pg", 9100, Decimal("3.00")).plan())
         assert result.committed and result.receipt is not None and result.diff is not None
-        commitment = commit_rows(
-            [
-                RowChange.from_values(
-                    d.table, d.primary_key, before=d.before, after=d.after, tenant=d.tenant_id
-                )
-                for d in result.diff.deltas
-            ],
-            secret=secret,
-        )
+        commitment = commit_rows(receipt_rows(result.diff), secret=secret)
         assert commitment.root == result.receipt.effect.row_root
         disclosure = commitment.disclose(
             range(commitment.count), receipt_id=result.receipt.receipt_id
         )
         account = _row(disclosure, "accounts").row
         assert account.after is not None and account.after["balance"] == "503.00"
+        # The refund's email discloses as the outbox row it was committed as.
+        (notify,) = result.diff.outbound
+        email = _row(disclosure, "interlock.outbox").row
+        assert (email.pk, email.op, email.tenant) == (notify.idempotency_key, "insert", "acme")
+        assert email.after is not None and email.after["payload_hash"] == notify.payload_hash
         bundle = log.bundle(0, log.checkpoint())
         assert verify_bundle(bundle, issuer_key=key, ledger=governor, rows=disclosure).passed
         altered = ROW_TAMPERING["a value in the after-image"][0](disclosure)

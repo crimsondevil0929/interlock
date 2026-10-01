@@ -141,20 +141,27 @@ A new frozen value type in `interlock.types`:
 |---|---|---|
 | `sink` | `str` | Operator-registered name (`"stripe"`, `"sendgrid"`), never a URL (§10). |
 | `operation` | `str` | A named operation the sink allows (`"refunds.create"`, `"mail.send"`). |
-| `payload` | `Mapping[str, JSON]` | The request body. JSON values only; numbers as decimal strings (the checkers need exact money, §5). |
-| `tenant_id` | `str \| None` | The tenant the request acts for; checked against rows and payload (§5.2). |
-| `not_after` | `timedelta` | How long after commit the request may still be delivered (default per sink). |
+| `payload` | `Mapping[str, JSON]` | The request body, in ARC1's canonical domain: no floats, integers within ±(2^53−1), no NUL. Money as decimal strings (the checkers need exact money, §5). Frozen at construction. |
+| `not_after` | `timedelta \| None` | How long after staging the request may still be delivered, at most seven days. `None` takes the sink's default. |
+| `compensation` | `OutboundRequest \| None` | The request that undoes this one, when the operation registers an undo (§3.3). |
+
+The tenant the request acts for is the effect's own `Effect.tenant_id`, as for a
+statement, not a field of the request; it is checked against rows and payload
+(§5.2).
 
 `Effect` gains `request: OutboundRequest | None`. An `ENQUEUE` effect carries a
 `request` and an empty `statement`; every other kind carries a statement and no
 request. `Effect.__post_init__` enforces this. `PlanBuilder.enqueue(sink=,
 operation=, payload=, tenant_id=, compensation=, after=)` builds one.
 
-**The idempotency key** is `sha256("ILOK-OUTBOX" | plan_id | effect_id)` in hex,
-fixed at plan time and part of the plan's content hash (E4-2). A retried *plan*
-(after `StageConflictError`) keeps the same key, so a request that somehow
-committed twice is still deduplicated by the sink. A *repair* proposal gets a
-new `plan_id`, and so a new key, deliberately, since it is a different request.
+**The idempotency key** is `outbound_key(plan_id, effect_id)`:
+`canonical_hash(["outbound", plan_id, effect_id])`, a canonical-JSON array, so
+no two `(plan_id, effect_id)` pairs share a key by concatenation (E4-2). A
+retried *plan* (after `StageConflictError`) keeps the same key; the outbox's
+`UNIQUE (idempotency_key)` means a plan's request commits at most once, and
+executing a committed plan again is refused (`OutboundRequestError`, reason
+`duplicate`). A *repair* proposal gets a new `plan_id`, and so a new key,
+deliberately, since it is a different request.
 
 **Canonical form.** The payload is hashed with agentgov's ARC1 canonical JSON
 (`agentgov.receipts.canonical`), and `payload_hash` enters
@@ -170,8 +177,10 @@ in the row, and the hash the relay verifies before sending are the same value.
 - No field is named like a credential (`api_key`, `authorization`, `secret`,
   `password`, `token`): credentials come from the relay, and a payload that
   carries one is an agent trying to choose its own (§10).
-- An irreversible operation (sink config says so) carries a `Compensation`,
-  itself an `OutboundRequest` validated the same way (E4-3).
+- Every operation either names the operation that undoes it, in which case the
+  request must carry that compensation, itself an `OutboundRequest` validated
+  the same way, or is declared `"none-possible"` by the operator, in which case
+  it may not carry one (E4-3).
 - `depends_on` may name SQL effects and other `ENQUEUE` effects. The relay
   honours the order between requests (§7.3).
 
@@ -229,7 +238,7 @@ CREATE TABLE interlock.outbox (
     plan_id         text NOT NULL,
     effect_id       text NOT NULL,
     seq             integer NOT NULL,          -- topological position in the plan
-    depends_on      uuid[] NOT NULL DEFAULT '{}',  -- message_ids that must deliver first
+    depends_on      text[] NOT NULL DEFAULT '{}',  -- effect_ids, in this stage, delivered first
     sink            text NOT NULL REFERENCES interlock.sinks (name),
     operation       text NOT NULL,
     tenant_id       text,
@@ -299,10 +308,13 @@ interlock.begin_stage(p_stage uuid, p_plan text, p_gates jsonb, p_enqueue_hash b
 --   * sha256(p_payload) = p_payload_hash, recomputed server-side over the
 --     canonical text exactly as sent (stored as p_payload::jsonb),
 --   * the payload is under the sink's size bound.
-interlock.enqueue(p_token bytea, p_message uuid, p_effect text, p_seq int,
-                  p_depends uuid[], p_sink text, p_operation text, p_tenant text,
-                  p_payload text, p_payload_hash text, p_idem text,
-                  p_compensation jsonb, p_not_after interval) RETURNS void
+interlock.enqueue(p_token bytea, p_message uuid, p_effect text, p_seq integer,
+                  p_depends text[], p_sink text, p_operation text, p_tenant text,
+                  p_payload text, p_payload_hash text, p_idempotency_key text,
+                  p_compensation text, p_not_after_seconds integer) RETURNS void
+-- Also refused, with SQLSTATE IL004 and a JSON DETAIL naming the reason: a
+-- disabled sink. A wrong or absent token is IL002. not_after is measured from
+-- the same instant as enqueued_at.
 
 -- This stage's outbox rows, for diff(). SECURITY DEFINER, like stage_capture.
 interlock.stage_outbox(p_limit bigint) RETURNS TABLE (...)
@@ -449,8 +461,10 @@ WITH ready AS (
        AND (s.state = 'pending'
             OR (s.state = 'leased' AND s.lease_expires < clock_timestamp()))
        AND NOT EXISTS (                       -- dependencies delivered first (§7.3)
-             SELECT 1 FROM interlock.outbox_state d
-              WHERE d.message_id = ANY (o.depends_on) AND d.state <> 'delivered')
+             SELECT 1 FROM interlock.outbox dep
+               JOIN interlock.outbox_state d USING (message_id)
+              WHERE dep.stage_id = o.stage_id AND dep.effect_id = ANY (o.depends_on)
+                AND d.state <> 'delivered')
      ORDER BY o.enqueued_at, o.seq
      LIMIT $batch
        FOR UPDATE OF s SKIP LOCKED
@@ -498,8 +512,11 @@ adapter, then Stripe and SendGrid. Adapters never see the database.
 ### 7.3 Ordering
 
 Within a plan, requests are delivered in the plan's topological order.
-`depends_on` becomes `outbox.depends_on` between `message_id`s, and a message is
-claimable only when all its dependencies are `delivered`. If a dependency goes
+`outbox.depends_on` holds the effect ids of the requests in the same stage that
+must deliver first: those the effect depends on directly, and those reached
+through the SQL effects between them (a request after an `UPDATE` after a
+request waits for the first request). A message is claimable only when all its
+dependencies are `delivered`. If a dependency goes
 dead, its dependants are dead-lettered with reason `dependency failed`. Across
 plans there is no ordering, as with commits today.
 
@@ -657,7 +674,8 @@ including tests.
 
 - `install()`: the four tables, the append-only trigger on `outbox` and
   `outbox_attempts`, `enqueue`, `stage_outbox`, the `begin_stage` token
-  argument, grants for the relay role (`interlock install --relay-role`).
+  argument, grants for the relay role (`relay_roles` in `interlock.toml`, as
+  `stage_roles` and `audit_roles` are).
   `INSTALL_VERSION = "2"`, with an upgrade path from `"1"`.
 - `_verify_installation` checks them. `_verify_grants` keeps refusing a stage
   role that can write anything; the outbox tables must not appear.
