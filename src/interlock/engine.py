@@ -68,6 +68,7 @@ from interlock.exceptions import (
     PlanError,
     ScopeHaltedError,
     StageError,
+    SubstrateConfigurationError,
     SubstrateUnavailableError,
     UncompensatableEffectError,
 )
@@ -87,6 +88,7 @@ from interlock.types import (
     StageHandle,
     StageState,
     Verdict,
+    outbound_key,
 )
 
 if TYPE_CHECKING:
@@ -198,7 +200,9 @@ class EscrowEngine:
         committed or refused. See :mod:`interlock.receipts`.
     :param sinks: The sinks outbound requests (``ENQUEUE`` effects) may name.
         Without it, a plan with an outbound request is refused at admission.
-        See :mod:`interlock.outbound`.
+        A committed plan is charged each request's ``cost_per_call`` on top
+        of its settle cost, in the same settlement; its hold covers both. See
+        :mod:`interlock.outbound`.
     :raises ValueError: If ``settle_cost`` is negative, or ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`.
     """
@@ -369,7 +373,8 @@ class EscrowEngine:
             this plan only. What a plan cost to produce is a property of the
             plan, not of the engine that stages it, so an engine-wide constant
             forces either a flat rate for every plan or a new engine per plan.
-            ``None`` keeps the configured value.
+            ``None`` keeps the configured value. The plan's outbound requests
+            are charged on top, if it commits.
         :returns: The outcome, including the diff and verdict, whether or not
             the plan committed.
         :raises InterlockError: And only ``InterlockError``, carrying
@@ -397,6 +402,10 @@ class EscrowEngine:
         if cost < 0:
             raise PlanError(f"settle_cost cannot be negative, got {cost}")
         self.admit(plan)
+        # Charged at commit with the plan: what producing it cost, and what
+        # each request it enqueues costs, as the operator's registry prices
+        # it. A refused plan pays only the first: its requests never commit.
+        quoted = self._quote_outbound(plan)
         self._record(
             RecordType.PLAN_ADMITTED,
             plan,
@@ -411,7 +420,7 @@ class EscrowEngine:
         # Claim and settle: the hold is placed before the stage opens, so the
         # stage's snapshot can see it, and a plan its scope cannot pay for is
         # refused before it stages anything.
-        reservation = self._reserve(plan, cost)
+        reservation = self._reserve(plan, cost + quoted)
         try:
             handle = self._substrate.open(plan)
         except BaseException:
@@ -425,6 +434,7 @@ class EscrowEngine:
         committed = False
         lost_reply = False
         claim: SettlementClaim | None = None
+        outbound_cost = Decimal(0)
 
         try:
             self._record(
@@ -446,6 +456,10 @@ class EscrowEngine:
                 stage=handle.stage_id,
                 note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)",
             )
+            # What the commit will charge for: the requests the stage wrote,
+            # which must be exactly the ones the plan declared, at the price
+            # the hold was placed for.
+            outbound_cost = self._price_outbound(plan, diff, quoted)
 
             judged = adjudicate(plan, diff, self._checkers, stage_id=handle.stage_id)
             verdict = judged.verdict
@@ -510,7 +524,9 @@ class EscrowEngine:
                     # and their commit marker are. Redeemed, its spend names
                     # the intent, the record in front of the COMMIT it rode in.
                     if ledger is not None:
-                        claim = ledger.claim(intent.record_hash, cost=cost, reservation=reservation)
+                        claim = ledger.claim(
+                            intent.record_hash, cost=cost + outbound_cost, reservation=reservation
+                        )
                     try:
                         self._substrate.commit(handle)
                     except CommitUnsettledError as lost:
@@ -572,10 +588,12 @@ class EscrowEngine:
             settlement = self._redeem(plan, claim)
         else:
             # Every other path settles after the stage, in AgentGov's own
-            # transaction: a plan not joined to the ledger, and one that did
-            # not commit (whose cost to produce was spent all the same,
-            # captured against its reservation when it has one).
-            settlement = self._reverse_anchor(plan, head, cost, reservation)
+            # transaction: a plan not joined to the ledger, charged for its
+            # requests too when it committed, and one that did not commit
+            # (whose cost to produce was spent all the same, captured against
+            # its reservation when it has one).
+            charge = cost + outbound_cost if committed else cost
+            settlement = self._reverse_anchor(plan, head, charge, reservation)
         receipt = None
         if receipt_id is not None and judged is not None and terminal is not None:
             receipt = self._issue_receipt(
@@ -1159,6 +1177,73 @@ class EscrowEngine:
                 "AgentGov could not be read; writing this record unanchored", exc_info=True
             )
             return AnchorPoint.unanchored()
+
+    def _quote_outbound(self, plan: EffectPlan) -> Decimal:
+        """What the plan's requests will cost if it commits: each one at its
+        sink's ``cost_per_call`` in this engine's registry. Admission has
+        already refused a request whose sink the registry lacks."""
+        total = Decimal(0)
+        for effect in plan.effects:
+            if effect.request is None or self._sinks is None:
+                continue
+            sink = self._sinks.get(effect.request.sink)
+            if sink is not None:
+                total += sink.cost_per_call
+        return total
+
+    def _price_outbound(self, plan: EffectPlan, diff: EffectDiff, quoted: Decimal) -> Decimal:
+        """The cost of the requests the stage wrote, which commit charges.
+
+        The outbox must hold exactly the plan's requests, each as declared:
+        a request it does not hold would be charged for and never sent, and
+        one the plan did not declare would be sent without being charged for.
+        Neither can happen through ``interlock.enqueue``, whose token no
+        statement of the plan holds; this is the check that it did not. The
+        database prices each request from its own copy of the registry; that
+        price must be this engine's, which the hold was placed for.
+
+        :raises StageError: If the outbox and the plan disagree.
+        :raises SubstrateConfigurationError: If the database prices a sink
+            differently from this engine's registry.
+        """
+        declared = {e.effect_id: e for e in plan.effects if e.request is not None}
+        measured = {d.effect_id: d for d in diff.outbound}
+        if len(measured) != len(diff.outbound) or measured.keys() != declared.keys():
+            raise StageError(
+                f"the stage's outbox holds {len(diff.outbound)} request(s) and the plan "
+                f"declares {len(declared)}, not the same ones; nothing is charged or sent "
+                f"for a request the plan and the outbox do not agree on"
+            )
+        for effect_id, effect in declared.items():
+            request, delta = effect.request, measured[effect_id]
+            assert request is not None
+            if (
+                delta.sink,
+                delta.operation,
+                delta.payload_hash,
+                delta.idempotency_key,
+                delta.tenant_id,
+            ) != (
+                request.sink,
+                request.operation,
+                request.payload_hash,
+                outbound_key(plan.plan_id, effect_id),
+                effect.tenant_id,
+            ):
+                raise StageError(
+                    f"the outbox holds request {effect_id!r} other than the plan declared it"
+                )
+            sink = self._sinks.get(delta.sink) if self._sinks is not None else None
+            if sink is None or delta.cost != sink.cost_per_call:
+                raise SubstrateConfigurationError(
+                    f"the database prices a {delta.sink} request at {delta.cost}, and this "
+                    f"engine's sink registry at "
+                    f"{sink.cost_per_call if sink is not None else 'nothing'}; install the "
+                    f"registry the engine runs with before a request is charged"
+                )
+        total = sum((d.cost for d in diff.outbound), Decimal(0))
+        assert total == quoted, (total, quoted)
+        return total
 
     def _reserve(self, plan: EffectPlan, cost: Decimal) -> Authorization | None:
         """Place the plan's hold, in same-transaction mode, before it stages.

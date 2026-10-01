@@ -1,10 +1,14 @@
 # Transactional outbox: design (Epic 2)
 
-**Status: design. No implementation.** This document turns the outbox sketch in
+**Status: phases 0 to 4 built** (see §12): requests are admitted, staged in the
+outbox, charged at commit, and delivered by the relay, which is proven against crashes
+at every point of its path. Not built yet: the outbound checkers and rate windows of
+§5.2 and §5.3, compensation and operator records in the escrow chain (§8), delivery
+receipts (§9), and SQLite (Phase 6). Where a section describes what was built, it says
+so; where the build departed from the design, the section was changed to match it. This
+document turns the outbox sketch in
 [`ESCROW_SPEC.md` §4.4](ESCROW_SPEC.md#44-non-transactional-sinks) (requirements
-E4-1 to E4-5) into an architecture, a schema and an implementation plan. Where
-the two disagree, this document is newer; §4.4 should be updated to point here
-when Phase 1 lands.
+E4-1 to E4-5) into an architecture, a schema and an implementation plan.
 
 ---
 
@@ -117,7 +121,7 @@ Three processes' worth of roles, and three database roles:
 |---|---|---|
 | installer / owner | `interlock install` | Owns the tables and functions. |
 | stage role | every stage, and therefore every agent statement | `EXECUTE` on `interlock.enqueue` and `interlock.stage_outbox` only. The token gates `enqueue`. |
-| relay role (new) | `interlock relay` | `SELECT` on `outbox`; `SELECT, UPDATE` on `outbox_state`; `INSERT` on `outbox_attempts`. No other table. Holds sink credentials outside the database. |
+| relay role (new) | `interlock relay` | `SELECT` on the four outbox tables, and `EXECUTE` on the six `relay_*` functions (§4.2), through which every change it makes goes. No write privilege on any table. Holds sink credentials outside the database. |
 
 ---
 
@@ -231,11 +235,13 @@ CREATE TABLE interlock.sinks (
     config_hash     text NOT NULL              -- sha256 of the canonical sink config
 );
 
--- The obligation. Immutable once written: the request the checkers adjudicated.
+-- The obligation: the request the checkers adjudicated, priced as the
+-- database's registry priced it when the stage wrote it. Append-only.
 CREATE TABLE interlock.outbox (
     message_id      uuid PRIMARY KEY,
     stage_id        uuid NOT NULL REFERENCES interlock.stages (stage_id),
     plan_id         text NOT NULL,
+    scope_id        text NOT NULL,             -- whose breaker the relay reads
     effect_id       text NOT NULL,
     seq             integer NOT NULL,          -- topological position in the plan
     depends_on      text[] NOT NULL DEFAULT '{}',  -- effect_ids, in this stage, delivered first
@@ -245,50 +251,65 @@ CREATE TABLE interlock.outbox (
     payload         jsonb NOT NULL,
     payload_hash    text NOT NULL,             -- canonical-JSON sha256, as in the plan
     idempotency_key text NOT NULL UNIQUE,
+    cost            text NOT NULL,             -- the sink's cost_per_call, charged at commit
     compensation    jsonb,                     -- the serialized undo (E4-3), if any
     not_after       timestamptz NOT NULL,
-    enqueued_at     timestamptz NOT NULL DEFAULT clock_timestamp(),
+    enqueued_at     timestamptz NOT NULL,
     UNIQUE (stage_id, effect_id)
 );
 
--- Delivery state. The only mutable table, written by the relay alone.
+-- Delivery state, changed only through the relay's and operators' functions.
 CREATE TABLE interlock.outbox_state (
     message_id      uuid PRIMARY KEY REFERENCES interlock.outbox (message_id),
     state           text NOT NULL DEFAULT 'pending'
                     CHECK (state IN ('pending', 'leased', 'held', 'delivered', 'dead', 'cancelled')),
-    attempts        integer NOT NULL DEFAULT 0,
+    attempts        integer NOT NULL DEFAULT 0,   -- calls started
+    attempt_floor   integer NOT NULL DEFAULT 0,   -- calls before the last requeue
+    fence           bigint NOT NULL DEFAULT 0,    -- the lease's generation (§7.1)
     lease_owner     text,
     lease_expires   timestamptz,
     next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    reason          text                       -- why held / dead / cancelled
+    reason          text,                         -- why pending / held / dead / cancelled
+    log_seq         integer NOT NULL DEFAULT 0,   -- the delivery log's head
+    log_head        text NOT NULL,                -- its hash; the genesis hash at enqueue
+    updated_at      timestamptz NOT NULL DEFAULT clock_timestamp()
 );
-CREATE INDEX outbox_ready ON interlock.outbox_state (next_attempt_at)
-    WHERE state IN ('pending', 'leased');
 
--- Every attempt, append-only, hash-linked per message (OB-5).
+-- The delivery log: every call started, every outcome, every hold, release,
+-- cancellation and requeue, hash-linked per message (OB-5). Append-only.
 CREATE TABLE interlock.outbox_attempts (
     message_id      uuid NOT NULL REFERENCES interlock.outbox (message_id),
-    attempt         integer NOT NULL,
-    relay_id        text NOT NULL,
-    started_at      timestamptz NOT NULL,
-    finished_at     timestamptz,
-    outcome         text NOT NULL
-                    CHECK (outcome IN ('delivered', 'retryable', 'permanent', 'unknown', 'expired', 'held')),
+    seq             integer NOT NULL,          -- position in the message's log
+    attempt         integer,                   -- the call this row is about, if any
+    event           text NOT NULL,             -- sending, delivered, retryable, permanent,
+                                               -- unknown, lost, held, deferred, expired,
+                                               -- refused, dependency_failed, released,
+                                               -- requeued, cancelled
+    actor           text NOT NULL,             -- the relay, or operator:<name>
+    at              timestamptz NOT NULL,
     status_code     integer,
     response_digest text,                      -- sha256 of the response body; the body is not kept
-    error           text,                      -- bounded, redacted
-    prev_hash       text NOT NULL,             -- attempt 1 links to payload_hash
-    attempt_hash    text NOT NULL,             -- sha256(prev_hash || canonical(this row))
-    PRIMARY KEY (message_id, attempt)
+    detail          text,                      -- bounded; a call's breaker reading, an error
+    state_after     text,                      -- the state this row moved the message to
+    prev_hash       text NOT NULL,             -- row 1 links to the message's genesis hash
+    event_hash      text NOT NULL,
+    PRIMARY KEY (message_id, seq)
 );
 ```
 
 **Why three tables.** The request must never change after it was adjudicated,
 so `outbox` is append-only, enforced by the same `BEFORE UPDATE OR DELETE OR
 TRUNCATE` trigger pattern agentgov's `entries` uses, enabled `ALWAYS`. Delivery
-state must change, so it lives apart, in the one table the relay may update. The
-attempt log is append-only and hash-linked, so a rewritten delivery history is
-detectable (`interlock reconcile-effects` verifies the links, §8.3).
+state must change, so it lives apart, changed only through functions that check
+the caller's lease. The delivery log is append-only and hash-linked: a trigger,
+`outbox_log_link`, assigns each row its position, its predecessor's hash and its
+own, and advances the head in `outbox_state`, so no writer, the installer
+included, can append a row that does not link. A row's hash is SHA-256 over a
+length-prefixed framing of its fields, which `interlock.deliveries` reproduces
+byte for byte; `interlock outbox verify` recomputes every chain and checks each
+message's state against the state its log leads to. *As built: the log records
+every state change, not only calls (the design's one-row-per-attempt log could not
+record a call before it was made and its outcome after, both append-only).*
 
 `outbox_state` rows are inserted by `interlock.enqueue` in the stage's
 transaction, beside the `outbox` row, so they exist exactly when it does.
@@ -318,6 +339,18 @@ interlock.enqueue(p_token bytea, p_message uuid, p_effect text, p_seq integer,
 
 -- This stage's outbox rows, for diff(). SECURITY DEFINER, like stage_capture.
 interlock.stage_outbox(p_limit bigint) RETURNS TABLE (...)
+
+-- The relay's (granted to relay_roles; each checks the caller's lease and fence,
+-- and records what it does in the delivery log):
+interlock.relay_claim(p_relay, p_lease_seconds, p_limit, p_sinks)   -- leases due messages
+interlock.relay_sending(p_message, p_relay, p_fence, p_detail)      -- records a call, before it
+interlock.relay_outcome(p_message, p_relay, p_fence, p_attempt, p_outcome,
+                        p_status, p_digest, p_detail, p_delay_ms)    -- records what came back
+interlock.relay_hold / relay_defer / relay_refuse                   -- breaker, unreadable, tampered
+
+-- The operator's (granted to no role; run as the installer):
+interlock.outbox_release(p_message, p_actor), outbox_release_scope(p_scope, p_actor),
+interlock.outbox_cancel(p_message, p_actor, p_reason), outbox_requeue(p_message, p_actor)
 ```
 
 **Why a token, when `enqueue` checks that a stage is open.** Every agent
@@ -408,13 +441,26 @@ not policy.
 
 ### 5.4 Budget
 
-Each request's `cost_per_call` joins the plan's settle cost. Claim and settle
-already reserves before staging and claims in the commit, so a plan whose scope
-cannot pay for its calls is refused before it stages anything, and the claim
-that commits with the outbox rows is what pays for them. Cost is charged at
-commit, when the obligation is incurred, not at delivery. A dead-lettered
-request is refunded by the operator action that cancels it (§8), as an AgentGov
-`refund()`, so the ledger shows both.
+*Built (Phase 2).* Each request's `cost_per_call` joins the plan's settle cost, and
+the plan is charged at commit, when the obligation is incurred, not at delivery:
+
+- **Reserve the sum.** Before the stage opens, the hold is placed for the settle cost
+  plus every request's price in the engine's registry. A scope that cannot pay for
+  the plan *and its requests* is refused before anything is staged.
+- **Price from the database, check against the engine.** `enqueue` stores each
+  request's price from the database's own copy of the registry. After the stage is
+  measured, the engine requires the outbox to hold exactly the plan's requests, each
+  as declared, at the price the hold was placed for. A request the plan did not
+  declare would be sent without being paid for, and one it declared but the outbox
+  lacks would be paid for and never sent; either refuses the plan, and so does a
+  database that prices a sink differently from the engine.
+- **Charge the sum at commit.** The settlement claim that commits with the outbox
+  rows (claim and settle), or the reverse anchor written after the commit, carries
+  settle cost plus the requests' cost. A refused plan pays only its settle cost: its
+  requests never commit.
+
+A dead-lettered request is not refunded yet; the operator action that cancels it
+will refund it as an AgentGov `refund()` (§8, Phase 5), so the ledger shows both.
 
 ---
 
@@ -446,68 +492,67 @@ ARC1 needs no format change for this; §9 adds an optional delivery receipt.
 
 ## 7. The relay
 
-`interlock relay --config interlock.toml` is a separate long-running process
-(E4-1). It never runs inside a stage and never opens one. Run as many as you
-like: they share work through row locks.
+*Built (Phases 3 and 4; `interlock.relay`, `interlock.adapters`).* `interlock relay
+--config interlock.toml` is a separate long-running process (E4-1). It never runs
+inside a stage and never opens one. Run as many as you like, each with as many
+workers as you like: they share work through row locks, and never wait on each
+other. One worker is one `Relay`: one connection, one breaker, one call at a time.
 
 ### 7.1 Claiming work
 
-```sql
-WITH ready AS (
-    SELECT s.message_id
-      FROM interlock.outbox_state s
-      JOIN interlock.outbox o USING (message_id)
-     WHERE s.next_attempt_at <= clock_timestamp()
-       AND (s.state = 'pending'
-            OR (s.state = 'leased' AND s.lease_expires < clock_timestamp()))
-       AND NOT EXISTS (                       -- dependencies delivered first (§7.3)
-             SELECT 1 FROM interlock.outbox dep
-               JOIN interlock.outbox_state d USING (message_id)
-              WHERE dep.stage_id = o.stage_id AND dep.effect_id = ANY (o.depends_on)
-                AND d.state <> 'delivered')
-     ORDER BY o.enqueued_at, o.seq
-     LIMIT $batch
-       FOR UPDATE OF s SKIP LOCKED
-)
-UPDATE interlock.outbox_state s
-   SET state = 'leased', lease_owner = $relay_id,
-       lease_expires = clock_timestamp() + $lease, attempts = s.attempts + 1
-  FROM ready WHERE s.message_id = ready.message_id
-RETURNING s.message_id, s.attempts;
-```
+`interlock.relay_claim` leases up to a batch of due messages whose dependencies are
+all delivered, `FOR UPDATE SKIP LOCKED`, in its own short transaction, and commits
+the lease before any call is made. A row of a stage that has not committed is
+invisible to it (OB-7): the relay cannot send early, by construction.
 
-Run at `READ COMMITTED`, in its own short transaction. `SKIP LOCKED` lets many
-relays work without contention. A row of a stage that has not committed is
-invisible here (OB-7): the relay cannot send early, by construction. The lease
-is committed **before** the call, so a relay that dies mid-call releases the
-message by expiry, not by anyone's cleanup.
+Every claim takes the lease's next **fence**. A relay may record a call, or change a
+message's state, only under the fence it was leased with, and only records a call on
+a lease that has not run out. A relay that stalls past its lease therefore cannot
+act on the message again, whatever it does next, and its successor's work cannot be
+overwritten. The one exception is truth: a `delivered` outcome is recorded and
+delivers the message whoever holds the lease, because the sink acted.
+
+A lease that ran out after its relay recorded a call and before it recorded an
+outcome is a call whose outcome nobody will report. The claim that takes the
+message over records it as **`lost`** first, naming the dead relay: the sink may
+have acted.
 
 ### 7.2 Delivering one message
 
-1. **Re-check before sending.** Read the `outbox` row and verify
-   `sha256(canonical(payload)) = payload_hash` (OB-2: what is sent is what was
-   adjudicated). Check `now() <= not_after`, or record `expired` and dead-letter.
-   Check AgentGov's breaker for the plan's scope (read-only view, refreshed), or
-   record `held` and park (§7.6).
-2. **Call** the sink adapter with the stored payload, the relay's credentials for
-   the sink, `Idempotency-Key: <idempotency_key>` where supported, and a timeout.
-3. **Classify** the outcome:
+1. **Re-check before sending.** Re-canonicalize the stored `jsonb` and hash it: what
+   is sent is what was adjudicated (OB-2), or the message is refused, not sent.
+2. **Read the breaker**, AgentGov's, for the message's scope and its ancestors, from a
+   read-only view caught up with the ledger immediately before the call. Tripped:
+   the message is **held**, and stays held until an operator releases it. Unreadable:
+   nothing is sent, no attempt is spent, and the message is deferred. A scope
+   AgentGov does not know is held. (`NoBreaker` exists for deployments without
+   AgentGov, and only when chosen explicitly.)
+3. **Record the call, then make it.** `relay_sending` appends `sending`, with the
+   ledger position the breaker was read at, and commits, before the adapter is
+   called. The database refuses it on a lease that is no longer this relay's or has
+   run out, on a message past its deadline (expired), and on a disabled sink (held).
+4. **Classify** the outcome (the adapter, `interlock.adapters.HttpAdapter`):
 
    | Result | Outcome | Next |
    |---|---|---|
    | 2xx | `delivered` | state `delivered` |
-   | 409 with the same idempotency key | `delivered` | the sink already has it |
-   | 429, 5xx, timeout before the request was sent | `retryable` | backoff |
-   | Connection lost after the request was sent | `unknown` | retry **with the same key** (at-least-once) |
-   | Other 4xx | `permanent` | dead letter |
+   | 408, 409, 425, 429, 500, 502–504; refused connection or unresolvable host | `retryable` | backoff; nothing was sent, or the sink did not act |
+   | any other status, a redirect included | `permanent` | dead letter |
+   | timeout or connection lost after the request was sent; an adapter that raised | `unknown` | the sink's `unknown_outcome`: redeliver with the same key, or dead-letter |
 
-4. **Record** the attempt row, hash-linked, then update `outbox_state`, in one
-   transaction. Backoff is exponential with full jitter, capped, honouring
-   `Retry-After`. After `max_attempts` the message is dead.
+   *As built: 409 is retryable, not delivered: a sink that honours keys answers it
+   while an earlier call with the same key is still in progress. A redirect is never
+   followed: an endpoint is configured, not discovered.*
+5. **Record the outcome**, and the state it leads to, in one transaction. A
+   connection lost here is reconnected and the outcome recorded again; a reply lost
+   after the commit finds it already recorded.
 
-Sink adapters are small classes behind one protocol (`SinkAdapter.send(request,
-credentials, idempotency_key) -> SinkResponse`): a generic JSON-over-HTTPS
-adapter, then Stripe and SendGrid. Adapters never see the database.
+**Retry math.** The wait after failed call *n* is drawn from `[d/2, d)`, where
+`d = min(backoff_cap, backoff_base × 2^(n−1))`, and is at least the sink's
+`Retry-After`. The draw is a hash of the idempotency key and *n*, not a random
+number: the same on every relay and in every audit, uncorrelated between messages,
+and never less than half the backoff. After `max_attempts` calls, or when the next
+attempt would be due after the request's deadline, the message is dead.
 
 ### 7.3 Ordering
 
@@ -516,56 +561,74 @@ Within a plan, requests are delivered in the plan's topological order.
 must deliver first: those the effect depends on directly, and those reached
 through the SQL effects between them (a request after an `UPDATE` after a
 request waits for the first request). A message is claimable only when all its
-dependencies are `delivered`. If a dependency goes
-dead, its dependants are dead-lettered with reason `dependency failed`. Across
-plans there is no ordering, as with commits today.
+dependencies are `delivered`. When a message dies or is cancelled, every request
+waiting for it, directly or not, dies with it (`dependency_failed`); requeueing it
+brings them back. Across plans there is no ordering, as with commits today.
 
 ### 7.4 Crash windows
 
-| The relay dies… | Left behind | What happens |
-|---|---|---|
-| before leasing | `pending` | another relay claims it |
-| after leasing, before calling | `leased`, lease running | claimable again when the lease expires; no call was made |
-| after the call, before recording | `leased`, the sink acted | redelivered after expiry **with the same key**: the sink deduplicates if it supports keys, otherwise a duplicate (§7.5) |
-| after recording, before updating state | attempt row, state `leased` | the next claim sees an attempt `delivered` for this message and closes it without calling (a claim checks the last attempt first) |
+*Proven (Phase 4, `tests/test_relay_crash.py`):* a relay child process is killed
+with SIGKILL at each point below, for a sink that honours keys (`mail`), one that
+does not and redelivers (`sms`), and one that does not and dead-letters (`pager`);
+a surviving relay then finishes. What is checked is exact: the state, the delivery
+log, the calls the sink received and the effects it took.
 
-These windows get the same treatment as the escrow's commit path: a child
-process killed at each one, and a random-instant soak (Phase 4).
+| The relay dies… | Left behind | Then: mail / sms / pager |
+|---|---|---|
+| inside the claim's transaction | nothing (rolled back) | delivered once / once / once |
+| after the claim, the breaker read, or inside the call's recording | a lease, no call recorded | the lease runs out; delivered once, no `lost` |
+| after recording the call, before making it | a call recorded, never made | `lost`; called again: 1 call, 1 effect / the same / **dead, 0 calls** |
+| with the call in flight, after the sink answered, or inside the outcome's recording | a call made, the sink acted, no outcome | `lost`; called again: **2 calls, 1 effect** / **2 calls, 2 effects** / dead, 1 effect |
+| after recording the outcome | delivered | nothing to do |
+
+Before the lease runs out, no relay takes the message: nobody may assume its relay
+died. A random-instant soak kills racing relays over sinks that fail, drop
+connections and hang at random, and checks after every run that every message is
+delivered, every call a sink received is in the log under a number no other call
+used, no call began before the one before it ended or was recorded lost, every
+duplicate effect is accounted for by a lost or unknown call, and every delivery log
+verifies.
 
 ### 7.5 Sinks and duplicates
 
 | Sink | Idempotency | Duplicate on relay crash |
 |---|---|---|
 | Stripe | `Idempotency-Key` header, 24h | absorbed |
-| SendGrid mail send | none | possible; mitigated with a `custom_args` message id and a suppression window, not prevented |
-| SMTP | none | possible |
+| SendGrid mail send | none | possible with `redeliver`; with `dead-letter`, at most once, for an operator to resolve |
+| SMTP | none | as SendGrid |
 | Generic webhook | `Idempotency-Key` if the receiver honours it | depends on the receiver |
 
-`interlock.sinks.idempotency` records which. `interlock check` warns when a sink
-without idempotency is registered for an irreversible operation.
+`interlock.sinks.idempotency` records which, and `unknown_outcome` which guarantee
+the operator chose for an unknown outcome: `"redeliver"` (at least once, the
+default) or `"dead-letter"` (at most once).
 
 ### 7.6 A halt after commit
 
 The obligation committed while the scope was live. Should a trip after commit
-stop delivery? **Default: yes, hold.** The relay parks the message in state
-`held` and does not call. `interlock outbox release` delivers it after an
-operator's decision, and `cancel` drops it. A halt usually means something is
-wrong, and holding costs latency, not correctness. It is configurable per sink
-(`deliver_when_halted = true` for, say, a customer receipt that must go out).
-
----
+stop delivery? **Yes, hold**, fail closed, and it is what is built: the relay reads
+the breaker immediately before every call and parks the message as `held`.
+`interlock outbox release` (one message, or `--scope` for all of a scope's) sends it
+back for delivery after an operator's decision, and `cancel` drops it. A halt
+usually means something is wrong, and holding costs latency, not correctness.
+Per-sink delivery during a halt (`deliver_when_halted`, for a customer receipt
+that must go out) is not built.
 
 ## 8. Failure, compensation, operators
 
 ### 8.1 Dead letters
 
-`dead` rows are the operator's queue, via `interlock outbox dead` and
-`interlock outbox show <message>`. Actions, each recorded as an escrow chain
-record naming the message:
+*Built, except the escrow-chain records and the refund.* `dead` and `held` rows are
+the operator's queue: `interlock outbox status`, `list --state dead`, `show
+<message>` (its delivery log), and `verify`. Actions, each run as the installer and
+recorded in the message's delivery log with the operator's name:
 
-- `retry`: back to `pending`, new attempts, same key.
-- `cancel`: `cancelled`. Refunds the request's cost through AgentGov.
-- `compensate`: enqueue the stored compensation (§8.2).
+- `release`: a held message back to `pending`.
+- `requeue`: a dead message back to `pending` with a fresh budget of attempts, the
+  same key, and the requests that died waiting for it. Not one past its deadline:
+  the deadline is part of what was adjudicated.
+- `cancel`: `cancelled`, and the requests waiting for it with it.
+- `compensate` (§8.2) is not built, nor are the escrow-chain records of these
+  actions, nor the AgentGov refund on `cancel` (Phase 5).
 
 ### 8.2 Compensation (E4-3, E4-4, E4-5)
 
@@ -657,7 +720,7 @@ Each phase ships on its own, behind `interlock.toml` configuration: a deployment
 without `[[sinks]]` sees no behaviour change. Estimates are engineer-weeks,
 including tests.
 
-### Phase 0: types and admission (0.5–1 wk)
+### Phase 0: types and admission (0.5–1 wk) — built
 
 - `OutboundRequest`; `Effect.request` and the invariant that `ENQUEUE` carries a
   request and no statement; `PlanBuilder.enqueue`.
@@ -670,7 +733,7 @@ including tests.
 - **Tests:** admission refusals, one per rule; key stable across retries,
   different across repairs; plan hash changes with any payload byte.
 
-### Phase 1: PostgreSQL staging (1–1.5 wk)
+### Phase 1: PostgreSQL staging (1–1.5 wk) — built
 
 - `install()`: the four tables, the append-only trigger on `outbox` and
   `outbox_attempts`, `enqueue`, `stage_outbox`, the `begin_stage` token
@@ -687,7 +750,11 @@ including tests.
   bytes equal server bytes); the extended `test_crash_consistency.py` invariant
   *outbox rows ⟺ marker*.
 
-### Phase 2: checkers and windows (1 wk)
+### Phase 2: checkers and windows (1 wk) — budget built; checkers and windows not
+
+*As built, Phase 2 was narrowed to the budget (§5.4): the sum reserved, priced,
+checked and charged at commit. The checkers of §5.2 and the windows of §5.3 remain.*
+
 
 - The seven checkers of §5.2, with feedback hints and property tests that their
   feedback leaks no payload value or other tenant's count.
@@ -698,7 +765,10 @@ including tests.
   rate limits exact under 16 concurrent stages to one sink (no overshoot, by
   replaying the chain); a replayed verdict equals the recorded one.
 
-### Phase 3: the relay (1.5–2 wk)
+### Phase 3: the relay (1.5–2 wk) — built
+
+*As built: the generic HTTP adapter only; Stripe and SendGrid adapters are not built.*
+
 
 - `interlock relay` command, claim loop (§7.1), re-check before sending (§7.2),
   outcome classification, backoff, dead letters, dependency ordering, halted
@@ -709,7 +779,7 @@ including tests.
   holds; `not_after` expires; 16 relays racing deliver each message once, to a
   sink that honours keys.
 
-### Phase 4: relay crash consistency (1 wk)
+### Phase 4: relay crash consistency (1 wk) — built (§7.4)
 
 - A relay child process killed at `leased`, `called`, `recorded`, and at random
   instants, in the style of `test_crash_consistency.py`. Checked after each

@@ -40,12 +40,19 @@ from interlock.exceptions import OutboundRequestError
 from interlock.types import MAX_NOT_AFTER, OutboundRequest, canonical_hash
 
 __all__ = [
+    "DEAD_LETTER",
     "NONE_POSSIBLE",
+    "REDELIVER",
     "OperationSpec",
     "SinkRegistry",
     "SinkSpec",
     "schema_problems",
 ]
+
+REDELIVER: Final = "redeliver"
+"""A call whose outcome is unknown is made again, with the same key."""
+DEAD_LETTER: Final = "dead-letter"
+"""A call whose outcome is unknown is not made again: the message is dead."""
 
 NONE_POSSIBLE: Final = "none-possible"
 """The ``compensation`` an operator declares for an operation nothing can
@@ -135,6 +142,15 @@ class SinkSpec:
         deliver twice.
     :ivar not_after: How long after staging a request may still be delivered,
         when the request does not say.
+    :ivar max_attempts: Calls the relay makes before a request is dead.
+    :ivar backoff_base: The wait after the first failed call. Each later wait
+        doubles, up to ``backoff_cap``, with jitter
+        (:func:`interlock.relay.retry_delay`).
+    :ivar unknown_outcome: What the relay does when it cannot tell whether a
+        call reached the sink (a timeout after sending, a relay that died
+        mid-call): ``"redeliver"`` with the same idempotency key, at least
+        once; or ``"dead-letter"``, at most once, for an operator to resolve.
+        A sink without idempotency duplicates on redelivery.
     """
 
     name: str
@@ -143,6 +159,10 @@ class SinkSpec:
     idempotency: str = "header"
     max_payload_bytes: int = 16_384
     not_after: timedelta = timedelta(minutes=15)
+    max_attempts: int = 10
+    backoff_base: timedelta = timedelta(seconds=1)
+    backoff_cap: timedelta = timedelta(minutes=10)
+    unknown_outcome: str = REDELIVER
     _by_name: Mapping[str, OperationSpec] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -171,6 +191,19 @@ class SinkSpec:
             raise ValueError(
                 f"sink {self.name!r}: not_after must be positive and at most {MAX_NOT_AFTER}"
             )
+        if self.max_attempts < 1:
+            raise ValueError(f"sink {self.name!r}: max_attempts must be at least 1")
+        if not timedelta(milliseconds=1) <= self.backoff_base <= self.backoff_cap:
+            raise ValueError(
+                f"sink {self.name!r}: backoff_base must be at least a millisecond and no "
+                f"more than backoff_cap"
+            )
+        if self.backoff_cap > MAX_NOT_AFTER:
+            raise ValueError(f"sink {self.name!r}: backoff_cap is at most {MAX_NOT_AFTER}")
+        if self.unknown_outcome not in (REDELIVER, DEAD_LETTER):
+            raise ValueError(
+                f"sink {self.name!r}: unknown_outcome is {REDELIVER!r} or {DEAD_LETTER!r}"
+            )
         object.__setattr__(self, "_by_name", by_name)
 
     def operation(self, name: str) -> OperationSpec | None:
@@ -187,6 +220,10 @@ class SinkSpec:
                 self.idempotency,
                 self.max_payload_bytes,
                 int(self.not_after.total_seconds()),
+                self.max_attempts,
+                int(self.backoff_base / timedelta(milliseconds=1)),
+                int(self.backoff_cap / timedelta(milliseconds=1)),
+                self.unknown_outcome,
                 sorted(
                     [
                         op.name,

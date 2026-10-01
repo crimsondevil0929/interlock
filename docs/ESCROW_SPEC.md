@@ -1074,8 +1074,12 @@ reading the test suite.
   marker or not at all. Its idempotency key derives from `(plan_id, effect_id)`
   (E4-2). Its compensation is part of the request, so it is hashed into the plan
   the chain records at admission and committed in the outbox row with the do
-  (E4-3). There is no relay yet (E4-1), so nothing is delivered, and no
-  compensation is applied (E4-4, E4-5). SQLite refuses the effect.
+  (E4-3). `interlock relay` is a separate process that reads committed rows only
+  (E4-1) and delivers at least once under that key, recording every call and
+  every change of state in a hash-linked delivery log; it holds a message whose
+  scope's breaker has tripped. No compensation is applied yet (E4-4, E4-5), and
+  operator actions are recorded in the delivery log, not the escrow chain. SQLite
+  refuses the effect. See `docs/OUTBOX_DESIGN.md`.
 - **Deterministic replay.** Nothing captures or re-injects substrate-assigned
   values (`now()`, sequences, `random()`), so a recorded verdict cannot be
   re-derived by re-running the plan.

@@ -520,6 +520,8 @@ class OutboundDelta:
         of :meth:`EffectDiff.content_hash`, which must replay.
     :ivar depends_on: The plan's ``ENQUEUE`` effects that must be delivered
         before this one: its dependencies, followed through SQL effects.
+    :ivar cost: What the request costs, as the database's sink registry priced
+        it when the stage wrote it. Charged with the plan, at commit.
     """
 
     message_id: uuid.UUID
@@ -531,6 +533,7 @@ class OutboundDelta:
     payload_hash: str
     idempotency_key: str
     depends_on: tuple[EffectId, ...] = ()
+    cost: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,6 +664,7 @@ class EffectDiff:
                             o.payload_hash,
                             o.idempotency_key,
                             list(o.depends_on),
+                            format(o.cost.normalize(), "f"),
                         ]
                         for o in sorted(self.outbound, key=lambda o: o.effect_id)
                     ],

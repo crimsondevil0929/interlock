@@ -149,6 +149,10 @@ def test_install_mirrors_the_registry_without_endpoints_or_credentials(pg: Pg) -
             "idempotency": sink.idempotency,
             "max_payload_bytes": sink.max_payload_bytes,
             "not_after_seconds": int(sink.not_after.total_seconds()),
+            "max_attempts": sink.max_attempts,
+            "backoff_base_ms": int(sink.backoff_base / timedelta(milliseconds=1)),
+            "backoff_cap_ms": int(sink.backoff_cap / timedelta(milliseconds=1)),
+            "unknown_outcome": sink.unknown_outcome,
             "config_hash": sink.config_hash(),
             "enabled": True,
         }
@@ -194,7 +198,21 @@ def may_execute(env: Pg, grantee: str, signature: str) -> bool:
 
 ENQUEUE = (
     "interlock.enqueue(bytea, uuid, text, integer, text[], text, text, text, text, text, "
-    "text, text, integer)"
+    "text, text, integer, text)"
+)
+RELAY_CALLS = (
+    "interlock.relay_claim(text, double precision, integer, text[])",
+    "interlock.relay_sending(uuid, text, bigint, text)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint)",
+    "interlock.relay_hold(uuid, text, bigint, text)",
+    "interlock.relay_defer(uuid, text, bigint, text, bigint)",
+    "interlock.relay_refuse(uuid, text, bigint, text)",
+)
+OPERATOR_CALLS = (
+    "interlock.outbox_release(uuid, text)",
+    "interlock.outbox_release_scope(text, text)",
+    "interlock.outbox_cancel(uuid, text, text)",
+    "interlock.outbox_requeue(uuid, text)",
 )
 
 
@@ -205,22 +223,30 @@ def test_each_role_holds_exactly_its_part(pg: Pg) -> None:
         assert privileges(pg, pg.role) == {t: set() for t in OUTBOX_TABLES}
         assert may_execute(pg, pg.role, ENQUEUE)
         assert may_execute(pg, pg.role, "interlock.stage_outbox(bigint)")
-        # The relay reads requests, moves their state, and appends attempts.
+        assert not any(may_execute(pg, pg.role, f) for f in RELAY_CALLS + OPERATOR_CALLS)
+        # The relay reads the outbox, and changes delivery state only through
+        # the relay functions, which check its lease and log every change.
         assert privileges(pg, relay) == {
             "sinks": {"SELECT"},
             "outbox": {"SELECT"},
-            "outbox_state": {"SELECT", "UPDATE"},
-            "outbox_attempts": {"SELECT", "INSERT"},
+            "outbox_state": {"SELECT"},
+            "outbox_attempts": {"SELECT"},
             "stages": set(),
         }
+        assert all(may_execute(pg, relay, f) for f in RELAY_CALLS)
+        assert not any(may_execute(pg, relay, f) for f in OPERATOR_CALLS)
         assert not may_execute(pg, relay, ENQUEUE)
         assert not may_execute(pg, relay, "interlock.begin_stage(uuid, text, jsonb, bytea)")
         # The auditor reads everything and writes nothing.
         assert privileges(pg, audit) == {t: {"SELECT"} for t in OUTBOX_TABLES}
-        assert not may_execute(pg, audit, ENQUEUE)
-        # Nobody else, through PUBLIC.
-        assert not may_execute(pg, "public", ENQUEUE)
-        assert not may_execute(pg, "public", "interlock.outbox_append_only()")
+        assert not any(may_execute(pg, audit, f) for f in (ENQUEUE, *RELAY_CALLS))
+        # Nobody else, through PUBLIC: no interlock function at all.
+        public = scalar(
+            pg.admin,
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'interlock' AND has_function_privilege('public', p.oid, 'EXECUTE')",
+        )
+        assert public == 0
 
 
 def test_a_stage_role_that_can_write_the_outbox_cannot_stage(pg: Pg) -> None:
@@ -292,10 +318,12 @@ def test_a_committed_plan_leaves_its_request_in_the_outbox(pg: Pg) -> None:
         "depends_on": [],
         "sink": "mail",
         "operation": "send",
+        "scope_id": "agent",
         "tenant_id": "acme",
         "payload": MAIL,
         "payload_hash": request.payload_hash,
         "idempotency_key": outbound_key(plan.plan_id, EffectId("notify")),
+        "cost": "0.002",
         "compensation": None,
     }
     # The sink's default: fifteen minutes from staging.
@@ -503,7 +531,7 @@ class Unvetted(PostgresSubstrate):
 
 FORGED = (
     "SELECT interlock.enqueue('\\x00'::bytea, gen_random_uuid(), 'x', 1, '{}', 'mail', "
-    "'send', NULL, '{}', encode(sha256('{}'), 'hex'), 'forged', NULL, NULL)"
+    "'send', NULL, '{}', encode(sha256('{}'), 'hex'), 'forged', NULL, NULL, 'agent')"
 )
 
 
@@ -591,11 +619,12 @@ def call_enqueue(conn: Any, stage_token: bytes, **overrides: Any) -> None:
         "key": f"key-{uuid.uuid4()}",
         "compensation": None,
         "seconds": None,
+        "scope": "agent",
     } | overrides
     conn.execute(
         "SELECT interlock.enqueue(%(token)s, %(message)s, %(effect)s, %(seq)s, "
         "%(depends)s::text[], %(sink)s, %(operation)s, %(tenant)s, %(payload)s, "
-        "%(payload_hash)s, %(key)s, %(compensation)s, %(seconds)s)",
+        "%(payload_hash)s, %(key)s, %(compensation)s, %(seconds)s, %(scope)s)",
         args,
     )
 
@@ -609,6 +638,7 @@ def call_enqueue(conn: Any, stage_token: bytes, **overrides: Any) -> None:
         ({"sink": "payments", "operation": "send"}, "IL004", "unregistered_operation"),
         ({"payload": '{"body":"' + "x" * 4096 + '"}'}, "IL004", "payload_size"),
         ({"payload_hash": "0" * 64}, "IL004", "payload_hash"),
+        ({"scope": ""}, "IL002", None),
         # The hash is over the bytes sent, so a re-encoding is a mismatch.
         (
             {
@@ -671,7 +701,7 @@ def test_a_role_without_the_grant_cannot_call_enqueue(pg: Pg) -> None:
         "UPDATE interlock.outbox SET sink = 'payments'",
         "DELETE FROM interlock.outbox",
         "TRUNCATE interlock.outbox CASCADE",
-        "UPDATE interlock.outbox_attempts SET outcome = 'delivered'",
+        "UPDATE interlock.outbox_attempts SET event = 'delivered'",
         "DELETE FROM interlock.outbox_attempts",
         "TRUNCATE interlock.outbox_attempts",
     ],
@@ -680,9 +710,9 @@ def test_the_outbox_is_append_only_even_for_its_owner(pg: Pg, statement: str) ->
     assert engine(pg).execute(ship().build()).committed
     with psycopg.connect(pg.admin, autocommit=True) as conn:
         conn.execute(
-            "INSERT INTO interlock.outbox_attempts (message_id, attempt, relay_id, started_at, "
-            "outcome, prev_hash, attempt_hash) SELECT message_id, 1, 'relay', now(), "
-            "'retryable', '', 'h' FROM interlock.outbox"
+            "INSERT INTO interlock.outbox_attempts (message_id, seq, event, actor, at, "
+            "prev_hash, event_hash, state_after) SELECT message_id, 1, 'held', 'owner', now(), "
+            "'', '', 'held' FROM interlock.outbox"
         )
         before = conn.execute(
             "SELECT o.*, a.* FROM interlock.outbox o JOIN interlock.outbox_attempts a "
@@ -704,6 +734,7 @@ def test_the_outbox_is_append_only_even_for_its_owner(pg: Pg, statement: str) ->
         "ALTER TABLE interlock.outbox DISABLE TRIGGER outbox_append_only",
         "ALTER TABLE interlock.outbox ENABLE REPLICA TRIGGER outbox_append_only_truncate",
         "DROP TRIGGER attempts_append_only ON interlock.outbox_attempts",
+        "ALTER TABLE interlock.outbox_attempts DISABLE TRIGGER outbox_log_link",
     ],
 )
 def test_a_stage_will_not_open_over_an_outbox_that_can_be_rewritten(pg: Pg, tamper: str) -> None:
@@ -788,3 +819,15 @@ def test_repair_drops_a_request_no_sink_admits(pg: Pg) -> None:
     (dropped,) = repair.dropped
     assert (dropped.effect_id, dropped.cause) == ("sms", "inadmissible")
     untouched(pg)
+
+
+def test_an_outbox_from_a_pre_release_build_is_refused_not_reshaped(pg_back_office: str) -> None:
+    """Phases 0 and 1 kept a different delivery log. Installing over it would
+    leave functions reading columns that do not exist: refused, saying what
+    to do."""
+    with psycopg.connect(pg_back_office, autocommit=True) as conn:
+        conn.execute("CREATE SCHEMA interlock")
+        conn.execute("CREATE TABLE interlock.outbox_attempts (attempt_hash text)")
+        with pytest.raises(psycopg.Error, match="pre-release build") as caught:
+            install(conn, specs("orders"))
+        assert caught.value.sqlstate == "IL005"

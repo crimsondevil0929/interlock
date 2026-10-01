@@ -134,6 +134,9 @@ REVERSE_ANCHORS = (EntryType.ANCHOR, EntryType.SPEND)
 """A reverse anchor is a free ANCHOR entry or the SPEND settling the plan; the
 hold before a paid one carries the same memo and is not one."""
 
+CHARGED = Decimal("0.25") + TEST_SINKS[0].cost_per_call
+"""What a committed refund pays: its settle cost, and its email."""
+
 COMMITTED_NOTE = "recovered: commit marker present, stage committed (intent {})"
 ABORTED_NOTE = "recovered: no commit marker, stage rolled back (intent {})"
 
@@ -835,14 +838,15 @@ def test_a_kill_at_each_point_of_the_commit_path_is_recovered_exactly(
             if e.memo.startswith("interlock:") and e.entry_type in REVERSE_ANCHORS
         ]
         if crash.shared and case.committed:
-            # Claimed in the stage's own commit; booked naming the intent.
+            # Claimed in the stage's own commit; booked naming the intent. The
+            # plan pays for itself and for its email, at commit.
             (anchor,) = anchors
             (intent,) = intents
-            assert anchor.entry_type is EntryType.SPEND and anchor.amount == Decimal("0.25")
+            assert anchor.entry_type is EntryType.SPEND and anchor.amount == CHARGED
             assert anchor.memo == f"interlock:{intent.record_hash[:16]}"
         elif case.at == "anchored":
             (anchor,) = anchors
-            assert anchor.entry_type is EntryType.SPEND and anchor.amount == Decimal("0.25")
+            assert anchor.entry_type is EntryType.SPEND and anchor.amount == CHARGED
             assert anchor.memo == f"interlock:{terminal.record_hash[:16]}"
         else:
             assert anchors == []

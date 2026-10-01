@@ -912,6 +912,88 @@ role may call that writes elsewhere, an extension such as `dblink` that opens an
 connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
 or later; CI runs 16.
 
+## Outbound requests
+
+An email, a refund through a payment API, a webhook: none of them can be staged, and none
+can be rolled back. So on PostgreSQL Interlock stages the *request* instead, and a separate
+relay makes the call after the plan commits ([`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md)).
+
+1. `PlanBuilder.enqueue()` puts the request in the plan beside its SQL effects. The engine
+   admits it only against the operator's `SinkRegistry`: a registered sink and operation, a
+   payload under the sink's size bound that matches the operation's JSON Schema, no field
+   named like a credential, and the compensation the operation registers, if any.
+2. The stage writes it to `interlock.outbox` in its own transaction, through a function
+   gated by a token only the substrate holds. The checkers read it back from there, and it
+   commits with the plan's rows and stage marker, or not at all.
+3. The plan pays at commit: its settle cost and each request's `cost_per_call`, in one
+   settlement. The hold placed before staging covers both; a refused plan pays only its
+   settle cost, since its requests never commit.
+4. `interlock relay`, a separate process under its own database role and the only holder of
+   the sinks' credentials, delivers the committed requests.
+
+```toml
+relay_roles = ["interlock_relay"]     # install grants them the relay functions, nothing else
+
+[[sinks]]
+name = "payments"
+cost_per_call = "0.0005"
+idempotency = "header"                # the sink deduplicates on Idempotency-Key
+unknown_outcome = "redeliver"         # or "dead-letter": at most once
+max_attempts = 10
+
+[[sinks.operations]]
+name = "refund"
+compensation = "refund.reverse"
+
+[[sinks.operations]]
+name = "refund.reverse"
+
+[relay]
+database = "postgresql://interlock_relay@db/app"
+ledger = "postgresql://interlock_relay@db/app"    # AgentGov, read-only, for the breaker
+
+[[relay.endpoints]]
+sink = "payments"
+url = "https://api.payments.example"
+routes = { refund = "POST /v1/refunds", "refund.reverse" = "POST /v1/refunds/reverse" }
+header_env = { Authorization = "PAYMENTS_AUTHORIZATION" }    # the value is in the environment
+```
+
+```bash
+interlock relay --config interlock.toml --workers 4     # until SIGTERM; --once drains and exits
+interlock outbox status  --config interlock.toml --database postgresql://owner@db/app
+interlock outbox verify  --config interlock.toml --database postgresql://owner@db/app
+interlock outbox release --scope support-agent --actor alice --config interlock.toml ...
+```
+
+A relay reads AgentGov's ledger and never writes it: over a ledger shared through
+PostgreSQL, grant its role `USAGE` on the `agentgov` schema and `SELECT` on its tables,
+nothing more. Over a SQLite ledger, name the file; it is opened read-only.
+
+What the relay guarantees, each with a test that fails without it:
+
+- **Nothing is sent before its plan commits, and nothing but what was adjudicated.** The
+  relay reads committed rows only, and re-hashes the stored payload before every call; a
+  payload that no longer matches is refused, not sent.
+- **Every call is recorded before it is made, and its outcome after**, in the message's
+  delivery log, `interlock.outbox_attempts`. The database links each row to the one before
+  it by hash; `interlock outbox verify` recomputes every link and checks each message's
+  state against its log.
+- **A tripped breaker holds.** AgentGov's breaker for the message's scope is read
+  immediately before every call; tripped, the message is held, not sent, until an operator
+  releases it. Each call records the ledger position its breaker check read.
+- **Relays never share a message.** Leases are claimed with `FOR UPDATE SKIP LOCKED`, and a
+  fence on each lease stops a relay whose lease ran out from acting on the message again.
+- **Delivery is at least once, and a duplicate is never silent.** Every call carries the
+  same idempotency key. A relay that dies after its call reached the sink and before it
+  recorded the outcome leaves the call to be recorded as lost and made again: a sink that
+  honours the key acts once, one that does not acts twice, and the log shows the lost call
+  the second effect came from. `unknown_outcome = "dead-letter"` makes such a sink at most
+  once instead. `tests/test_relay_crash.py` kills relays at every point of this path.
+- **Failure is bounded.** Retries back off exponentially with deterministic jitter, honour
+  `Retry-After`, and stop at `max_attempts` or the request's deadline. A dead request takes
+  the requests waiting for it with it; `interlock outbox requeue` brings them back.
+
 ## Unrecorded writes
 
 The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
@@ -1030,13 +1112,12 @@ against the shipped code, not inferred.
   quote's proof of work are verifiable; its milestones are the harness's claim.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
-- **Non-transactional sinks cannot be staged, only enqueued, and nothing delivers yet.** An
-  email has no shadow. `PlanBuilder.enqueue()` adds an `EffectKind.ENQUEUE` effect: an
-  outbound request to a registered sink, which on PostgreSQL is written to
-  `interlock.outbox` inside the stage, measured into the diff, and committed with the plan's
-  rows or not at all (see [`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md)). The relay that
-  delivers committed requests, at least once under an idempotency key, is not built yet, so
-  a committed request waits in the outbox. SQLite has no outbox and refuses the effect.
+- **External effects get a weaker guarantee than rows, by design.** The guarantee for
+  external effects is deliberately weaker, and stated as such: the **request** is measured,
+  adjudicated and made durable exactly when the rest of the plan is; its **delivery** is
+  at-least-once, recorded, and bounded; what the external system then does is not measured
+  at all. See [Outbound requests](#outbound-requests). SQLite has no outbox and refuses an
+  outbound request.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
 

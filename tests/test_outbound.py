@@ -730,3 +730,148 @@ def test_a_schema_file_must_be_a_json_object(tmp_path: Path) -> None:
     (tmp_path / "schemas" / "mail-send.json").write_text("{not json")
     with pytest.raises(ConfigError, match="not valid JSON"):
         load_config(path)
+
+
+# --------------------------------------------------------------------------
+# the relay's configuration and retry policy
+# --------------------------------------------------------------------------
+
+RELAY = """
+[relay]
+database = "postgresql://relay@db/app"
+ledger = "/var/lib/agentgov/ledger.db"
+lease_seconds = 30
+timeout_seconds = 5
+workers = 4
+
+[[relay.endpoints]]
+sink = "mail"
+url = "https://mail.example"
+routes = { send = "POST /v3/send" }
+header_env = { Authorization = "MAIL_AUTHORIZATION" }
+
+[[relay.endpoints]]
+sink = "payments"
+url = "https://pay.example"
+routes = { refund = "POST /refunds", "refund.reverse" = "POST /refunds/reverse" }
+"""
+
+
+def test_the_relay_section_is_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("INTERLOCK_RELAY_DATABASE", raising=False)
+    config = load_config(write_config(tmp_path, CONFIG + RELAY))
+    relay = config.relay
+    assert relay is not None
+    assert (relay.database, relay.ledger, relay.breaker, relay.workers) == (
+        "postgresql://relay@db/app",
+        "/var/lib/agentgov/ledger.db",
+        "agentgov",
+        4,
+    )
+    assert (relay.lease, relay.timeout) == (timedelta(seconds=30), timedelta(seconds=5))
+    mail_endpoint, payments = relay.endpoints
+    assert mail_endpoint.header_env == {"Authorization": "MAIL_AUTHORIZATION"}
+    assert payments.routes == {"refund": "POST /refunds", "refund.reverse": "POST /refunds/reverse"}
+    monkeypatch.setenv("INTERLOCK_RELAY_DATABASE", "postgresql://other@db/app")
+    moved = load_config(write_config(tmp_path, CONFIG + RELAY)).relay
+    assert moved is not None and moved.database == "postgresql://other@db/app"
+
+
+@pytest.mark.parametrize(
+    ("edit", "match"),
+    [
+        (lambda t: t.replace('ledger = "/var/lib/agentgov/ledger.db"\n', ""), "ledger"),
+        (lambda t: t.replace("lease_seconds = 30", "lease_seconds = 9"), "twice"),
+        (lambda t: t.replace('sink = "payments"', 'sink = "sms"'), "no \\[\\[sinks\\]\\]"),
+        (lambda t: t.replace(', "refund.reverse" = "POST /refunds/reverse"', ""), "missing"),
+        (
+            lambda t: t.replace(
+                '{ send = "POST /v3/send" }', '{ send = "POST /v3/send", x = "y" }'
+            ),
+            "unknown",
+        ),
+        (
+            lambda t: (
+                t
+                + '\n[[relay.endpoints]]\nsink = "mail"\nurl = "https://b.example"\n'
+                + 'routes = { send = "POST /send" }\n'
+            ),
+            "same sink",
+        ),
+        (lambda t: t.replace("[[relay.endpoints]]", "[[relay.nothing]]"), "endpoints"),
+        (lambda t: t.replace("timeout_seconds = 5", "timeout_seconds = 0"), "positive"),
+    ],
+)
+def test_a_malformed_relay_section_is_named(tmp_path: Path, edit: Any, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        load_config(write_config(tmp_path, edit(CONFIG + RELAY)))
+
+
+def test_no_breaker_is_said_out_loud(tmp_path: Path) -> None:
+    text = (CONFIG + RELAY).replace(
+        'ledger = "/var/lib/agentgov/ledger.db"\n', 'breaker = "none"\n'
+    )
+    relay = load_config(write_config(tmp_path, text)).relay
+    assert relay is not None and (relay.breaker, relay.ledger) == ("none", None)
+    with pytest.raises(ConfigError, match="'agentgov' or 'none'"):
+        load_config(write_config(tmp_path, text.replace('breaker = "none"', 'breaker = "off"')))
+
+
+def test_a_relay_host_needs_no_stage_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("INTERLOCK_DATABASE", raising=False)
+    text = (CONFIG + RELAY).replace('database = "postgresql://agent@db/app"\n', "", 1)
+    with pytest.raises(ConfigError, match="no database"):
+        load_config(write_config(tmp_path, text))
+    assert load_config(write_config(tmp_path, text), require_database=False).relay is not None
+
+
+@pytest.mark.parametrize(
+    ("edit", "match"),
+    [
+        (
+            lambda t: t.replace(
+                "not_after_seconds = 600", "not_after_seconds = 600\nmax_attempts = 0"
+            ),
+            "max_attempts",
+        ),
+        (
+            lambda t: t.replace(
+                "not_after_seconds = 600", "not_after_seconds = 600\nbackoff_base_seconds = 0"
+            ),
+            "positive",
+        ),
+        (
+            lambda t: t.replace(
+                "not_after_seconds = 600", "not_after_seconds = 600\nbackoff_base_seconds = 900"
+            ),
+            "backoff_cap",
+        ),
+        (
+            lambda t: t.replace(
+                "not_after_seconds = 600", 'not_after_seconds = 600\nunknown_outcome = "maybe"'
+            ),
+            "unknown_outcome",
+        ),
+    ],
+)
+def test_a_malformed_retry_policy_is_named(tmp_path: Path, edit: Any, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        load_config(write_config(tmp_path, edit(CONFIG)))
+
+
+def test_the_retry_policy_is_read_and_hashed(tmp_path: Path) -> None:
+    text = CONFIG.replace(
+        "not_after_seconds = 600",
+        "not_after_seconds = 600\nmax_attempts = 3\nbackoff_base_seconds = 0.5\n"
+        'backoff_cap_seconds = 30\nunknown_outcome = "dead-letter"',
+    )
+    sink = load_config(write_config(tmp_path, text)).sinks[0]
+    assert (sink.max_attempts, sink.backoff_base, sink.backoff_cap, sink.unknown_outcome) == (
+        3,
+        timedelta(milliseconds=500),
+        timedelta(seconds=30),
+        "dead-letter",
+    )
+    assert sink.config_hash() != load_config(write_config(tmp_path, CONFIG)).sinks[0].config_hash()
