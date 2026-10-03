@@ -42,6 +42,7 @@ from interlock.deliveries import (  # noqa: E402
     requeue,
     verify_delivery_log,
 )
+from interlock.outbox_store import PostgresOutboxStore  # noqa: E402
 from interlock.relay import (  # noqa: E402
     BreakerReading,
     NoBreaker,
@@ -1133,8 +1134,9 @@ def test_an_outcome_is_recorded_through_a_lost_connection(outbox: Outbox) -> Non
 
         def _reached(self, point: str, lease: Any) -> None:
             if point == "called":
-                assert self._conn is not None
-                pid = self._conn.info.backend_pid
+                store = self.store
+                assert isinstance(store, PostgresOutboxStore)
+                pid = store.connection().info.backend_pid
                 with outbox.admin() as conn:
                     conn.execute("SELECT pg_terminate_backend(%s)", (pid,))
 
