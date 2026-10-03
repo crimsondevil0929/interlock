@@ -184,3 +184,41 @@ settlement row: a crash between any two is resumed without a second receipt or c
 4. Rate windows.
 5. *(after agentgov 0.4.0 is published)* Settlement: delivery receipts and credits.
 6. Documentation, mutation pass, final verification.
+
+## 7. As built
+
+Where the implementation settled what the design left open, or refined it.
+
+### Step 3: attested outcomes
+
+- **The relay attests as it records.** `Relay(signer=...)` is required and must be
+  Ed25519 (an HMAC key verifies only for whoever holds it, so anyone who could check an
+  attestation could make one). The relay signs inside its outcome step, from the lease and
+  the result, so no path records an outcome without one.
+- **`interlock relay` starts only with a registered key**: `--key`, else
+  `INTERLOCK_RELAY_KEY`, else `[relay] key`; one missing, unreadable, or absent from
+  `[relays.keys]` is refused with exit 2 before anything is claimed. `interlock keygen
+  --role relay|operator` writes a key and prints the line that registers it
+  (`interlock operator keygen` remains).
+- **The database checks the shape.** An outcome row's attestation must be exactly
+  `{"alg":"ed25519","key_id":<16 hex>,"signature":<128 hex>}`, canonical: PostgreSQL's
+  link trigger raises `IL008`; SQLite's `_interlock_log_attested` aborts. Verification
+  checks the signature.
+- **A relay of an older version left running cannot record an outcome.** On PostgreSQL
+  the ten-argument `relay_outcome` is gone, so it records a call and never its outcome;
+  the next relay finds the call lost and makes it again. On SQLite it records nothing:
+  the link trigger hashes the attestation through a function only version 4 registers.
+- **Legacy, narrowly.** An unattested outcome counts as version 3's only if it is dated
+  before version 4 was installed, on a message enqueued before then, and not after a row
+  of version 4's in its log; otherwise it is named, backdated. What remains: such an
+  outcome forged into a log version 4 never wrote to, on a message version 3 enqueued, is
+  indistinguishable from version 3's own, and is counted, not trusted. `outbox verify`
+  prints the count. Pinning the legacy set outside the database (the install's signed
+  operator record could vouch for it) would close it; it is left open.
+- **A copied attestation is caught twice.** On another call its signature fails; on the
+  same call it is a second outcome, which `verify_delivery_log` names.
+- `outbox show` names the relay that attested each outcome; `outbox verify` counts the
+  attested outcomes, or says attestations went unchecked when `[relays.keys]` is absent.
+- Upgrades from versions 2 and 3 are tested against each version's frozen code:
+  PostgreSQL's SQL (`tests/outbox_v2.py`, `tests/outbox_v3.py`) and SQLite's module
+  (`tests/sqlite_outbox_v3.py`).

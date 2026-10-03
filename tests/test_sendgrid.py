@@ -37,7 +37,7 @@ from interlock.sendgrid import MAIL_SEND, SendGridAdapter, sendgrid_sink, v3_bod
 from interlock.types import EffectId, OutboundRequest, outbound_key
 from tests.fakesendgrid import KEY, FakeSendGrid, rate_limited, send_then
 from tests.fakesink import hang, status
-from tests.outbox_env import BACKENDS, RELAY_SINKS, SCOPE, Outbox, build_either
+from tests.outbox_env import BACKENDS, RELAY_SINKS, SCOPE, Outbox, build_either, relay_signer
 
 EMAIL: dict[str, Any] = {
     "to": [{"email": "ann@acme.test", "name": "Ann"}],
@@ -267,6 +267,7 @@ def relay(outbox: Outbox, sendgrid: FakeSendGrid) -> Relay:
         breaker=NoBreaker(),
         lease=timedelta(seconds=2),
         timeout=timedelta(seconds=0.5),
+        signer=relay_signer(),
     )
 
 

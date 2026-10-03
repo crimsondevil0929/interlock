@@ -1,4 +1,12 @@
-"""The transactional outbox on SQLite (``docs/EPIC3_DESIGN.md`` §2).
+"""FROZEN: the outbox on SQLite as version 3 installed and relayed it.
+
+``src/interlock/sqlite_outbox.py`` at interlock main ``76a6f7f`` (Epic 3),
+verbatim below this note, for ``tests/test_attestations.py``: version 4 is
+installed over a file version 3 installed and relayed. Never edit this file.
+
+The original docstring follows.
+
+The transactional outbox on SQLite (``docs/EPIC3_DESIGN.md`` §2).
 
 The same outbox as PostgreSQL's (``docs/OUTBOX_DESIGN.md``), in the database
 file itself: ``_interlock_sinks``, ``_interlock_outbox``,
@@ -97,12 +105,6 @@ _EVENTS: Final = (
     "'cancelled', 'compensated'"
 )
 
-_ATTESTATION_GLOB: Final = (
-    '{"alg":"ed25519","key_id":"' + "[0-9a-f]" * 16 + '","signature":"' + "[0-9a-f]" * 128 + '"}'
-)
-"""An attestation's shape, ``{alg, key_id, signature}`` as canonical JSON:
-the trigger checks it, verification checks the signature."""
-
 _SCHEMA: Final = (
     "CREATE TABLE IF NOT EXISTS main._interlock_commits "
     "(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)",
@@ -173,7 +175,6 @@ _SCHEMA: Final = (
         state_after     TEXT CHECK (state_after IN ({_STATES})),
         remote_ref      TEXT,
         authority       TEXT,
-        attestation     TEXT,
         prev_hash       TEXT NOT NULL,
         event_hash      TEXT NOT NULL,
         PRIMARY KEY (message_id, seq)
@@ -199,7 +200,7 @@ _SCHEMA: Final = (
             OR NEW.event_hash IS NOT interlock_event_hash(
                    NEW.prev_hash, NEW.message_id, NEW.seq, NEW.attempt, NEW.event, NEW.actor,
                    NEW.at, NEW.status_code, NEW.response_digest, NEW.detail, NEW.state_after,
-                   NEW.remote_ref, NEW.authority, NEW.attestation);
+                   NEW.remote_ref, NEW.authority);
     END""",
     f"""CREATE TRIGGER IF NOT EXISTS _interlock_log_head AFTER INSERT ON {LOG}
     BEGIN
@@ -215,14 +216,6 @@ _SCHEMA: Final = (
     BEGIN
         SELECT RAISE(ABORT, 'interlock: an operator action needs a signed authority');
     END""",
-    # What a sink answered is recorded only as the relay that heard it signed
-    # it (docs/EPIC4_DESIGN.md §2): an Ed25519 signature, as canonical JSON.
-    f"""CREATE TRIGGER IF NOT EXISTS _interlock_log_attested BEFORE INSERT ON {LOG}
-    WHEN NEW.event IN ('delivered', 'retryable', 'permanent', 'unknown')
-     AND (NEW.attestation IS NULL OR NEW.attestation NOT GLOB '{_ATTESTATION_GLOB}')
-    BEGIN
-        SELECT RAISE(ABORT, 'interlock: a relay''s outcome needs the relay''s attestation');
-    END""",
     # When this outbox was installed: every operator row after it is signed.
     f"CREATE TABLE IF NOT EXISTS main.{EPOCHS} (version TEXT PRIMARY KEY, at INTEGER NOT NULL)",
 )
@@ -235,11 +228,7 @@ LOG_TRIGGERS: Final = (
     "_interlock_log_link",
     "_interlock_log_head",
     "_interlock_log_authority",
-    "_interlock_log_attested",
 )
-_REDEFINED: Final = ("_interlock_log_link", "_interlock_log_attested")
-"""Triggers whose definition a later version changed: dropped and created
-again at every install, so an upgraded file runs the current ones."""
 
 
 # --------------------------------------------------------------------------
@@ -271,7 +260,7 @@ def _us(span: timedelta) -> int:
 
 def register(conn: sqlite3.Connection) -> None:
     """Register what the delivery log's triggers need on ``conn``."""
-    conn.create_function("interlock_event_hash", 14, _event_hash_sql, deterministic=True)
+    conn.create_function("interlock_event_hash", 13, _event_hash_sql, deterministic=True)
 
 
 def _event_hash_sql(
@@ -288,7 +277,6 @@ def _event_hash_sql(
     state_after: str | None,
     remote_ref: str | None,
     authority: str | None,
-    attestation: str | None,
 ) -> str:
     return event_hash(
         prev,
@@ -304,17 +292,7 @@ def _event_hash_sql(
         state_after,
         remote_ref,
         authority,
-        attestation,
     )
-
-
-def installed_version(conn: sqlite3.Connection) -> int:
-    """Which version installed the outbox in this file: 4 when its delivery log
-    records relays' attestations, 3 before; 0 when there is none."""
-    if not outbox_installed(conn):
-        return 0
-    columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({LOG})").fetchall()}
-    return 4 if "attestation" in columns else 3
 
 
 def outbox_installed(conn: sqlite3.Connection) -> bool:
@@ -347,19 +325,11 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if installed_version(conn) == 3:
-                # Version 4 over 3, in place: the column, and the triggers
-                # that changed. Every row written before keeps its hash.
-                conn.execute(f"ALTER TABLE {LOG} ADD COLUMN attestation TEXT")
-            for trigger in _REDEFINED:
-                conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             for statement in _SCHEMA:
                 conn.execute(statement)
-            for version in ("3", "4"):
-                conn.execute(
-                    f"INSERT OR IGNORE INTO {EPOCHS} (version, at) VALUES (?, ?)",
-                    (version, now_us()),
-                )
+            conn.execute(
+                f"INSERT OR IGNORE INTO {EPOCHS} (version, at) VALUES ('3', ?)", (now_us(),)
+            )
             listed = list(sinks)
             for sink in listed:
                 conn.execute(
@@ -635,15 +605,9 @@ class SqliteOutboxStore:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA trusted_schema=ON")
-            version = installed_version(conn)
-            if version == 0:
+            if not outbox_installed(conn):
                 raise SubstrateConfigurationError(
                     f"no outbox in {path}: run `interlock install` with [[sinks]] configured"
-                )
-            if version < 4:
-                raise SubstrateConfigurationError(
-                    f"the outbox in {path} was installed by version {version}: run "
-                    f"`interlock install` to upgrade it in place to version 4"
                 )
             mode = conn.execute("PRAGMA journal_mode").fetchone()
             if mode is None or str(mode[0]).lower() != "wal":
@@ -721,7 +685,6 @@ class SqliteOutboxStore:
         digest: str | None = None,
         remote_ref: str | None = None,
         authority: str | None = None,
-        attestation: str | None = None,
     ) -> str:
         head = conn.execute(
             f"SELECT log_seq, log_head FROM {STATE} WHERE message_id = ?", (message,)
@@ -746,12 +709,11 @@ class SqliteOutboxStore:
             state_after,
             remote_ref,
             authority,
-            attestation,
         )
         conn.execute(
             f"INSERT INTO {LOG} (message_id, seq, attempt, event, actor, at, status_code, "
-            f"response_digest, detail, state_after, remote_ref, authority, attestation, "
-            f"prev_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"response_digest, detail, state_after, remote_ref, authority, prev_hash, "
+            f"event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message,
                 seq,
@@ -765,7 +727,6 @@ class SqliteOutboxStore:
                 state_after,
                 remote_ref,
                 authority,
-                attestation,
                 str(head[1]),
                 digest_,
             ),
@@ -976,13 +937,7 @@ class SqliteOutboxStore:
         return attempt
 
     def outcome(
-        self,
-        lease: Lease,
-        relay_id: str,
-        attempt: int,
-        result: DeliveryResult,
-        delay: timedelta,
-        attestation: str,
+        self, lease: Lease, relay_id: str, attempt: int, result: DeliveryResult, delay: timedelta
     ) -> str | None:
         from interlock.exceptions import InterlockError
 
@@ -1069,7 +1024,6 @@ class SqliteOutboxStore:
                         status=result.status_code,
                         digest=result.response_digest,
                         remote_ref=result.remote_ref if result.outcome == "delivered" else None,
-                        attestation=attestation,
                     )
                     if next_state == "pending":
                         self._settle(conn, message, "pending", why, due)
@@ -1395,12 +1349,11 @@ class SqliteOutboxStore:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
-                enqueued_at=instant(int(m[13])),
             )
             for m in self._conn.execute(
                 f"SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
                 f"o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, "
-                f"s.log_seq, s.log_head, o.enqueued_at FROM {OUTBOX} AS o JOIN {STATE} AS s "
+                f"s.log_seq, s.log_head FROM {OUTBOX} AS o JOIN {STATE} AS s "
                 f"ON s.message_id = o.message_id "
                 f"WHERE ?1 IS NULL OR o.message_id IN (SELECT value FROM json_each(?1)) "
                 f"ORDER BY o.enqueued_at, o.message_id",
@@ -1423,12 +1376,11 @@ class SqliteOutboxStore:
                 event_hash=str(r[13]),
                 remote_ref=None if r[10] is None else str(r[10]),
                 authority=None if r[11] is None else str(r[11]),
-                attestation=None if r[14] is None else str(r[14]),
             )
             for r in self._conn.execute(
                 f"SELECT message_id, seq, attempt, event, actor, at, status_code, "
                 f"response_digest, detail, state_after, remote_ref, authority, prev_hash, "
-                f"event_hash, attestation FROM {LOG} "
+                f"event_hash FROM {LOG} "
                 f"WHERE ?1 IS NULL OR message_id IN (SELECT value FROM json_each(?1)) "
                 f"ORDER BY message_id, seq",
                 (ids,),
@@ -1485,10 +1437,8 @@ class SqliteOutboxStore:
             ).fetchall()
         ]
 
-    def epoch(self, version: str = "3") -> datetime | None:
-        row = self._conn.execute(
-            f"SELECT at FROM {EPOCHS} WHERE version = ?", (version,)
-        ).fetchone()
+    def epoch(self) -> datetime | None:
+        row = self._conn.execute(f"SELECT at FROM {EPOCHS} WHERE version = '3'").fetchone()
         return None if row is None else instant(int(row[0]))
 
     def authorized(self, authority: str) -> list[AuthorizedRow]:

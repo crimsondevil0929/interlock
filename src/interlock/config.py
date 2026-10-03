@@ -33,6 +33,7 @@ TOML, so the standard library reads it::
     schema = "schemas/mail-send.json" # relative to this file; omit for any object
 
     [relay]                           # interlock relay; see interlock.relay
+    key = "relay.key"                 # this relay's Ed25519 key (interlock keygen --role relay)
     database = "postgresql://interlock_relay@db/app"  # a relay role
     ledger = "postgresql://interlock_relay@db/app"    # AgentGov, for the breaker
     ledger_schema = "agentgov"
@@ -68,6 +69,12 @@ and its relay adapter; configuration names which of its operations to allow::
     secret_env = "STRIPE_SECRET_KEY"  # the variable holding the API key
     # url = "https://api.stripe.com"  # the vendor's own, unless given
     # stripe_version = "2024-06-20"   # stripe; sandbox = true for sendgrid
+
+Relays sign every outcome they record (``docs/EPIC4_DESIGN.md`` §2); their
+public keys are registered for verification::
+
+    [relays.keys]
+    east-1 = "ed25519:9a1b..."
 
 Operators sign every action on the outbox (``docs/EPIC3_DESIGN.md`` §6)::
 
@@ -165,6 +172,9 @@ class RelayConfig:
     poll_seconds: float = 1.0
     batch: int = 1
     workers: int = 1
+    key: Path | None = None
+    """This relay's own Ed25519 key file (``interlock keygen --role relay``),
+    or ``INTERLOCK_RELAY_KEY``: it signs every outcome the relay records."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +213,13 @@ class InterlockConfig:
     relay_roles: tuple[str, ...] = ()
     relay: RelayConfig | None = None
     operators: OperatorsConfig | None = None
+    relays: Mapping[str, str] | None = None
+    """``[relays.keys]``: each relay's name and Ed25519 public key. A relay
+    starts only with a key registered here, and verification holds every
+    outcome to one of them."""
+
+    def relay_keyring(self) -> Keyring | None:
+        return None if self.relays is None else Keyring(self.relays)
 
     def with_database(self, database: str | None) -> InterlockConfig:
         if not database:
@@ -265,8 +282,9 @@ def load_config(
             "relay_roles are PostgreSQL roles; a SQLite relay is bounded by the file's "
             "permissions instead"
         )
-    relay = _relay(raw.get("relay"), sinks)
+    relay = _relay(raw.get("relay"), sinks, Path(path).parent)
     operators = _operators(raw.get("operators"), Path(path).parent)
+    relays = _relays(raw.get("relays"))
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -279,7 +297,21 @@ def load_config(
         relay_roles=relay_roles,
         relay=relay,
         operators=operators,
+        relays=relays,
     )
+
+
+def _relays(raw: object) -> Mapping[str, str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"keys"}:
+        raise ConfigError("[relays] holds one table, [relays.keys]: each relay's public key")
+    try:
+        keys = _table_of_strings(raw, "keys")
+        Keyring(keys)
+    except ValueError as exc:
+        raise ConfigError(f"[relays.keys]: {exc}") from exc
+    return keys
 
 
 def _operators(raw: object, base: Path) -> OperatorsConfig | None:
@@ -303,7 +335,7 @@ def _operators(raw: object, base: Path) -> OperatorsConfig | None:
     return config
 
 
-def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
+def _relay(raw: object, sinks: tuple[SinkSpec, ...], base: Path) -> RelayConfig | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -373,6 +405,7 @@ def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
             poll_seconds=_seconds(raw, "poll_seconds", 1),
             batch=_integer(raw, "batch", 1),
             workers=_integer(raw, "workers", 1),
+            key=base / _string(raw, "key") if "key" in raw else None,
         )
     except ConfigError as exc:
         raise ConfigError(f"[relay]: {exc}") from exc

@@ -108,7 +108,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "3"
+INSTALL_VERSION: Final = "4"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -373,7 +373,8 @@ _OUTBOX_TABLES: Final = (
 _RELAY_FUNCTIONS: Final = (
     "interlock.relay_claim(text, double precision, integer, text[])",
     "interlock.relay_sending(uuid, text, bigint, text)",
-    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text, "
+    "text)",
     "interlock.relay_hold(uuid, text, bigint, text)",
     "interlock.relay_defer(uuid, text, bigint, text, bigint)",
     "interlock.relay_refuse(uuid, text, bigint, text)",
@@ -427,6 +428,10 @@ def install(
     it over version 2 upgrades in place, in the same transaction, and every
     delivery log written under version 2 still verifies. Stop the relays
     first: a relay of version 2 cannot record an outcome in version 3.
+
+    Version 4 (``docs/EPIC4_DESIGN.md`` §2) records each relay's attestation
+    with every outcome, and refuses an outcome without one. It upgrades
+    version 3 in place the same way; again, stop the relays first.
     """
     from psycopg import sql
 
@@ -557,15 +562,22 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
     )
 
 
-def installed_v3(conn: psycopg.Connection[Any]) -> bool:
-    """Whether the outbox in this database is version 3's: its delivery log
-    records what a call created."""
+def installed_version(conn: psycopg.Connection[Any]) -> int:
+    """Which version installed the outbox in this database: 4 when its
+    delivery log records relays' attestations, 3 when what calls created, 2
+    when neither; 0 when there is no outbox."""
     row = conn.execute(
-        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
-        "WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
-        "AND attname = 'remote_ref' AND NOT attisdropped)"
+        "SELECT pg_catalog.to_regclass('interlock.outbox_attempts') IS NOT NULL, "
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+        "        WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
+        "        AND attname = 'remote_ref' AND NOT attisdropped), "
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+        "        WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
+        "        AND attname = 'attestation' AND NOT attisdropped)"
     ).fetchone()
-    return bool(row is not None and row[0])
+    if row is None or not row[0]:
+        return 0
+    return 4 if row[2] else 3 if row[1] else 2
 
 
 def _milliseconds(span: timedelta) -> int:
@@ -1281,10 +1293,11 @@ class PostgresSubstrate:
                 "Interlock in this database was installed by an older version, without "
                 "the outbox. Run `interlock install` to upgrade it in place"
             )
-        if not installed_v3(conn):
+        version = installed_version(conn)
+        if version < int(INSTALL_VERSION):
             raise SubstrateConfigurationError(
-                "Interlock in this database was installed by version 2. Run "
-                "`interlock install` to upgrade it in place to version 3"
+                f"Interlock in this database was installed by version {version}. Run "
+                f"`interlock install` to upgrade it in place to version {INSTALL_VERSION}"
             )
         guards = {
             (str(r[0]), str(r[1])): (str(r[2]), str(r[3]))

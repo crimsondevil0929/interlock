@@ -65,6 +65,9 @@ __all__ = [
 GENESIS_TAG: Final = "interlock-outbox-genesis-v1"
 EVENT_TAG: Final = "interlock-outbox-event-v1"
 EVENT_TAG_V2: Final = "interlock-outbox-event-v2"
+EVENT_TAG_V3: Final = "interlock-outbox-event-v3"
+"""Rows that carry a relay's attestation (schema version 4) are framed with
+it, after the remote reference and the authority."""
 """Rows that carry a ``remote_ref`` or an ``authority`` (schema version 3)
 are framed with both; every other row as in version 2, so no hash written
 before them changes."""
@@ -154,6 +157,7 @@ def event_hash(
     state_after: str | None,
     remote_ref: str | None = None,
     authority: str | None = None,
+    attestation: str | None = None,
 ) -> str:
     """The hash of one delivery-log row, as ``interlock.outbox_event_hash``
     computes it, and SQLite's ``interlock_event_hash``."""
@@ -170,6 +174,8 @@ def event_hash(
         detail,
         state_after,
     ]
+    if attestation is not None:
+        return _digest(EVENT_TAG_V3, *fields, remote_ref, authority, attestation)
     if remote_ref is None and authority is None:
         return _digest(EVENT_TAG, *fields)
     return _digest(EVENT_TAG_V2, *fields, remote_ref, authority)
@@ -204,6 +210,9 @@ class LogEvent:
     event_hash: str
     remote_ref: str | None = None
     authority: str | None = None
+    attestation: str | None = None
+    """The relay's signature of an outcome (schema version 4):
+    ``{alg, key_id, signature}`` as canonical JSON."""
 
     def recomputed(self) -> str:
         return event_hash(
@@ -220,6 +229,7 @@ class LogEvent:
             self.state_after,
             self.remote_ref,
             self.authority,
+            self.attestation,
         )
 
 
@@ -230,15 +240,17 @@ _EVENTS: Final = (
     "WHERE %(ids)s::uuid[] IS NULL OR message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY message_id, seq"
 )
-_EXTRA_V3: Final = "remote_ref, authority"
-_EXTRA_V2: Final = "NULL::text, NULL::text"
+_EXTRA_V4: Final = "remote_ref, authority, attestation"
+_EXTRA_V3: Final = "remote_ref, authority, NULL::text"
+_EXTRA_V2: Final = "NULL::text, NULL::text, NULL::text"
 """Version 2 had neither column; its logs are read, and verified, as they are
 before an upgrade."""
 
 _MESSAGES: Final = (
     "SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
     "o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, s.log_seq, "
-    "s.log_head FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
+    "s.log_head, o.enqueued_at "
+    "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
     "WHERE %(ids)s::uuid[] IS NULL OR o.message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY o.enqueued_at, o.message_id"
 )
@@ -260,6 +272,7 @@ def _event(row: Sequence[Any]) -> LogEvent:
         event_hash=str(row[11]),
         remote_ref=_text(row[12]),
         authority=_text(row[13]),
+        attestation=_text(row[14]),
     )
 
 
@@ -281,6 +294,7 @@ class LoggedMessage:
     attempts: int
     log_seq: int
     log_head: str
+    enqueued_at: datetime | None = None
 
     def genesis(self) -> str:
         return genesis_hash(
@@ -311,9 +325,10 @@ class OutboxReader(Protocol):
 
     def counts(self) -> dict[str, int]: ...
 
-    def epoch(self) -> datetime | None:
-        """When schema version 3 was first installed: an operator's row without
-        an authority older than this is version 2's."""
+    def epoch(self, version: str = "3") -> datetime | None:
+        """When schema ``version`` was first installed here. An operator's row
+        without an authority older than version 3's is version 2's; an outcome
+        without a relay's attestation older than version 4's, version 3's."""
         ...
 
     def registry(self) -> list[dict[str, Any]]:
@@ -473,12 +488,11 @@ class PostgresReader:
             yield
 
     def _events(self) -> str:
-        row = self._conn.execute(
-            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
-            "WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
-            "AND attname = 'remote_ref' AND NOT attisdropped)"
-        ).fetchone()
-        return _EVENTS.format(extra=_EXTRA_V3 if row is not None and row[0] else _EXTRA_V2)
+        from interlock.postgres import installed_version
+
+        version = installed_version(self._conn)
+        extra = _EXTRA_V4 if version >= 4 else _EXTRA_V3 if version == 3 else _EXTRA_V2
+        return _EVENTS.format(extra=extra)
 
     def snapshot(
         self, message_ids: Sequence[uuid.UUID] | None
@@ -503,16 +517,18 @@ class PostgresReader:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
+                enqueued_at=m[13],
             )
             for m in self._conn.execute(_MESSAGES, params).fetchall()
         ]
         events = [_event(row) for row in self._conn.execute(self._events(), params)]
         return found, events
 
-    def epoch(self) -> datetime | None:
+    def epoch(self, version: str = "3") -> datetime | None:
         row = self._conn.execute(
             "SELECT CASE WHEN pg_catalog.to_regclass('interlock.outbox_epochs') IS NULL "
-            "THEN NULL ELSE (SELECT at FROM interlock.outbox_epochs WHERE version = '3') END"
+            "THEN NULL ELSE (SELECT at FROM interlock.outbox_epochs WHERE version = %s) END",
+            (version,),
         ).fetchone()
         return None if row is None else row[0]
 

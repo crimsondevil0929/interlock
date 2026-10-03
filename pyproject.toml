@@ -32,8 +32,9 @@ interlock = "interlock.cli:main_entry"
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
-# Signing operator records (interlock outbox release, compensate...) with an
-# Ed25519 key. Verifying them needs nothing extra.
+# Signing with an Ed25519 key: a relay's attestations (interlock relay), an
+# operator's records (interlock outbox release, compensate...). Verifying
+# either needs nothing extra.
 sign = ["interlock-agentgov[sign]>=0.4.0"]
 
 [tool.uv.sources]

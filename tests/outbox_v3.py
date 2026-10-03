@@ -1,4 +1,13 @@
-"""The transactional outbox's PostgreSQL objects (``docs/OUTBOX_DESIGN.md``).
+"""FROZEN: the outbox's PostgreSQL objects as version 3 installed them.
+
+``src/interlock/outbox_sql.py`` at interlock main ``76a6f7f`` (Epic 3),
+verbatim below this note, with version 3's sink mirror and grants after it,
+for ``tests/test_pg_upgrade.py``: version 4 is installed over a database
+version 3 installed. Never edit this file.
+
+The original docstring follows.
+
+The transactional outbox's PostgreSQL objects (``docs/OUTBOX_DESIGN.md``).
 
 Installed by :func:`interlock.postgres.install`, after the stage's own objects.
 Three kinds of function, by who may call them:
@@ -21,7 +30,9 @@ recomputes every link outside the database.
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Sequence
+from datetime import timedelta
+from typing import Any, Final
 
 __all__ = [
     "OUTBOX_FUNCTIONS",
@@ -144,7 +155,6 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_attempts (
                                                 'dead', 'cancelled')),
     remote_ref      text,
     authority       text,
-    attestation     text,
     prev_hash       text NOT NULL,
     event_hash      text NOT NULL,
     PRIMARY KEY (message_id, seq)
@@ -172,13 +182,6 @@ ALTER TABLE interlock.outbox
 ALTER TABLE interlock.outbox_attempts
     ADD COLUMN IF NOT EXISTS remote_ref text,
     ADD COLUMN IF NOT EXISTS authority text;
-
--- Version 4, in place over version 3: every outcome a relay records carries
--- its Ed25519 attestation (docs/EPIC4_DESIGN.md §2). The column is NULL in
--- every row written before, and a row without one hashes as before. Outcome
--- rows older than version 4's epoch are version 3's, unattested.
-ALTER TABLE interlock.outbox_attempts ADD COLUMN IF NOT EXISTS attestation text;
-INSERT INTO interlock.outbox_epochs (version) VALUES ('4') ON CONFLICT (version) DO NOTHING;
 DO $upgrade$
 BEGIN
     IF NOT EXISTS (
@@ -257,29 +260,19 @@ AS $fn$
 $fn$;
 
 -- A row's hash. A row with neither a remote reference nor an operator's
--- authority nor a relay's attestation hashes as version 2 hashed every row
--- (event-v1); one with either of the first two and no attestation, as
--- version 3 did (event-v2); one with an attestation frames all three
--- (event-v3). No hash written before version 4 changes.
+-- authority hashes as version 2 hashed every row (event-v1), so a log written
+-- under version 2 verifies unchanged; a row with either frames both (event-v2).
 DROP FUNCTION IF EXISTS interlock.outbox_event_hash(
     text, uuid, integer, integer, text, text, timestamptz, integer, text, text, text);
-DROP FUNCTION IF EXISTS interlock.outbox_event_hash(
-    text, uuid, integer, integer, text, text, timestamptz, integer, text, text, text, text,
-    text);
 CREATE OR REPLACE FUNCTION interlock.outbox_event_hash(
     p_prev text, p_message uuid, p_seq integer, p_attempt integer, p_event text,
     p_actor text, p_at timestamptz, p_status integer, p_digest text, p_detail text,
-    p_state_after text, p_remote_ref text, p_authority text, p_attestation text)
+    p_state_after text, p_remote_ref text, p_authority text)
 RETURNS text
 LANGUAGE sql STABLE PARALLEL SAFE
 SET search_path = pg_catalog, pg_temp
 AS $fn$
     SELECT CASE
-        WHEN p_attestation IS NOT NULL THEN interlock.outbox_digest(
-            'interlock-outbox-event-v3', p_prev, p_message::text, p_seq::text,
-            p_attempt::text, p_event, p_actor, interlock.outbox_instant(p_at),
-            p_status::text, p_digest, p_detail, p_state_after, p_remote_ref, p_authority,
-            p_attestation)
         WHEN p_remote_ref IS NULL AND p_authority IS NULL THEN interlock.outbox_digest(
             'interlock-outbox-event-v1', p_prev, p_message::text, p_seq::text,
             p_attempt::text, p_event, p_actor, interlock.outbox_instant(p_at),
@@ -517,20 +510,13 @@ BEGIN
         RAISE EXCEPTION 'interlock: an operator''s % needs the authority of a signed intent',
             NEW.event USING ERRCODE = 'IL007';
     END IF;
-    -- What a sink answered is recorded only as the relay that heard it signed it.
-    IF NEW.event IN ('delivered', 'retryable', 'permanent', 'unknown')
-       AND (NEW.attestation IS NULL OR NEW.attestation !~
-            '^\{"alg":"ed25519","key_id":"[0-9a-f]{16}","signature":"[0-9a-f]{128}"\}$') THEN
-        RAISE EXCEPTION 'interlock: a relay''s % needs the relay''s attestation', NEW.event
-            USING ERRCODE = 'IL008';
-    END IF;
     NEW.seq := head_seq + 1;
     NEW.prev_hash := head;
     NEW.at := pg_catalog.clock_timestamp();
     NEW.event_hash := interlock.outbox_event_hash(
         NEW.prev_hash, NEW.message_id, NEW.seq, NEW.attempt, NEW.event, NEW.actor, NEW.at,
         NEW.status_code, NEW.response_digest, NEW.detail, NEW.state_after, NEW.remote_ref,
-        NEW.authority, NEW.attestation);
+        NEW.authority);
     UPDATE interlock.outbox_state
        SET log_seq = NEW.seq, log_head = NEW.event_hash
      WHERE message_id = NEW.message_id;
@@ -543,12 +529,10 @@ RELAY_FUNCTIONS: Final = r"""
 -- Appends one row to a message's delivery log. Internal: granted to no one.
 DROP FUNCTION IF EXISTS interlock.outbox_log(
     uuid, integer, text, text, integer, text, text, text);
-DROP FUNCTION IF EXISTS interlock.outbox_log(
-    uuid, integer, text, text, integer, text, text, text, text, text);
 CREATE OR REPLACE FUNCTION interlock.outbox_log(
     p_message uuid, p_attempt integer, p_event text, p_actor text, p_status integer,
     p_digest text, p_detail text, p_state_after text, p_remote_ref text DEFAULT NULL,
-    p_authority text DEFAULT NULL, p_attestation text DEFAULT NULL)
+    p_authority text DEFAULT NULL)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -556,12 +540,12 @@ AS $fn$
 BEGIN
     INSERT INTO interlock.outbox_attempts (
         message_id, seq, attempt, event, actor, at, status_code, response_digest, detail,
-        state_after, remote_ref, authority, attestation, prev_hash, event_hash)
+        state_after, remote_ref, authority, prev_hash, event_hash)
     VALUES (
         p_message, 1, p_attempt, p_event, pg_catalog.left(coalesce(p_actor, '?'), 200),
         pg_catalog.clock_timestamp(), p_status, pg_catalog.left(p_digest, 128),
         pg_catalog.left(p_detail, 1000), p_state_after, pg_catalog.left(p_remote_ref, 255),
-        p_authority, p_attestation, '', '');
+        p_authority, '', '');
 END
 $fn$;
 
@@ -804,12 +788,9 @@ $fn$;
 -- spent or the deadline would pass first.
 DROP FUNCTION IF EXISTS interlock.relay_outcome(
     uuid, text, bigint, integer, text, integer, text, text, bigint);
-DROP FUNCTION IF EXISTS interlock.relay_outcome(
-    uuid, text, bigint, integer, text, integer, text, text, bigint, text);
 CREATE OR REPLACE FUNCTION interlock.relay_outcome(
     p_message uuid, p_relay text, p_fence bigint, p_attempt integer, p_outcome text,
-    p_status integer, p_digest text, p_detail text, p_delay_ms bigint, p_remote_ref text,
-    p_attestation text)
+    p_status integer, p_digest text, p_detail text, p_delay_ms bigint, p_remote_ref text)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -885,9 +866,7 @@ BEGIN
         next_state,
         -- What the call created (a Stripe payment intent's id): only a call
         -- that delivered created anything.
-        CASE WHEN p_outcome = 'delivered' THEN p_remote_ref END,
-        NULL,
-        p_attestation);
+        CASE WHEN p_outcome = 'delivered' THEN p_remote_ref END);
     IF next_state = 'pending' THEN
         PERFORM interlock.outbox_settle(p_message, 'pending', why, due);
     ELSIF next_state IS NOT NULL THEN
@@ -1274,3 +1253,65 @@ OUTBOX_TRIGGER_NAMES: Final = (
     ("outbox_attempts", "outbox_log_link", "interlock.outbox_log_link"),
 )
 """What keeps a committed request, and its delivery log, as written and linked."""
+
+
+# --------------------------------------------------------------------------
+# Version 3's sink mirror and grants (src/interlock/postgres.py at 76a6f7f),
+# for interlock.postgres.install to run in place of version 4's.
+# --------------------------------------------------------------------------
+
+RELAY_FUNCTIONS_V3: Final = (
+    "interlock.relay_claim(text, double precision, integer, text[])",
+    "interlock.relay_sending(uuid, text, bigint, text)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text)",
+    "interlock.relay_hold(uuid, text, bigint, text)",
+    "interlock.relay_defer(uuid, text, bigint, text, bigint)",
+    "interlock.relay_refuse(uuid, text, bigint, text)",
+)
+
+OUTBOX_TABLES_V3: Final = (
+    "interlock.sinks",
+    "interlock.outbox",
+    "interlock.outbox_state",
+    "interlock.outbox_attempts",
+    "interlock.outbox_epochs",
+)
+
+
+def install_sinks_v3(conn: Any, sinks: Sequence[Any]) -> None:
+    """Mirror the registry into ``interlock.sinks``, as version 3 did."""
+    for sink in sinks:
+        conn.execute(
+            "INSERT INTO interlock.sinks (name, kind, operations, cost_per_call, idempotency, "
+            "max_payload_bytes, not_after_seconds, max_attempts, backoff_base_ms, "
+            "backoff_cap_ms, unknown_outcome, config_hash, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true) "
+            "ON CONFLICT (name) DO UPDATE SET kind = EXCLUDED.kind, "
+            "operations = EXCLUDED.operations, cost_per_call = EXCLUDED.cost_per_call, "
+            "idempotency = EXCLUDED.idempotency, "
+            "max_payload_bytes = EXCLUDED.max_payload_bytes, "
+            "not_after_seconds = EXCLUDED.not_after_seconds, "
+            "max_attempts = EXCLUDED.max_attempts, "
+            "backoff_base_ms = EXCLUDED.backoff_base_ms, "
+            "backoff_cap_ms = EXCLUDED.backoff_cap_ms, "
+            "unknown_outcome = EXCLUDED.unknown_outcome, "
+            "config_hash = EXCLUDED.config_hash, enabled = true",
+            (
+                sink.name,
+                sink.kind,
+                [op.name for op in sink.operations],
+                str(sink.cost_per_call),
+                sink.idempotency,
+                sink.max_payload_bytes,
+                int(sink.not_after.total_seconds()),
+                sink.max_attempts,
+                int(sink.backoff_base / timedelta(milliseconds=1)),
+                int(sink.backoff_cap / timedelta(milliseconds=1)),
+                sink.unknown_outcome,
+                sink.config_hash(),
+            ),
+        )
+    conn.execute(
+        "UPDATE interlock.sinks SET enabled = false WHERE NOT (name = ANY (%s))",
+        ([sink.name for sink in sinks],),
+    )

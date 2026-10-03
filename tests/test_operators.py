@@ -64,6 +64,7 @@ from tests.outbox_env import (
     SqliteOutbox,
     build_either,
     mail,
+    relay_signer,
     sms,
 )
 
@@ -470,6 +471,7 @@ def deliver(outbox: Outbox, stripe: FakeStripe) -> None:
         breaker=NoBreaker(),
         lease=timedelta(seconds=10),
         timeout=timedelta(seconds=2),
+        signer=relay_signer(),
     )
     with relay:
         outbox.drain(relay)
@@ -606,6 +608,7 @@ def test_a_placeholder_with_nothing_to_bind_is_refused(outbox: Outbox) -> None:
             "orders": HttpAdapter(sink.url, routes={"hold": "POST /h", "release": "POST /r"})
         },
         breaker=NoBreaker(),
+        signer=relay_signer(),
     )
     with relay:
         outbox.drain(relay)

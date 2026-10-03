@@ -73,10 +73,17 @@ class OutboxStore(Protocol):
         ...
 
     def outcome(
-        self, lease: Lease, relay_id: str, attempt: int, result: DeliveryResult, delay: timedelta
+        self,
+        lease: Lease,
+        relay_id: str,
+        attempt: int,
+        result: DeliveryResult,
+        delay: timedelta,
+        attestation: str,
     ) -> str | None:
-        """Record what a call returned; the state the message is now in, or
-        ``None`` when it was no longer this relay's to change."""
+        """Record what a call returned, with the relay's signed attestation of
+        it; the state the message is now in, or ``None`` when it was no longer
+        this relay's to change."""
         ...
 
     def hold(self, lease: Lease, relay_id: str, reason: str) -> bool: ...
@@ -117,14 +124,14 @@ class PostgresOutboxStore:
                 self._conn.close()
             except psycopg.Error:
                 pass
-        from interlock.postgres import installed_v3
+        from interlock.postgres import INSTALL_VERSION, installed_version
 
         try:
             conn = psycopg.connect(self._dsn, autocommit=True, application_name="interlock-relay")
             conn.execute("SET statement_timeout = '30s'")
             conn.execute("SET lock_timeout = '10s'")
             conn.execute("SET idle_in_transaction_session_timeout = '60s'")
-            current = installed_v3(conn)
+            current = installed_version(conn) >= int(INSTALL_VERSION)
         except psycopg.Error as exc:
             raise SubstrateUnavailableError(f"the relay cannot reach its database: {exc}") from exc
         if not current:
@@ -186,7 +193,13 @@ class PostgresOutboxStore:
         return None if row is None or row[0] is None else int(row[0])
 
     def outcome(
-        self, lease: Lease, relay_id: str, attempt: int, result: DeliveryResult, delay: timedelta
+        self,
+        lease: Lease,
+        relay_id: str,
+        attempt: int,
+        result: DeliveryResult,
+        delay: timedelta,
+        attestation: str,
     ) -> str | None:
         """Record what the call returned. The call already happened, so this
         is retried through a lost connection: a reply lost after the commit
@@ -198,7 +211,8 @@ class PostgresOutboxStore:
                 conn = self.connection()
                 with conn.transaction():
                     row = conn.execute(
-                        "SELECT interlock.relay_outcome(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        "SELECT interlock.relay_outcome("
+                        "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (
                             lease.message_id,
                             relay_id,
@@ -210,6 +224,7 @@ class PostgresOutboxStore:
                             result.detail or None,
                             milliseconds(delay),
                             result.remote_ref,
+                            attestation,
                         ),
                     ).fetchone()
                     self.checkpoint("outcome-uncommitted", lease)

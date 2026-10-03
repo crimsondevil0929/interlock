@@ -57,6 +57,8 @@ from tests.outbox_env import (  # noqa: E402
     build_either,
     mail,
     page,
+    relay_signer,
+    relays_section,
     sms,
 )
 
@@ -879,7 +881,7 @@ def test_a_relay_refuses_a_lease_shorter_than_two_timeouts(outbox: Outbox) -> No
     with pytest.raises(ValueError, match="twice"):
         outbox.relay(lease=timedelta(seconds=3), timeout=timedelta(seconds=2))
     with pytest.raises(ValueError, match="adapter"):
-        Relay(outbox.store(), adapters={}, breaker=NoBreaker())
+        Relay(outbox.store(), adapters={}, breaker=NoBreaker(), signer=relay_signer())
 
 
 # --------------------------------------------------------------------------
@@ -947,6 +949,7 @@ idempotency = "none"
 name = "send"
 
 [relay]
+key = "relay.key"
 database = "{relay}"
 ledger = "{ledger}"
 lease_seconds = 4
@@ -982,6 +985,7 @@ def write_config(outbox: PostgresOutbox, tmp_path: Path) -> Path:
             sms=outbox.sink("sms").url,
         )
         + operators_section(tmp_path)
+        + relays_section(tmp_path)
     )
     return path
 
@@ -1066,6 +1070,7 @@ def test_interlock_outbox_inspects_verifies_and_acts(
         0,
         [
             "every delivery log verifies",
+            "every outcome is attested by a registered relay (2)",
             "every operator action is signed, and the operator log verifies",
         ],
     )
@@ -1100,6 +1105,7 @@ def test_a_claim_never_waits_on_another(outbox: PostgresOutbox) -> None:
         relay_id="slow",
         lease=timedelta(seconds=10),
         timeout=timedelta(seconds=2),
+        signer=relay_signer(),
     )
     holder = threading.Thread(target=lambda: slow._claim(1))
     holder.start()
@@ -1163,7 +1169,12 @@ def test_an_outcome_is_recorded_through_a_lost_connection(outbox: PostgresOutbox
                     conn.execute("SELECT pg_terminate_backend(%s)", (pid,))
 
     _, (message,) = outbox.commit(mail(1))
-    relay = Severed(outbox.relay_dsn, adapters=outbox.adapters(), breaker=outbox.breaker())
+    relay = Severed(
+        outbox.relay_dsn,
+        adapters=outbox.adapters(),
+        breaker=outbox.breaker(),
+        signer=relay_signer(),
+    )
     try:
         assert relay.run_once().delivered == 1
     finally:
@@ -1207,6 +1218,7 @@ def test_a_lease_about_to_run_out_is_not_used_for_a_call(outbox: Outbox) -> None
         breaker=outbox.breaker(),
         lease=timedelta(seconds=1),
         timeout=timedelta(seconds=0.4),
+        signer=relay_signer(),
     )
     try:
         assert late.run_once().deferred == 1
@@ -1227,7 +1239,12 @@ class Raising:
 def test_an_adapter_that_raises_is_an_unknown_outcome(outbox: Outbox) -> None:
     """Whatever an adapter raises, the call may have been made."""
     _, (message,) = outbox.commit(page(1))
-    relay = Relay(outbox.store(), adapters={"pager": Raising()}, breaker=outbox.breaker())
+    relay = Relay(
+        outbox.store(),
+        adapters={"pager": Raising()},
+        breaker=outbox.breaker(),
+        signer=relay_signer(),
+    )
     try:
         relay.run_once()
     finally:
@@ -1307,6 +1324,7 @@ def test_what_a_relay_refuses_to_be(outbox: PostgresOutbox) -> None:
             "postgresql://nobody@127.0.0.1:1/none?connect_timeout=1",
             adapters={"mail": Raising()},
             breaker=NoBreaker(),
+            signer=relay_signer(),
         )
     with pytest.raises(ValueError, match="not an outcome"):
         DeliveryResult("maybe")
@@ -1516,6 +1534,7 @@ columns = ["id"]
         (
             '\n[[sinks]]\nname = "mail"\n[[sinks.operations]]\nname = "send"\n'
             '[relay]\ndatabase = "postgresql://relay@127.0.0.1:1/none"\nbreaker = "none"\n'
+            'key = "relay.key"\n'
             '[[relay.endpoints]]\nsink = "mail"\nurl = "http://127.0.0.1:1"\n'
             'routes = { send = "POST /s" }\nheader_env = { Authorization = "NOT_SET_ANYWHERE" }\n',
             ("relay",),
@@ -1534,7 +1553,7 @@ def test_the_relay_command_names_what_is_missing(
     monkeypatch.delenv("INTERLOCK_RELAY_DATABASE", raising=False)
     monkeypatch.delenv("NOT_SET_ANYWHERE", raising=False)
     path = tmp_path / "interlock.toml"
-    path.write_text(NO_RELAY + extra)
+    path.write_text(NO_RELAY + extra + (relays_section(tmp_path) if "key =" in extra else ""))
     code, _ = cli(*argv, "--config", str(path), "--once")
     assert code == 3
     assert message in capsys.readouterr().err

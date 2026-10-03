@@ -48,7 +48,9 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from agentgov.exceptions import UnknownScopeError
+from agentgov.receipts import Attestation, AttestedOutcome, DeliveredRequest
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
+from agentgov.receipts.signing import Signer
 
 from interlock.anchor import _halted
 from interlock.exceptions import SubstrateUnavailableError
@@ -72,6 +74,8 @@ __all__ = [
     "Relay",
     "RelayReport",
     "SinkAdapter",
+    "attest",
+    "attested_outcome",
     "retry_delay",
 ]
 
@@ -408,8 +412,12 @@ class Relay:
         the same lease, so a large batch needs a long lease.
     :param breaker_retry: How soon a message is tried again when the breaker
         could not be read.
-    :raises ValueError: On a lease shorter than twice the timeout, or no
-        adapters.
+    :param signer: This relay's own Ed25519 key. Every outcome the relay
+        records carries its signed attestation of what the sink answered
+        (ARC1 1.1; ``docs/EPIC4_DESIGN.md`` §1.1), and the database refuses an
+        outcome without one. Register its public half in ``[relays.keys]``.
+    :raises ValueError: On a lease shorter than twice the timeout, no
+        adapters, or a key that is not Ed25519.
     :raises SubstrateUnavailableError: If the database cannot be reached.
     """
 
@@ -420,6 +428,7 @@ class Relay:
         "_breaker_retry",
         "_lease",
         "_relay_id",
+        "_signer",
         "_store",
         "_timeout",
     )
@@ -435,9 +444,15 @@ class Relay:
         timeout: timedelta = timedelta(seconds=10),
         batch: int = 1,
         breaker_retry: timedelta = timedelta(seconds=5),
+        signer: Signer,
     ) -> None:
         if not adapters:
             raise ValueError("a relay needs an adapter for at least one sink")
+        if signer.alg != "ed25519":
+            raise ValueError(
+                "a relay attests with an Ed25519 key: an attestation anyone can verify, and "
+                "only the relay can make"
+            )
         if timeout <= timedelta(0) or lease < 2 * timeout:
             raise ValueError(
                 f"the lease ({lease}) must be at least twice the call timeout ({timeout}), "
@@ -454,6 +469,7 @@ class Relay:
         self._timeout = timeout
         self._batch = batch
         self._breaker_retry = breaker_retry
+        self._signer = signer
         self._store: OutboxStore = PostgresOutboxStore(store) if isinstance(store, str) else store
         self._store.checkpoint = self._reached
 
@@ -593,7 +609,11 @@ class Relay:
     def _outcome(
         self, lease: Lease, attempt: int, result: DeliveryResult, delay: timedelta
     ) -> str | None:
-        return self._store.outcome(lease, self._relay_id, attempt, result, delay)
+        """Record what the call returned, with this relay's signed statement of
+        it: ``{alg, key_id, signature}``, canonical, as the outcome's row
+        stores it."""
+        attestation = attest(lease, attempt, result, self._signer)
+        return self._store.outcome(lease, self._relay_id, attempt, result, delay, attestation)
 
     def _hold(self, lease: Lease, reason: str) -> str:
         return HELD if self._store.hold(lease, self._relay_id, reason) else SKIPPED
@@ -608,6 +628,37 @@ class Relay:
     def _reached(self, point: str, lease: Lease | None) -> None:
         """A point on the delivery path. Nothing happens here; the crash tests
         (``tests/relay_child.py``) stop the process at each one."""
+
+
+def attested_outcome(lease: Lease, attempt: int, result: DeliveryResult) -> Attestation:
+    """The ARC1 attestation of one call's outcome, unsigned: the request as
+    the lease holds it, and what the call returned."""
+    return Attestation(
+        request=DeliveredRequest(
+            message_id=str(lease.message_id),
+            effect_id=lease.effect_id,
+            sink=lease.sink,
+            operation=lease.operation,
+            payload_hash=lease.payload_hash,
+            idempotency_key=lease.idempotency_key,
+        ),
+        outcome=AttestedOutcome(
+            attempt=attempt,
+            result=result.outcome,
+            status_code=result.status_code,
+            response_digest=result.response_digest,
+            # What a call created exists only if it delivered: the row records
+            # no reference for any other outcome, and so the relay signs none.
+            remote_ref=result.remote_ref if result.outcome == DELIVERED else None,
+        ),
+    )
+
+
+def attest(lease: Lease, attempt: int, result: DeliveryResult, signer: Signer) -> str:
+    """Sign :func:`attested_outcome`; the signature as canonical JSON."""
+    signed = attested_outcome(lease, attempt, result).sign(signer)
+    assert signed.signature is not None
+    return canonical_bytes(signed.signature.to_json()).decode("ascii")
 
 
 def _verified_payload(lease: Lease) -> bytes | None:

@@ -58,7 +58,7 @@ from tests.children import Child
 from tests.conftest import OBSERVED, build_sqlite_back_office
 from tests.crash_child import ACKNOWLEDGED, SCOPE, Refund, checkers
 from tests.fakesink import DROP, OK, FakeSink, hang, status
-from tests.outbox_env import ROUTES
+from tests.outbox_env import RELAY_SEED, ROUTES, relay_signer
 from tests.schemas import TEST_SINKS, specs
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX")
@@ -215,6 +215,7 @@ class Crash:
             "ledger": str(self.ledger),
             "sinks": {"mail": sink.url},
             "relay_id": f"relay-{number}",
+            "key": RELAY_SEED.hex(),
             "lease": 1.5,
             "timeout": 0.5,
             "batch": 2,
@@ -252,6 +253,7 @@ class Crash:
             relay_id="survivor",
             lease=timedelta(seconds=5),
             timeout=timedelta(seconds=2),
+            signer=relay_signer(),
         )
         try:
             for _ in range(500):
