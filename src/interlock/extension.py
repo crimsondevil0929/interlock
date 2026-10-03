@@ -55,7 +55,7 @@ from typing import Any, Final
 
 from agentgov.core import Authorization, BudgetManager, EntryType, LedgerEntry
 from agentgov.exceptions import AgentGovError, CircuitOpenError
-from agentgov.receipts import OutcomeStatus, ReceiptLog
+from agentgov.receipts import ActionReceipt, OutcomeStatus, ReceiptLog
 
 from interlock.exceptions import ExtensionError
 from interlock.records import RecordKind, RecordLog, SignedRecord, anchor_memo, money
@@ -600,7 +600,8 @@ class BudgetGuard:
         mine = [
             receipt
             for receipt in log.receipts()
-            if receipt.outcome.status in _COMMITTED
+            if isinstance(receipt, ActionReceipt)
+            and receipt.outcome.status in _COMMITTED
             and receipt.authority.scope_path
             and _belongs(receipt.authority.scope_path[-1], task)
         ]

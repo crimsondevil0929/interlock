@@ -550,6 +550,7 @@ def check_receipts(env: Crash, opened: Restarted, records: Sequence[EscrowRecord
             ledger=opened.governor,
         )
         assert report.passed, (index, report.to_json())
+        assert isinstance(receipt, ActionReceipt)
         check_link(records, receipt)
 
 

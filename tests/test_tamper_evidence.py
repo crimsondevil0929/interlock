@@ -511,7 +511,7 @@ def test_rewriting_a_receipts_rows_fails_at_the_first_key_the_forger_lacks(
     """The refund's receipt is made to commit to other rows. Each forger
     holds one more key than the last, and gets exactly one check further."""
     genuine = history.bundle(REFUND)
-    forged = _rewrite_rows(genuine.receipt)
+    forged = _rewrite_rows(genuine.action_receipt)
     root = genuine.checkpoint.root_hash[:16] if genuine.checkpoint else ""
 
     # Anyone who can edit the file: the signature no longer covers the body.
@@ -700,7 +700,7 @@ def test_a_forged_receipt_signature_fails_the_signature_check(
 ) -> None:
     forge, detail = RECEIPT_FORGERIES[forgery]
     genuine = history.bundle(REFUND)
-    forged = dataclasses.replace(genuine, receipt=forge(genuine.receipt, history.key))
+    forged = dataclasses.replace(genuine, receipt=forge(genuine.action_receipt, history.key))
     failed_at(history.verify(forged), "receipt signature", Failure.SIGNATURE, detail)
 
 
