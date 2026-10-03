@@ -65,9 +65,9 @@ from interlock.anchor import AnchorPoint
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowRecord
 from interlock.invariants import BlastRadius, InvariantChecker
-from interlock.types import EffectDiff, EffectPlan, Verdict, canonical_hash
+from interlock.types import OUTBOX_TARGET, EffectDiff, EffectPlan, Verdict, canonical_hash
 
-__all__ = ["ReceiptIssuer", "checker_records", "schema_hash"]
+__all__ = ["ReceiptIssuer", "checker_records", "receipt_rows", "schema_hash"]
 
 _TEXT_LIMIT = 512
 
@@ -132,12 +132,8 @@ class ReceiptIssuer:
 
         :raises agentgov.exceptions.ReceiptError: If the log refuses it.
         """
-        rows = [
-            RowChange.from_values(
-                d.table, d.primary_key, before=d.before, after=d.after, tenant=d.tenant_id
-            )
-            for d in diff.deltas
-        ]
+        rows = receipt_rows(diff)
+        outbox = {OUTBOX_TARGET} if diff.outbound else set()
         commitment = commit_rows(rows, secret=self._row_secret)
         report = getattr(substrate, "cascade_report", None)
         observed = sorted(getattr(substrate, "observed_tables", frozenset()))
@@ -168,11 +164,13 @@ class ReceiptIssuer:
                 row_root=commitment.root,
                 row_count=len(rows),
                 summary=EffectSummary(
-                    inserted=diff.rows_inserted,
+                    inserted=diff.rows_inserted + len(diff.outbound),
                     updated=diff.rows_updated,
                     deleted=diff.rows_deleted,
-                    tables=tuple(diff.tables_touched),
-                    tenants=tuple(diff.tenant_ids),
+                    tables=tuple(diff.tables_touched | outbox),
+                    tenants=tuple(
+                        diff.tenant_ids | {o.tenant_id for o in diff.outbound if o.tenant_id}
+                    ),
                 ),
                 truncated=diff.truncated,
             ),
@@ -180,7 +178,7 @@ class ReceiptIssuer:
                 observed_tables=tuple(observed),
                 cascade_closed=isinstance(report, CascadeReport) and report.closed,
                 authorizer_on=bool(getattr(substrate, "enforces_table_access", False)),
-                known_gaps=_gaps(substrate, report),
+                known_gaps=_gaps(substrate, report, len(diff.outbound)),
             ),
             decision=Decision(
                 verdict_hash=verdict.content_hash(),
@@ -204,6 +202,39 @@ class ReceiptIssuer:
             ),
         )
         return self._log.issue(draft)
+
+
+def receipt_rows(diff: EffectDiff) -> list[RowChange]:
+    """The rows a receipt's ``row_root`` commits to, in commitment order.
+
+    Every measured row, then each outbound request as the row the stage
+    inserted into the outbox, committed with the rest. A request's payload is
+    represented by its hash: the commitment proves which request was staged
+    without the receipt carrying its body. Disclosing a receipt's rows means
+    committing exactly this list with the issuer's row secret.
+    """
+    rows = [
+        RowChange.from_values(
+            d.table, d.primary_key, before=d.before, after=d.after, tenant=d.tenant_id
+        )
+        for d in diff.deltas
+    ]
+    rows += [
+        RowChange.from_values(
+            OUTBOX_TARGET,
+            o.idempotency_key,
+            before=None,
+            after={
+                "sink": o.sink,
+                "operation": o.operation,
+                "payload_hash": o.payload_hash,
+                "effect_id": o.effect_id,
+            },
+            tenant=o.tenant_id,
+        )
+        for o in diff.outbound
+    ]
+    return rows
 
 
 def checker_records(checkers: Sequence[InvariantChecker]) -> tuple[CheckerRecord, ...]:
@@ -255,8 +286,13 @@ def _config(checker: object) -> list[tuple[str, str]]:
     return [(type(checker).__qualname__, ""), *sorted((k, repr(v)) for k, v in state.items())]
 
 
-def _gaps(substrate: object, report: object) -> tuple[str, ...]:
+def _gaps(substrate: object, report: object, outbound: int = 0) -> tuple[str, ...]:
     gaps: list[str] = []
+    if outbound:
+        gaps.append(
+            f"{outbound} outbound request(s): delivered at least once by the relay after "
+            f"commit; their external effects are not measured"
+        )
     if isinstance(report, CascadeReport):
         gaps += [f"unmeasured cascade: {reach.describe()}" for reach in report.gaps]
     else:

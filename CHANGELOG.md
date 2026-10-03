@@ -9,9 +9,98 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-Requires agentgov's shared ledger (`feat/v0.3.0-fleet-ledger`, not yet tagged);
-`pyproject.toml` points at a sibling checkout until it is, and must be repinned to the
-release tag before this merges.
+### Added
+
+- **Outbound requests, staged in a transactional outbox (Epic 2, phases 0 and 1; see
+  `docs/OUTBOX_DESIGN.md`).** `PlanBuilder.enqueue(sink=, operation=, payload=, ...)` adds
+  an `EffectKind.ENQUEUE` effect carrying an `OutboundRequest`, whose payload is frozen and
+  hashed over its ARC1 canonical bytes. `EscrowEngine(sinks=SinkRegistry(...))` admits a
+  request only for a registered sink and operation, under the sink's size bound, with no
+  credential-like field, matching the operation's JSON Schema (a strict subset; anything
+  else is refused at registration), and carrying the compensation the operation registers,
+  or none when the operator declares it `"none-possible"` (E4-3). On PostgreSQL the request
+  is written to `interlock.outbox` inside the stage through `interlock.enqueue`, a function
+  gated by a per-stage token only the substrate holds; the database re-checks the sink, the
+  operation, the size and the payload hash over the bytes sent. It is measured into
+  `EffectDiff.outbound`, committed with the plan's rows and marker or not at all, recorded
+  in the receipt's row commitment (`interlock.receipts.receipt_rows`) and noted on
+  `COMMIT_INTENT` (`; outbound N`). Its idempotency key is `outbound_key(plan_id,
+  effect_id)`, unique in the outbox, so a plan's request commits at most once. SQLite
+  refuses the effect.
+- **`[[sinks]]` and `relay_roles` in `interlock.toml`,** which `interlock install` mirrors
+  into `interlock.sinks` (a sink no longer listed is disabled, not deleted, and the relay
+  holds its messages) and grants.
+- **Crash consistency with an outbox.** Every refund in `tests/test_crash_consistency.py`
+  also enqueues its email; at every kill point, in both ledger modes, a request is in the
+  outbox exactly when its plan's stage marker is.
+- **Requests are paid for at commit (Epic 2, phase 2).** A plan's hold covers its settle
+  cost and each request's `cost_per_call`, so a scope that cannot pay for the plan and its
+  requests is refused before staging; the settlement that commits with the outbox rows (or
+  the reverse anchor written after the commit) charges the sum. A refused plan pays only
+  its settle cost. The database prices each request from its own copy of the registry and
+  stores the price with it (`interlock.outbox.cost`, `OutboundDelta.cost`); the engine
+  requires the outbox to hold exactly the plan's requests, as declared, at the engine's
+  price, and refuses the plan otherwise, so nothing is sent unpaid or paid for unsent.
+- **`interlock relay` delivers committed requests (Epic 2, phase 3).** `Relay` claims
+  leases with `FOR UPDATE SKIP LOCKED`, each under a fence that stops a relay whose lease ran
+  out from acting again; re-hashes the stored payload before every call; reads AgentGov's
+  breaker (`LedgerBreaker`, read-only, over a SQLite or PostgreSQL ledger) immediately
+  before every call and holds the message, not sends it, when the scope is halted, or
+  unknown to AgentGov; records the call before making it and the outcome after; retries
+  with exponential backoff and deterministic jitter (`retry_delay`), honouring
+  `Retry-After`, up to the sink's `max_attempts` and the request's deadline; delivers in
+  plan order; and dead-letters a request, with everything that waits for it, on a
+  permanent failure. `HttpAdapter` is the generic JSON-over-HTTP sink adapter: credentials
+  from the relay's environment only, redirects never followed. Every change of a message's
+  state is a row of its delivery log (`interlock.outbox_attempts`), hash-linked by the
+  database from a genesis bound to the request; `verify_delivery_log` recomputes it.
+  `interlock outbox status|list|show|verify|release|cancel|requeue` for operators. Sinks
+  gain `max_attempts`, `backoff_base_seconds`, `backoff_cap_seconds` and
+  `unknown_outcome` (`"redeliver"`, at least once; `"dead-letter"`, at most once); the
+  configuration gains `[relay]`.
+- **`CrossEffectAgreement`: a request must say what its rows say.** A pure checker that
+  holds a field of an outbound request, read back from the outbox, to the rows the same plan
+  wrote, as measured: the sum of a column over inserted rows (`measure="inserted"`), its net
+  change over every row written (`"net"`), or one exact value every row holds (`"value"`),
+  optionally pairing each request with its own rows (`key=`). Strict both ways: a request
+  with no rows, or rows with no request, is refused. A refund request for 5000.00 beside the
+  refund row the plan inserted for 50.00 is refused before commit, and nothing is written or
+  sent; the agent is told the rule (`cross_effect_agreement`), never the amounts.
+- **Relay crash consistency (Epic 2, phase 4).** `tests/test_relay_crash.py` kills a relay
+  process with SIGKILL at each point of the delivery path, for a sink that honours keys, one
+  that does not, and one that dead-letters, and checks the exact outcome; a duplicate
+  effect occurs only for a keyless redelivering sink whose relay died between the sink
+  acting and the outcome committing, and the delivery log records the lost call it came
+  from. A random-instant soak kills racing relays over failing sinks and checks that
+  nothing is lost and every call and duplicate is accounted for.
+
+### Changed
+
+- **`INSTALL_VERSION` is `"2"`.** `interlock install` over version 1 upgrades in place, in
+  one transaction: `interlock.stages` gains `enqueue_hash`, `begin_stage` its token
+  argument, and the outbox tables their append-only triggers (enabled `ALWAYS`). A stage
+  refuses to open over a version-1 installation, over an outbox whose append-only triggers
+  are missing or disabled, and for a stage role that can write any `interlock` table.
+- **`EffectPlan.stated_rows` ignores `ENQUEUE` effects,** which write no observed row, so a
+  plan with a request still gets `StatedFootprint`'s check.
+- **The relay role reads the outbox and writes nothing directly:** every change goes
+  through the `relay_*` functions, which check its lease. `interlock install` revokes
+  `EXECUTE` from `PUBLIC` on every function in the `interlock` schema, and grants back only
+  what each role needs. The delivery log of the phase 0–1 commit is replaced; installing
+  over an outbox from that pre-release build is refused with what to do (`IL005`).
+
+Every plan, effect and diff hash computed before outbound requests is unchanged: the new
+fields enter a hash only when present (pinned in `tests/test_outbound.py`).
+
+### Fixed
+
+- **`interlock.__version__` reads `0.3.0`,** the version published to PyPI; it still read
+  `0.2.1`. A test now holds it to `pyproject.toml`.
+
+## [0.3.0] - 2026-09-27
+
+Requires agentgov 0.3.0 (`interlock-agentgov` on PyPI), whose PostgreSQL fleet ledger
+the same-transaction mode joins. Published to PyPI as `interlock-escrow`.
 
 ### Added
 

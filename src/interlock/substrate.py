@@ -38,6 +38,7 @@ from interlock.cascade import (
 )
 from interlock.exceptions import (
     ForbiddenStatementError,
+    OutboundRequestError,
     StageConflictError,
     StageError,
     StageExpiredError,
@@ -47,6 +48,7 @@ from interlock.types import (
     CommitReceipt,
     Effect,
     EffectDiff,
+    EffectKind,
     EffectOutcome,
     EffectPlan,
     RowDelta,
@@ -558,6 +560,13 @@ class SqliteSubstrate:
         """
         conn = self._require(handle)
         self._assert_live(handle)
+        if effect.kind is EffectKind.ENQUEUE:
+            raise OutboundRequestError(
+                f"effect {effect.effect_id!r} is an outbound request, and the SQLite substrate "
+                f"has no transactional outbox yet",
+                reason="substrate",
+                sink=effect.request.sink if effect.request is not None else None,
+            )
         refusal = self.reject_reason(effect)
         if refusal is not None:
             raise ForbiddenStatementError(

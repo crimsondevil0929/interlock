@@ -45,10 +45,12 @@ putting this in front of a production database.
 
 from __future__ import annotations
 
+from interlock.adapters import HttpAdapter
 from interlock.anchor import AnchorPoint, LedgerAnchor
 from interlock.builder import PlanBuilder, new_effect_id, new_plan_id
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
+from interlock.deliveries import verify_delivery_log
 from interlock.engine import EscrowEngine, StageResult
 from interlock.exceptions import (
     AdmissionError,
@@ -61,6 +63,7 @@ from interlock.exceptions import (
     ForbiddenStatementError,
     InterlockError,
     LedgerUnverifiedError,
+    OutboundRequestError,
     PlanError,
     RecordIntegrityError,
     RecoveryError,
@@ -87,6 +90,7 @@ from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEviden
 from interlock.invariants import (
     BlastRadius,
     ColumnValueGuard,
+    CrossEffectAgreement,
     InvariantChecker,
     NoDelete,
     NoSchemaChange,
@@ -97,6 +101,7 @@ from interlock.invariants import (
     TruncationGuard,
     default_checkers,
 )
+from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
 from interlock.postgres import PostgresSubstrate
 from interlock.receipts import ReceiptIssuer
 from interlock.records import RecordKind, RecordLog, SignedRecord, check_anchors, verify_records
@@ -110,6 +115,16 @@ from interlock.recovery import (
     Trip,
     TripKind,
 )
+from interlock.relay import (
+    Delivery,
+    DeliveryResult,
+    LedgerBreaker,
+    NoBreaker,
+    Relay,
+    RelayReport,
+    SinkAdapter,
+    retry_delay,
+)
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
@@ -121,6 +136,7 @@ from interlock.types import (
     EffectKind,
     EffectPlan,
     InvariantViolation,
+    OutboundRequest,
     PlanId,
     RowDelta,
     Severity,
@@ -128,7 +144,7 @@ from interlock.types import (
     Verdict,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "AdmissionError",
@@ -145,7 +161,10 @@ __all__ = [
     "CommitUnsettledError",
     "Compensation",
     "ConstraintFeedback",
+    "CrossEffectAgreement",
     "CyclicPlanError",
+    "Delivery",
+    "DeliveryResult",
     "Directive",
     "DroppedEffect",
     "Effect",
@@ -162,15 +181,21 @@ __all__ = [
     "ExtensionGrant",
     "ExtensionRequest",
     "ForbiddenStatementError",
+    "HttpAdapter",
     "InterlockError",
     "InvariantChecker",
     "InvariantViolation",
     "LedgerAnchor",
+    "LedgerBreaker",
     "LedgerUnverifiedError",
     "Milestones",
+    "NoBreaker",
     "NoDelete",
     "NoSchemaChange",
+    "OperationSpec",
     "OperatorEvidence",
+    "OutboundRequest",
+    "OutboundRequestError",
     "PlanBuilder",
     "PlanError",
     "PlanId",
@@ -187,6 +212,8 @@ __all__ = [
     "RecoveryRuntime",
     "RecoveryStep",
     "Refusal",
+    "Relay",
+    "RelayReport",
     "Repair",
     "RepairFeedback",
     "RowDelta",
@@ -195,6 +222,9 @@ __all__ = [
     "Severity",
     "ShadowSubstrate",
     "SignedRecord",
+    "SinkAdapter",
+    "SinkRegistry",
+    "SinkSpec",
     "Spend",
     "SqliteSubstrate",
     "StageConflictError",
@@ -220,5 +250,7 @@ __all__ = [
     "default_checkers",
     "new_effect_id",
     "new_plan_id",
+    "retry_delay",
+    "verify_delivery_log",
     "verify_records",
 ]

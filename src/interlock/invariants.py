@@ -17,9 +17,10 @@ which the untrusted agent sets. Each says so in its own docstring.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, runtime_checkable
 
 from interlock.feedback import FeedbackHint, Guidance
 from interlock.types import (
@@ -27,6 +28,8 @@ from interlock.types import (
     EffectKind,
     EffectPlan,
     InvariantViolation,
+    OutboundDelta,
+    RowDelta,
     Severity,
 )
 
@@ -34,6 +37,7 @@ __all__ = [
     "BUILT_IN_CHECKERS",
     "BlastRadius",
     "ColumnValueGuard",
+    "CrossEffectAgreement",
     "InvariantChecker",
     "NoDelete",
     "NoSchemaChange",
@@ -523,6 +527,329 @@ class NoSchemaChange:
         return FeedbackHint(kind=Guidance.SCHEMA_CHANGE)
 
 
+_MEASURES: Final = ("inserted", "net", "value")
+_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+"""A decimal numeral as money travels in a payload: ``"50.00"``, ``"-3"``. No
+exponent, no leading zeros, so ``"007"`` stays an identifier."""
+
+
+class CrossEffectAgreement:
+    """Refuse a plan whose outbound request disagrees with the rows it rides with.
+
+    The plan's two halves must say the same thing. A refund request for 5000.00
+    beside the refund row the same plan inserted for 50.00 is a prompt-injected
+    payload or a bug, and either way it is caught by arithmetic, not judgement
+    (``docs/OUTBOX_DESIGN.md`` §5.2). Both halves are measured: the request is
+    read back from the outbox, as the relay will send it, and the rows from the
+    stage's capture. A pure function of ``(plan, diff)``, like every checker.
+
+    :param sink: The requests this rule applies to: this sink's...
+    :param operation: ...calls of this operation.
+    :param field: The payload field, a dotted path: ``"amount"``,
+        ``"refund.amount"``, ``"lines.0.amount"``.
+    :param table: The rows the field must agree with: this table's...
+    :param column: ...values of this column.
+    :param measure: What of the rows the field must equal.
+
+        - ``"inserted"`` (the default): the sum of ``column`` over the rows the
+          plan inserted. A refund's amount against the refund rows.
+        - ``"net"``: the net change of ``column`` over every row the plan
+          wrote, after minus before, summed. A credit against the balance it
+          moved.
+        - ``"value"``: the one value of ``column`` every row the plan wrote
+          holds, compared exactly. A currency, an order id, a recipient.
+    :param key: Pairs requests with rows, as ``(payload_field, column)``: each
+        request is held to the rows whose ``column`` equals its
+        ``payload_field``, and every key on one side must be on the other.
+        Without it, the requests' total is held to the rows' total (for
+        ``"value"``, every request to the rows' one value).
+
+    Strict both ways: a request with no rows to agree with is a disagreement,
+    and so are rows with no request, since the rule says the two go together.
+    A plan that has neither passes. Numbers compare exactly, as ``Decimal``: a
+    numeric column against a payload integer or decimal string (money travels
+    as decimal strings; no float reaches a payload). Anything else compares as
+    itself, so ``"007"`` is not ``7``.
+
+    :raises ValueError: On an unknown measure, or an empty name or key.
+    """
+
+    __slots__ = ("_column", "_field", "_key", "_measure", "_operation", "_path", "_sink", "_table")
+
+    def __init__(
+        self,
+        sink: str,
+        operation: str,
+        *,
+        field: str,
+        table: str,
+        column: str,
+        measure: str = "inserted",
+        key: tuple[str, str] | None = None,
+    ) -> None:
+        for label, value in (
+            ("sink", sink),
+            ("operation", operation),
+            ("field", field),
+            ("table", table),
+            ("column", column),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"CrossEffectAgreement needs a {label}")
+        if measure not in _MEASURES:
+            raise ValueError(f"measure is one of {', '.join(_MEASURES)}, not {measure!r}")
+        if key is not None and (
+            len(key) != 2 or not all(isinstance(k, str) and k.strip() for k in key)
+        ):
+            raise ValueError("key is a (payload_field, column) pair")
+        self._sink = sink
+        self._operation = operation
+        self._field = field
+        self._path = _path(field)
+        self._table = table
+        self._column = column
+        self._measure = measure
+        self._key = key
+
+    @property
+    def name(self) -> str:
+        return (
+            f"cross_effect_agreement:{self._sink}.{self._operation}.{self._field}"
+            f"={self._table}.{self._column}"
+        )
+
+    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        requests = [
+            o for o in diff.outbound if o.sink == self._sink and o.operation == self._operation
+        ]
+        table = self._table.lower()
+        rows = [
+            d
+            for d in diff.deltas
+            if d.table.lower() == table and (self._measure != "inserted" or d.operation == "insert")
+        ]
+        if not requests and not rows:
+            return ()
+        problems: list[tuple[str, dict[str, str]]] = []
+        groups: dict[tuple[str, str] | None, tuple[list[OutboundDelta], list[RowDelta]]] = {}
+        if self._key is None:
+            groups[None] = (requests, rows)
+        else:
+            path, key_column = _path(self._key[0]), self._key[1]
+            for request in requests:
+                found, value = _at(request.payload, path)
+                scalar = _scalar(value) if found else None
+                if scalar is None:
+                    problems.append(
+                        (
+                            f"a {self._sink}.{self._operation} request has no {self._key[0]} "
+                            f"to pair it with {self._table} rows",
+                            {"effect": request.effect_id},
+                        )
+                    )
+                    continue
+                groups.setdefault(scalar, ([], []))[0].append(request)
+            for row in rows:
+                image = row.after if row.after is not None else row.before
+                scalar = _scalar(image.get(key_column)) if image is not None else None
+                if scalar is None:
+                    problems.append(
+                        (
+                            f"a {self._table} row has no {key_column} to pair it with a request",
+                            {"row": row.primary_key},
+                        )
+                    )
+                    continue
+                groups.setdefault(scalar, ([], []))[1].append(row)
+        for group_key, (grouped_requests, grouped_rows) in groups.items():
+            problems += self._compare(group_key, grouped_requests, grouped_rows)
+        return tuple(
+            InvariantViolation(
+                invariant=self.name,
+                severity=Severity.BLOCKING,
+                message=message,
+                evidence={
+                    "sink": self._sink,
+                    "operation": self._operation,
+                    "field": self._field,
+                    "rows": f"{self._table}.{self._column}",
+                    "measure": self._measure,
+                    **evidence,
+                },
+            )
+            for message, evidence in problems
+        )
+
+    def _compare(
+        self,
+        group: tuple[str, str] | None,
+        requests: list[OutboundDelta],
+        rows: list[RowDelta],
+    ) -> list[tuple[str, dict[str, str]]]:
+        where = "" if group is None or self._key is None else f" for {self._key[0]} {group[1]}"
+        evidence = {} if group is None else {"key": group[1]}
+        if not requests:
+            return [
+                (
+                    f"the plan wrote {self._table} rows{where} with no "
+                    f"{self._sink}.{self._operation} request to match them",
+                    evidence,
+                )
+            ]
+        if not rows:
+            return [
+                (
+                    f"a {self._sink}.{self._operation} request{where} has no {self._table} "
+                    f"rows to agree with",
+                    evidence,
+                )
+            ]
+        if self._measure == "value":
+            return self._compare_values(where, evidence, requests, rows)
+        requested = Decimal(0)
+        for request in requests:
+            found, value = _at(request.payload, self._path)
+            number = _number(value) if found else None
+            if number is None:
+                return [
+                    (
+                        f"a {self._sink}.{self._operation} request{where} carries no number "
+                        f"at {self._field}",
+                        {**evidence, "effect": request.effect_id},
+                    )
+                ]
+            requested += number
+        measured = Decimal(0)
+        for row in rows:
+            change = self._row_amount(row)
+            if change is None:
+                return [
+                    (
+                        f"a {self._table} row{where} holds no number in {self._column}",
+                        {**evidence, "row": row.primary_key},
+                    )
+                ]
+            measured += change
+        if requested == measured:
+            return []
+        return [
+            (
+                f"{self._sink}.{self._operation} asks for {requested} at {self._field}{where}; "
+                f"the plan's {self._table} rows record {measured} "
+                f"({'inserted' if self._measure == 'inserted' else 'net change'})",
+                {**evidence, "requested": str(requested), "measured": str(measured)},
+            )
+        ]
+
+    def _row_amount(self, row: RowDelta) -> Decimal | None:
+        if self._measure == "inserted":
+            return _number(row.after.get(self._column)) if row.after is not None else None
+        after = Decimal(0)
+        before = Decimal(0)
+        if row.after is not None:
+            value = _number(row.after.get(self._column))
+            if value is None:
+                return None
+            after = value
+        if row.before is not None:
+            value = _number(row.before.get(self._column))
+            if value is None:
+                return None
+            before = value
+        return after - before
+
+    def _compare_values(
+        self,
+        where: str,
+        evidence: dict[str, str],
+        requests: list[OutboundDelta],
+        rows: list[RowDelta],
+    ) -> list[tuple[str, dict[str, str]]]:
+        recorded: set[tuple[str, str]] = set()
+        for row in rows:
+            image = row.after if row.after is not None else row.before
+            scalar = _scalar(image.get(self._column)) if image is not None else None
+            if scalar is None:
+                return [
+                    (
+                        f"a {self._table} row{where} holds no value in {self._column}",
+                        {**evidence, "row": row.primary_key},
+                    )
+                ]
+            recorded.add(scalar)
+        if len(recorded) > 1:
+            return [
+                (
+                    f"the plan's {self._table} rows{where} hold {len(recorded)} different "
+                    f"{self._column} values, so no request can agree with them",
+                    evidence,
+                )
+            ]
+        (expected,) = recorded
+        for request in requests:
+            found, value = _at(request.payload, self._path)
+            if not found or _scalar(value) != expected:
+                # Values are not echoed: a recipient or an account is data.
+                return [
+                    (
+                        f"a {self._sink}.{self._operation} request{where} carries a "
+                        f"{self._field} other than the {self._column} its {self._table} rows "
+                        f"hold",
+                        {**evidence, "effect": request.effect_id},
+                    )
+                ]
+        return []
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # The rule, never the values: the requested and recorded amounts are
+        # the agent's own, but a "value" rule's are data.
+        return FeedbackHint(
+            kind=Guidance.OUTBOUND_AGREEMENT, tables=(self._table,), columns=(self._column,)
+        )
+
+
+def _path(field: str) -> tuple[str, ...]:
+    return tuple(part for part in field.removeprefix("$.").split(".") if part)
+
+
+def _at(payload: object, path: tuple[str, ...]) -> tuple[bool, object]:
+    """The value at ``path`` in a payload, and whether there is one."""
+    current = payload
+    for part in path:
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        elif isinstance(current, tuple | list) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+        else:
+            return False, None
+    return True, current
+
+
+def _number(value: object) -> Decimal | None:
+    """A number, exactly: an integer, a ``Decimal``, or a decimal numeral."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | Decimal):
+        return Decimal(value)
+    if isinstance(value, str) and _NUMERAL.fullmatch(value):
+        return Decimal(value)
+    return None
+
+
+def _scalar(value: object) -> tuple[str, str] | None:
+    """A value as it compares: numbers by value, everything else as itself."""
+    number = _number(value)
+    if number is not None:
+        return ("number", format(number.normalize(), "f"))
+    if isinstance(value, bool):
+        return ("boolean", "true" if value else "false")
+    if isinstance(value, str):
+        return ("text", value)
+    return None
+
+
 def default_checkers(
     *,
     row_limit: int,
@@ -554,6 +881,7 @@ def _percent(fraction: Decimal) -> int:
 
 BUILT_IN_CHECKERS: frozenset[type] = frozenset(
     {
+        CrossEffectAgreement,
         BlastRadius,
         TenantIsolation,
         TableAllowlist,

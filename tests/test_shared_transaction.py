@@ -53,13 +53,19 @@ from interlock.exceptions import (  # noqa: E402
     InterlockError,
     ScopeHaltedError,
     StageConflictError,
+    StageError,
+    SubstrateConfigurationError,
 )
-from interlock.types import EffectDiff, EffectPlan, StageHandle  # noqa: E402
+from interlock.outbound import SinkRegistry, SinkSpec  # noqa: E402
+from interlock.postgres import install  # noqa: E402
+from interlock.types import EffectDiff, EffectId, EffectPlan, StageHandle  # noqa: E402
 from tests.conftest import OBSERVED, Pg  # noqa: E402
 from tests.crash_child import ACKNOWLEDGED, SCOPE, Refund, checkers  # noqa: E402
-from tests.schemas import specs  # noqa: E402
+from tests.schemas import TEST_SINKS, specs  # noqa: E402
 
 SETTLE = Decimal("0.25")
+EMAIL = TEST_SINKS[0].cost_per_call
+"""Each refund also enqueues an email, which a committed refund pays for."""
 
 
 def refund(n: int, amount: str = "3.00", *, globex: bool = False) -> Refund:
@@ -105,6 +111,9 @@ def engine(pg: Pg, gov: BudgetManager, *, during: Callable[[], None] | None = No
         chain=EscrowChain(),
         anchor=LedgerAnchor(governed=gov, same_transaction=True),
         settle_cost=SETTLE,
+        # Each refund also enqueues its email: the outbox row commits in the
+        # same transaction as the ledger claim and the stage marker.
+        sinks=SinkRegistry(TEST_SINKS),
     )
 
 
@@ -151,7 +160,7 @@ def test_a_committed_plan_claims_in_its_commit_and_settles_after_it(
     assert "; settlement claimed" in intent.note
     assert intent.note.endswith("; commit marker armed")
     (spend,) = settled(ledger)
-    assert spend.amount == SETTLE
+    assert spend.amount == SETTLE + EMAIL
     assert spend.memo == f"interlock:{intent.record_hash[:16]}", "names the intent it rode in"
     assert spend.ref is not None, "settled against the hold placed before the stage"
     assert result.anchored_to == spend.entry_hash
@@ -190,7 +199,7 @@ def test_a_ledger_commit_during_the_stage_conflicts_with_nothing(
     eng = engine(pg, ledger, during=elsewhere(pg, lambda other: other.spend(SCOPE, "1.00")))
     result = eng.execute(refund(0).plan())
     assert result.committed
-    assert [s.amount for s in settled(ledger)] == [Decimal("1.00"), SETTLE]
+    assert [s.amount for s in settled(ledger)] == [Decimal("1.00"), SETTLE + EMAIL]
     assert books(pg) == (Decimal("503.00"), frozenset({9100}), 1)
     ledger.verify_integrity()
 
@@ -374,8 +383,164 @@ def test_racing_engines_all_commit_under_a_busy_ledger(
     assert refunds == {9100 + n for n in range(len(plans))}
     assert balance == Decimal("500.00") + len(plans)
     assert markers == len(plans)
+    # Conflicts were retried as the same plan: each retry staged its email
+    # again, under the same idempotency key, and only the commit kept one.
+    with psycopg.connect(pg.admin) as conn:
+        queued = conn.execute(
+            "SELECT o.plan_id FROM interlock.outbox o JOIN interlock.stages s USING (stage_id) "
+            "WHERE o.plan_id = s.plan_id"
+        ).fetchall()
+    assert sorted(str(r[0]) for r in queued) == sorted(p.plan_id for p in plans)
     spends = settled(ledger)
     assert len(spends) == markers, "one settlement per committed stage, none without one"
     assert len({s.memo for s in spends}) == len(spends)
-    assert sum((s.amount for s in spends), Decimal(0)) == SETTLE * len(plans)
+    assert sum((s.amount for s in spends), Decimal(0)) == (SETTLE + EMAIL) * len(plans)
     ledger.verify_integrity()
+
+
+# --------------------------------------------------------------------------
+# Outbound requests are paid for at commit (Epic 2, phase 2)
+# --------------------------------------------------------------------------
+
+
+def holds(gov: BudgetManager) -> list[LedgerEntry]:
+    gov.refresh()
+    return [e for e in gov.audit_trail(SCOPE) if e.entry_type is EntryType.HOLD]
+
+
+def refund_with_emails(n: int, emails: int) -> EffectPlan:
+    """A refund that tells the customer ``emails`` times."""
+    builder = PlanBuilder(SCOPE, intent=f"refund {n}")
+    builder.update(
+        table="accounts",
+        statement="UPDATE accounts SET balance = balance + 1 WHERE id = 100",
+        tenant_id="acme",
+        effect_id=EffectId("credit"),
+        stated_rows=1,
+    )
+    for e in range(emails):
+        builder.enqueue(
+            sink="mail",
+            operation="send",
+            payload={"to": "customer@acme.test", "subject": f"refund {n}, note {e}"},
+            tenant_id="acme",
+            effect_id=EffectId(f"email{e}"),
+            after=[EffectId("credit")],
+        )
+    return builder.build()
+
+
+def test_the_hold_and_the_charge_cover_every_request(pg: Pg, ledger: BudgetManager) -> None:
+    """The plan's settle cost and each request's price are reserved before the
+    stage opens and claimed in its commit: one hold, one spend, the sum."""
+    eng = engine(pg, ledger)
+    result = eng.execute(refund_with_emails(0, 3))
+    assert result.committed
+    total = SETTLE + 3 * EMAIL
+    (hold,) = holds(ledger)
+    assert hold.amount == total
+    (spend,) = settled(ledger)
+    assert (spend.amount, spend.ref) == (total, hold.entry_id)
+    assert result.diff is not None
+    assert [d.cost for d in result.diff.outbound] == [EMAIL] * 3
+    with psycopg.connect(pg.admin) as conn:
+        priced = conn.execute(
+            "SELECT array_agg(cost ORDER BY seq) FROM interlock.outbox"
+        ).fetchone()
+    assert priced == ([str(EMAIL)] * 3,)
+    ledger.verify_integrity()
+
+
+def test_a_refused_plan_pays_for_itself_and_not_for_its_requests(
+    pg: Pg, ledger: BudgetManager
+) -> None:
+    """Its requests never committed, so they are never charged: the hold that
+    covered them is captured at the settle cost alone."""
+    eng = engine(pg, ledger)
+    result = eng.execute(refund(0, globex=True).plan())
+    assert not result.committed
+    (hold,) = holds(ledger)
+    assert hold.amount == SETTLE + EMAIL
+    (spend,) = settled(ledger)
+    assert spend.amount == SETTLE
+    assert ledger.stale_authorizations(0) == ()
+
+
+def test_a_scope_that_can_pay_for_the_plan_but_not_its_requests_is_refused(
+    pg: Pg, ledger: BudgetManager
+) -> None:
+    ledger.spend(SCOPE, "99.745")  # 0.255 left: the plan's 0.25, not its three emails
+    eng = engine(pg, ledger)
+    with pytest.raises(ScopeHaltedError, match="cannot reserve"):
+        eng.execute(refund_with_emails(0, 3))
+    assert "refused before staging" in eng.chain.records()[-1].note
+    with psycopg.connect(pg.admin) as conn:
+        assert conn.execute("SELECT count(*) FROM interlock.outbox").fetchone() == (0,)
+    assert [s.amount for s in settled(ledger)] == [Decimal("99.745")]
+
+
+def test_a_price_the_database_disagrees_with_charges_nothing(pg: Pg, ledger: BudgetManager) -> None:
+    """The engine reserves at its registry's price; the database prices the
+    request from its own copy. When they differ the plan is not committed, and
+    nothing is charged: the hold is released."""
+    dearer = (SinkSpec("mail", TEST_SINKS[0].operations, cost_per_call=Decimal("0.003")),)
+    with psycopg.connect(pg.admin, autocommit=True) as conn:
+        install(conn, specs(*OBSERVED), stage_roles=[pg.role], sinks=(*dearer, TEST_SINKS[1]))
+    eng = engine(pg, ledger)
+    with pytest.raises(SubstrateConfigurationError, match=r"prices a mail request at 0\.003"):
+        eng.execute(refund(0).plan())
+    assert books(pg) == (Decimal("500.00"), frozenset(), 0)
+    assert settled(ledger) == []
+    assert ledger.stale_authorizations(0) == (), "the hold was released"
+
+
+class Forging(Hooked):
+    """A substrate that reports one request more than the stage wrote."""
+
+    __slots__ = ()
+
+    def diff(self, handle: StageHandle) -> EffectDiff:
+        import dataclasses
+
+        diff = super().diff(handle)
+        forged = dataclasses.replace(diff.outbound[0], effect_id=EffectId("forged"))
+        return dataclasses.replace(diff, outbound=(*diff.outbound, forged))
+
+
+def test_requests_the_plan_did_not_declare_are_never_charged_for(
+    pg: Pg, ledger: BudgetManager
+) -> None:
+    eng = EscrowEngine(
+        Forging(pg.agent),
+        checkers=checkers(),
+        chain=EscrowChain(),
+        anchor=LedgerAnchor(governed=ledger, same_transaction=True),
+        settle_cost=SETTLE,
+        sinks=SinkRegistry(TEST_SINKS),
+    )
+    with pytest.raises(StageError, match="not the same ones"):
+        eng.execute(refund(0).plan())
+    assert books(pg) == (Decimal("500.00"), frozenset(), 0)
+    assert settled(ledger) == []
+    assert ledger.stale_authorizations(0) == ()
+
+
+def test_a_separate_ledger_is_charged_for_requests_after_commit(pg: Pg, tmp_path: Any) -> None:
+    """Without the shared ledger, the reverse anchor written after the commit
+    carries the same charge."""
+    gov = BudgetManager.open_sqlite(str(tmp_path / "governor.db"))
+    try:
+        gov.open_root(SCOPE, "100")
+        eng = EscrowEngine(
+            PostgresSubstrate(pg.agent, tables=specs(*OBSERVED), acknowledge_cascades=ACKNOWLEDGED),
+            checkers=checkers(),
+            anchor=LedgerAnchor(governed=gov),
+            settle_cost=SETTLE,
+            sinks=SinkRegistry(TEST_SINKS),
+        )
+        assert eng.execute(refund_with_emails(0, 2)).committed
+        assert [s.amount for s in settled(gov)] == [SETTLE + 2 * EMAIL]
+        assert not eng.execute(refund(1, globex=True).plan()).committed
+        assert [s.amount for s in settled(gov)] == [SETTLE + 2 * EMAIL, SETTLE]
+    finally:
+        gov.close()
