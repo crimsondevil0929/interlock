@@ -138,6 +138,9 @@ class DeliveryResult:
         never stored: it may hold personal data.
     :ivar retry_after: The sink's ``Retry-After``, in seconds: the soonest the
         next call may be made.
+    :ivar remote_ref: The id of what a delivered call created (a Stripe
+        payment intent's ``pi_...``), recorded in the delivery log: what a
+        compensation is bound to.
     """
 
     outcome: str
@@ -145,6 +148,7 @@ class DeliveryResult:
     response_digest: str | None = None
     detail: str = ""
     retry_after: float | None = None
+    remote_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in _OUTCOMES:

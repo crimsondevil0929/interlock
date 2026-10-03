@@ -1,4 +1,14 @@
-"""The transactional outbox's PostgreSQL objects (``docs/OUTBOX_DESIGN.md``).
+"""FROZEN: the outbox's PostgreSQL objects as version 2 installed them.
+
+``src/interlock/outbox_sql.py`` at interlock main ``deb8a8c`` (Epic 2),
+verbatim below this note, with version 2's sink mirror and relay grants after
+it, for ``tests/test_pg_upgrade.py``: version 3 is installed over a database
+version 2 installed, and every log version 2 wrote must still verify. Never
+edit this file; a later version gets a frozen copy of its own.
+
+The original docstring follows.
+
+The transactional outbox's PostgreSQL objects (``docs/OUTBOX_DESIGN.md``).
 
 Installed by :func:`interlock.postgres.install`, after the stage's own objects.
 Three kinds of function, by who may call them:
@@ -21,7 +31,9 @@ recomputes every link outside the database.
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Sequence
+from datetime import timedelta
+from typing import Any, Final
 
 __all__ = [
     "OUTBOX_FUNCTIONS",
@@ -57,8 +69,6 @@ OUTBOX_TABLES: Final = r"""
 -- The registry, mirrored from configuration. No endpoints, no credentials.
 CREATE TABLE IF NOT EXISTS interlock.sinks (
     name              text PRIMARY KEY,
-    kind              text NOT NULL DEFAULT 'http'
-                      CHECK (kind IN ('http', 'stripe', 'sendgrid')),
     operations        text[] NOT NULL,
     cost_per_call     text NOT NULL,
     idempotency       text NOT NULL CHECK (idempotency IN ('header', 'none')),
@@ -91,7 +101,6 @@ CREATE TABLE IF NOT EXISTS interlock.outbox (
     idempotency_key text NOT NULL UNIQUE,
     cost            text NOT NULL,
     compensation    jsonb,
-    compensates     uuid REFERENCES interlock.outbox (message_id),
     not_after       timestamptz NOT NULL,
     enqueued_at     timestamptz NOT NULL,
     UNIQUE (stage_id, effect_id)
@@ -134,7 +143,7 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_attempts (
                     CHECK (event IN ('sending', 'delivered', 'retryable', 'permanent',
                                      'unknown', 'lost', 'held', 'deferred', 'expired',
                                      'refused', 'dependency_failed', 'released', 'requeued',
-                                     'cancelled', 'compensated')),
+                                     'cancelled')),
     actor           text NOT NULL,
     at              timestamptz NOT NULL,
     status_code     integer,
@@ -142,43 +151,11 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_attempts (
     detail          text,
     state_after     text CHECK (state_after IN ('pending', 'leased', 'held', 'delivered',
                                                 'dead', 'cancelled')),
-    remote_ref      text,
-    authority       text,
     prev_hash       text NOT NULL,
     event_hash      text NOT NULL,
     PRIMARY KEY (message_id, seq)
 );
 REVOKE ALL ON interlock.outbox_attempts FROM PUBLIC;
-
--- Version 3, in place over version 2. Every column it adds is NULL in every
--- row written before, and a row with neither remote_ref nor authority hashes
--- as version 2 hashed it: every delivery log written under 2 still verifies.
-ALTER TABLE interlock.sinks
-    ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'http'
-        CHECK (kind IN ('http', 'stripe', 'sendgrid'));
-ALTER TABLE interlock.outbox
-    ADD COLUMN IF NOT EXISTS compensates uuid REFERENCES interlock.outbox (message_id);
-ALTER TABLE interlock.outbox_attempts
-    ADD COLUMN IF NOT EXISTS remote_ref text,
-    ADD COLUMN IF NOT EXISTS authority text;
-DO $upgrade$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_catalog.pg_constraint
-         WHERE conrelid = 'interlock.outbox_attempts'::regclass
-           AND conname = 'outbox_attempts_event_check'
-           AND pg_catalog.pg_get_constraintdef(oid) LIKE '%compensated%') THEN
-        ALTER TABLE interlock.outbox_attempts
-            DROP CONSTRAINT IF EXISTS outbox_attempts_event_check;
-        ALTER TABLE interlock.outbox_attempts
-            ADD CONSTRAINT outbox_attempts_event_check
-            CHECK (event IN ('sending', 'delivered', 'retryable', 'permanent', 'unknown',
-                             'lost', 'held', 'deferred', 'expired', 'refused',
-                             'dependency_failed', 'released', 'requeued', 'cancelled',
-                             'compensated'));
-    END IF;
-END
-$upgrade$;
 """
 
 STAGE_OUTBOX_FUNCTIONS: Final = r"""
@@ -238,29 +215,18 @@ AS $fn$
         p_effect, p_sink, p_operation, p_idempotency_key, p_payload_hash)
 $fn$;
 
--- A row's hash. A row with neither a remote reference nor an operator's
--- authority hashes as version 2 hashed every row (event-v1), so a log written
--- under version 2 verifies unchanged; a row with either frames both (event-v2).
-DROP FUNCTION IF EXISTS interlock.outbox_event_hash(
-    text, uuid, integer, integer, text, text, timestamptz, integer, text, text, text);
 CREATE OR REPLACE FUNCTION interlock.outbox_event_hash(
     p_prev text, p_message uuid, p_seq integer, p_attempt integer, p_event text,
     p_actor text, p_at timestamptz, p_status integer, p_digest text, p_detail text,
-    p_state_after text, p_remote_ref text, p_authority text)
+    p_state_after text)
 RETURNS text
 LANGUAGE sql STABLE PARALLEL SAFE
 SET search_path = pg_catalog, pg_temp
 AS $fn$
-    SELECT CASE
-        WHEN p_remote_ref IS NULL AND p_authority IS NULL THEN interlock.outbox_digest(
-            'interlock-outbox-event-v1', p_prev, p_message::text, p_seq::text,
-            p_attempt::text, p_event, p_actor, interlock.outbox_instant(p_at),
-            p_status::text, p_digest, p_detail, p_state_after)
-        ELSE interlock.outbox_digest(
-            'interlock-outbox-event-v2', p_prev, p_message::text, p_seq::text,
-            p_attempt::text, p_event, p_actor, interlock.outbox_instant(p_at),
-            p_status::text, p_digest, p_detail, p_state_after, p_remote_ref, p_authority)
-    END
+    SELECT interlock.outbox_digest(
+        'interlock-outbox-event-v1', p_prev, p_message::text, p_seq::text, p_attempt::text,
+        p_event, p_actor, interlock.outbox_instant(p_at), p_status::text, p_digest, p_detail,
+        p_state_after)
 $fn$;
 
 -- Writes one outbound request, its delivery state and the head of its
@@ -297,8 +263,6 @@ DECLARE
     sink_bytes integer;
     sink_seconds integer;
     sink_cost text;
-    sink_kind text;
-    problem text;
     bytes bytea := pg_catalog.convert_to(p_payload, 'UTF8');
     -- One instant: not_after is exactly its window past enqueued_at.
     enqueued timestamptz := pg_catalog.clock_timestamp();
@@ -315,8 +279,8 @@ BEGIN
         RAISE EXCEPTION 'interlock: an outbound request needs the scope that pays for it'
             USING ERRCODE = 'IL002';
     END IF;
-    SELECT k.operations, k.max_payload_bytes, k.not_after_seconds, k.cost_per_call, k.kind
-      INTO sink_ops, sink_bytes, sink_seconds, sink_cost, sink_kind
+    SELECT k.operations, k.max_payload_bytes, k.not_after_seconds, k.cost_per_call
+      INTO sink_ops, sink_bytes, sink_seconds, sink_cost
       FROM interlock.sinks k
      WHERE k.name = p_sink AND k.enabled;
     IF sink_ops IS NULL THEN
@@ -346,19 +310,6 @@ BEGIN
                   DETAIL = pg_catalog.json_build_object(
                       'reason', 'payload_hash', 'sink', p_sink)::text;
     END IF;
-    -- A charge carries the refund that undoes exactly it, whatever registry
-    -- the engine that staged it was configured with (docs/EPIC3_DESIGN.md §4.1).
-    IF sink_kind = 'stripe'
-       AND p_operation IN ('payment_intents.create', 'charges.create') THEN
-        problem := interlock.stripe_compensation_problem(
-            p_operation, p_payload::jsonb, p_compensation::jsonb);
-        IF problem IS NOT NULL THEN
-            RAISE EXCEPTION 'interlock: sink % refuses the request: %', p_sink, problem
-                USING ERRCODE = 'IL004',
-                      DETAIL = pg_catalog.json_build_object(
-                          'reason', 'compensation', 'sink', p_sink)::text;
-        END IF;
-    END IF;
     INSERT INTO interlock.outbox (
         message_id, stage_id, plan_id, scope_id, effect_id, seq, depends_on, sink,
         operation, tenant_id, payload, payload_hash, idempotency_key, cost, compensation,
@@ -376,56 +327,6 @@ BEGIN
         interlock.outbox_genesis(p_message, stage, plan, p_scope, p_effect, p_sink, p_operation,
                                  p_idempotency_key, p_payload_hash)
     );
-END
-$fn$;
-
--- interlock.stripe.compensation_problem, word for word: what is wrong with
--- the refund a Stripe charge carries, or NULL when it undoes exactly it.
-CREATE OR REPLACE FUNCTION interlock.stripe_compensation_problem(
-    p_operation text, p_charge jsonb, p_compensation jsonb)
-RETURNS text
-LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
-SET search_path = pg_catalog, pg_temp
-AS $fn$
-DECLARE
-    named text := CASE p_operation WHEN 'payment_intents.create' THEN 'payment_intent'
-                                   ELSE 'charge' END;
-    other text := CASE p_operation WHEN 'payment_intents.create' THEN 'charge'
-                                   ELSE 'payment_intent' END;
-    refund jsonb := p_compensation -> 'payload';
-    amount jsonb;
-    charged jsonb := p_charge -> 'amount';
-BEGIN
-    IF p_compensation IS NULL THEN
-        RETURN p_operation || ' takes money, and the request carries no refund to give it back';
-    END IF;
-    IF p_compensation ->> 'operation' IS DISTINCT FROM 'refunds.create' THEN
-        RETURN p_operation || ' is undone by refunds.create, not '
-            || coalesce(p_compensation ->> 'operation', 'None');
-    END IF;
-    IF refund IS NULL OR pg_catalog.jsonb_typeof(refund) <> 'object' THEN
-        RETURN 'the refund has no payload';
-    END IF;
-    IF (refund -> named) IS DISTINCT FROM '{"$bind": "delivered.id"}'::jsonb THEN
-        RETURN 'the refund names the ' || named
-            || ' it undoes by {"$bind": "delivered.id"}, never by a literal id';
-    END IF;
-    IF refund ? other THEN
-        RETURN 'the refund of a ' || named || ' names no ' || other;
-    END IF;
-    IF refund ? 'currency' THEN
-        RETURN 'the refund names no currency: a refund is in the charge''s';
-    END IF;
-    amount := refund -> 'amount';
-    IF amount IS NOT NULL AND (
-        pg_catalog.jsonb_typeof(amount) <> 'number'
-        OR charged IS NULL OR pg_catalog.jsonb_typeof(charged) <> 'number'
-        OR amount::text !~ '^[0-9]+$' OR charged::text !~ '^[0-9]+$'
-        OR amount::text::numeric <= 0 OR amount::text::numeric > charged::text::numeric) THEN
-        RETURN 'the refund gives back at most the ' || coalesce(charged::text, 'None')
-            || ' charged, not ' || amount::text;
-    END IF;
-    RETURN NULL;
 END
 $fn$;
 
@@ -489,8 +390,7 @@ BEGIN
     NEW.at := pg_catalog.clock_timestamp();
     NEW.event_hash := interlock.outbox_event_hash(
         NEW.prev_hash, NEW.message_id, NEW.seq, NEW.attempt, NEW.event, NEW.actor, NEW.at,
-        NEW.status_code, NEW.response_digest, NEW.detail, NEW.state_after, NEW.remote_ref,
-        NEW.authority);
+        NEW.status_code, NEW.response_digest, NEW.detail, NEW.state_after);
     UPDATE interlock.outbox_state
        SET log_seq = NEW.seq, log_head = NEW.event_hash
      WHERE message_id = NEW.message_id;
@@ -501,12 +401,9 @@ $fn$;
 
 RELAY_FUNCTIONS: Final = r"""
 -- Appends one row to a message's delivery log. Internal: granted to no one.
-DROP FUNCTION IF EXISTS interlock.outbox_log(
-    uuid, integer, text, text, integer, text, text, text);
 CREATE OR REPLACE FUNCTION interlock.outbox_log(
     p_message uuid, p_attempt integer, p_event text, p_actor text, p_status integer,
-    p_digest text, p_detail text, p_state_after text, p_remote_ref text DEFAULT NULL,
-    p_authority text DEFAULT NULL)
+    p_digest text, p_detail text, p_state_after text)
 RETURNS void
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -514,12 +411,11 @@ AS $fn$
 BEGIN
     INSERT INTO interlock.outbox_attempts (
         message_id, seq, attempt, event, actor, at, status_code, response_digest, detail,
-        state_after, remote_ref, authority, prev_hash, event_hash)
+        state_after, prev_hash, event_hash)
     VALUES (
         p_message, 1, p_attempt, p_event, pg_catalog.left(coalesce(p_actor, '?'), 200),
         pg_catalog.clock_timestamp(), p_status, pg_catalog.left(p_digest, 128),
-        pg_catalog.left(p_detail, 1000), p_state_after, pg_catalog.left(p_remote_ref, 255),
-        p_authority, '', '');
+        pg_catalog.left(p_detail, 1000), p_state_after, '', '');
 END
 $fn$;
 
@@ -760,11 +656,9 @@ $fn$;
 -- delivery: the sink acted, whoever held the lease, so the message is
 -- delivered. A retry is due p_delay_ms from now, unless the attempts are
 -- spent or the deadline would pass first.
-DROP FUNCTION IF EXISTS interlock.relay_outcome(
-    uuid, text, bigint, integer, text, integer, text, text, bigint);
 CREATE OR REPLACE FUNCTION interlock.relay_outcome(
     p_message uuid, p_relay text, p_fence bigint, p_attempt integer, p_outcome text,
-    p_status integer, p_digest text, p_detail text, p_delay_ms bigint, p_remote_ref text)
+    p_status integer, p_digest text, p_detail text, p_delay_ms bigint)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -837,10 +731,7 @@ BEGIN
         p_message, p_attempt, p_outcome, p_relay, p_status, p_digest,
         CASE WHEN why IS NOT NULL AND next_state = 'delivered'
              THEN coalesce(p_detail || '; ', '') || why ELSE p_detail END,
-        next_state,
-        -- What the call created (a Stripe payment intent's id): only a call
-        -- that delivered created anything.
-        CASE WHEN p_outcome = 'delivered' THEN p_remote_ref END);
+        next_state);
     IF next_state = 'pending' THEN
         PERFORM interlock.outbox_settle(p_message, 'pending', why, due);
     ELSIF next_state IS NOT NULL THEN
@@ -1075,3 +966,56 @@ OUTBOX_TRIGGER_NAMES: Final = (
     ("outbox_attempts", "outbox_log_link", "interlock.outbox_log_link"),
 )
 """What keeps a committed request, and its delivery log, as written and linked."""
+
+
+# --------------------------------------------------------------------------
+# Version 2's sink mirror and relay grants (src/interlock/postgres.py at
+# deb8a8c), for interlock.postgres.install to run in place of version 3's.
+# --------------------------------------------------------------------------
+
+RELAY_FUNCTIONS_V2: Final = (
+    "interlock.relay_claim(text, double precision, integer, text[])",
+    "interlock.relay_sending(uuid, text, bigint, text)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint)",
+    "interlock.relay_hold(uuid, text, bigint, text)",
+    "interlock.relay_defer(uuid, text, bigint, text, bigint)",
+    "interlock.relay_refuse(uuid, text, bigint, text)",
+)
+
+
+def install_sinks_v2(conn: Any, sinks: Sequence[Any]) -> None:
+    """Mirror the registry into ``interlock.sinks``, as version 2 did: no kind."""
+    for sink in sinks:
+        conn.execute(
+            "INSERT INTO interlock.sinks (name, operations, cost_per_call, idempotency, "
+            "max_payload_bytes, not_after_seconds, max_attempts, backoff_base_ms, "
+            "backoff_cap_ms, unknown_outcome, config_hash, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true) "
+            "ON CONFLICT (name) DO UPDATE SET "
+            "operations = EXCLUDED.operations, cost_per_call = EXCLUDED.cost_per_call, "
+            "idempotency = EXCLUDED.idempotency, "
+            "max_payload_bytes = EXCLUDED.max_payload_bytes, "
+            "not_after_seconds = EXCLUDED.not_after_seconds, "
+            "max_attempts = EXCLUDED.max_attempts, "
+            "backoff_base_ms = EXCLUDED.backoff_base_ms, "
+            "backoff_cap_ms = EXCLUDED.backoff_cap_ms, "
+            "unknown_outcome = EXCLUDED.unknown_outcome, "
+            "config_hash = EXCLUDED.config_hash, enabled = true",
+            (
+                sink.name,
+                [op.name for op in sink.operations],
+                str(sink.cost_per_call),
+                sink.idempotency,
+                sink.max_payload_bytes,
+                int(sink.not_after.total_seconds()),
+                sink.max_attempts,
+                int(sink.backoff_base / timedelta(milliseconds=1)),
+                int(sink.backoff_cap / timedelta(milliseconds=1)),
+                sink.unknown_outcome,
+                sink.config_hash(),
+            ),
+        )
+    conn.execute(
+        "UPDATE interlock.sinks SET enabled = false WHERE NOT (name = ANY (%s))",
+        ([sink.name for sink in sinks],),
+    )

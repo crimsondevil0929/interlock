@@ -193,7 +193,8 @@ class Outbox:
     def engine(self, **kwargs: Any) -> EscrowEngine:
         checkers = kwargs.pop("checkers", [BlastRadius(100)])
         substrate = kwargs.pop("substrate", None) or self.substrate()
-        return EscrowEngine(substrate, checkers=checkers, sinks=REGISTRY, **kwargs)
+        sinks = kwargs.pop("sinks", REGISTRY)
+        return EscrowEngine(substrate, checkers=checkers, sinks=sinks, **kwargs)
 
     def commit(
         self,

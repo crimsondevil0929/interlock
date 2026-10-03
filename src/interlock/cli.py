@@ -40,7 +40,7 @@ from typing import Any, TextIO
 
 from interlock.cascade import CascadeReport, analyze_cascades, read_postgres_foreign_keys
 from interlock.chain import EscrowChain, EscrowRecord
-from interlock.config import ConfigError, InterlockConfig, RelayConfig, load_config
+from interlock.config import ConfigError, Endpoint, InterlockConfig, RelayConfig, load_config
 from interlock.deliveries import (
     cancel,
     message_log,
@@ -200,7 +200,7 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
         print("installed: the outbox, and WAL mode", file=out)
         for sink in config.sinks:
             operations = ", ".join(op.name for op in sink.operations)
-            print(f"registered sink: {sink.name} ({operations})", file=out)
+            print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
         _print_report(_sqlite(config).check_cascades(), out)
         return EXIT_OK
     import psycopg
@@ -232,7 +232,7 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
         print(f"granted to audit role: {role}", file=out)
     for sink in config.sinks:
         operations = ", ".join(op.name for op in sink.operations)
-        print(f"registered sink: {sink.name} ({operations})", file=out)
+        print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
     for role in config.relay_roles:
         print(f"granted to relay role: {role}", file=out)
     _print_report(report, out)
@@ -312,26 +312,66 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             breaker.close()
 
 
-def _adapters(settings: RelayConfig) -> dict[str, Any]:
-    from interlock.adapters import HttpAdapter
+def _kind(sink: Any) -> str:
+    return "" if sink.kind == "http" else f"{sink.kind}: "
 
+
+def _adapters(settings: RelayConfig) -> dict[str, Any]:
     missing = sorted(
-        f"{variable} (sink {endpoint.sink}, header {header})"
-        for endpoint in settings.endpoints
-        for header, variable in endpoint.header_env.items()
-        if variable not in os.environ
+        [
+            f"{variable} (sink {endpoint.sink}, header {header})"
+            for endpoint in settings.endpoints
+            for header, variable in endpoint.header_env.items()
+            if variable not in os.environ
+        ]
+        + [
+            f"{endpoint.secret_env} (sink {endpoint.sink}, its API key)"
+            for endpoint in settings.endpoints
+            if endpoint.secret_env and endpoint.secret_env not in os.environ
+        ]
     )
     if missing:
         raise SubstrateConfigurationError(
             f"the relay's credentials come from its environment, and these are not set: "
             f"{', '.join(missing)}"
         )
-    return {
-        endpoint.sink: HttpAdapter(
-            endpoint.url, routes=endpoint.routes, headers=_environment(endpoint.header_env)
+    return {endpoint.sink: _adapter(endpoint) for endpoint in settings.endpoints}
+
+
+def _adapter(endpoint: Endpoint) -> Any:
+    """The adapter for one endpoint: the generic one, or its vendor's."""
+    if endpoint.kind == "stripe":
+        from interlock.stripe import API, STRIPE_VERSION, StripeAdapter
+
+        return StripeAdapter(
+            _variable(endpoint.secret_env),
+            base_url=endpoint.url or API,
+            version=endpoint.stripe_version or STRIPE_VERSION,
         )
-        for endpoint in settings.endpoints
-    }
+    if endpoint.kind == "sendgrid":
+        from interlock.sendgrid import API as SENDGRID_API
+        from interlock.sendgrid import SendGridAdapter
+
+        return SendGridAdapter(
+            _variable(endpoint.secret_env),
+            base_url=endpoint.url or SENDGRID_API,
+            sandbox=endpoint.sandbox,
+        )
+    from interlock.adapters import HttpAdapter
+
+    return HttpAdapter(
+        endpoint.url, routes=endpoint.routes, headers=_environment(endpoint.header_env)
+    )
+
+
+def _variable(name: str) -> Callable[[], str]:
+    """A secret read from the environment on every call, so a rotated key
+    takes effect without a restart."""
+
+    def value() -> str:
+        return os.environ[name]
+
+    return value
 
 
 def _environment(names: Mapping[str, str]) -> Callable[[], dict[str, str]]:

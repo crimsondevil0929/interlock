@@ -19,7 +19,8 @@ The points are :meth:`interlock.relay.Relay._reached`'s:
 ==========================  ==============================================
 
 The scenario names its store: ``postgres`` (``dsn`` a relay role's connection
-string) or ``sqlite`` (``dsn`` the file).
+string) or ``sqlite`` (``dsn`` the file); and, under ``typed``, the sinks it
+delivers to through Stripe's or SendGrid's adapter rather than the generic one.
 
 A SIGKILL runs nothing after it: no ``finally``, no ``atexit``, no
 connection close. PostgreSQL finds the session gone and rolls back whatever
@@ -45,7 +46,9 @@ from typing import Any, NoReturn
 
 from interlock.adapters import HttpAdapter
 from interlock.relay import Lease, LedgerBreaker, Relay
+from interlock.sendgrid import SendGridAdapter
 from interlock.sqlite_outbox import SqliteOutboxStore
+from interlock.stripe import StripeAdapter
 from tests.outbox_env import ROUTES
 
 
@@ -79,9 +82,19 @@ class Dying(Relay):
             os.kill(os.getpid(), signal.SIGKILL)
 
 
+def adapter(name: str, url: str, typed: dict[str, Any] | None) -> Any:
+    """The adapter the scenario names: the generic one, or a vendor's."""
+    if typed is None:
+        return HttpAdapter(url, routes=ROUTES[name])
+    if typed["kind"] == "stripe":
+        return StripeAdapter(typed["key"], base_url=url)
+    return SendGridAdapter(typed["key"], base_url=url)
+
+
 def run(scenario: dict[str, Any]) -> NoReturn:
+    typed = scenario.get("typed", {})
     adapters = {
-        name: HttpAdapter(url, routes=ROUTES[name]) for name, url in scenario["sinks"].items()
+        name: adapter(name, url, typed.get(name)) for name, url in scenario["sinks"].items()
     }
     store = (
         SqliteOutboxStore(scenario["dsn"]) if scenario.get("store") == "sqlite" else scenario["dsn"]

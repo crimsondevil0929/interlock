@@ -18,7 +18,8 @@ from __future__ import annotations
 import hashlib
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -200,11 +201,15 @@ class LogEvent:
 
 _EVENTS: Final = (
     "SELECT message_id, seq, attempt, event, actor, at, status_code, response_digest, "
-    "detail, state_after, prev_hash, event_hash, NULL::text, NULL::text "
+    "detail, state_after, prev_hash, event_hash, {extra} "
     "FROM interlock.outbox_attempts "
     "WHERE %(ids)s::uuid[] IS NULL OR message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY message_id, seq"
 )
+_EXTRA_V3: Final = "remote_ref, authority"
+_EXTRA_V2: Final = "NULL::text, NULL::text"
+"""Version 2 had neither column; its logs are read, and verified, as they are
+before an upgrade."""
 
 _MESSAGES: Final = (
     "SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
@@ -229,8 +234,8 @@ def _event(row: Sequence[Any]) -> LogEvent:
         state_after=_text(row[9]),
         prev_hash=str(row[10]),
         event_hash=str(row[11]),
-        remote_ref=_text(row[12]) if len(row) > 12 else None,
-        authority=_text(row[13]) if len(row) > 13 else None,
+        remote_ref=_text(row[12]),
+        authority=_text(row[13]),
     )
 
 
@@ -291,10 +296,35 @@ class PostgresReader:
     def __init__(self, conn: psycopg.Connection[Any]) -> None:
         self._conn = conn
 
+    @contextmanager
+    def _one_snapshot(self) -> Iterator[None]:
+        """Read messages and logs as of one instant: a relay committing between
+        the two reads would otherwise show a log ahead of its head."""
+        from psycopg.pq import TransactionStatus
+
+        if self._conn.info.transaction_status != TransactionStatus.IDLE:
+            yield  # the caller's transaction, and its snapshot
+            return
+        with self._conn.transaction():
+            self._conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            yield
+
+    def _events(self) -> str:
+        row = self._conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+            "WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
+            "AND attname = 'remote_ref' AND NOT attisdropped)"
+        ).fetchone()
+        return _EVENTS.format(extra=_EXTRA_V3 if row is not None and row[0] else _EXTRA_V2)
+
     def snapshot(
         self, message_ids: Sequence[uuid.UUID] | None
     ) -> tuple[list[LoggedMessage], list[LogEvent]]:
         params = {"ids": None if message_ids is None else list(message_ids)}
+        with self._one_snapshot():
+            return self._read(params)
+
+    def _read(self, params: dict[str, Any]) -> tuple[list[LoggedMessage], list[LogEvent]]:
         found = [
             LoggedMessage(
                 message_id=m[0],
@@ -313,7 +343,8 @@ class PostgresReader:
             )
             for m in self._conn.execute(_MESSAGES, params).fetchall()
         ]
-        return found, [_event(row) for row in self._conn.execute(_EVENTS, params)]
+        events = [_event(row) for row in self._conn.execute(self._events(), params)]
+        return found, events
 
     def views(
         self, *, state: str | None, scope_id: str | None, limit: int

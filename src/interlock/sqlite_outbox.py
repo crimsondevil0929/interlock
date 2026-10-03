@@ -57,6 +57,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
+from interlock.outbound import typed_sink
 from interlock.outbox_store import Checkpoint, milliseconds
 from interlock.types import OutboundDelta, _frozen
 
@@ -96,7 +97,8 @@ _SCHEMA: Final = (
     "(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)",
     f"""CREATE TABLE IF NOT EXISTS main.{SINKS} (
         name              TEXT PRIMARY KEY,
-        kind              TEXT NOT NULL DEFAULT 'http',
+        kind              TEXT NOT NULL DEFAULT 'http'
+                          CHECK (kind IN ('http', 'stripe', 'sendgrid')),
         operations        TEXT NOT NULL,
         cost_per_call     TEXT NOT NULL,
         idempotency       TEXT NOT NULL CHECK (idempotency IN ('header', 'none')),
@@ -319,7 +321,7 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
                     f"config_hash = excluded.config_hash, enabled = 1",
                     (
                         sink.name,
-                        getattr(sink, "kind", "http"),
+                        sink.kind,
                         json.dumps([op.name for op in sink.operations]),
                         str(sink.cost_per_call),
                         sink.idempotency,
@@ -371,7 +373,8 @@ def enqueue(
 
     :raises OutboundRequestError: On a sink or operation the registry does
         not have enabled, a payload over its bound or not matching its hash,
-        or a request already in the outbox.
+        a typed sink's request its rule refuses (a Stripe charge without the
+        refund that undoes it), or a request already in the outbox.
     """
     request = effect.request
     assert request is not None
@@ -408,6 +411,22 @@ def enqueue(
             reason="payload_hash",
             sink=request.sink,
         )
+    typed = typed_sink(str(sink[0]))
+    if typed is not None:
+        # The typed sink's rule, a second time, from the kind this file holds:
+        # whatever registry the engine was configured with.
+        problem = typed.compensation_problem(
+            request.operation,
+            request.payload,
+            None if request.compensation is None else request.compensation.to_json(),
+        )
+        if problem is not None:
+            raise OutboundRequestError(
+                f"effect {effect.effect_id!r} refused by the outbox: sink {request.sink!r} "
+                f"refuses the request: {problem}",
+                reason="compensation",
+                sink=request.sink,
+            )
     message_id = uuid.uuid4()
     enqueued = now_us()
     window = request.not_after if request.not_after is not None else timedelta(seconds=int(sink[3]))
@@ -647,6 +666,7 @@ class SqliteOutboxStore:
         actor = (actor or "?")[:200]
         digest = None if digest is None else digest[:128]
         detail = None if detail is None else detail[:1000]
+        remote_ref = None if remote_ref is None else remote_ref[:255]
         digest_ = event_hash(
             str(head[1]),
             uuid.UUID(message),
@@ -975,7 +995,7 @@ class SqliteOutboxStore:
                         detail=detail,
                         status=result.status_code,
                         digest=result.response_digest,
-                        remote_ref=getattr(result, "remote_ref", None),
+                        remote_ref=result.remote_ref if result.outcome == "delivered" else None,
                     )
                     if next_state == "pending":
                         self._settle(conn, message, "pending", why, due)

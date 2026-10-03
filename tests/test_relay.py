@@ -1262,16 +1262,16 @@ def test_a_redirect_is_never_followed(outbox: Outbox) -> None:
 def test_retry_after_as_an_http_date() -> None:
     from email.utils import format_datetime
 
-    from interlock.adapters import _seconds
+    from interlock.adapters import retry_after_seconds
 
     soon = format_datetime(datetime.now(UTC) + timedelta(seconds=90), usegmt=True)
-    seconds = _seconds(soon)
+    seconds = retry_after_seconds(soon)
     assert seconds is not None and 85 <= seconds <= 90
-    assert _seconds("120") == 120
-    assert _seconds("next tuesday") is None
-    assert _seconds(None) is None
+    assert retry_after_seconds("120") == 120
+    assert retry_after_seconds("next tuesday") is None
+    assert retry_after_seconds(None) is None
     past = format_datetime(datetime.now(UTC) - timedelta(seconds=90), usegmt=True)
-    assert _seconds(past) == 0
+    assert retry_after_seconds(past) == 0
 
 
 @POSTGRES_ONLY

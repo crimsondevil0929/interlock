@@ -3,7 +3,9 @@
 An adapter makes one kind of call. It holds the sink's endpoint and
 credentials, which live in the relay's configuration and environment and
 nowhere else, and it never sees the database. :class:`HttpAdapter` is the
-generic JSON-over-HTTP(S) one.
+generic JSON-over-HTTP(S) one; :class:`interlock.stripe.StripeAdapter` and
+:class:`interlock.sendgrid.SendGridAdapter` speak their vendors' APIs over the
+same transport (:func:`exchange`), and classify their vendors' replies.
 
 The classification is the part that matters, because it decides whether a call
 is made again:
@@ -34,13 +36,14 @@ import socket
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Final
 
 from interlock.relay import DELIVERED, PERMANENT, RETRYABLE, UNKNOWN, Delivery, DeliveryResult
 
-__all__ = ["HttpAdapter"]
+__all__ = ["HttpAdapter", "Reply", "exchange", "retry_after_seconds"]
 
 RETRYABLE_STATUSES: Final = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 """Statuses that say the sink did not act and may if asked again. 409 is
@@ -55,6 +58,62 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+_OPENER: Final = urllib.request.build_opener(_NoRedirects())
+
+
+@dataclass(frozen=True, slots=True)
+class Reply:
+    """What a sink answered: its status, its body (up to a megabyte) and its
+    headers, for the adapter that asked to classify."""
+
+    status: int
+    body: bytes
+    headers: Mapping[str, str]
+
+    @property
+    def digest(self) -> str:
+        """SHA-256 of the body: recorded, never the body itself."""
+        return hashlib.sha256(self.body).hexdigest()
+
+    def header(self, name: str) -> str | None:
+        wanted = name.lower()
+        return next((v for k, v in self.headers.items() if k.lower() == wanted), None)
+
+
+def exchange(
+    url: str, body: bytes, headers: Mapping[str, str], method: str, timeout: float
+) -> Reply | DeliveryResult:
+    """Make one call. The sink's reply, whatever its status; or, when there
+    was none, what that means: ``retryable`` when the request never left this
+    process (a refused connection, an unresolvable host, a connect timeout),
+    ``unknown`` when it was sent and the reply was lost. Redirects are never
+    followed."""
+    # The scheme is http or https, checked by every adapter at construction;
+    # the path is configuration or the adapter's own. Nothing in the URL comes
+    # from the request.
+    request = urllib.request.Request(  # noqa: S310
+        url, data=body, headers=dict(headers), method=method
+    )
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            return Reply(int(response.status), response.read(_MAX_BODY), dict(response.headers))
+    except urllib.error.HTTPError as exc:
+        try:
+            content = exc.read(_MAX_BODY)
+        except (OSError, http.client.HTTPException):
+            content = b""
+        return Reply(int(exc.code), content, dict(exc.headers or {}))
+    except urllib.error.URLError as exc:
+        # Raised while connecting: the request never left this process.
+        reason = exc.reason
+        if isinstance(reason, ConnectionRefusedError | socket.gaierror | TimeoutError):
+            return DeliveryResult(RETRYABLE, detail=f"not sent: {reason}")
+        return DeliveryResult(UNKNOWN, detail=f"connection failed: {reason}")
+    except (TimeoutError, http.client.HTTPException, ConnectionError, OSError) as exc:
+        # After the request was sent: whether the sink acted is unknown.
+        return DeliveryResult(UNKNOWN, detail=f"{type(exc).__name__} after sending: {exc}")
+
+
 class HttpAdapter:
     """Delivers a request as a JSON body to a configured endpoint.
 
@@ -67,7 +126,7 @@ class HttpAdapter:
     :raises ValueError: On a route that is not ``"METHOD /path"``.
     """
 
-    __slots__ = ("_base", "_headers", "_idempotency_header", "_opener", "_retryable", "_routes")
+    __slots__ = ("_base", "_headers", "_idempotency_header", "_retryable", "_routes")
 
     def __init__(
         self,
@@ -91,7 +150,6 @@ class HttpAdapter:
         self._headers = headers or {}
         self._idempotency_header = idempotency_header
         self._retryable = retryable_statuses
-        self._opener = urllib.request.build_opener(_NoRedirects())
 
     def send(self, delivery: Delivery) -> DeliveryResult:
         route = self._routes.get(delivery.operation)
@@ -110,37 +168,10 @@ class HttpAdapter:
                 "X-Interlock-Payload-SHA256": delivery.payload_hash,
             }
         )
-        # The scheme is http or https, checked at construction; the path is
-        # configuration. Nothing in the URL comes from the request.
-        request = urllib.request.Request(  # noqa: S310
-            self._base + path, data=delivery.payload, headers=headers, method=method
-        )
-        try:
-            with self._opener.open(request, timeout=delivery.timeout) as response:
-                body = response.read(_MAX_BODY)
-                return _classify(
-                    int(response.status), body, response.headers.get("Retry-After"), self._retryable
-                )
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read(_MAX_BODY)
-            except (OSError, http.client.HTTPException):
-                body = b""
-            return _classify(
-                int(exc.code),
-                body,
-                exc.headers.get("Retry-After") if exc.headers else None,
-                self._retryable,
-            )
-        except urllib.error.URLError as exc:
-            # Raised while connecting: the request never left this process.
-            reason = exc.reason
-            if isinstance(reason, ConnectionRefusedError | socket.gaierror | TimeoutError):
-                return DeliveryResult(RETRYABLE, detail=f"not sent: {reason}")
-            return DeliveryResult(UNKNOWN, detail=f"connection failed: {reason}")
-        except (TimeoutError, http.client.HTTPException, ConnectionError, OSError) as exc:
-            # After the request was sent: whether the sink acted is unknown.
-            return DeliveryResult(UNKNOWN, detail=f"{type(exc).__name__} after sending: {exc}")
+        reply = exchange(self._base + path, delivery.payload, headers, method, delivery.timeout)
+        if isinstance(reply, DeliveryResult):
+            return reply
+        return _classify(reply.status, reply.body, reply.header("Retry-After"), self._retryable)
 
 
 def _classify(
@@ -155,13 +186,13 @@ def _classify(
             status_code=status,
             response_digest=digest,
             detail=f"HTTP {status}",
-            retry_after=_seconds(retry_after),
+            retry_after=retry_after_seconds(retry_after),
         )
     detail = f"HTTP {status}" + (" (redirects are not followed)" if 300 <= status < 400 else "")
     return DeliveryResult(PERMANENT, status_code=status, response_digest=digest, detail=detail)
 
 
-def _seconds(retry_after: str | None) -> float | None:
+def retry_after_seconds(retry_after: str | None) -> float | None:
     """``Retry-After`` as seconds from now: a number, or an HTTP date."""
     if not retry_after:
         return None

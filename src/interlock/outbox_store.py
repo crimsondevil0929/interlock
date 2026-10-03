@@ -25,7 +25,7 @@ from collections.abc import Callable, Sequence
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
-from interlock.exceptions import SubstrateUnavailableError
+from interlock.exceptions import SubstrateConfigurationError, SubstrateUnavailableError
 
 if TYPE_CHECKING:
     import psycopg
@@ -117,13 +117,22 @@ class PostgresOutboxStore:
                 self._conn.close()
             except psycopg.Error:
                 pass
+        from interlock.postgres import installed_v3
+
         try:
             conn = psycopg.connect(self._dsn, autocommit=True, application_name="interlock-relay")
             conn.execute("SET statement_timeout = '30s'")
             conn.execute("SET lock_timeout = '10s'")
             conn.execute("SET idle_in_transaction_session_timeout = '60s'")
+            current = installed_v3(conn)
         except psycopg.Error as exc:
             raise SubstrateUnavailableError(f"the relay cannot reach its database: {exc}") from exc
+        if not current:
+            conn.close()
+            raise SubstrateConfigurationError(
+                "the outbox in the relay's database was installed by an older version: run "
+                "`interlock install` to upgrade it (stop every relay first)"
+            )
         self._conn = conn
         return conn
 
@@ -189,7 +198,7 @@ class PostgresOutboxStore:
                 conn = self.connection()
                 with conn.transaction():
                     row = conn.execute(
-                        "SELECT interlock.relay_outcome(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        "SELECT interlock.relay_outcome(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (
                             lease.message_id,
                             relay_id,
@@ -200,6 +209,7 @@ class PostgresOutboxStore:
                             result.response_digest,
                             result.detail or None,
                             milliseconds(delay),
+                            result.remote_ref,
                         ),
                     ).fetchone()
                     self.checkpoint("outcome-uncommitted", lease)
