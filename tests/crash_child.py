@@ -49,6 +49,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
@@ -80,6 +81,7 @@ from interlock.types import (
     PlanId,
     StageHandle,
 )
+from interlock.windows import RateWindow, Requests, RowSum
 from tests.conftest import OBSERVED
 from tests.schemas import TEST_SINKS, specs
 
@@ -185,6 +187,15 @@ def checkers() -> list[Any]:
         TenantIsolation(1),
         BlastRadius(10),
         TenantDrawdownGuard("accounts", "balance", max_drop_fraction=0.3),
+    ]
+
+
+def windows() -> list[RateWindow]:
+    """Two windows every refund adds to, too wide ever to fill: what a plan
+    adds is in their history exactly when its stage committed."""
+    return [
+        RateWindow("refunds_per_agent", timedelta(days=1), 1_000_000, RowSum("refunds", "amount")),
+        RateWindow("mail_per_tenant", timedelta(days=1), 1_000_000, Requests("mail"), "tenant"),
     ]
 
 
@@ -394,6 +405,7 @@ def build(scenario: Mapping[str, Any], kill: Kill) -> EscrowEngine:
         settle_cost=str(scenario.get("settle", "0.25")),
         receipts=ReceiptIssuer(log, row_secret=bytes.fromhex(str(scenario["row_secret"]))),
         sinks=SinkRegistry(TEST_SINKS),
+        windows=windows(),
     )
 
 

@@ -17,8 +17,7 @@ which the untrusted agent sets. Each says so in its own docstring.
 
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Final, Protocol, runtime_checkable
 
@@ -32,6 +31,10 @@ from interlock.types import (
     RowDelta,
     Severity,
 )
+from interlock.types import exact_number as _number
+from interlock.types import field_path as _path
+from interlock.types import value_at as _at
+from interlock.windows import RateWindowCheck
 
 __all__ = [
     "BUILT_IN_CHECKERS",
@@ -528,9 +531,6 @@ class NoSchemaChange:
 
 
 _MEASURES: Final = ("inserted", "net", "value")
-_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
-"""A decimal numeral as money travels in a payload: ``"50.00"``, ``"-3"``. No
-exponent, no leading zeros, so ``"007"`` stays an identifier."""
 
 
 class CrossEffectAgreement:
@@ -810,34 +810,6 @@ class CrossEffectAgreement:
         )
 
 
-def _path(field: str) -> tuple[str, ...]:
-    return tuple(part for part in field.removeprefix("$.").split(".") if part)
-
-
-def _at(payload: object, path: tuple[str, ...]) -> tuple[bool, object]:
-    """The value at ``path`` in a payload, and whether there is one."""
-    current = payload
-    for part in path:
-        if isinstance(current, Mapping) and part in current:
-            current = current[part]
-        elif isinstance(current, tuple | list) and part.isdigit() and int(part) < len(current):
-            current = current[int(part)]
-        else:
-            return False, None
-    return True, current
-
-
-def _number(value: object) -> Decimal | None:
-    """A number, exactly: an integer, a ``Decimal``, or a decimal numeral."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int | Decimal):
-        return Decimal(value)
-    if isinstance(value, str) and _NUMERAL.fullmatch(value):
-        return Decimal(value)
-    return None
-
-
 def _scalar(value: object) -> tuple[str, str] | None:
     """A value as it compares: numbers by value, everything else as itself."""
     number = _number(value)
@@ -882,6 +854,7 @@ def _percent(fraction: Decimal) -> int:
 BUILT_IN_CHECKERS: frozenset[type] = frozenset(
     {
         CrossEffectAgreement,
+        RateWindowCheck,
         BlastRadius,
         TenantIsolation,
         TableAllowlist,

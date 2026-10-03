@@ -56,7 +56,7 @@ from interlock.sqlite_outbox import SqliteOutboxStore, install_sqlite_outbox
 from interlock.types import EffectId, outbound_key
 from tests.children import Child
 from tests.conftest import OBSERVED, build_sqlite_back_office
-from tests.crash_child import ACKNOWLEDGED, SCOPE, Refund, checkers
+from tests.crash_child import ACKNOWLEDGED, SCOPE, Refund, checkers, windows
 from tests.fakesink import DROP, OK, FakeSink, hang, status
 from tests.outbox_env import RELAY_SEED, ROUTES, relay_signer
 from tests.schemas import TEST_SINKS, specs
@@ -108,6 +108,8 @@ class Books:
     markers: frozenset[str]
     outbox: frozenset[str]
     """The plans with a request in the outbox."""
+    windowed: dict[str, Decimal]
+    """What each plan added to the refunds window, by its stage's plan."""
 
     @classmethod
     def read(cls, path: str) -> Books:
@@ -130,6 +132,19 @@ class Books:
             assert all(n == 1 for n in requests.values()), f"a request twice: {requests}"
             total = value("SELECT count(*) FROM _interlock_outbox")
             assert total == sum(requests.values()), "a request without its stage's marker"
+            windowed: dict[str, Decimal] = {}
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = '_interlock_windows'"
+            ).fetchone():
+                rows = conn.execute(
+                    "SELECT c.plan_id, w.amount, w.window_name FROM _interlock_windows w "
+                    "JOIN _interlock_commits c USING (stage_id)"
+                ).fetchall()
+                bound = value("SELECT count(*) FROM _interlock_windows")
+                assert bound == len(rows), "window history without its stage's marker"
+                windowed = {
+                    str(r[0]): Decimal(str(r[1])) for r in rows if r[2] == "refunds_per_agent"
+                }
             return cls(
                 balance=cents(value("SELECT balance FROM accounts WHERE id = 100")),
                 qty=int(value("SELECT qty FROM order_items WHERE id = 5000")),
@@ -142,6 +157,7 @@ class Books:
                     str(r[0]) for r in conn.execute("SELECT stage_id FROM _interlock_commits")
                 ),
                 outbox=frozenset(requests),
+                windowed=windowed,
             )
 
     @classmethod
@@ -156,6 +172,7 @@ class Books:
             refunds={r.refund_id: r.amount for r in done},
             markers=frozenset(markers),
             outbox=frozenset(r.plan_id for r in done),
+            windowed={r.plan_id: r.amount for r in done},
         )
 
 
@@ -241,6 +258,7 @@ class Crash:
             anchor=LedgerAnchor(governed=governor, same_transaction=False),
             settle_cost="0.25",
             sinks=SinkRegistry(TEST_SINKS),
+            windows=windows(),
         )
         return Restarted(chain, governor, engine)
 

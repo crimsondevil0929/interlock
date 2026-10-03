@@ -47,7 +47,8 @@ import json
 import logging
 import secrets
 import uuid
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
@@ -92,9 +93,11 @@ from interlock.types import (
     RowDelta,
     StageHandle,
     SubstrateCapabilities,
+    WindowMeasure,
     _frozen,
     outbound_key,
 )
+from interlock.windows import WindowCharge, window_lock
 
 if TYPE_CHECKING:
     import psycopg
@@ -133,6 +136,9 @@ _CONFLICTS: Final = frozenset({"40001", "40P01", "55P03"})
 _OUTBOUND: Final = "IL004"
 """The outbox refused a request: an unregistered or disabled sink, an operation
 it does not install, a payload over its bound or not matching its hash."""
+_WINDOWS: Final = "IL009"
+"""``interlock.window_totals`` was called inside a stage: the rate windows'
+history is never a stage's to read."""
 _UNIQUE: Final = "23505"
 _CANCELLED: Final = "57014"
 _PRIVILEGE: Final = "42501"
@@ -287,6 +293,79 @@ BEGIN
 END
 $fn$;
 
+-- Rate windows (docs/EPIC4_DESIGN.md §3). A stage locks each window key it
+-- adds to, in one order, until it ends; reads what the keys hold from outside
+-- itself; and writes what it adds with its token, beside its stages row.
+CREATE OR REPLACE FUNCTION interlock.window_lock(p_locks bigint[])
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    lock_id bigint;
+BEGIN
+    FOR lock_id IN SELECT DISTINCT l FROM pg_catalog.unnest(p_locks) AS l ORDER BY 1 LOOP
+        PERFORM pg_catalog.pg_advisory_xact_lock(lock_id);
+    END LOOP;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.window_totals(
+    p_windows text[], p_keys text[], p_spans_us bigint[]
+)
+RETURNS TABLE (out_window text, out_key text, out_total numeric)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    now_at timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    -- Outside every stage, in READ COMMITTED: a stage's snapshot would miss
+    -- what committed after it began, and an agent's statement, which runs
+    -- only inside a stage, may not read what other plans added.
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed'
+       OR coalesce(pg_catalog.current_setting('interlock.stage_id', true), '') <> ''
+       OR EXISTS (SELECT 1 FROM interlock.stages s
+                   WHERE s.xid = pg_catalog.pg_current_xact_id_if_assigned()) THEN
+        RAISE EXCEPTION 'interlock: the rate windows'' history is read outside every stage'
+            USING ERRCODE = 'IL009';
+    END IF;
+    RETURN QUERY
+        SELECT w.name, w.key,
+               coalesce((SELECT sum(l.amount) FROM interlock.window_ledger l
+                          WHERE l.window_name = w.name AND l.key = w.key
+                            AND l.at > now_at - w.span * interval '1 microsecond'), 0)
+          FROM ROWS FROM (pg_catalog.unnest(p_windows), pg_catalog.unnest(p_keys),
+                          pg_catalog.unnest(p_spans_us)) AS w(name, key, span);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.window_add(
+    p_token bytea, p_windows text[], p_keys text[], p_amounts numeric[]
+)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    stage uuid;
+    expected bytea;
+BEGIN
+    SELECT s.stage_id, s.enqueue_hash INTO stage, expected
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL OR expected IS NULL
+       OR pg_catalog.sha256(p_token) IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'interlock: this transaction''s stage did not add to a rate window'
+            USING ERRCODE = 'IL002';
+    END IF;
+    INSERT INTO interlock.window_ledger (stage_id, window_name, key, amount)
+    SELECT stage, w.name, w.key, w.amount
+      FROM ROWS FROM (pg_catalog.unnest(p_windows), pg_catalog.unnest(p_keys),
+                      pg_catalog.unnest(p_amounts)) AS w(name, key, amount);
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION interlock.resolve(p_stage uuid, p_xid xid8)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
@@ -343,6 +422,22 @@ REVOKE ALL ON interlock.installation FROM PUBLIC;
 -- Version 2: the transactional outbox (docs/OUTBOX_DESIGN.md); its own
 -- objects are in interlock.outbox_sql.
 ALTER TABLE interlock.stages ADD COLUMN IF NOT EXISTS enqueue_hash bytea;
+
+-- Version 4: what each committed plan added to each rate window
+-- (docs/EPIC4_DESIGN.md §3), written in its stage, so a row exists exactly
+-- when its stages row does. No role writes it but through
+-- interlock.window_add, and none but an auditor reads it.
+CREATE TABLE IF NOT EXISTS interlock.window_ledger (
+    stage_id uuid NOT NULL REFERENCES interlock.stages (stage_id),
+    window_name text NOT NULL,
+    key text NOT NULL,
+    amount numeric NOT NULL CHECK (amount > 0),
+    at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (stage_id, window_name, key)
+);
+CREATE INDEX IF NOT EXISTS window_ledger_by_key
+    ON interlock.window_ledger (window_name, key, at);
+REVOKE ALL ON interlock.window_ledger FROM PUBLIC;
 """
 
 _ENQUEUE_CALL: Final = (
@@ -360,6 +455,9 @@ _STAGE_FUNCTIONS: Final = (
     "interlock.resolve(uuid, xid8)",
     _ENQUEUE,
     "interlock.stage_outbox(bigint)",
+    "interlock.window_lock(bigint[])",
+    "interlock.window_totals(text[], text[], bigint[])",
+    "interlock.window_add(bytea, text[], text[], numeric[])",
 )
 
 _OUTBOX_TABLES: Final = (
@@ -511,7 +609,8 @@ def install(
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
             conn.execute(
                 "GRANT SELECT ON interlock.stages, interlock.unmediated, "
-                f"interlock.installation, {', '.join(_OUTBOX_TABLES)} TO {role}"
+                f"interlock.installation, interlock.window_ledger, "
+                f"{', '.join(_OUTBOX_TABLES)} TO {role}"
             )
         for role in relays:
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
@@ -564,8 +663,9 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
 
 def installed_version(conn: psycopg.Connection[Any]) -> int:
     """Which version installed the outbox in this database: 4 when its
-    delivery log records relays' attestations, 3 when what calls created, 2
-    when neither; 0 when there is no outbox."""
+    delivery log records relays' attestations and rate windows keep their
+    history, 3 when the log records what calls created, 2 before; 0 when
+    there is no outbox."""
     row = conn.execute(
         "SELECT pg_catalog.to_regclass('interlock.outbox_attempts') IS NOT NULL, "
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
@@ -573,11 +673,12 @@ def installed_version(conn: psycopg.Connection[Any]) -> int:
         "        AND attname = 'remote_ref' AND NOT attisdropped), "
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
         "        WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
-        "        AND attname = 'attestation' AND NOT attisdropped)"
+        "        AND attname = 'attestation' AND NOT attisdropped), "
+        "pg_catalog.to_regclass('interlock.window_ledger') IS NOT NULL"
     ).fetchone()
     if row is None or not row[0]:
         return 0
-    return 4 if row[2] else 3 if row[1] else 2
+    return 4 if row[2] and row[3] else 3 if row[1] else 2
 
 
 def _milliseconds(span: timedelta) -> int:
@@ -612,6 +713,7 @@ class PostgresSubstrate:
     __slots__ = (
         "_acknowledged",
         "_by_name",
+        "_charges",
         "_conn",
         "_dsn",
         "_enforce",
@@ -721,6 +823,7 @@ class PostgresSubstrate:
         self._token: bytes | None = None
         self._scope: str | None = None
         self._order = EnqueueOrder()
+        self._charges: tuple[WindowCharge, ...] = ()
 
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
@@ -1031,8 +1134,86 @@ class PostgresSubstrate:
             outbound=outbound,
         )
 
+    def measure_windows(
+        self, handle: StageHandle, charges: Sequence[WindowCharge]
+    ) -> tuple[WindowMeasure, ...]:
+        """What each window holds for each key the plan adds to, exactly.
+
+        First, on the stage's own connection, a transaction-scoped advisory
+        lock on every key, taken in one order (``interlock.window_lock``), so
+        no two stages wait on each other in a cycle: no stage can add to a
+        key this one holds until this one commits or rolls back. Then the
+        history, read on a second connection in ``READ COMMITTED``
+        (``interlock.window_totals``), which sees every commit, those after
+        this stage's snapshot included, and is closed once it has read. What
+        the plan adds is written with the stage's token when it commits.
+
+        :raises StageConflictError: If a key stayed locked by another stage
+            past the lock timeout.
+        """
+        import psycopg
+
+        conn = self._require(handle)
+        self._assert_live(handle)
+        # Connected before locking, so connecting is not inside the wait the
+        # lock imposes on others; closed once it has read, so the stage holds
+        # one session again by its commit.
+        with self._reader() as side:
+            try:
+                conn.execute(self._timeouts())
+                self._lock_windows(conn, charges)
+            except psycopg.Error as exc:
+                if exc.sqlstate in _CONFLICTS:
+                    raise StageConflictError(
+                        f"a rate window this plan adds to stayed locked by another stage: {exc}"
+                    ) from exc
+                raise self._setup_error(exc) from exc
+            try:
+                rows = side.execute(
+                    "SELECT out_window, out_key, out_total "
+                    "FROM interlock.window_totals(%s::text[], %s::text[], %s::bigint[])",
+                    (
+                        [c.window for c in charges],
+                        [c.key for c in charges],
+                        [c.span // timedelta(microseconds=1) for c in charges],
+                    ),
+                ).fetchall()
+            except psycopg.Error as exc:
+                raise self._setup_error(exc) from exc
+        held = {(str(w), str(k)): Decimal(str(total)) for w, k, total in rows}
+        self._charges = tuple(charges)
+        return tuple(
+            WindowMeasure(c.window, c.key, held.get((c.window, c.key), Decimal(0)), c.amount)
+            for c in charges
+        )
+
+    def _lock_windows(self, conn: psycopg.Connection[Any], charges: Sequence[WindowCharge]) -> None:
+        """Lock every key the plan adds to until the stage ends, in one order."""
+        locks = sorted({window_lock(c.window, c.key) for c in charges})
+        conn.execute("SELECT interlock.window_lock(%s::bigint[])", (locks,))
+
+    @contextmanager
+    def _reader(self) -> Iterator[psycopg.Connection[Any]]:
+        """A second connection, outside the stage, for one read: ``READ
+        COMMITTED``, so each statement sees every commit before it."""
+        import psycopg
+
+        side = self._connect()
+        try:
+            try:
+                side.execute(
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                )
+                side.execute(f"SET statement_timeout = {max(1, int(self._stage_seconds * 1000))}")
+            except psycopg.Error as exc:
+                raise SubstrateUnavailableError(f"cannot read the rate windows: {exc}") from exc
+            yield side
+        finally:
+            side.close()
+
     def commit(self, handle: StageHandle) -> CommitReceipt:
-        """Make the staged work durable, with its ``interlock.stages`` row.
+        """Make the staged work durable, with its ``interlock.stages`` row,
+        and what the plan adds to each rate window it was measured against.
 
         :raises StageError: If the transaction had already failed, or the
             server refused the commit. PostgreSQL answers ``COMMIT`` on a
@@ -1054,6 +1235,21 @@ class PostgresSubstrate:
                 f"stage {handle.stage_id} cannot commit: its transaction is "
                 f"{conn.info.transaction_status.name}"
             )
+        if self._charges:
+            try:
+                conn.execute(
+                    "SELECT interlock.window_add(%s, %s::text[], %s::text[], %s::numeric[])",
+                    (
+                        self._token,
+                        [c.window for c in self._charges],
+                        [c.key for c in self._charges],
+                        [c.amount for c in self._charges],
+                    ),
+                )
+            except psycopg.Error as exc:
+                raise StageError(
+                    f"could not record what the plan adds to its windows: {exc}"
+                ) from exc
         try:
             cursor = conn.execute("COMMIT")
         except psycopg.Error as exc:
@@ -1461,6 +1657,12 @@ class PostgresSubstrate:
         if sqlstate == _TAMPERED:
             return ForbiddenStatementError(
                 f"{who} refused: {exc}. The stage marker is set by the substrate alone",
+                reason="protected",
+            )
+        if sqlstate == _WINDOWS:
+            return ForbiddenStatementError(
+                f"{who} refused: {exc}. What other plans added to a rate window is not "
+                f"a stage's to read",
                 reason="protected",
             )
         if sqlstate == _PRIVILEGE:

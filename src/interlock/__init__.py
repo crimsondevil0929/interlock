@@ -142,6 +142,15 @@ from interlock.types import (
     Severity,
     StageState,
     Verdict,
+    WindowMeasure,
+)
+from interlock.windows import (
+    Plans,
+    RateWindow,
+    RateWindowCheck,
+    Requests,
+    RequestSum,
+    RowSum,
 )
 
 __version__ = "0.3.0"
@@ -199,8 +208,11 @@ __all__ = [
     "PlanBuilder",
     "PlanError",
     "PlanId",
+    "Plans",
     "PostgresSubstrate",
     "Progress",
+    "RateWindow",
+    "RateWindowCheck",
     "ReceiptIssuer",
     "RecordIntegrityError",
     "RecordKind",
@@ -216,7 +228,10 @@ __all__ = [
     "RelayReport",
     "Repair",
     "RepairFeedback",
+    "RequestSum",
+    "Requests",
     "RowDelta",
+    "RowSum",
     "Rung",
     "ScopeHaltedError",
     "Severity",
@@ -245,6 +260,7 @@ __all__ = [
     "TruncationGuard",
     "UncompensatableEffectError",
     "Verdict",
+    "WindowMeasure",
     "__version__",
     "check_anchors",
     "default_checkers",

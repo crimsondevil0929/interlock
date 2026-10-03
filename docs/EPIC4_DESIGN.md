@@ -222,3 +222,56 @@ Where the implementation settled what the design left open, or refined it.
 - Upgrades from versions 2 and 3 are tested against each version's frozen code:
   PostgreSQL's SQL (`tests/outbox_v2.py`, `tests/outbox_v3.py`) and SQLite's module
   (`tests/sqlite_outbox_v3.py`).
+
+### Step 4: rate windows
+
+- **The API.** `RateWindow(name, span, limit, measure, per)`, with the measures
+  `Requests(sink, operation=None)`, `RequestSum(sink, operation, field)`,
+  `RowSum(table, column, rows="inserted"|"net")` (`rows`, so as not to read as the
+  window's own `measure`) and `Plans()`. A limit is an integer, a `Decimal` or a decimal
+  string, never a float. A name is a lowercase identifier: it is what the refused agent is
+  told. `EscrowEngine(windows=...)` adds one built-in `RateWindowCheck` per window, refuses
+  two windows of one name, and refuses windows on a substrate that keeps no history. The
+  configuration file takes them as `[[windows]]`, checked against its `[[sinks]]` and
+  `[[tables]]`.
+- **What a plan adds is positive, or refuses it.** Per key, only what is above zero is
+  added. A request with no number at the field, or a negative one; a row with no number in
+  the column; an inserted row with a negative one: each refuses the plan rather than be
+  guessed at. Net is taken per window key, so moving money between rows of one key adds
+  nothing; a net decrease adds nothing and takes nothing back. SQLite hands a `NUMERIC`
+  column back as a float, read at the precision SQLite printed it with.
+- **A request's tenant is the plan's to declare,** so a per-tenant window alone can be
+  spread across invented tenants. Beside a per-scope or global window it buys nothing: the
+  tests show the spread refused by the second.
+- **A plan that adds to no window locks nothing and reads nothing.** The repair search
+  measures each candidate as `execute` would, so a proposal fits the window.
+- **The diff carries the measures** (`EffectDiff.windows`, each a `WindowMeasure`: window,
+  key, history, amount), hashed only when present, so every diff measured before windows
+  keeps its hash. The check fails closed on a diff with no measure for a key the plan adds
+  to, or with another amount than the plan adds.
+- **PostgreSQL**, in schema version 4 (folded in rather than a version 5: neither is
+  released): `interlock.window_ledger` (a foreign key to `interlock.stages`, amounts above
+  zero); `window_lock(bigint[])`, taking each distinct lock in ascending order;
+  `window_totals(...)`, which refuses a stage's transaction and anything but `READ
+  COMMITTED` (`IL009`, a protected statement to the agent); `window_add(token, ...)`, gated
+  by the stage's token as `enqueue` is. A key's lock is 64 bits of SHA-256 over the window
+  and the key. The second connection is opened before the locks are taken, so connecting
+  is not part of anyone's wait, and closed once it has read, so by its commit a stage holds
+  one session again (the crash tests' lost-COMMIT cases count on that). A lock wait obeys
+  the stage's lock timeout: contention past it is a `StageConflictError`, which the agent
+  is told may succeed if resubmitted. Auditors read the ledger; stage and relay roles
+  cannot.
+- **SQLite**: `_interlock_windows`, created with the commit-marker table, its rows bound
+  to the marker by a deferred foreign key; read inside the stage, written by `commit()`
+  just before the marker. The authorizer refuses a plan's statements any read or write of
+  it, with `enforce_table_access=False` too: the one table a plan may not read.
+- **The agent is told** `rate_window`, the window's name (only from the built-in check,
+  only as an identifier), and a tenant only if the plan declared it; never what the window
+  holds or its limit.
+- **Proofs.** Eight plans racing into a window of four commit exactly four, on both
+  stores; on PostgreSQL, with the lock removed, more than four commit. Both crash harnesses
+  run every plan through two windows and check, at every kill point, that window history
+  exists for exactly the plans that committed, and is bound to their markers.
+- **Left open:** history is never pruned. Rows older than the longest span are read by no
+  check, but they are a record of what each plan added; removing them is the operator's
+  call.
