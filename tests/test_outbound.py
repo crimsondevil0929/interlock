@@ -133,9 +133,18 @@ def test_a_payload_is_a_json_object() -> None:
 
 
 @pytest.mark.parametrize(
-    "not_after", [timedelta(0), timedelta(seconds=-1), MAX_NOT_AFTER + timedelta(seconds=1)]
+    "not_after",
+    [
+        timedelta(0),
+        timedelta(seconds=-1),
+        MAX_NOT_AFTER + timedelta(seconds=1),
+        # The outbox and the plan's hash keep whole seconds: a fraction would
+        # be cut off, and below a second the request could never be sent.
+        timedelta(milliseconds=600),
+        timedelta(seconds=90.5),
+    ],
 )
-def test_not_after_is_positive_and_bounded(not_after: timedelta) -> None:
+def test_not_after_is_whole_seconds_positive_and_bounded(not_after: timedelta) -> None:
     with pytest.raises(PlanError, match="not_after"):
         OutboundRequest("mail", "send", MAIL, not_after=not_after)
     assert OutboundRequest("mail", "send", MAIL, not_after=MAX_NOT_AFTER).not_after == MAX_NOT_AFTER
@@ -488,6 +497,10 @@ def test_the_compensation_rule() -> None:
         (lambda: SinkSpec("mail", (OperationSpec("send"),), idempotency="maybe"), "idempotency"),
         (lambda: SinkSpec("mail", (OperationSpec("send"),), max_payload_bytes=0), "positive"),
         (lambda: SinkSpec("mail", (OperationSpec("send"),), not_after=timedelta(0)), "not_after"),
+        (
+            lambda: SinkSpec("mail", (OperationSpec("send"),), not_after=timedelta(seconds=1.5)),
+            "whole number of seconds",
+        ),
         (lambda: OperationSpec("Send"), "identifier"),
         (lambda: OperationSpec("send", compensation="Un Send"), "compensation"),
         (lambda: OperationSpec("send", schema={"$ref": "#/x"}), r"\$ref"),
@@ -706,7 +719,7 @@ def test_sinks_are_read_from_the_config_file(tmp_path: Path) -> None:
         ),
         (lambda t: t.replace("max_payload_bytes = 4096", 'max_payload_bytes = "4k"'), "integer"),
         (lambda t: t.replace("mail-send.json", "missing.json"), "cannot read schema"),
-        (lambda t: t.replace('substrate = "postgres"', 'substrate = "sqlite"'), "postgres"),
+        (lambda t: t.replace('substrate = "postgres"', 'substrate = "sqlite"'), "PostgreSQL roles"),
         (lambda t: t.replace('name = "payments"', 'name = "mail"'), "twice"),
         (lambda t: t.replace('compensation = "refund.reverse"', 'compensation = "undo"'), "undo"),
         (lambda t: t + '\n[[sinks]]\nname = "empty"\n', r"sinks\[2\].*operations"),

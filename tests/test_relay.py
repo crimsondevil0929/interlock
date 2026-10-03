@@ -27,6 +27,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,10 +37,6 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from interlock.deliveries import (  # noqa: E402
-    cancel,
-    release,
-    release_scope,
-    requeue,
     verify_delivery_log,
 )
 from interlock.outbox_store import PostgresOutboxStore  # noqa: E402
@@ -50,21 +47,28 @@ from interlock.relay import (  # noqa: E402
     retry_delay,
 )
 from interlock.types import outbound_key  # noqa: E402
-from tests.conftest import Pg  # noqa: E402
 from tests.fakesink import DROP, hang, status  # noqa: E402
 from tests.outbox_env import (  # noqa: E402
+    BACKENDS,
+    RELAY_SINKS,
     SCOPE,
     Outbox,
-    build_outbox,
+    PostgresOutbox,
+    build_either,
     mail,
     page,
     sms,
 )
 
 
-@pytest.fixture
-def outbox(pg: Pg, tmp_path: Path) -> Iterator[Outbox]:
-    yield from build_outbox(pg, tmp_path)
+@pytest.fixture(params=BACKENDS)
+def outbox(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Outbox]:
+    """The outbox on each store: every test that takes it runs on both."""
+    yield from build_either(request, tmp_path)
+
+
+POSTGRES_ONLY = pytest.mark.parametrize("outbox", ["postgres"], indirect=True)
+"""For what only PostgreSQL has: roles, SKIP LOCKED, its triggers, its sessions."""
 
 
 # --------------------------------------------------------------------------
@@ -104,7 +108,8 @@ class Paused:
         self.gate = threading.Event()
 
 
-def test_nothing_is_sent_before_its_stage_commits(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_nothing_is_sent_before_its_stage_commits(outbox: PostgresOutbox) -> None:
     """OB-7: the relay reads committed rows only. A stage that has written its
     request and not committed has, to the relay, written nothing."""
     from interlock import PostgresSubstrate
@@ -188,8 +193,9 @@ def test_relays_racing_never_share_a_message(outbox: Outbox, sink: str) -> None:
 
 
 def _all_messages(outbox: Outbox) -> list[uuid.UUID]:
-    with outbox.admin() as conn:
-        return [r[0] for r in conn.execute("SELECT message_id FROM interlock.outbox")]
+    from interlock.deliveries import messages
+
+    return [m.message_id for m in messages(outbox.operator(), limit=100_000)]
 
 
 # --------------------------------------------------------------------------
@@ -373,9 +379,8 @@ def test_a_tripped_breaker_holds_instead_of_sending(outbox: Outbox) -> None:
     assert "at agentgov entry" in held.detail
     # The operator resets the breaker and releases what it held.
     outbox.governor.reset(SCOPE)
-    with outbox.admin() as conn:
-        assert release(conn, message, actor="ops") is True
-        assert release(conn, message, actor="ops") is False, "released once"
+    assert outbox.release(message, actor="ops") is True
+    assert outbox.release(message, actor="ops") is False, "released once"
     with outbox.relay() as relay:
         outbox.drain(relay)
     assert outbox.state(message) == "delivered"
@@ -507,11 +512,7 @@ def test_requests_are_delivered_in_plan_order(outbox: Outbox) -> None:
         outbox.drain(relay)
     assert [c.key for c in sink.calls] == [keys[0], keys[0], keys[1]]
     assert outbox.state(first) == outbox.state(second) == "delivered"
-    with outbox.admin() as conn:
-        depends = conn.execute(
-            "SELECT depends_on FROM interlock.outbox WHERE message_id = %s", (second,)
-        ).fetchone()
-    assert depends == (["r0"],)
+    assert outbox.depends(second) == ["r0"]
 
 
 def test_a_dependency_that_dies_takes_its_dependants_with_it(outbox: Outbox) -> None:
@@ -536,13 +537,7 @@ def test_a_tampered_payload_is_refused(outbox: Outbox) -> None:
     even for its owner; one who lifts the trigger to rewrite a payload gets a
     refusal, not a delivery."""
     _, (message,) = outbox.commit(mail(1))
-    with outbox.admin() as conn:
-        conn.execute("ALTER TABLE interlock.outbox DISABLE TRIGGER outbox_append_only")
-        conn.execute(
-            "UPDATE interlock.outbox SET payload = %s::jsonb WHERE message_id = %s",
-            ('{"subject": "s", "to": "attacker@evil.test"}', message),
-        )
-        conn.execute("ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only")
+    outbox.tamper_payload(message, '{"subject": "s", "to": "attacker@evil.test"}')
     with outbox.relay() as relay:
         assert relay.run_once().refused == 1
     assert outbox.sink("mail").calls == []
@@ -624,9 +619,8 @@ def test_cancelling_a_held_request_cancels_what_waits_for_it(outbox: Outbox) -> 
         assert relay.run_once(limit=10).held == 1
         assert relay.run_once(limit=10).claimed == 0, "the second waits for the held first"
     assert (outbox.state(first), outbox.state(second)) == ("held", "pending")
-    with outbox.admin() as conn:
-        assert cancel(conn, first, actor="ops", reason="customer withdrew") is True
-        assert cancel(conn, first, actor="ops", reason="again") is False
+    assert outbox.cancel(first, actor="ops", reason="customer withdrew") is True
+    assert outbox.cancel(first, actor="ops", reason="again") is False
     assert (outbox.state(first), outbox.state(second)) == ("cancelled", "dead")
     assert outbox.events(first) == [("held", None), ("cancelled", None)]
     assert outbox.row(first)["reason"] == "customer withdrew"
@@ -639,9 +633,8 @@ def test_requeueing_a_dead_request_brings_back_what_died_waiting(outbox: Outbox)
     with outbox.relay() as relay:
         outbox.drain(relay)
     assert (outbox.state(first), outbox.state(second)) == ("dead", "dead")
-    with outbox.admin() as conn:
-        assert requeue(conn, first, actor="ops") == 2
-        assert requeue(conn, first, actor="ops") == 0, "no longer dead"
+    assert outbox.requeue(first, actor="ops") == 2
+    assert outbox.requeue(first, actor="ops") == 0, "no longer dead"
     with outbox.relay() as relay:
         outbox.drain(relay)
     assert (outbox.state(first), outbox.state(second)) == ("delivered", "delivered")
@@ -662,8 +655,7 @@ def test_release_by_scope(outbox: Outbox) -> None:
     with outbox.relay() as relay:
         outbox.drain(relay)
     outbox.governor.reset(SCOPE)
-    with outbox.admin() as conn:
-        assert release_scope(conn, SCOPE, actor="ops") == 2
+    assert outbox.release_scope(SCOPE, actor="ops") == 2
     with outbox.relay() as relay:
         outbox.drain(relay)
     assert [outbox.state(m) for m in messages] == ["delivered", "delivered"]
@@ -674,7 +666,8 @@ def test_release_by_scope(outbox: Outbox) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_rewritten_delivery_log_does_not_verify(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_a_rewritten_delivery_log_does_not_verify(outbox: PostgresOutbox) -> None:
     """The log is append-only, even for its owner. One who lifts the trigger
     to rewrite a row, or to remove the last, is caught by recomputation."""
     _, (message,) = outbox.commit(mail(1))
@@ -709,7 +702,8 @@ def test_a_rewritten_delivery_log_does_not_verify(outbox: Outbox) -> None:
     assert any("records no delivery" in p for p in problems), problems
 
 
-def test_the_log_is_linked_by_the_database_not_the_writer(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_the_log_is_linked_by_the_database_not_the_writer(outbox: PostgresOutbox) -> None:
     """Even the owner, inserting a row by hand with a forged link, gets a row
     the trigger linked properly: the chain cannot be forked or skipped."""
     _, (message,) = outbox.commit(mail(1))
@@ -744,7 +738,8 @@ def test_the_log_is_linked_by_the_database_not_the_writer(outbox: Outbox) -> Non
         "UPDATE interlock.sinks SET enabled = true",
     ],
 )
-def test_the_relay_role_can_only_relay(outbox: Outbox, statement: str) -> None:
+@POSTGRES_ONLY
+def test_the_relay_role_can_only_relay(outbox: PostgresOutbox, statement: str) -> None:
     outbox.commit(mail(1))
     with (
         psycopg.connect(outbox.relay_dsn) as conn,
@@ -753,7 +748,8 @@ def test_the_relay_role_can_only_relay(outbox: Outbox, statement: str) -> None:
         conn.execute(statement)
 
 
-def test_the_stage_role_cannot_relay(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_the_stage_role_cannot_relay(outbox: PostgresOutbox) -> None:
     with (
         psycopg.connect(outbox.pg.agent) as conn,
         pytest.raises(psycopg.errors.InsufficientPrivilege),
@@ -881,7 +877,7 @@ def test_a_relay_refuses_a_lease_shorter_than_two_timeouts(outbox: Outbox) -> No
     with pytest.raises(ValueError, match="twice"):
         outbox.relay(lease=timedelta(seconds=3), timeout=timedelta(seconds=2))
     with pytest.raises(ValueError, match="adapter"):
-        Relay(outbox.relay_dsn, adapters={}, breaker=NoBreaker())
+        Relay(outbox.store(), adapters={}, breaker=NoBreaker())
 
 
 # --------------------------------------------------------------------------
@@ -889,7 +885,8 @@ def test_a_relay_refuses_a_lease_shorter_than_two_timeouts(outbox: Outbox) -> No
 # --------------------------------------------------------------------------
 
 
-def test_a_running_relay_survives_losing_its_database(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_a_running_relay_survives_losing_its_database(outbox: PostgresOutbox) -> None:
     """``run`` delivers until stopped. A connection the server ends is a
     pause, not a death: the relay reconnects and carries on."""
     relay = outbox.relay(relay_id="long-lived")
@@ -967,7 +964,7 @@ routes = {{ send = "POST /sms/send" }}
 """
 
 
-def write_config(outbox: Outbox, tmp_path: Path) -> Path:
+def write_config(outbox: PostgresOutbox, tmp_path: Path) -> Path:
     import json
 
     from tests.schemas import MAIL_SEND_SCHEMA
@@ -996,8 +993,9 @@ def cli(*argv: str) -> tuple[int, str]:
     return code, out.getvalue()
 
 
+@POSTGRES_ONLY
 def test_interlock_relay_delivers_with_credentials_from_its_environment(
-    outbox: Outbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    outbox: PostgresOutbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = write_config(outbox, tmp_path)
     _, (message,) = outbox.commit(mail(1))
@@ -1014,8 +1012,9 @@ def test_interlock_relay_delivers_with_credentials_from_its_environment(
     assert [e.actor for e in outbox.log(message)] == ["cli:0", "cli:0"]
 
 
+@POSTGRES_ONLY
 def test_interlock_outbox_inspects_verifies_and_acts(
-    outbox: Outbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    outbox: PostgresOutbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("INTERLOCK_TEST_MAIL_AUTH", "Bearer x")
     path = str(write_config(outbox, tmp_path))
@@ -1056,7 +1055,8 @@ def test_interlock_outbox_inspects_verifies_and_acts(
     assert code == 1 and str(held) in out
 
 
-def test_a_claim_never_waits_on_another(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_a_claim_never_waits_on_another(outbox: PostgresOutbox) -> None:
     """``FOR UPDATE SKIP LOCKED``: a relay whose claim is still open holds its
     messages' rows, and another relay's claim skips them instead of waiting,
     taking what is free."""
@@ -1124,7 +1124,8 @@ def test_a_late_delivery_is_the_truth_even_after_a_dead_letter(outbox: Outbox) -
 # --------------------------------------------------------------------------
 
 
-def test_an_outcome_is_recorded_through_a_lost_connection(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_an_outcome_is_recorded_through_a_lost_connection(outbox: PostgresOutbox) -> None:
     """The call was made, and the relay's connection is ended before it can
     record what came back. It reconnects and records it, still holding the
     lease: no lost call, no second call."""
@@ -1180,7 +1181,7 @@ def test_a_lease_about_to_run_out_is_not_used_for_a_call(outbox: Outbox) -> None
 
     _, (message,) = outbox.commit(mail(1))
     late = Late(
-        outbox.relay_dsn,
+        outbox.store(),
         adapters=outbox.adapters(),
         breaker=outbox.breaker(),
         lease=timedelta(seconds=1),
@@ -1205,7 +1206,7 @@ class Raising:
 def test_an_adapter_that_raises_is_an_unknown_outcome(outbox: Outbox) -> None:
     """Whatever an adapter raises, the call may have been made."""
     _, (message,) = outbox.commit(page(1))
-    relay = Relay(outbox.relay_dsn, adapters={"pager": Raising()}, breaker=outbox.breaker())
+    relay = Relay(outbox.store(), adapters={"pager": Raising()}, breaker=outbox.breaker())
     try:
         relay.run_once()
     finally:
@@ -1215,7 +1216,8 @@ def test_an_adapter_that_raises_is_an_unknown_outcome(outbox: Outbox) -> None:
     assert outbox.state(message) == "dead", "the pager does not redeliver an unknown outcome"
 
 
-def test_the_breaker_reads_a_ledger_shared_through_postgresql(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_the_breaker_reads_a_ledger_shared_through_postgresql(outbox: PostgresOutbox) -> None:
     from agentgov import BudgetManager
 
     from interlock.relay import LedgerBreaker
@@ -1272,7 +1274,8 @@ def test_retry_after_as_an_http_date() -> None:
     assert _seconds(past) == 0
 
 
-def test_what_a_relay_refuses_to_be(outbox: Outbox) -> None:
+@POSTGRES_ONLY
+def test_what_a_relay_refuses_to_be(outbox: PostgresOutbox) -> None:
     from interlock.exceptions import SubstrateUnavailableError
     from interlock.relay import DeliveryResult
 
@@ -1288,8 +1291,9 @@ def test_what_a_relay_refuses_to_be(outbox: Outbox) -> None:
         DeliveryResult("maybe")
 
 
+@POSTGRES_ONLY
 def test_a_relay_process_stops_cleanly_on_sigterm(
-    outbox: Outbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    outbox: PostgresOutbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``interlock relay`` as an operator runs it: until told to stop. On
     SIGTERM it finishes the call in hand, records it, reports, and exits 0."""
@@ -1344,6 +1348,85 @@ def test_an_expired_lease_records_no_call(outbox: Outbox) -> None:
     slow.close()
     assert outbox.events(message) == []
     assert outbox.row(message)["attempts"] == 0
+
+
+def test_a_deadline_that_passes_after_the_claim_sends_nothing(outbox: Outbox) -> None:
+    """The deadline is checked again when the call is recorded: a message
+    whose deadline passed while it sat leased expires, unsent."""
+    _, (message,) = outbox.commit(mail(1), not_after=timedelta(seconds=1))
+    relay = outbox.relay(breaker=NoBreaker())
+    (lease,) = relay._claim(1)
+    time.sleep(1.1)
+    assert relay._sending(lease, "breaker clear at test") is None
+    relay.close()
+    assert outbox.state(message) == "dead"
+    assert outbox.events(message) == [("expired", None)]
+    assert outbox.sink("mail").calls == []
+    outbox.verify()
+
+
+def test_a_sink_disabled_after_the_claim_holds_its_message(outbox: Outbox) -> None:
+    """Installing without a sink disables it at once, even for a message a
+    relay has already leased: the call is not made, and the message waits for
+    an operator."""
+    _, (message,) = outbox.commit(mail(1))
+    relay = outbox.relay(breaker=NoBreaker())
+    (lease,) = relay._claim(1)
+    outbox.reinstall(tuple(s for s in RELAY_SINKS if s.name != "mail"))
+    assert relay._sending(lease, "breaker clear at test") is None
+    assert outbox.state(message) == "held"
+    assert outbox.events(message) == [("held", None)]
+    assert outbox.row(message)["reason"] == "sink disabled"
+    outbox.reinstall(RELAY_SINKS)
+    assert outbox.release(message, actor="ops")
+    outbox.drain(relay)
+    relay.close()
+    assert outbox.state(message) == "delivered"
+    outbox.verify()
+
+
+def test_a_call_cut_off_on_its_last_attempt_is_dead(outbox: Outbox) -> None:
+    """A relay that died with its call recorded has spent that attempt: when
+    it was the last one, the relay that takes the message over records the
+    call lost and the message dead, and makes no call."""
+    outbox.reinstall(
+        tuple(replace(s, max_attempts=1) if s.name == "mail" else s for s in RELAY_SINKS)
+    )
+    _, (message,) = outbox.commit(mail(1))
+    stalled = outbox.relay(
+        relay_id="stalled",
+        breaker=NoBreaker(),
+        lease=timedelta(seconds=1),
+        timeout=timedelta(seconds=0.4),
+    )
+    (lease,) = stalled._claim(1)
+    assert stalled._sending(lease, "breaker clear at test") == 1
+    stalled.close()  # dead here: the call recorded, never made
+    time.sleep(1.1)
+    with outbox.relay(relay_id="survivor", breaker=NoBreaker()) as survivor:
+        assert survivor.run_once().claimed == 0
+    assert outbox.state(message) == "dead"
+    assert outbox.events(message) == [("sending", 1), ("lost", 1)]
+    assert outbox.row(message)["reason"] == "attempts exhausted"
+    assert outbox.sink("mail").calls == []
+    outbox.verify()
+
+
+def test_a_lease_taken_over_can_neither_hold_nor_defer_nor_refuse(outbox: Outbox) -> None:
+    _, (message,) = outbox.commit(mail(1))
+    slow = outbox.relay(relay_id="slow", lease=timedelta(seconds=1), timeout=timedelta(seconds=0.4))
+    (lease,) = slow._claim(1)
+    time.sleep(1.1)
+    with outbox.relay(relay_id="fast", breaker=NoBreaker()) as fast:
+        (taken,) = fast._claim(1)
+        assert slow._hold(lease, "tripped, says the slow relay") == "skipped"
+        assert slow._defer(lease, "later, says the slow relay", timedelta(0)) == "skipped"
+        assert slow._refuse(lease, "tampered, says the slow relay") == "skipped"
+        assert outbox.state(message) == "leased"
+        assert fast._deliver(taken) == "delivered"
+    slow.close()
+    assert outbox.events(message) == [("sending", 1), ("delivered", 1)]
+    outbox.verify()
 
 
 # --------------------------------------------------------------------------
@@ -1436,10 +1519,14 @@ def test_the_relay_command_names_what_is_missing(
     assert message in capsys.readouterr().err
 
 
-def test_the_outbox_command_needs_postgresql(
+def test_the_outbox_command_on_a_missing_sqlite_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = tmp_path / "interlock.toml"
-    path.write_text(NO_RELAY.replace('substrate = "postgres"', 'substrate = "sqlite"'))
+    path.write_text(
+        NO_RELAY.replace('substrate = "postgres"', 'substrate = "sqlite"').replace(
+            "postgresql://agent@127.0.0.1:1/none", str(tmp_path / "missing.sqlite")
+        )
+    )
     code, _ = cli("outbox", "status", "--config", str(path))
-    assert code == 3 and "PostgreSQL" in capsys.readouterr().err
+    assert code == 4 and "cannot open the outbox" in capsys.readouterr().err

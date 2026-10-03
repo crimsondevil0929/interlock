@@ -39,6 +39,7 @@ from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord
 from interlock.engine import EscrowEngine, StageResult
 from interlock.invariants import InvariantChecker, default_checkers
+from interlock.outbound import SinkRegistry
 from interlock.receipts import ReceiptIssuer
 from interlock.repair import Repair
 from interlock.substrate import SqliteSubstrate, TableSpec
@@ -78,6 +79,9 @@ class EscrowRuntime:
         write, unmeasured. See :class:`SqliteSubstrate`.
     :param receipts: Issue a signed ARC1 receipt for every adjudicated plan,
         committed or refused. See :mod:`interlock.receipts`.
+    :param sinks: The sinks outbound requests may name. The file needs the
+        outbox, which ``interlock install`` puts in it (or
+        :func:`interlock.sqlite_outbox.install_sqlite_outbox`).
 
     Construction runs the cascade check against the database (see
     :attr:`cascade_report`), so the database must exist: an operation whose
@@ -111,6 +115,7 @@ class EscrowRuntime:
         enforce_table_access: bool = True,
         acknowledge_cascades: Sequence[str] = (),
         receipts: ReceiptIssuer | None = None,
+        sinks: SinkRegistry | None = None,
     ) -> None:
         self._scope_id = scope_id
         self._settle_cost = Decimal(str(settle_cost))
@@ -143,6 +148,7 @@ class EscrowRuntime:
                     anchor=self._anchor,
                     settle_cost=self._settle_cost,
                     receipts=receipts,
+                    sinks=sinks,
                 )
                 self._recovered = self._engine.recover() if chain_path is not None else ()
             except BaseException:

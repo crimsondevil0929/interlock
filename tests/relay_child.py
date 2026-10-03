@@ -18,9 +18,14 @@ The points are :meth:`interlock.relay.Relay._reached`'s:
 ``recorded``                the outcome committed
 ==========================  ==============================================
 
+The scenario names its store: ``postgres`` (``dsn`` a relay role's connection
+string) or ``sqlite`` (``dsn`` the file).
+
 A SIGKILL runs nothing after it: no ``finally``, no ``atexit``, no
-connection close. The server finds the session gone and rolls back whatever
-transaction it had open, exactly as for a machine that lost power.
+connection close. PostgreSQL finds the session gone and rolls back whatever
+transaction it had open, exactly as for a machine that lost power. On SQLite
+the kernel releases the dead process's locks, and a transaction it had open
+never wrote its commit frame, so no reader ever sees it.
 
 Only ``started`` goes to stdout, which the parent reads; everything else to
 stderr, which is a file, so a busy relay never blocks on a full pipe.
@@ -40,6 +45,7 @@ from typing import Any, NoReturn
 
 from interlock.adapters import HttpAdapter
 from interlock.relay import Lease, LedgerBreaker, Relay
+from interlock.sqlite_outbox import SqliteOutboxStore
 from tests.outbox_env import ROUTES
 
 
@@ -77,8 +83,11 @@ def run(scenario: dict[str, Any]) -> NoReturn:
     adapters = {
         name: HttpAdapter(url, routes=ROUTES[name]) for name, url in scenario["sinks"].items()
     }
+    store = (
+        SqliteOutboxStore(scenario["dsn"]) if scenario.get("store") == "sqlite" else scenario["dsn"]
+    )
     relay = Dying(
-        scenario["dsn"],
+        store,
         adapters=adapters,
         breaker=LedgerBreaker.open(scenario["ledger"]),
         relay_id=scenario["relay_id"],

@@ -44,6 +44,8 @@ from interlock.exceptions import (
     StageExpiredError,
     SubstrateUnavailableError,
 )
+from interlock.outbound import EnqueueOrder
+from interlock.sqlite_outbox import OUTBOX_TABLES, enqueue, outbox_installed, stage_requests
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -54,6 +56,7 @@ from interlock.types import (
     RowDelta,
     StageHandle,
     SubstrateCapabilities,
+    outbound_key,
 )
 
 __all__ = [
@@ -340,9 +343,12 @@ class SqliteSubstrate:
         "_journal_triggers",
         "_markers",
         "_max_rows",
+        "_order",
+        "_outbox",
         "_path",
         "_report",
         "_report_version",
+        "_scope",
         "_stage_seconds",
         "_tables",
         "_target",
@@ -389,6 +395,9 @@ class SqliteSubstrate:
         self._report_version: int | None = None
         self._conn: sqlite3.Connection | None = None
         self._handle: StageHandle | None = None
+        self._order = EnqueueOrder()
+        self._scope: str | None = None
+        self._outbox = False
 
     @property
     def substrate_id(self) -> str:
@@ -403,7 +412,26 @@ class SqliteSubstrate:
             requires_compensation=False,
             max_stage_seconds=self._stage_seconds,
             max_diff_rows=self._max_rows,
+            outbound=self._markers and self._has_outbox(),
         )
+
+    def _has_outbox(self) -> bool:
+        """Whether ``interlock install`` put the outbox in this file. Learned
+        once found; looked for again until then, since it may be installed
+        while this substrate lives."""
+        if self._outbox:
+            return True
+        try:
+            conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return False
+        try:
+            self._outbox = outbox_installed(conn)
+        except sqlite3.Error:
+            return False
+        finally:
+            conn.close()
+        return self._outbox
 
     @property
     def observed_tables(self) -> frozenset[str]:
@@ -500,6 +528,10 @@ class SqliteSubstrate:
             expires_at=opened + timedelta(seconds=self._stage_seconds),
         )
         try:
+            # A commit is on disk when COMMIT returns. In WAL mode, NORMAL
+            # would let a power loss take back the last commits, outbox rows
+            # included. (It reads the schema, so it waits for the lock too.)
+            conn.execute("PRAGMA synchronous=FULL")
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError as exc:
             conn.close()
@@ -523,6 +555,8 @@ class SqliteSubstrate:
         conn.set_authorizer(self._authorize)
         self._conn = conn
         self._handle = handle
+        self._order = EnqueueOrder()
+        self._scope = plan.scope_id
         return handle
 
     def reject_reason(self, effect: Effect) -> str | None:
@@ -561,12 +595,9 @@ class SqliteSubstrate:
         conn = self._require(handle)
         self._assert_live(handle)
         if effect.kind is EffectKind.ENQUEUE:
-            raise OutboundRequestError(
-                f"effect {effect.effect_id!r} is an outbound request, and the SQLite substrate "
-                f"has no transactional outbox yet",
-                reason="substrate",
-                sink=effect.request.sink if effect.request is not None else None,
-            )
+            outcome = self._enqueue(conn, handle, effect)
+            self._order.applied(effect.effect_id, effect.depends_on, request=True)
+            return outcome
         refusal = self.reject_reason(effect)
         if refusal is not None:
             raise ForbiddenStatementError(
@@ -599,10 +630,53 @@ class SqliteSubstrate:
                     f"(:name), not positional ones (?)"
                 ) from exc
             raise StageError(f"effect {effect.effect_id!r} failed: {exc}") from exc
+        self._order.applied(effect.effect_id, effect.depends_on, request=False)
         return EffectOutcome(
             effect_id=effect.effect_id,
             rows_affected=max(cursor.rowcount, 0),
             applied_at=datetime.now(UTC),
+        )
+
+    def _enqueue(
+        self, conn: sqlite3.Connection, handle: StageHandle, effect: Effect
+    ) -> EffectOutcome:
+        """Write one outbound request to the outbox, in the stage's transaction.
+
+        With the authorizer lifted, as for the commit marker: the agent's own
+        statements are refused every write to the outbox, at prepare time.
+        The row is bound to the commit marker by a deferred foreign key, so it
+        commits with the stage, or not at all.
+        """
+        sink = effect.request.sink if effect.request is not None else None
+        if not self._markers or not self._has_outbox():
+            raise OutboundRequestError(
+                f"effect {effect.effect_id!r} is an outbound request, and this SQLite "
+                f"database has no outbox"
+                + ("" if self._markers else " (commit markers are off)")
+                + ": run `interlock install` with [[sinks]] configured",
+                reason="substrate",
+                sink=sink,
+            )
+        if not self._scope:
+            raise StageError(f"effect {effect.effect_id!r} needs the scope that pays for it")
+        with self._substrate_statements():
+            try:
+                enqueue(
+                    conn,
+                    stage_id=handle.stage_id,
+                    plan_id=handle.plan_id,
+                    scope_id=self._scope,
+                    effect=effect,
+                    seq=self._order.next_seq(),
+                    waits_for=self._order.waits_for(effect.depends_on),
+                    idempotency_key=outbound_key(handle.plan_id, effect.effect_id),
+                )
+            except sqlite3.Error as exc:
+                raise StageError(
+                    f"effect {effect.effect_id!r} could not be written to the outbox: {exc}"
+                ) from exc
+        return EffectOutcome(
+            effect_id=effect.effect_id, rows_affected=1, applied_at=datetime.now(UTC)
         )
 
     def diff(self, handle: StageHandle) -> EffectDiff:
@@ -621,8 +695,11 @@ class SqliteSubstrate:
                 f"ORDER BY tbl, pk, rowid LIMIT ?",
                 (self._max_rows + 1,),
             ).fetchall()
+            requests = (
+                stage_requests(conn, handle.stage_id, self._max_rows + 1) if self._outbox else []
+            )
 
-        truncated = len(rows) > self._max_rows
+        truncated = len(rows) > self._max_rows or len(requests) > self._max_rows
         deltas: list[RowDelta] = []
         for row in rows[: self._max_rows]:
             table = str(row["tbl"])
@@ -651,6 +728,7 @@ class SqliteSubstrate:
             computed_at=datetime.now(UTC),
             deltas=tuple(deltas),
             truncated=truncated,
+            outbound=tuple(requests[: self._max_rows]),
         )
 
     def commit(self, handle: StageHandle) -> CommitReceipt:
@@ -911,6 +989,16 @@ class SqliteSubstrate:
         if key == STAGE_JOURNAL_TABLE:
             return self._deny(
                 f"statement attempts {verb} on {table!r}, which only the substrate writes",
+                "protected",
+            )
+        if key in OUTBOX_TABLES:
+            # Written by the substrate (a request, in its stage) and by relays
+            # and operators, each through Interlock's own code. A statement
+            # that wrote here would enqueue what was never adjudicated, or
+            # mark a request delivered.
+            return self._deny(
+                f"statement attempts {verb} on {table!r}, which only the substrate, the "
+                f"relay and operators write",
                 "protected",
             )
         if key == _MARKER_TABLE:

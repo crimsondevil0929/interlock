@@ -82,6 +82,9 @@ ignore = ["S101"]
 "src/interlock/postgres.py" = ["S608"]
 # The SQLite journal DDL and reads, over the same validated names and constants.
 "src/interlock/reconcile.py" = ["S608"]
+# The SQLite outbox: its own four table names, module constants, joined into
+# constant SQL; every value is a bound parameter.
+"src/interlock/sqlite_outbox.py" = ["S608"]
 
 [tool.mypy]
 python_version = "3.11"

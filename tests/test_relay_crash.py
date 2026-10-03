@@ -1,4 +1,4 @@
-"""Crash consistency for the relay (Epic 2, phase 4).
+"""Crash consistency for the relay (Epic 2, phase 4; on SQLite, Epic 3).
 
 A relay is a separate process, and processes die: SIGKILL, power, the OOM
 killer. Each test here runs a relay in a child process
@@ -34,6 +34,11 @@ idempotency keys, set to redeliver, whose relay died between the sink acting
 and the outcome committing. And it is never silent: the delivery log records
 the lost call it came from.
 
+Every test runs against both stores. On SQLite the two relays of a pair
+are two processes contending for one file's write lock, and a kill can land
+while a relay holds it: the kernel releases it, and what the relay had written
+of its transaction never committed.
+
 **At random instants**, relays racing in pairs over a sink that fails, drops
 connections and hangs at random, killed over and over. Whatever the
 interleaving: every message is delivered; every call the sinks received is in
@@ -63,16 +68,12 @@ from typing import Any
 
 import pytest
 
-psycopg = pytest.importorskip("psycopg")
-
-from interlock.deliveries import OUTCOMES, LogEvent  # noqa: E402
-from interlock.outbound import OperationSpec, SinkSpec  # noqa: E402
-from interlock.postgres import install  # noqa: E402
-from interlock.types import outbound_key  # noqa: E402
-from tests.conftest import OBSERVED, Pg  # noqa: E402
-from tests.fakesink import DROP, HOLD, OK, hang, status  # noqa: E402
-from tests.outbox_env import RELAY_SINKS, Outbox, build_outbox, mail, page, sms  # noqa: E402
-from tests.schemas import MAIL_SEND_SCHEMA, specs  # noqa: E402
+from interlock.deliveries import OUTCOMES, LogEvent
+from interlock.outbound import OperationSpec, SinkSpec
+from interlock.types import outbound_key
+from tests.fakesink import DROP, HOLD, OK, hang, status
+from tests.outbox_env import BACKENDS, RELAY_SINKS, Outbox, build_either, mail, page, sms
+from tests.schemas import MAIL_SEND_SCHEMA
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX")
 
@@ -81,9 +82,10 @@ LEASE = 1.5
 TIMEOUT = 0.5
 
 
-@pytest.fixture
-def outbox(pg: Pg, tmp_path: Path) -> Iterator[Outbox]:
-    yield from build_outbox(pg, tmp_path)
+@pytest.fixture(params=BACKENDS)
+def outbox(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Outbox]:
+    """Every crash test runs against both stores."""
+    yield from build_either(request, tmp_path)
 
 
 # --------------------------------------------------------------------------
@@ -150,7 +152,7 @@ def scenario(
     idle_rounds: int = 25,
 ) -> dict[str, Any]:
     return {
-        "dsn": outbox.relay_dsn,
+        **outbox.relay_target(),
         "ledger": outbox.ledger_path,
         "sinks": {name: outbox.sink(name).url for name in sinks},
         "relay_id": relay_id,
@@ -161,22 +163,6 @@ def scenario(
         "message": "" if message is None else str(message),
         "idle_rounds": idle_rounds,
     }
-
-
-def settle(outbox: Outbox) -> None:
-    """Wait for the server to end every session the dead relays left, and so
-    roll back whatever transaction each had open."""
-    deadline = time.monotonic() + 30
-    with outbox.admin() as conn:
-        while True:
-            row = conn.execute(
-                "SELECT count(*) FROM pg_stat_activity WHERE usename = %s", (outbox.relay_role,)
-            ).fetchone()
-            if row == (0,):
-                return
-            if time.monotonic() > deadline:
-                raise AssertionError("the dead relays' sessions did not end")
-            time.sleep(0.02)
 
 
 # --------------------------------------------------------------------------
@@ -280,12 +266,16 @@ def test_a_relay_killed_at_each_point_is_recovered_exactly(
             sink.release.set()
         else:
             child.wait_killed()
-    settle(outbox)
+    outbox.settle()
 
     if point.leased and not point.recorded:
         # A dead relay's lease is not taken early: nobody may assume it died.
-        with outbox.relay(relay_id="early") as early:
-            assert early.run_once(limit=10).claimed == 0
+        # Checked while every lease has time left: on a loaded machine the
+        # first may have run out by the time the third relay is dead.
+        left = min(outbox.lease_left(messages[name]) for name in SINKS)
+        if left > 0.3:
+            with outbox.relay(relay_id="early") as early:
+                assert early.run_once(limit=10).claimed == 0
     time.sleep(LEASE + 0.3)
     with outbox.relay(relay_id="survivor") as survivor:
         outbox.drain(survivor)
@@ -334,14 +324,7 @@ SOAK_SINKS = (
 
 def test_relays_killed_at_random_instants_lose_nothing(outbox: Outbox, tmp_path: Path) -> None:
     rng = random.Random(20261001)  # noqa: S311 - a reproducible schedule, not a secret
-    with outbox.admin() as conn:
-        install(
-            conn,
-            specs(*OBSERVED),
-            stage_roles=[outbox.pg.role],
-            sinks=SOAK_SINKS,
-            relay_roles=[outbox.relay_role],
-        )
+    outbox.reinstall(SOAK_SINKS)
     # Eight plans of three requests, each waiting for the one before it.
     plans: list[list[uuid.UUID]] = []
     keys: dict[uuid.UUID, tuple[str, str]] = {}
@@ -384,7 +367,7 @@ def test_relays_killed_at_random_instants_lose_nothing(outbox: Outbox, tmp_path:
             child.kill()
         if not outbox.unsettled():
             break
-    settle(outbox)
+    outbox.settle()
 
     for name in ("mail", "sms"):
         outbox.sink(name).chaos = None

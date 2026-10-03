@@ -192,8 +192,15 @@ def _parser() -> argparse.ArgumentParser:
 def _install(config: InterlockConfig, out: TextIO) -> int:
     names = ", ".join(t.name for t in config.tables)
     if config.substrate != "postgres":
+        from interlock.sqlite_outbox import install_sqlite_outbox
+
         install_sqlite_journal(config.database, config.tables)
+        install_sqlite_outbox(config.database, config.sinks)
         print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
+        print("installed: the outbox, and WAL mode", file=out)
+        for sink in config.sinks:
+            operations = ", ".join(op.name for op in sink.operations)
+            print(f"registered sink: {sink.name} ({operations})", file=out)
         _print_report(_sqlite(config).check_cascades(), out)
         return EXIT_OK
     import psycopg
@@ -234,11 +241,13 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
 
 def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
     from interlock.relay import LedgerBreaker, NoBreaker, Relay, RelayReport
+    from interlock.sqlite_outbox import SqliteOutboxStore
 
     settings = config.relay
     if settings is None:
         raise SubstrateConfigurationError("the configuration file has no [relay] section")
-    dsn = args.database or settings.database
+    sqlite = config.substrate != "postgres"
+    dsn = args.database or settings.database or (config.database if sqlite else "")
     if not dsn:
         raise SubstrateConfigurationError(
             "no database for the relay: set [relay] database, pass --database, or set "
@@ -257,7 +266,7 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             breakers.append(breaker)
             relays.append(
                 Relay(
-                    dsn,
+                    SqliteOutboxStore(dsn) if sqlite else dsn,
                     adapters=_adapters(settings),
                     breaker=breaker,
                     relay_id=f"{args.relay_id}:{index}" if args.relay_id else None,
@@ -357,64 +366,109 @@ def _print_relay(report: Any, out: TextIO) -> None:
 
 
 def _outbox(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    actor = getattr(args, "actor", None) or getpass.getuser()
+    if config.substrate != "postgres":
+        from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore
+
+        store = SqliteOutboxStore(config.database, writes=OPERATOR)
+        try:
+            return _outbox_action(_SqliteActions(store), args, actor, out)
+        finally:
+            store.close()
     import psycopg
 
-    if config.substrate != "postgres":
-        raise SubstrateConfigurationError("the outbox is PostgreSQL's; substrate is not")
-    actor = getattr(args, "actor", None) or getpass.getuser()
     try:
         with psycopg.connect(config.database, autocommit=True) as conn:
-            if args.action == "status":
-                counts = state_counts(conn)
-                for state in ("pending", "leased", "held", "delivered", "dead", "cancelled"):
-                    print(f"{state:<10} {counts.get(state, 0)}", file=out)
-                return EXIT_OK
-            if args.action == "list":
-                for m in messages(conn, state=args.state, scope_id=args.scope, limit=args.limit):
-                    print(
-                        f"{m.message_id}  {m.state:<9} {m.sink}.{m.operation}  scope "
-                        f"{m.scope_id}  plan {m.plan_id}  calls {m.attempts}"
-                        + (f"  ({m.reason})" if m.reason else ""),
-                        file=out,
-                    )
-                return EXIT_OK
-            if args.action == "show":
-                log = message_log(conn, args.message)
-                for event in log:
-                    print(
-                        f"{event.seq:>3} {event.at.isoformat()} {event.event:<17} "
-                        f"call {event.attempt or '-'}  {event.actor}"
-                        + (f"  HTTP {event.status_code}" if event.status_code else "")
-                        + (f"  -> {event.state_after}" if event.state_after else "")
-                        + (f"  {event.detail}" if event.detail else ""),
-                        file=out,
-                    )
-                return EXIT_OK if log else EXIT_FINDINGS
-            if args.action == "verify":
-                problems = verify_delivery_log(conn)
-                for problem in problems:
-                    print(problem, file=out)
-                if problems:
-                    return EXIT_FINDINGS
-                print("every delivery log verifies", file=out)
-                return EXIT_OK
-            if args.action == "release":
-                if args.scope:
-                    count = release_scope(conn, args.scope, actor=actor)
-                    print(f"released {count} message(s) of scope {args.scope}", file=out)
-                    return EXIT_OK if count else EXIT_FINDINGS
-                done = release(conn, args.message, actor=actor)
-                print("released" if done else "not held; nothing released", file=out)
-                return EXIT_OK if done else EXIT_FINDINGS
-            if args.action == "cancel":
-                done = cancel(conn, args.message, actor=actor, reason=args.reason)
-                print("cancelled" if done else "not cancellable; nothing done", file=out)
-                return EXIT_OK if done else EXIT_FINDINGS
-            count = requeue(conn, args.message, actor=actor)
-            print(f"requeued {count} message(s)", file=out)
-            return EXIT_OK if count else EXIT_FINDINGS
+            return _outbox_action(_PostgresActions(conn), args, actor, out)
     except psycopg.Error as exc:
         raise SubstrateUnavailableError(f"outbox {args.action} failed: {exc}") from exc
+
+
+class _PostgresActions:
+    def __init__(self, conn: Any) -> None:
+        self.source = conn
+
+    def release(self, message: uuid.UUID, actor: str) -> bool:
+        return release(self.source, message, actor=actor)
+
+    def release_scope(self, scope: str, actor: str) -> int:
+        return release_scope(self.source, scope, actor=actor)
+
+    def cancel(self, message: uuid.UUID, actor: str, reason: str) -> bool:
+        return cancel(self.source, message, actor=actor, reason=reason)
+
+    def requeue(self, message: uuid.UUID, actor: str) -> int:
+        return requeue(self.source, message, actor=actor)
+
+
+class _SqliteActions:
+    def __init__(self, store: Any) -> None:
+        self.source = store
+
+    def release(self, message: uuid.UUID, actor: str) -> bool:
+        return bool(self.source.release(message, actor=f"operator:{actor}"))
+
+    def release_scope(self, scope: str, actor: str) -> int:
+        return int(self.source.release_scope(scope, actor=f"operator:{actor}"))
+
+    def cancel(self, message: uuid.UUID, actor: str, reason: str) -> bool:
+        return bool(self.source.cancel(message, actor=f"operator:{actor}", reason=reason))
+
+    def requeue(self, message: uuid.UUID, actor: str) -> int:
+        return int(self.source.requeue(message, actor=f"operator:{actor}"))
+
+
+def _outbox_action(actions: Any, args: argparse.Namespace, actor: str, out: TextIO) -> int:
+    source = actions.source
+    if args.action == "status":
+        counts = state_counts(source)
+        for state in ("pending", "leased", "held", "delivered", "dead", "cancelled"):
+            print(f"{state:<10} {counts.get(state, 0)}", file=out)
+        return EXIT_OK
+    if args.action == "list":
+        for m in messages(source, state=args.state, scope_id=args.scope, limit=args.limit):
+            print(
+                f"{m.message_id}  {m.state:<9} {m.sink}.{m.operation}  scope "
+                f"{m.scope_id}  plan {m.plan_id}  calls {m.attempts}"
+                + (f"  ({m.reason})" if m.reason else ""),
+                file=out,
+            )
+        return EXIT_OK
+    if args.action == "show":
+        log = message_log(source, args.message)
+        for event in log:
+            print(
+                f"{event.seq:>3} {event.at.isoformat()} {event.event:<17} "
+                f"call {event.attempt or '-'}  {event.actor}"
+                + (f"  HTTP {event.status_code}" if event.status_code else "")
+                + (f"  -> {event.state_after}" if event.state_after else "")
+                + (f"  {event.detail}" if event.detail else ""),
+                file=out,
+            )
+        return EXIT_OK if log else EXIT_FINDINGS
+    if args.action == "verify":
+        problems = verify_delivery_log(source)
+        for problem in problems:
+            print(problem, file=out)
+        if problems:
+            return EXIT_FINDINGS
+        print("every delivery log verifies", file=out)
+        return EXIT_OK
+    if args.action == "release":
+        if args.scope:
+            count = actions.release_scope(args.scope, actor)
+            print(f"released {count} message(s) of scope {args.scope}", file=out)
+            return EXIT_OK if count else EXIT_FINDINGS
+        done = actions.release(args.message, actor)
+        print("released" if done else "not held; nothing released", file=out)
+        return EXIT_OK if done else EXIT_FINDINGS
+    if args.action == "cancel":
+        done = actions.cancel(args.message, actor, args.reason)
+        print("cancelled" if done else "not cancellable; nothing done", file=out)
+        return EXIT_OK if done else EXIT_FINDINGS
+    count = actions.requeue(args.message, actor)
+    print(f"requeued {count} message(s)", file=out)
+    return EXIT_OK if count else EXIT_FINDINGS
 
 
 def _check(config: InterlockConfig, out: TextIO) -> int:

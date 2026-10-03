@@ -222,7 +222,8 @@ class OutboundRequest:
         is staged.
     :raises PlanError: If the payload is outside the canonical domain, holds a
         NUL character (which PostgreSQL's ``jsonb`` refuses), or
-        ``not_after`` is not positive or exceeds :data:`MAX_NOT_AFTER`.
+        ``not_after`` is not a whole number of seconds, positive and at most
+        :data:`MAX_NOT_AFTER`.
     """
 
     sink: str
@@ -248,6 +249,10 @@ class OutboundRequest:
             raise PlanError(
                 f"not_after must be positive and at most {MAX_NOT_AFTER}, got {self.not_after}"
             )
+        if self.not_after is not None and self.not_after % timedelta(seconds=1):
+            # The outbox stores whole seconds and the plan's hash covers whole
+            # seconds: a fraction would be cut off, to nothing below a second.
+            raise PlanError(f"not_after is a whole number of seconds, got {self.not_after}")
         # The bytes hashed are the bytes sent: nothing re-encodes the payload
         # between here and the outbox.
         object.__setattr__(self, "_canonical", canonical)

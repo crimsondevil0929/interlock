@@ -303,28 +303,27 @@ def test_each_configuration_is_its_own_record() -> None:
 
 
 # --------------------------------------------------------------------------
-# end to end, on PostgreSQL
+# end to end, on each store
 # --------------------------------------------------------------------------
 
-psycopg = pytest.importorskip("psycopg")
-
-from tests.conftest import Pg  # noqa: E402
-from tests.outbox_env import Outbox, build_outbox  # noqa: E402
+from tests.outbox_env import BACKENDS, Outbox, build_either  # noqa: E402
 
 
-@pytest.fixture
-def outbox(pg: Pg, tmp_path: Path) -> Iterator[Outbox]:
-    yield from build_outbox(pg, tmp_path)
+@pytest.fixture(params=BACKENDS)
+def outbox(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Outbox]:
+    yield from build_either(request, tmp_path)
 
 
 def refund_plan(
-    refund: int, recorded: str, requested: str | None, *, item: int = 5000
+    outbox: Outbox, refund: int, recorded: str, requested: str | None, *, item: int = 5000
 ) -> EffectPlan:
     builder = PlanBuilder("agent", intent=f"refund {refund}")
+    value = outbox.named
     builder.insert(
         table="refunds",
         statement=(
-            "INSERT INTO refunds (id, order_item_id, amount) VALUES (%(id)s, %(item)s, %(amount)s)"
+            "INSERT INTO refunds (id, order_item_id, amount) "
+            f"VALUES ({value('id')}, {value('item')}, {value('amount')})"
         ),
         parameters={"id": refund, "item": item, "amount": recorded},
         effect_id=EffectId("row"),
@@ -341,17 +340,14 @@ def refund_plan(
 
 
 def refunds(outbox: Outbox) -> dict[int, Decimal]:
-    with outbox.admin() as conn:
-        return {
-            int(r[0]): Decimal(r[1])
-            for r in conn.execute("SELECT id, amount FROM refunds WHERE id >= 9100")
-        }
+    return {
+        int(r[0]): Decimal(str(r[1]))
+        for r in outbox.fetch("SELECT id, amount FROM refunds WHERE id >= 9100")
+    }
 
 
 def outboxed(outbox: Outbox) -> int:
-    with outbox.admin() as conn:
-        row = conn.execute("SELECT count(*) FROM interlock.outbox").fetchone()
-        return int(row[0]) if row else 0
+    return outbox.requests()
 
 
 def test_an_injected_refund_is_refused_before_commit_and_never_sent(outbox: Outbox) -> None:
@@ -360,12 +356,14 @@ def test_an_injected_refund_is_refused_before_commit_and_never_sent(outbox: Outb
     rows and the request are both well-formed; together they contradict each
     other, and the plan is refused: no row, no request, no call."""
     engine = outbox.engine(checkers=[BlastRadius(10), PAIRED])
-    result = engine.execute(refund_plan(9100, recorded="50.00", requested="5000.00"))
+    result = engine.execute(refund_plan(outbox, 9100, recorded="50.00", requested="5000.00"))
     assert not result.committed and result.state is StageState.ABORTED
     assert result.verdict is not None
     (blocked,) = result.verdict.blocking
     assert blocked.invariant.startswith("cross_effect_agreement")
-    assert (blocked.evidence["requested"], blocked.evidence["measured"]) == ("5000.00", "50.00")
+    assert blocked.evidence["requested"] == "5000.00"
+    # What the database holds: SQLite keeps a NUMERIC 50.00 as the integer 50.
+    assert Decimal(str(blocked.evidence["measured"])) == Decimal("50.00")
     assert result.diff is not None and result.diff.outbound, "it was judged on the stored request"
     assert refunds(outbox) == {} and outboxed(outbox) == 0
     with outbox.relay() as relay:
@@ -374,7 +372,7 @@ def test_an_injected_refund_is_refused_before_commit_and_never_sent(outbox: Outb
     assert result.feedback is not None and "5000" not in result.feedback.render()
 
     # The honest plan commits, and the relay sends exactly what the row says.
-    assert engine.execute(refund_plan(9101, recorded="50.00", requested="50.00")).committed
+    assert engine.execute(refund_plan(outbox, 9101, recorded="50.00", requested="50.00")).committed
     with outbox.relay() as relay:
         outbox.drain(relay)
     (call,) = outbox.sink("payments").calls
@@ -410,7 +408,7 @@ def test_a_refund_call_with_no_refund_row_is_refused(outbox: Outbox) -> None:
 
 def test_a_refund_row_with_no_call_is_refused(outbox: Outbox) -> None:
     engine = outbox.engine(checkers=[BlastRadius(10), PAIRED])
-    result = engine.execute(refund_plan(9100, recorded="50.00", requested=None))
+    result = engine.execute(refund_plan(outbox, 9100, recorded="50.00", requested=None))
     assert not result.committed
     assert result.verdict is not None
     (blocked,) = result.verdict.blocking

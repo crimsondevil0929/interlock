@@ -71,7 +71,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
-from interlock.outbound import SinkSpec
+from interlock.outbound import EnqueueOrder, SinkSpec
 from interlock.outbox_sql import (
     OUTBOX_FUNCTIONS,
     OUTBOX_GUARD,
@@ -588,15 +588,13 @@ class PostgresSubstrate:
         "_handle",
         "_lock_seconds",
         "_max_rows",
-        "_outbound_effects",
+        "_order",
         "_report",
         "_schema",
         "_scope",
-        "_seq",
         "_stage_seconds",
         "_tables",
         "_token",
-        "_upstream",
         "_xid",
     )
 
@@ -691,9 +689,7 @@ class PostgresSubstrate:
     def _reset_outbound(self) -> None:
         self._token: bytes | None = None
         self._scope: str | None = None
-        self._seq = 0
-        self._upstream: dict[EffectId, frozenset[EffectId]] = {}
-        self._outbound_effects: set[EffectId] = set()
+        self._order = EnqueueOrder()
 
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
@@ -851,25 +847,10 @@ class PostgresSubstrate:
                 rows_affected=max(cursor.rowcount, 0),
                 applied_at=datetime.now(UTC),
             )
-        self._upstream[effect.effect_id] = self._requests_before(effect)
-        if effect.kind is EffectKind.ENQUEUE:
-            self._outbound_effects.add(effect.effect_id)
+        self._order.applied(
+            effect.effect_id, effect.depends_on, request=effect.kind is EffectKind.ENQUEUE
+        )
         return outcome
-
-    def _requests_before(self, effect: Effect) -> frozenset[EffectId]:
-        """The plan's outbound requests ``effect`` depends on, directly or
-        through SQL effects: what the relay must deliver before it.
-
-        The engine applies effects in topological order, so every dependency
-        has been applied, and recorded, before its dependant.
-        """
-        found: set[EffectId] = set()
-        for dependency in effect.depends_on:
-            if dependency in self._outbound_effects:
-                found.add(dependency)
-            else:
-                found |= self._upstream.get(dependency, frozenset())
-        return frozenset(found)
 
     def _enqueue(
         self, conn: psycopg.Connection[Any], handle: StageHandle, effect: Effect
@@ -885,7 +866,6 @@ class PostgresSubstrate:
         request = effect.request
         if request is None or self._token is None or not self._scope:
             raise StageError(f"effect {effect.effect_id!r} cannot be enqueued outside a stage")
-        self._seq += 1
         compensation = (
             None
             if request.compensation is None
@@ -899,8 +879,8 @@ class PostgresSubstrate:
                     self._token,
                     uuid.uuid4(),
                     effect.effect_id,
-                    self._seq,
-                    sorted(self._requests_before(effect)),
+                    self._order.next_seq(),
+                    sorted(self._order.waits_for(effect.depends_on)),
                     request.sink,
                     request.operation,
                     effect.tenant_id,

@@ -187,10 +187,11 @@ def load_config(
         except ValueError as exc:
             raise ConfigError(f"tables[{index}]: {exc}") from exc
     sinks = _sinks(raw.get("sinks", []), Path(path).parent)
-    if sinks and substrate != "postgres":
+    relay_roles = tuple(_strings(raw, "relay_roles", required=False))
+    if relay_roles and substrate != "postgres":
         raise ConfigError(
-            "[[sinks]] need substrate = 'postgres': the outbox is a PostgreSQL table, "
-            "written in the stage's transaction"
+            "relay_roles are PostgreSQL roles; a SQLite relay is bounded by the file's "
+            "permissions instead"
         )
     relay = _relay(raw.get("relay"), sinks)
     return InterlockConfig(
@@ -202,7 +203,7 @@ def load_config(
         audit_roles=tuple(_strings(raw, "audit_roles", required=False)),
         acknowledge_cascades=tuple(_strings(raw, "acknowledge_cascades", required=False)),
         sinks=sinks,
-        relay_roles=tuple(_strings(raw, "relay_roles", required=False)),
+        relay_roles=relay_roles,
         relay=relay,
     )
 

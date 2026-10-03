@@ -22,20 +22,25 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 if TYPE_CHECKING:
     import psycopg
 
 __all__ = [
     "LogEvent",
+    "LoggedMessage",
     "MessageView",
+    "OutboxReader",
+    "PostgresReader",
     "cancel",
     "event_hash",
     "frame",
     "genesis_hash",
     "message_log",
     "messages",
+    "parse_instant",
+    "reader",
     "release",
     "release_scope",
     "requeue",
@@ -45,6 +50,10 @@ __all__ = [
 
 GENESIS_TAG: Final = "interlock-outbox-genesis-v1"
 EVENT_TAG: Final = "interlock-outbox-event-v1"
+EVENT_TAG_V2: Final = "interlock-outbox-event-v2"
+"""Rows that carry a ``remote_ref`` or an ``authority`` (schema version 3)
+are framed with both; every other row as in version 2, so no hash written
+before them changes."""
 
 OUTCOMES: Final = frozenset({"delivered", "retryable", "permanent", "unknown"})
 """Events that report what a call returned. ``lost`` is not one: it is the
@@ -63,8 +72,17 @@ def _digest(*fields: str | None) -> str:
     return hashlib.sha256(frame(*fields).encode("utf-8")).hexdigest()
 
 
-def _instant(at: datetime) -> str:
+def _instant(at: datetime | str) -> str:
+    """An instant as the log hashes it: UTC, to the microsecond. SQLite
+    stores the text itself, which is returned unchanged."""
+    if isinstance(at, str):
+        return at
     return at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def parse_instant(text: str) -> datetime:
+    """The inverse of the log's instant format."""
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
 
 
 def _text(value: object) -> str | None:
@@ -104,16 +122,17 @@ def event_hash(
     attempt: int | None,
     event: str,
     actor: str,
-    at: datetime,
+    at: datetime | str,
     status_code: int | None,
     response_digest: str | None,
     detail: str | None,
     state_after: str | None,
+    remote_ref: str | None = None,
+    authority: str | None = None,
 ) -> str:
     """The hash of one delivery-log row, as ``interlock.outbox_event_hash``
-    computes it."""
-    return _digest(
-        EVENT_TAG,
+    computes it, and SQLite's ``interlock_event_hash``."""
+    fields: list[str | None] = [
         prev_hash,
         str(message_id),
         str(seq),
@@ -125,7 +144,10 @@ def event_hash(
         response_digest,
         detail,
         state_after,
-    )
+    ]
+    if remote_ref is None and authority is None:
+        return _digest(EVENT_TAG, *fields)
+    return _digest(EVENT_TAG_V2, *fields, remote_ref, authority)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +160,9 @@ class LogEvent:
     :ivar state_after: The state the event moved the message to, or ``None``
         when it moved nothing: an outcome a relay reported after its lease
         was taken over.
+    :ivar remote_ref: What a delivered call created, as the sink named it: a
+        Stripe ``pi_...``. A compensation binds to it.
+    :ivar authority: The signed operator record behind an operator's row.
     """
 
     message_id: uuid.UUID
@@ -152,6 +177,8 @@ class LogEvent:
     state_after: str | None
     prev_hash: str
     event_hash: str
+    remote_ref: str | None = None
+    authority: str | None = None
 
     def recomputed(self) -> str:
         return event_hash(
@@ -166,12 +193,15 @@ class LogEvent:
             self.response_digest,
             self.detail,
             self.state_after,
+            self.remote_ref,
+            self.authority,
         )
 
 
 _EVENTS: Final = (
     "SELECT message_id, seq, attempt, event, actor, at, status_code, response_digest, "
-    "detail, state_after, prev_hash, event_hash FROM interlock.outbox_attempts "
+    "detail, state_after, prev_hash, event_hash, NULL::text, NULL::text "
+    "FROM interlock.outbox_attempts "
     "WHERE %(ids)s::uuid[] IS NULL OR message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY message_id, seq"
 )
@@ -199,17 +229,151 @@ def _event(row: Sequence[Any]) -> LogEvent:
         state_after=_text(row[9]),
         prev_hash=str(row[10]),
         event_hash=str(row[11]),
+        remote_ref=_text(row[12]) if len(row) > 12 else None,
+        authority=_text(row[13]) if len(row) > 13 else None,
     )
 
 
-def message_log(conn: psycopg.Connection[Any], message_id: uuid.UUID) -> tuple[LogEvent, ...]:
+@dataclass(frozen=True, slots=True)
+class LoggedMessage:
+    """A message as its delivery log is verified: what its genesis binds,
+    and the state and head its state row records."""
+
+    message_id: uuid.UUID
+    stage_id: uuid.UUID
+    plan_id: str
+    scope_id: str
+    effect_id: str
+    sink: str
+    operation: str
+    idempotency_key: str
+    payload_hash: str
+    state: str
+    attempts: int
+    log_seq: int
+    log_head: str
+
+    def genesis(self) -> str:
+        return genesis_hash(
+            self.message_id,
+            self.stage_id,
+            self.plan_id,
+            self.scope_id,
+            self.effect_id,
+            self.sink,
+            self.operation,
+            self.idempotency_key,
+            self.payload_hash,
+        )
+
+
+class OutboxReader(Protocol):
+    """What verification and inspection read, from either store."""
+
+    def snapshot(
+        self, message_ids: Sequence[uuid.UUID] | None
+    ) -> tuple[list[LoggedMessage], list[LogEvent]]:
+        """Messages and their log rows, in log order."""
+        ...
+
+    def views(
+        self, *, state: str | None, scope_id: str | None, limit: int
+    ) -> tuple[MessageView, ...]: ...
+
+    def counts(self) -> dict[str, int]: ...
+
+
+class PostgresReader:
+    """An :class:`OutboxReader` over a PostgreSQL connection."""
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: psycopg.Connection[Any]) -> None:
+        self._conn = conn
+
+    def snapshot(
+        self, message_ids: Sequence[uuid.UUID] | None
+    ) -> tuple[list[LoggedMessage], list[LogEvent]]:
+        params = {"ids": None if message_ids is None else list(message_ids)}
+        found = [
+            LoggedMessage(
+                message_id=m[0],
+                stage_id=m[1],
+                plan_id=str(m[2]),
+                scope_id=str(m[3]),
+                effect_id=str(m[4]),
+                sink=str(m[5]),
+                operation=str(m[6]),
+                idempotency_key=str(m[7]),
+                payload_hash=str(m[8]),
+                state=str(m[9]),
+                attempts=int(m[10]),
+                log_seq=int(m[11]),
+                log_head=str(m[12]),
+            )
+            for m in self._conn.execute(_MESSAGES, params).fetchall()
+        ]
+        return found, [_event(row) for row in self._conn.execute(_EVENTS, params)]
+
+    def views(
+        self, *, state: str | None, scope_id: str | None, limit: int
+    ) -> tuple[MessageView, ...]:
+        rows = self._conn.execute(
+            "SELECT o.message_id, o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, "
+            "o.tenant_id, o.cost, s.state, s.attempts, s.reason, s.lease_owner, o.not_after, "
+            "o.enqueued_at, s.next_attempt_at "
+            "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
+            "WHERE (%(state)s::text IS NULL OR s.state = %(state)s) "
+            "AND (%(scope)s::text IS NULL OR o.scope_id = %(scope)s) "
+            "ORDER BY o.enqueued_at, o.seq LIMIT %(limit)s",
+            {"state": state, "scope": scope_id, "limit": limit},
+        ).fetchall()
+        return tuple(
+            MessageView(
+                message_id=r[0],
+                plan_id=str(r[1]),
+                scope_id=str(r[2]),
+                effect_id=str(r[3]),
+                sink=str(r[4]),
+                operation=str(r[5]),
+                tenant_id=_text(r[6]),
+                cost=Decimal(str(r[7])),
+                state=str(r[8]),
+                attempts=int(r[9]),
+                reason=_text(r[10]),
+                lease_owner=_text(r[11]),
+                not_after=r[12],
+                enqueued_at=r[13],
+                next_attempt_at=r[14],
+            )
+            for r in rows
+        )
+
+    def counts(self) -> dict[str, int]:
+        return {
+            str(state): int(count)
+            for state, count in self._conn.execute(
+                "SELECT state, count(*) FROM interlock.outbox_state GROUP BY state ORDER BY state"
+            )
+        }
+
+
+def reader(source: object) -> OutboxReader:
+    """``source`` as an :class:`OutboxReader`: a store already is one; a
+    PostgreSQL connection is wrapped."""
+    if hasattr(source, "snapshot"):
+        return source  # type: ignore[return-value]
+    return PostgresReader(source)  # type: ignore[arg-type]
+
+
+def message_log(source: object, message_id: uuid.UUID) -> tuple[LogEvent, ...]:
     """A message's delivery log, in order."""
-    rows = conn.execute(_EVENTS, {"ids": [message_id]}).fetchall()
-    return tuple(_event(r) for r in rows)
+    _, events = reader(source).snapshot([message_id])
+    return tuple(events)
 
 
 def verify_delivery_log(
-    conn: psycopg.Connection[Any], *, message_ids: Iterable[uuid.UUID] | None = None
+    source: object, *, message_ids: Iterable[uuid.UUID] | None = None
 ) -> tuple[str, ...]:
     """Recompute every message's delivery log, and check it against the
     message's state.
@@ -221,29 +385,28 @@ def verify_delivery_log(
     the message is in is the state its log leads to. A ``delivered`` state
     needs a ``delivered`` row, and a ``delivered`` row a ``delivered`` state.
 
+    :param source: A PostgreSQL connection, or an outbox store.
     :param message_ids: Only these messages. All of them by default.
     :returns: Every problem found, naming its message. Empty when the logs
         verify.
     """
-    params = {"ids": None if message_ids is None else list(message_ids)}
-    messages_ = conn.execute(_MESSAGES, params).fetchall()
+    found_messages, events = reader(source).snapshot(
+        None if message_ids is None else list(message_ids)
+    )
     logs: dict[uuid.UUID, list[LogEvent]] = {}
-    for row in conn.execute(_EVENTS, params):
-        event = _event(row)
+    for event in events:
         logs.setdefault(event.message_id, []).append(event)
     problems: list[str] = []
-    for m in messages_:
-        message_id = m[0]
-        genesis = genesis_hash(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8])
+    for m in found_messages:
         found = _verify_one(
-            logs.pop(message_id, []),
-            genesis=genesis,
-            state=str(m[9]),
-            attempts=int(m[10]),
-            log_seq=int(m[11]),
-            log_head=str(m[12]),
+            logs.pop(m.message_id, []),
+            genesis=m.genesis(),
+            state=m.state,
+            attempts=m.attempts,
+            log_seq=m.log_seq,
+            log_head=m.log_head,
         )
-        problems += [f"message {message_id}: {p}" for p in found]
+        problems += [f"message {m.message_id}: {p}" for p in found]
     for orphan in logs:
         problems.append(f"message {orphan}: delivery-log rows for a message the outbox lacks")
     return tuple(problems)
@@ -337,53 +500,19 @@ class MessageView:
 
 
 def messages(
-    conn: psycopg.Connection[Any],
+    source: object,
     *,
     state: str | None = None,
     scope_id: str | None = None,
     limit: int = 100,
 ) -> tuple[MessageView, ...]:
     """Messages, oldest first, optionally in one state or for one scope."""
-    rows = conn.execute(
-        "SELECT o.message_id, o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, "
-        "o.tenant_id, o.cost, s.state, s.attempts, s.reason, s.lease_owner, o.not_after, "
-        "o.enqueued_at, s.next_attempt_at "
-        "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
-        "WHERE (%(state)s::text IS NULL OR s.state = %(state)s) "
-        "AND (%(scope)s::text IS NULL OR o.scope_id = %(scope)s) "
-        "ORDER BY o.enqueued_at, o.seq LIMIT %(limit)s",
-        {"state": state, "scope": scope_id, "limit": limit},
-    ).fetchall()
-    return tuple(
-        MessageView(
-            message_id=r[0],
-            plan_id=str(r[1]),
-            scope_id=str(r[2]),
-            effect_id=str(r[3]),
-            sink=str(r[4]),
-            operation=str(r[5]),
-            tenant_id=_text(r[6]),
-            cost=Decimal(str(r[7])),
-            state=str(r[8]),
-            attempts=int(r[9]),
-            reason=_text(r[10]),
-            lease_owner=_text(r[11]),
-            not_after=r[12],
-            enqueued_at=r[13],
-            next_attempt_at=r[14],
-        )
-        for r in rows
-    )
+    return reader(source).views(state=state, scope_id=scope_id, limit=limit)
 
 
-def state_counts(conn: psycopg.Connection[Any]) -> dict[str, int]:
+def state_counts(source: object) -> dict[str, int]:
     """How many messages are in each state."""
-    return {
-        str(state): int(count)
-        for state, count in conn.execute(
-            "SELECT state, count(*) FROM interlock.outbox_state GROUP BY state ORDER BY state"
-        )
-    }
+    return reader(source).counts()
 
 
 # --------------------------------------------------------------------------

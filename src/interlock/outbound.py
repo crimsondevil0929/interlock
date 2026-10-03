@@ -43,6 +43,7 @@ __all__ = [
     "DEAD_LETTER",
     "NONE_POSSIBLE",
     "REDELIVER",
+    "EnqueueOrder",
     "OperationSpec",
     "SinkRegistry",
     "SinkSpec",
@@ -191,6 +192,8 @@ class SinkSpec:
             raise ValueError(
                 f"sink {self.name!r}: not_after must be positive and at most {MAX_NOT_AFTER}"
             )
+        if self.not_after % timedelta(seconds=1):
+            raise ValueError(f"sink {self.name!r}: not_after is a whole number of seconds")
         if self.max_attempts < 1:
             raise ValueError(f"sink {self.name!r}: max_attempts must be at least 1")
         if not timedelta(milliseconds=1) <= self.backoff_base <= self.backoff_cap:
@@ -495,3 +498,43 @@ def _number(value: Any) -> Decimal | None:
             return None
         return number if number.is_finite() else None
     return None
+
+
+class EnqueueOrder:
+    """Within one stage: the order requests are written in, and which earlier
+    requests each one waits for.
+
+    An effect waits for the requests it depends on directly, and, through a
+    SQL effect between them, for the requests that effect waited for: a
+    request after an ``UPDATE`` after a request waits for the first request.
+    The engine applies effects in topological order, so every dependency is
+    recorded before its dependant. Both substrates keep one per stage.
+    """
+
+    __slots__ = ("_enqueued", "_seq", "_upstream")
+
+    def __init__(self) -> None:
+        self._seq = 0
+        self._upstream: dict[str, frozenset[str]] = {}
+        self._enqueued: set[str] = set()
+
+    def waits_for(self, depends_on: Iterable[str]) -> frozenset[str]:
+        """The requests an effect with these dependencies waits for."""
+        found: set[str] = set()
+        for dependency in depends_on:
+            if dependency in self._enqueued:
+                found.add(dependency)
+            else:
+                found |= self._upstream.get(dependency, frozenset())
+        return frozenset(found)
+
+    def next_seq(self) -> int:
+        """The position of the next request written."""
+        self._seq += 1
+        return self._seq
+
+    def applied(self, effect_id: str, depends_on: Iterable[str], *, request: bool) -> None:
+        """Record an applied effect, a request or a statement."""
+        self._upstream[effect_id] = self.waits_for(depends_on)
+        if request:
+            self._enqueued.add(effect_id)
