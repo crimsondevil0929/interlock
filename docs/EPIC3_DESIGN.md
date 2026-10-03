@@ -1,6 +1,7 @@
 # Epic 3: ecosystem adapters, signed operator logs, SQLite parity
 
-**Status: design, approved; built step by step on `feat/epic3-adapters-audit`.**
+**Status: built on `feat/epic3-adapters-audit`; §8 records where the build refined
+the design.**
 Builds on the transactional outbox of [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md)
 (Epic 2). Five decisions were settled before any code:
 
@@ -211,3 +212,43 @@ does not control.
   a charge is made once; an email is never sent twice.
 - Each ghost edit of §6 is made, and verification names it.
 - Every mechanism above has a test that fails when it is removed.
+
+## 8. As built
+
+Where the implementation settled what the design left open, or refined it:
+
+- **The interfaces.** `OutboxStore` (the relay's), `OutboxReader` (verification and
+  inspection) and `OutboxOperations` (an operator's actions) are each implemented by
+  both stores: `PostgresOutboxStore` / `PostgresReader` / `PostgresOperations` over a
+  connection, and `SqliteOutboxStore` for all three.
+- **Deadlines are whole seconds.** `not_after` with a fraction is refused: the outbox
+  stores whole seconds and the plan's hash covers them, and PostgreSQL had cut a fraction
+  below a second to nothing.
+- **Stripe's 5xx is `unknown` whatever else the reply says.** `Stripe-Should-Retry`
+  decides a 4xx. An `idempotency_error` is permanent unless it is a 409 (a call with the
+  key still in flight).
+- **The database binds compensations itself.** `outbox_compensate` (and SQLite's
+  `compensate`) accepts a payload only if it equals the compensation the original
+  stored, its placeholder bound to the `remote_ref` its delivery recorded; it works out
+  the compensations to wait for (E4-4) from the outbox, not the caller. A compensation's
+  effect is `compensate:<effect>`, its key `outbound_key(plan, "compensate:<effect>")`:
+  unique, so it is enqueued once.
+- **Compensating out of order is refused.** Before anything is signed: a request still
+  pending, leased or held that waits for the original (cancel it first), or a delivered,
+  compensable one outside the set being compensated (compensate it first, or the plan).
+- **Scope release is one intent.** `interlock outbox release --scope` signs one intent over
+  the scope's held messages, each released at its own head; `outbox_release_scope` is gone.
+- **Version 2's unsigned operator rows** are told from ghost edits by `outbox_epochs`, the
+  instant version 3 was first installed: older ones are counted as legacy, later ones named.
+- **Installs are signed.** With `[operators]`, `interlock install` signs an
+  `operator.installed` record vouching for the whole sink registry as the database mirrors
+  it; a registry that differs from the last one vouched for (a sink re-enabled, a bound
+  widened) is named by `verify`.
+- **Anchoring never blocks an action.** A ledger that cannot be written now (a SQLite
+  ledger a running engine holds) leaves the record unanchored; the next open anchors it.
+- **`interlock outbox resolve`** resolves dangling intents without acting.
+
+The proofs of §7 are `tests/test_sqlite_stage_crash.py`, `tests/test_relay_crash.py` (the
+matrix, typed sinks, and the soak, on both stores), `tests/test_operator_crash.py`,
+`tests/test_operators.py` (each ghost edit), `tests/test_pg_upgrade.py`, and the
+conformance suites run on both stores.

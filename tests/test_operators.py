@@ -192,16 +192,25 @@ def test_an_action_on_a_log_that_moved_is_refused_and_recorded(outbox: Outbox) -
     (message,) = held(outbox)
 
     def meanwhile(point: str) -> None:
-        if point == "intent":  # someone else acts between the read and the write
+        # Between the read and the write, the message is released and held
+        # again: held, as when the operator read it, at another head.
+        if point == "intent":
             actions = outbox.operations()
             head = actions.heads([message])[message]
             assert actions.release(message, actor="other", authority="c" * 64, expected_head=head)
+            outbox.governor.trip(SCOPE, "again")
+            with outbox.relay() as relay:
+                relay.run_once()
+            outbox.governor.reset(SCOPE)
+            assert outbox.state(message) == "held"
 
     with outbox.signed("alice", checkpoint=meanwhile) as alice:
         outcome = alice.release([message])
     assert not outcome.applied and outcome.record.kind == "operator.refused"
     assert outcome.skipped == ((message, "its delivery log moved after the operator read it"),)
+    assert outbox.state(message) == "held", "not released at a head nobody signed for"
     with outbox.signed("alice") as alice:
+        assert alice.release([message]).applied
         refused = alice.release([message])
     assert refused.skipped == ((message, "it is pending: release does not apply"),)
 
@@ -285,6 +294,19 @@ def test_every_ghost_edit_is_named(outbox: Outbox, edit: str, named: str) -> Non
     assert any(named in p and str(victim) in p for p in problems), problems
     if edit != "direct state":
         assert verify_delivery_log(outbox.operator()) == (), "a perfect forgery, as logs go"
+
+
+def test_an_authority_replayed_on_a_later_state_is_named(outbox: Outbox) -> None:
+    """The owner reuses a real authority on its own message, after the action
+    it authorized: the row is not at the head the operator signed for, and
+    not among the rows the action wrote."""
+    (message,) = held(outbox)
+    with outbox.signed("alice") as alice:
+        authority = alice.release([message]).intent.record_hash
+    outbox.forge(message, "released", authority=authority, state_after="pending")
+    problems = outbox.verify_operators().problems
+    assert any("not written at the head its intent was signed for" in p for p in problems)
+    assert any("not among the rows its applied record names" in p for p in problems)
 
 
 def set_state(outbox: Outbox, message: uuid.UUID, state: str) -> None:

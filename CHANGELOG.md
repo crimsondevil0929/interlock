@@ -9,6 +9,57 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 3: adapters, signed operator logs, SQLite parity; `docs/EPIC3_DESIGN.md`)
+
+- **The outbox on SQLite.** `interlock install` switches a SQLite file to WAL and installs
+  the outbox; stages enqueue in their own `BEGIN IMMEDIATE` transaction, a request bound to
+  its stage's commit marker by a deferred foreign key; `SqliteOutboxStore` runs the relay's
+  state machine under SQLite's one write lock. The delivery log is append-only and linked
+  by triggers through a function only Interlock's connections register. `interlock relay`
+  and `interlock outbox` work on a SQLite file. Every relay test, the relay's kill matrix
+  and its soak run on both stores; `tests/test_sqlite_stage_crash.py` kills a SQLite engine
+  at each point of its commit path, and an engine and a relay at random instants.
+- **Typed sinks: Stripe and SendGrid** (`interlock.stripe`, `interlock.sendgrid`;
+  `[[sinks]] type = ...`). Their own operations and strict schemas; a Stripe charge must
+  carry the refund that undoes exactly it, named by `{"$bind": "delivered.id"}`, checked at
+  admission and again by the database. `StripeAdapter` (form encoding, idempotency key,
+  pinned version, the created object's id recorded as `remote_ref`) and `SendGridAdapter`
+  (the v3 body, `custom_args`, sandbox mode; at most once by default). Both driven through
+  the relay's kill matrix against fakes keeping their protocols; live tests gated on
+  test-mode keys.
+- **Signed operator actions** (`interlock.operators`). Every `release`, `cancel`,
+  `requeue` and the new `compensate` is an intent signed with the operator's Ed25519 key
+  before the database is touched, applied under the intent's hash and only at the
+  delivery-log heads it names, and recorded applied or refused; a command killed mid-way is
+  resolved by the next. `interlock operator keygen`, `interlock outbox resolve`,
+  `[operators]` in `interlock.toml`, records anchored into AgentGov.
+- **`interlock outbox compensate`** enqueues the compensation a delivered request carried,
+  bound to what its delivery created, in reverse topological order across a plan, once,
+  and past its deadline only with `--late`.
+- **Ghost edits are named.** `interlock outbox verify` holds the delivery logs to the
+  operator log and the operator log to its keys and anchors: unsigned operator rows,
+  authorities no intent holds or replayed elsewhere, a log cut short, a sink registry
+  changed since the last signed install.
+- **Schema version 3**, installed in place over version 2: `remote_ref`, `authority`,
+  `compensates`, sink `kind`, `outbox_epochs`. Every delivery log written under version 2
+  still verifies; `tests/test_pg_upgrade.py` upgrades a database installed from version
+  2's own SQL.
+- `records.Keyring`: one ILOK1 log written by several signers, each record verified under
+  the key it names.
+
+### Changed (Epic 3)
+
+- **Breaking:** `deliveries.release`, `cancel` and `requeue` take the `authority` of a signed
+  intent and the `expected_head`; `deliveries.release_scope` is removed (release a scope
+  through `Operator.release_scope`). The database refuses an operator's row without an
+  authority. `interlock outbox release/cancel/requeue` need `[operators]` and a key;
+  `--actor` is gone: the key names the operator.
+- **Breaking:** `OutboundRequest.not_after` and `SinkSpec.not_after` are whole seconds.
+- A relay of version 2 cannot record outcomes in version 3: stop the relays, run
+  `interlock install`, start them again. A stage or relay against a version 2 database is
+  refused with that instruction.
+- `interlock outbox verify` reads both stores' logs in one consistent snapshot.
+
 ### Added
 
 - **Outbound requests, staged in a transactional outbox (Epic 2, phases 0 and 1; see
