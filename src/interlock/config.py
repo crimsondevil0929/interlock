@@ -69,6 +69,16 @@ and its relay adapter; configuration names which of its operations to allow::
     # url = "https://api.stripe.com"  # the vendor's own, unless given
     # stripe_version = "2024-06-20"   # stripe; sandbox = true for sendgrid
 
+Operators sign every action on the outbox (``docs/EPIC3_DESIGN.md`` §6)::
+
+    [operators]
+    log = "operators.ilok1"           # the signed operator log, beside this file
+    ledger = "governor.db"            # optional: anchor every record in AgentGov
+    scope = "interlock-operators"     # the ledger scope the anchors go to
+
+    [operators.keys]                  # public halves only: `interlock operator keygen`
+    alice = "ed25519:5f0c..."
+
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
 relay's in ``INTERLOCK_RELAY_DATABASE``. A sink has no endpoint or credential
@@ -97,6 +107,7 @@ from interlock.outbound import (
     SinkSpec,
     typed_sink,
 )
+from interlock.records import Keyring
 from interlock.substrate import TableSpec
 
 __all__ = [
@@ -104,6 +115,7 @@ __all__ = [
     "RELAY_DATABASE_ENV",
     "Endpoint",
     "InterlockConfig",
+    "OperatorsConfig",
     "RelayConfig",
     "load_config",
 ]
@@ -156,6 +168,29 @@ class RelayConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class OperatorsConfig:
+    """``[operators]``: who may act on the outbox, and the signed log of what
+    they did (``docs/EPIC3_DESIGN.md`` §6).
+
+    :ivar log: The operator log's file.
+    :ivar keys: Each operator's name and Ed25519 public key
+        (``ed25519:<hex>``). Only public halves: each operator holds their own
+        private key, and verifying needs none.
+    :ivar ledger: An AgentGov ledger every record is anchored into: a SQLite
+        file or a ``postgresql://`` DSN.
+    :ivar scope: The ledger scope the anchors are written to.
+    """
+
+    log: Path
+    keys: Mapping[str, str]
+    ledger: str | None = None
+    scope: str = "interlock-operators"
+
+    def keyring(self) -> Keyring:
+        return Keyring(self.keys)
+
+
+@dataclass(frozen=True, slots=True)
 class InterlockConfig:
     substrate: str
     database: str
@@ -167,6 +202,7 @@ class InterlockConfig:
     sinks: tuple[SinkSpec, ...] = ()
     relay_roles: tuple[str, ...] = ()
     relay: RelayConfig | None = None
+    operators: OperatorsConfig | None = None
 
     def with_database(self, database: str | None) -> InterlockConfig:
         if not database:
@@ -230,6 +266,7 @@ def load_config(
             "permissions instead"
         )
     relay = _relay(raw.get("relay"), sinks)
+    operators = _operators(raw.get("operators"), Path(path).parent)
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -241,7 +278,29 @@ def load_config(
         sinks=sinks,
         relay_roles=relay_roles,
         relay=relay,
+        operators=operators,
     )
+
+
+def _operators(raw: object, base: Path) -> OperatorsConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("'operators' must be a table ([operators])")
+    try:
+        keys = _table_of_strings(raw, "keys")
+        config = OperatorsConfig(
+            log=base / _string(raw, "log"),
+            keys=keys,
+            ledger=_string(raw, "ledger", default="") or None,
+            scope=_string(raw, "scope", default="interlock-operators"),
+        )
+        config.keyring()
+    except ValueError as exc:
+        raise ConfigError(f"[operators]: {exc}") from exc
+    if config.ledger is not None and not config.ledger.startswith(("postgres://", "postgresql://")):
+        config = replace(config, ledger=str(base / config.ledger))
+    return config
 
 
 def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:

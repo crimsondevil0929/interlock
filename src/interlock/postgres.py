@@ -367,6 +367,7 @@ _OUTBOX_TABLES: Final = (
     "interlock.outbox",
     "interlock.outbox_state",
     "interlock.outbox_attempts",
+    "interlock.outbox_epochs",
 )
 
 _RELAY_FUNCTIONS: Final = (

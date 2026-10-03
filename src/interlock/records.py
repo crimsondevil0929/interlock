@@ -54,7 +54,7 @@ from typing import Any, Final
 from agentgov.core import QUANTUM, EntryType, LedgerEntry
 from agentgov.exceptions import MalformedReceiptError
 from agentgov.receipts import canonical_bytes, loads_strict
-from agentgov.receipts.signing import Signer, Verifier
+from agentgov.receipts.signing import Signer, Verifier, parse_key
 
 from interlock.chain import _FileClaim, _fsync_directory, _split_tail
 from interlock.exceptions import AnchorError, RecordIntegrityError
@@ -64,12 +64,14 @@ __all__ = [
     "GENESIS",
     "RECORD_DOMAIN",
     "RECORD_VERSION",
+    "Keyring",
     "RecordKind",
     "RecordLog",
     "SignedRecord",
     "anchor_memo",
     "check_anchors",
     "money",
+    "read_records",
     "verify_records",
 ]
 
@@ -118,6 +120,29 @@ class RecordKind(StrEnum):
 
     EXTENSION_DECLINED = "extension.declined"
     """An operator declined a quote."""
+
+    OPERATOR_INTENT = "operator.intent"
+    """An operator is about to change the outbox: the action, its targets, and
+    each target's delivery-log head as the operator saw it. Written before the
+    database is touched; its hash is the action's authority
+    (``docs/EPIC3_DESIGN.md`` §6)."""
+
+    OPERATOR_APPLIED = "operator.applied"
+    """The database applied an intent: the delivery-log rows that carry its
+    authority."""
+
+    OPERATOR_REFUSED = "operator.refused"
+    """The database refused an intent: a head had moved, or the action no
+    longer applied. Nothing carries its authority."""
+
+    OPERATOR_INSTALLED = "operator.installed"
+    """An operator installed the outbox's sink registry: a digest of every
+    sink as the database mirrors it after the install. A registry that
+    differs from the last signed install was changed around Interlock."""
+
+    OPERATOR_ABANDONED = "operator.abandoned"
+    """The process that signed an intent stopped before acting on it, and no
+    row carries its authority: recorded by the next operator to act."""
 
 
 def money(amount: Decimal | int | str) -> str:
@@ -260,12 +285,58 @@ class SignedRecord:
         )
 
 
-def verify_records(records: Sequence[SignedRecord], verifier: Verifier) -> None:
+class Keyring:
+    """The public keys a log written by several signers is verified under:
+    each record under the key it names, and only under a key held here.
+
+    :param keys: Each signer's name, and their key: a :class:`Verifier`, or
+        written as ``ed25519:<hex>`` (an Ed25519 public key; verifying needs
+        no private half and nothing beyond agentgov).
+    :raises ValueError: On a key that does not parse, or one key under two
+        names.
+    """
+
+    __slots__ = ("_by_id", "_names")
+
+    def __init__(self, keys: Mapping[str, Verifier | str]) -> None:
+        self._by_id: dict[str, Verifier] = {}
+        self._names: dict[str, str] = {}
+        for name, key in keys.items():
+            try:
+                verifier = parse_key(key) if isinstance(key, str) else key
+            except MalformedReceiptError as exc:
+                raise ValueError(f"the key of {name!r} does not parse: {exc}") from exc
+            if verifier.key_id in self._by_id:
+                raise ValueError(
+                    f"{self._names[verifier.key_id]!r} and {name!r} hold one key; a key "
+                    f"names one signer"
+                )
+            self._by_id[verifier.key_id] = verifier
+            self._names[verifier.key_id] = name
+
+    def verifier(self, key_id: str) -> Verifier | None:
+        return self._by_id.get(key_id)
+
+    def name(self, key_id: str) -> str | None:
+        """Whose key ``key_id`` is."""
+        return self._names.get(key_id)
+
+    def __contains__(self, key_id: object) -> bool:
+        return key_id in self._by_id
+
+    def __len__(self) -> int:
+        return len(self._by_id)
+
+
+def verify_records(records: Sequence[SignedRecord], verifier: Verifier | Keyring) -> None:
     """Check a log from its first record: sequence, links and signatures.
 
     A log verified alone can still have lost its tail. Check it against the
     ledger's anchors with :func:`check_anchors` for that.
 
+    :param verifier: The key every record is signed with; or a
+        :class:`Keyring`, each record verified under the key it names, which
+        the keyring must hold.
     :raises RecordIntegrityError: On the first record that does not hold.
     """
     previous = GENESIS
@@ -285,7 +356,16 @@ def verify_records(records: Sequence[SignedRecord], verifier: Verifier) -> None:
                 f"record {index} links to {record.prev[:16]}, expected {previous[:16]}: "
                 f"the log was re-linked"
             )
-        record.verify(verifier)
+        if isinstance(verifier, Keyring):
+            key = verifier.verifier(record.key_id)
+            if key is None:
+                raise RecordIntegrityError(
+                    f"record {index} was signed by key {record.key_id}, which is not a "
+                    f"registered key"
+                )
+            record.verify(key)
+        else:
+            record.verify(verifier)
         previous = record.record_hash
 
 
@@ -346,17 +426,39 @@ class RecordLog:
     :param log_id: Names this log in every record and every ledger anchor.
         Logs that share a ledger must not share an id.
     :param path: Optional JSON Lines file.
+    :param keyring: For a log several signers write (the operator log): an
+        existing file is verified under it, each record under its own
+        signer's key, and ``signer`` must be one of its keys.
     :raises ChainInUseError: If another live log has the file open.
     :raises RecordIntegrityError: If the existing file does not verify.
+    :raises ValueError: If ``signer`` is not in ``keyring``.
     """
 
-    __slots__ = ("_claim", "_closed", "_head", "_lock", "_log_id", "_path", "_records", "_signer")
+    __slots__ = (
+        "_claim",
+        "_closed",
+        "_head",
+        "_keyring",
+        "_lock",
+        "_log_id",
+        "_path",
+        "_records",
+        "_signer",
+    )
 
     def __init__(
-        self, signer: Signer, *, log_id: str = "interlock", path: str | Path | None = None
+        self,
+        signer: Signer,
+        *,
+        log_id: str = "interlock",
+        path: str | Path | None = None,
+        keyring: Keyring | None = None,
     ) -> None:
         if not _LOG_ID.fullmatch(log_id):
             raise ValueError(f"a log id is 1-64 characters of [A-Za-z0-9._:@/-], got {log_id!r}")
+        if keyring is not None and signer.key_id not in keyring:
+            raise ValueError(f"the signer's key {signer.key_id} is not a registered key")
+        self._keyring = keyring
         self._signer = signer
         self._log_id = log_id
         self._records: list[SignedRecord] = []
@@ -444,15 +546,18 @@ class RecordLog:
             self._head = record.record_hash
             return record
 
-    def verify(self, verifier: Verifier | None = None) -> None:
-        """Verify the whole log, under the signer unless another key is given.
+    def verify(self, verifier: Verifier | Keyring | None = None) -> None:
+        """Verify the whole log: under ``verifier`` if given, else the keyring
+        the log was opened with, else the signer.
 
         :raises RecordIntegrityError: On the first record that does not hold.
         """
-        verify_records(self.records(), verifier if verifier is not None else self._signer)
+        if verifier is None:
+            verifier = self._keyring if self._keyring is not None else self._signer
+        verify_records(self.records(), verifier)
 
     @staticmethod
-    def load(path: str | Path, verifier: Verifier) -> tuple[SignedRecord, ...]:
+    def load(path: str | Path, verifier: Verifier | Keyring) -> tuple[SignedRecord, ...]:
         """Read and verify a log file without claiming it.
 
         A torn final line is a record in flight and is left out, not cut off.
@@ -517,11 +622,24 @@ class RecordLog:
                 handle.flush()
                 os.fsync(handle.fileno())
         records = _parse(path, complete)
-        verify_records(records, self._signer)
+        verify_records(records, self._keyring if self._keyring is not None else self._signer)
         if records and records[0].log != self._log_id:
             raise RecordIntegrityError(f"{path} holds log {records[0].log!r}, not {self._log_id!r}")
         self._records = records
         self._head = records[-1].record_hash if records else GENESIS
+
+
+def read_records(path: str | Path) -> tuple[SignedRecord, ...]:
+    """A log file's records, parsed and not verified: for a verifier that
+    reports every problem rather than stopping at the first. A torn final
+    line is a record in flight and is left out.
+
+    :raises FileNotFoundError: If there is no file at ``path``.
+    :raises RecordIntegrityError: If a line is not an ILOK1 record.
+    """
+    source = Path(path)
+    complete, _ = _split_tail(source.read_bytes())
+    return tuple(_parse(source, complete))
 
 
 def _parse(path: Path, data: bytes) -> list[SignedRecord]:

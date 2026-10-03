@@ -48,6 +48,7 @@ from interlock import (
 )
 from interlock.deliveries import verify_delivery_log
 from interlock.exceptions import OutboundRequestError, SubstrateUnavailableError
+from interlock.operators import generate_key
 from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
 from interlock.relay import DeliveryResult, NoBreaker, Relay
 from interlock.sqlite_outbox import (
@@ -488,10 +489,18 @@ def test_a_row_that_does_not_extend_its_log_is_refused(outbox: SqliteOutbox) -> 
             with pytest.raises(sqlite3.IntegrityError, match="must extend"):
                 conn.execute(
                     "INSERT INTO _interlock_outbox_attempts (message_id, seq, event, actor, at, "
-                    "prev_hash, event_hash) VALUES (?, ?, 'released', 'dba', "
+                    "prev_hash, event_hash) VALUES (?, ?, 'held', 'dba', "
                     "'2026-10-03T00:00:00.000000Z', ?, 'x')",
                     (str(message), seq, prev),
                 )
+        # And an operator's row needs a signed authority before anything else.
+        with pytest.raises(sqlite3.IntegrityError, match="signed authority"):
+            conn.execute(
+                "INSERT INTO _interlock_outbox_attempts (message_id, seq, event, actor, at, "
+                "prev_hash, event_hash) VALUES (?, 99, 'released', 'dba', "
+                "'2026-10-03T00:00:00.000000Z', 'x', 'x')",
+                (str(message),),
+            )
 
 
 @pytest.mark.parametrize(
@@ -580,9 +589,17 @@ def test_the_command_line_on_a_sqlite_file(tmp_path: Path) -> None:
     sink = FakeSink()
     try:
         path = tmp_path / "interlock.toml"
-        path.write_text(CONFIG.format(database=database, url=sink.url))
-        code, out = cli("install", "--config", str(path))
+        key = generate_key(tmp_path / "ops.key")
+        path.write_text(
+            CONFIG.format(database=database, url=sink.url)
+            + f'\n[operators]\nlog = "operators.ilok1"\n'
+            f'[operators.keys]\nops = "{key.public_key().spec()}"\n'
+        )
+        # With [operators], installing changes the registry an operator signs for.
+        assert cli("install", "--config", str(path))[0] == 2
+        code, out = cli("install", "--config", str(path), "--key", str(tmp_path / "ops.key"))
         assert code == 0 and "the outbox, and WAL mode" in out and "registered sink: mail" in out
+        assert "signed by ops: the sink registry" in out
         registry = SinkRegistry(
             [SinkSpec("mail", (OperationSpec("send"),), cost_per_call=Decimal("0.002"))]
         )
@@ -603,7 +620,18 @@ def test_the_command_line_on_a_sqlite_file(tmp_path: Path) -> None:
         assert code == 0 and "delivered  1" in out and "dead       1" in out
         code, out = cli("outbox", "list", "--state", "dead", "--config", str(path))
         dead = uuid.UUID(out.split()[0])
-        assert cli("outbox", "requeue", str(dead), "--config", str(path), "--actor", "ops")[0] == 0
+        # Unsigned, an operator's action is refused; signed, it is recorded.
+        assert cli("outbox", "requeue", str(dead), "--config", str(path))[0] == 2
+        code, out = cli(
+            "outbox",
+            "requeue",
+            str(dead),
+            "--config",
+            str(path),
+            "--key",
+            str(tmp_path / "ops.key"),
+        )
+        assert code == 0 and "signed by ops" in out and "operator.applied" in out
         assert cli("relay", "--config", str(path), "--once")[0] == 0
         code, out = cli("outbox", "show", str(dead), "--config", str(path))
         assert code == 0 and [line.split()[2] for line in out.splitlines()] == [
@@ -614,7 +642,7 @@ def test_the_command_line_on_a_sqlite_file(tmp_path: Path) -> None:
             "delivered",
         ]
         code, out = cli("outbox", "verify", "--config", str(path))
-        assert (code, out.strip()) == (0, "every delivery log verifies")
+        assert code == 0 and "every operator action is signed" in out
     finally:
         sink.close()
 

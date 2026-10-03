@@ -18,15 +18,16 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator, Mapping
-from contextlib import closing
-from datetime import timedelta
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import closing, contextmanager
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import psycopg
 from agentgov import BudgetManager
+from agentgov.receipts.signing import Ed25519Signer
 from psycopg.conninfo import make_conninfo
 
 from interlock import (
@@ -38,12 +39,33 @@ from interlock import (
     deliveries,
 )
 from interlock.adapters import HttpAdapter
-from interlock.deliveries import LogEvent, message_log, state_counts, verify_delivery_log
+from interlock.deliveries import (
+    LogEvent,
+    OutboxOperations,
+    event_hash,
+    message_log,
+    state_counts,
+    verify_delivery_log,
+)
+from interlock.operators import (
+    Operator,
+    OperatorLog,
+    OperatorRefusedError,
+    OperatorReport,
+    verify_operators,
+)
 from interlock.outbound import DEAD_LETTER, OperationSpec, SinkRegistry, SinkSpec
 from interlock.outbox_store import OutboxStore, PostgresOutboxStore
 from interlock.postgres import install
+from interlock.records import Keyring, read_records
 from interlock.relay import Breaker, LedgerBreaker, Relay
-from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore, install_sqlite_outbox, now_us
+from interlock.sqlite_outbox import (
+    OPERATOR,
+    SqliteOutboxStore,
+    install_sqlite_outbox,
+    instant_text,
+    now_us,
+)
 from interlock.types import EffectId, EffectPlan, OutboundRequest
 from tests.conftest import (
     OBSERVED,
@@ -118,6 +140,7 @@ class Outbox:
         self.ledger_path = ledger_path
         self.governor = governor
         self.sinks: dict[str, FakeSink] = {}
+        self.keys: dict[str, Ed25519Signer] = {}
 
     # -- the database: each backend's own ------------------------------------
 
@@ -146,17 +169,105 @@ class Outbox:
         append-only guard."""
         raise NotImplementedError
 
-    def release(self, message: uuid.UUID, *, actor: str) -> bool:
+    def operations(self) -> OutboxOperations:
+        """What an operator's actions go through, on this store."""
         raise NotImplementedError
+
+    def forge(
+        self,
+        message: uuid.UUID,
+        event: str,
+        *,
+        authority: str | None,
+        state_after: str | None,
+        actor: str = "operator:dba",
+    ) -> None:
+        """A ghost edit, as the database's owner could make one: a delivery-log
+        row written around Interlock's triggers, linked and hashed exactly as
+        Interlock would have, the head advanced and the state set to match.
+        The delivery log alone cannot tell it from a real one."""
+        raise NotImplementedError
+
+    def _forged(
+        self,
+        message: uuid.UUID,
+        event: str,
+        authority: str | None,
+        state_after: str | None,
+        actor: str,
+        at: datetime | str,
+    ) -> tuple[int, str, str]:
+        head = self.row(message)
+        seq, prev = int(head["log_seq"]) + 1, str(head["log_head"])
+        digest = event_hash(
+            prev,
+            message,
+            seq,
+            None,
+            event,
+            actor,
+            at,
+            None,
+            None,
+            "edited",
+            state_after,
+            None,
+            authority,
+        )
+        return seq, prev, digest
+
+    # -- operators: every action signed, as `interlock outbox` signs it ---------
+
+    def operator_key(self, actor: str) -> Ed25519Signer:
+        if actor not in self.keys:
+            self.keys[actor] = Ed25519Signer.generate()
+        return self.keys[actor]
+
+    def keyring(self) -> Keyring:
+        return Keyring({name: key.public_key() for name, key in self.keys.items()})
+
+    @property
+    def operator_log(self) -> Path:
+        return Path(self.ledger_path).parent / "operators.ilok1"
+
+    @contextmanager
+    def signed(
+        self,
+        actor: str = "ops",
+        *,
+        checkpoint: Callable[[str], None] | None = None,
+        ledger: BudgetManager | None = None,
+    ) -> Iterator[Operator]:
+        """An operator session, as one ``interlock outbox`` command opens it."""
+        key = self.operator_key(actor)
+        log = OperatorLog(self.operator_log, key, self.keyring(), ledger=ledger, scope="operators")
+        try:
+            yield Operator(log, self.operations(), checkpoint=checkpoint)
+        finally:
+            log.close()
+
+    def release(self, message: uuid.UUID, *, actor: str) -> bool:
+        with self.signed(actor) as operator:
+            return operator.release([message]).applied
 
     def release_scope(self, scope: str, *, actor: str) -> int:
-        raise NotImplementedError
+        with self.signed(actor) as operator:
+            try:
+                return operator.release_scope(scope).count("released")
+            except OperatorRefusedError:
+                return 0
 
     def cancel(self, message: uuid.UUID, *, actor: str, reason: str) -> bool:
-        raise NotImplementedError
+        with self.signed(actor) as operator:
+            return operator.cancel(message, reason=reason).applied
 
     def requeue(self, message: uuid.UUID, *, actor: str) -> int:
-        raise NotImplementedError
+        with self.signed(actor) as operator:
+            return operator.requeue(message).count("requeued")
+
+    def verify_operators(self) -> OperatorReport:
+        records = read_records(self.operator_log) if self.operator_log.exists() else ()
+        return verify_operators(self.operator(), records, self.keyring())
 
     def relay_target(self) -> dict[str, str]:
         """Where a relay in another process finds the outbox: the store's
@@ -166,6 +277,11 @@ class Outbox:
     def lease_left(self, message: uuid.UUID) -> float:
         """Seconds left on the message's lease, by the database's clock; 0
         when it is not leased."""
+        raise NotImplementedError
+
+    def operator_target(self) -> dict[str, str]:
+        """Where an operator in another process acts: as the installer on
+        PostgreSQL, the file on SQLite."""
         raise NotImplementedError
 
     def settle(self) -> None:
@@ -280,6 +396,11 @@ class Outbox:
         return [(e.event, e.attempt) for e in self.log(message)]
 
     def verify(self) -> None:
+        """Every delivery log verifies, and every operator row is signed."""
+        assert self.verify_operators().problems == ()
+        self.verify_logs()
+
+    def verify_logs(self) -> None:
         problems = verify_delivery_log(self.operator())
         assert problems == (), problems
 
@@ -351,20 +472,40 @@ class PostgresOutbox(Outbox):
         )
         conn.execute("ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only")
 
-    def release(self, message: uuid.UUID, *, actor: str) -> bool:
-        return deliveries.release(self.operator(), message, actor=actor)
+    def operations(self) -> OutboxOperations:
+        return deliveries.operations(self.operator())
 
-    def release_scope(self, scope: str, *, actor: str) -> int:
-        return deliveries.release_scope(self.operator(), scope, actor=actor)
-
-    def cancel(self, message: uuid.UUID, *, actor: str, reason: str) -> bool:
-        return deliveries.cancel(self.operator(), message, actor=actor, reason=reason)
-
-    def requeue(self, message: uuid.UUID, *, actor: str) -> int:
-        return deliveries.requeue(self.operator(), message, actor=actor)
+    def forge(
+        self,
+        message: uuid.UUID,
+        event: str,
+        *,
+        authority: str | None,
+        state_after: str | None,
+        actor: str = "operator:dba",
+    ) -> None:
+        at = datetime.now(UTC)
+        seq, prev, digest = self._forged(message, event, authority, state_after, actor, at)
+        conn = self.operator()
+        conn.execute("ALTER TABLE interlock.outbox_attempts DISABLE TRIGGER outbox_log_link")
+        conn.execute(
+            "INSERT INTO interlock.outbox_attempts (message_id, seq, event, actor, at, detail, "
+            "state_after, authority, prev_hash, event_hash) "
+            "VALUES (%s, %s, %s, %s, %s, 'edited', %s, %s, %s, %s)",
+            (message, seq, event, actor, at, state_after, authority, prev, digest),
+        )
+        conn.execute(
+            "UPDATE interlock.outbox_state SET log_seq = %s, log_head = %s, "
+            "state = coalesce(%s, state) WHERE message_id = %s",
+            (seq, digest, state_after, message),
+        )
+        conn.execute("ALTER TABLE interlock.outbox_attempts ENABLE ALWAYS TRIGGER outbox_log_link")
 
     def relay_target(self) -> dict[str, str]:
         return {"store": "postgres", "dsn": self.relay_dsn}
+
+    def operator_target(self) -> dict[str, str]:
+        return {"store": "postgres", "dsn": self.pg.admin}
 
     def lease_left(self, message: uuid.UUID) -> float:
         row = (
@@ -479,19 +620,43 @@ class SqliteOutbox(Outbox):
                 (payload, str(message)),
             )
 
-    def release(self, message: uuid.UUID, *, actor: str) -> bool:
-        return self.operator().release(message, actor=f"operator:{actor}")
+    def operations(self) -> OutboxOperations:
+        return self.operator()
 
-    def release_scope(self, scope: str, *, actor: str) -> int:
-        return self.operator().release_scope(scope, actor=f"operator:{actor}")
-
-    def cancel(self, message: uuid.UUID, *, actor: str, reason: str) -> bool:
-        return self.operator().cancel(message, actor=f"operator:{actor}", reason=reason)
-
-    def requeue(self, message: uuid.UUID, *, actor: str) -> int:
-        return self.operator().requeue(message, actor=f"operator:{actor}")
+    def forge(
+        self,
+        message: uuid.UUID,
+        event: str,
+        *,
+        authority: str | None,
+        state_after: str | None,
+        actor: str = "operator:dba",
+    ) -> None:
+        at = instant_text(now_us())
+        seq, prev, digest = self._forged(message, event, authority, state_after, actor, at)
+        with closing(self.raw()) as conn:
+            for trigger in (
+                "_interlock_log_link",
+                "_interlock_log_authority",
+                "_interlock_log_head",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            conn.execute(
+                "INSERT INTO _interlock_outbox_attempts (message_id, seq, event, actor, at, "
+                "detail, state_after, authority, prev_hash, event_hash) "
+                "VALUES (?, ?, ?, ?, ?, 'edited', ?, ?, ?, ?)",
+                (str(message), seq, event, actor, at, state_after, authority, prev, digest),
+            )
+            conn.execute(
+                "UPDATE _interlock_outbox_state SET log_seq = ?, log_head = ?, "
+                "state = coalesce(?, state) WHERE message_id = ?",
+                (seq, digest, state_after, str(message)),
+            )
 
     def relay_target(self) -> dict[str, str]:
+        return {"store": "sqlite", "dsn": self.path}
+
+    def operator_target(self) -> dict[str, str]:
         return {"store": "sqlite", "dsn": self.path}
 
     def lease_left(self, message: uuid.UUID) -> float:

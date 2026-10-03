@@ -173,7 +173,7 @@ def test_a_sink_no_longer_listed_is_disabled_not_deleted(pg: Pg) -> None:
 
 
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
-OUTBOX_TABLES = ("sinks", "outbox", "outbox_state", "outbox_attempts", "stages")
+OUTBOX_TABLES = ("sinks", "outbox", "outbox_state", "outbox_attempts", "outbox_epochs", "stages")
 
 
 def privileges(env: Pg, grantee: str) -> dict[str, set[str]]:
@@ -210,10 +210,10 @@ RELAY_CALLS = (
     "interlock.relay_refuse(uuid, text, bigint, text)",
 )
 OPERATOR_CALLS = (
-    "interlock.outbox_release(uuid, text)",
-    "interlock.outbox_release_scope(text, text)",
-    "interlock.outbox_cancel(uuid, text, text)",
-    "interlock.outbox_requeue(uuid, text)",
+    "interlock.outbox_release(uuid, text, text, text)",
+    "interlock.outbox_cancel(uuid, text, text, text, text)",
+    "interlock.outbox_requeue(uuid, text, text, text)",
+    "interlock.outbox_compensate(uuid, text, text, text, uuid, text, text, text)",
 )
 
 
@@ -232,6 +232,7 @@ def test_each_role_holds_exactly_its_part(pg: Pg) -> None:
             "outbox": {"SELECT"},
             "outbox_state": {"SELECT"},
             "outbox_attempts": {"SELECT"},
+            "outbox_epochs": {"SELECT"},
             "stages": set(),
         }
         assert all(may_execute(pg, relay, f) for f in RELAY_CALLS)

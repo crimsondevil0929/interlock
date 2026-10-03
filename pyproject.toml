@@ -32,6 +32,9 @@ interlock = "interlock.cli:main_entry"
 
 [project.optional-dependencies]
 postgres = ["psycopg[binary]>=3.2"]
+# Signing operator records (interlock outbox release, compensate...) with an
+# Ed25519 key. Verifying them needs nothing extra.
+sign = ["interlock-agentgov[sign]>=0.3.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -52,6 +55,7 @@ dev = [
     # scripts/live_stress_test.py only. Not a runtime dependency: nothing in
     # src/ imports it, and the library never talks to a model provider.
     "anthropic>=1.0.0",
+    "cryptography>=42",
 ]
 
 [tool.pytest.ini_options]

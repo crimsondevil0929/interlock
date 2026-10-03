@@ -55,6 +55,12 @@ VERSION_2: dict[str, Any] = {
     "OUTBOX_TRIGGERS": v2.OUTBOX_TRIGGERS,
     "_RELAY_FUNCTIONS": v2.RELAY_FUNCTIONS_V2,
     "_install_sinks": v2.install_sinks_v2,
+    "_OUTBOX_TABLES": (
+        "interlock.sinks",
+        "interlock.outbox",
+        "interlock.outbox_state",
+        "interlock.outbox_attempts",
+    ),
     "INSTALL_VERSION": "2",
 }
 

@@ -150,6 +150,16 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_attempts (
 );
 REVOKE ALL ON interlock.outbox_attempts FROM PUBLIC;
 
+-- When each version was first installed here. An operator's row without an
+-- authority is version 2's when it is older than version 3; any later one was
+-- written around Interlock (docs/EPIC3_DESIGN.md §6).
+CREATE TABLE IF NOT EXISTS interlock.outbox_epochs (
+    version text PRIMARY KEY,
+    at      timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+REVOKE ALL ON interlock.outbox_epochs FROM PUBLIC;
+INSERT INTO interlock.outbox_epochs (version) VALUES ('3') ON CONFLICT (version) DO NOTHING;
+
 -- Version 3, in place over version 2. Every column it adds is NULL in every
 -- row written before, and a row with neither remote_ref nor authority hashes
 -- as version 2 hashed it: every delivery log written under 2 still verifies.
@@ -483,6 +493,11 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'interlock: message % has no delivery state', NEW.message_id
             USING ERRCODE = 'IL002';
+    END IF;
+    IF NEW.event IN ('released', 'cancelled', 'requeued', 'compensated')
+       AND (NEW.authority IS NULL OR NEW.authority !~ '^[0-9a-f]{64}$') THEN
+        RAISE EXCEPTION 'interlock: an operator''s % needs the authority of a signed intent',
+            NEW.event USING ERRCODE = 'IL007';
     END IF;
     NEW.seq := head_seq + 1;
     NEW.prev_hash := head;
@@ -927,10 +942,21 @@ END
 $fn$;
 
 -- Operator actions. Granted to no role: they run as the installer.
+--
+-- Version 3: each takes the authority it acts under (the hash of the
+-- operator's signed intent, docs/EPIC3_DESIGN.md §6), which the delivery-log
+-- row it writes carries, and the head of the message's log as the operator
+-- saw it when they signed. A head that moved is a refusal: an authorization
+-- is never replayed on a later state.
+DROP FUNCTION IF EXISTS interlock.outbox_release(uuid, text);
+DROP FUNCTION IF EXISTS interlock.outbox_release_scope(text, text);
+DROP FUNCTION IF EXISTS interlock.outbox_cancel(uuid, text, text);
+DROP FUNCTION IF EXISTS interlock.outbox_requeue(uuid, text);
 
 -- Releases a held message for delivery: an operator's decision, after the
 -- breaker that held it was reset or judged not to apply.
-CREATE OR REPLACE FUNCTION interlock.outbox_release(p_message uuid, p_actor text)
+CREATE OR REPLACE FUNCTION interlock.outbox_release(
+    p_message uuid, p_actor text, p_authority text, p_expected_head text)
 RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -938,44 +964,23 @@ AS $fn$
 BEGIN
     PERFORM 1 FROM interlock.outbox_state AS st
      WHERE st.message_id = p_message AND st.state = 'held'
+       AND st.log_head = p_expected_head
        FOR UPDATE;
     IF NOT FOUND THEN
         RETURN false;
     END IF;
     PERFORM interlock.outbox_log(
-        p_message, NULL, 'released', p_actor, NULL, NULL, 'released by an operator', 'pending');
+        p_message, NULL, 'released', p_actor, NULL, NULL, 'released by an operator', 'pending',
+        NULL, p_authority);
     PERFORM interlock.outbox_settle(p_message, 'pending', 'released');
     RETURN true;
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION interlock.outbox_release_scope(p_scope text, p_actor text)
-RETURNS integer
-LANGUAGE plpgsql SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $fn$
-DECLARE
-    held uuid;
-    released integer := 0;
-BEGIN
-    FOR held IN
-        SELECT st.message_id
-          FROM interlock.outbox_state AS st
-          JOIN interlock.outbox AS o ON o.message_id = st.message_id
-         WHERE o.scope_id = p_scope AND st.state = 'held'
-         ORDER BY o.enqueued_at, o.seq
-    LOOP
-        IF interlock.outbox_release(held, p_actor) THEN
-            released := released + 1;
-        END IF;
-    END LOOP;
-    RETURN released;
-END
-$fn$;
-
 -- Cancels a message that is not being delivered and was not delivered:
 -- pending, held or dead. Its dependants die with it.
-CREATE OR REPLACE FUNCTION interlock.outbox_cancel(p_message uuid, p_actor text, p_reason text)
+CREATE OR REPLACE FUNCTION interlock.outbox_cancel(
+    p_message uuid, p_actor text, p_reason text, p_authority text, p_expected_head text)
 RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -983,13 +988,14 @@ AS $fn$
 BEGIN
     PERFORM 1 FROM interlock.outbox_state AS st
      WHERE st.message_id = p_message AND st.state IN ('pending', 'held', 'dead')
+       AND st.log_head = p_expected_head
        FOR UPDATE;
     IF NOT FOUND THEN
         RETURN false;
     END IF;
     PERFORM interlock.outbox_log(
         p_message, NULL, 'cancelled', p_actor, NULL, NULL,
-        coalesce(p_reason, 'cancelled by an operator'), 'cancelled');
+        coalesce(p_reason, 'cancelled by an operator'), 'cancelled', NULL, p_authority);
     PERFORM interlock.outbox_settle(
         p_message, 'cancelled', coalesce(p_reason, 'cancelled by an operator'));
     PERFORM interlock.outbox_fail_dependants(p_message, p_actor);
@@ -998,11 +1004,30 @@ END
 $fn$;
 
 -- Sends a dead message back for delivery with a fresh budget of attempts,
--- and the requests that died waiting for it with it. Not one past its
--- deadline: the deadline is part of what was adjudicated.
-CREATE OR REPLACE FUNCTION interlock.outbox_requeue(p_message uuid, p_actor text)
+-- and the requests that died waiting for it with it, under one authority.
+-- Not one past its deadline: the deadline is part of what was adjudicated.
+CREATE OR REPLACE FUNCTION interlock.outbox_requeue(
+    p_message uuid, p_actor text, p_authority text, p_expected_head text)
 RETURNS integer
 LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    PERFORM 1 FROM interlock.outbox_state AS st
+     WHERE st.message_id = p_message AND st.log_head = p_expected_head
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 0;
+    END IF;
+    RETURN interlock.outbox_requeue_from(p_message, p_actor, p_authority);
+END
+$fn$;
+
+-- outbox_requeue without the head: for the dependants it brings back. Internal.
+CREATE OR REPLACE FUNCTION interlock.outbox_requeue_from(
+    p_message uuid, p_actor text, p_authority text)
+RETURNS integer
+LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $fn$
 DECLARE
@@ -1020,7 +1045,8 @@ BEGIN
         RETURN 0;
     END IF;
     PERFORM interlock.outbox_log(
-        p_message, NULL, 'requeued', p_actor, NULL, NULL, 'requeued by an operator', 'pending');
+        p_message, NULL, 'requeued', p_actor, NULL, NULL, 'requeued by an operator', 'pending',
+        NULL, p_authority);
     UPDATE interlock.outbox_state
        SET attempt_floor = attempts
      WHERE message_id = p_message;
@@ -1035,9 +1061,150 @@ BEGIN
            AND ds.state = 'dead' AND ds.reason = 'dependency failed: ' || effect
          ORDER BY d.seq
     LOOP
-        requeued := requeued + interlock.outbox_requeue(dep.message_id, p_actor);
+        requeued := requeued + interlock.outbox_requeue_from(dep.message_id, p_actor, p_authority);
     END LOOP;
     RETURN requeued;
+END
+$fn$;
+
+-- A compensation's payload with every {"$bind": "delivered.id"} replaced by
+-- what the delivered call created. Internal.
+CREATE OR REPLACE FUNCTION interlock.outbox_bind(p_value jsonb, p_ref text)
+RETURNS jsonb
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    bound jsonb;
+    item record;
+BEGIN
+    IF pg_catalog.jsonb_typeof(p_value) = 'object' THEN
+        IF p_value = '{"$bind": "delivered.id"}'::jsonb THEN
+            RETURN pg_catalog.to_jsonb(p_ref);
+        END IF;
+        bound := '{}'::jsonb;
+        FOR item IN SELECT key, value FROM pg_catalog.jsonb_each(p_value) LOOP
+            bound := bound || pg_catalog.jsonb_build_object(
+                item.key, interlock.outbox_bind(item.value, p_ref));
+        END LOOP;
+        RETURN bound;
+    END IF;
+    IF pg_catalog.jsonb_typeof(p_value) = 'array' THEN
+        SELECT coalesce(pg_catalog.jsonb_agg(interlock.outbox_bind(e.value, p_ref)
+                                             ORDER BY e.ordinality), '[]'::jsonb)
+          INTO bound
+          FROM pg_catalog.jsonb_array_elements(p_value) WITH ORDINALITY AS e;
+        RETURN bound;
+    END IF;
+    RETURN p_value;
+END
+$fn$;
+
+-- Enqueues the compensation a delivered request carried (E4-3), as a new
+-- message: its placeholder bound to what the delivered call created, waiting
+-- for the compensations of the requests that waited for the original (E4-4),
+-- once per original (its effect is the original's, prefixed). The original's
+-- log records it. The payload is the caller's canonical bytes, and must be
+-- the stored compensation, bound: nothing else can be enqueued this way.
+CREATE OR REPLACE FUNCTION interlock.outbox_compensate(
+    p_original uuid, p_actor text, p_authority text, p_expected_head text, p_message uuid,
+    p_payload text, p_payload_hash text, p_idempotency_key text)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    o record;
+    k record;
+    ref text;
+    expected jsonb;
+    comp jsonb;
+    effect text;
+    next_seq integer;
+    waits text[];
+    bytes bytea := pg_catalog.convert_to(p_payload, 'UTF8');
+    enqueued timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    PERFORM 1 FROM interlock.outbox_state AS st
+     WHERE st.message_id = p_original AND st.state = 'delivered'
+       AND st.log_head = p_expected_head
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    SELECT * INTO o FROM interlock.outbox WHERE message_id = p_original;
+    comp := o.compensation;
+    IF comp IS NULL THEN
+        RETURN false;
+    END IF;
+    SELECT a.remote_ref INTO ref FROM interlock.outbox_attempts AS a
+     WHERE a.message_id = p_original AND a.event = 'delivered'
+     ORDER BY a.seq DESC LIMIT 1;
+    IF ref IS NULL AND interlock.outbox_bind(comp -> 'payload', '') <> comp -> 'payload' THEN
+        RETURN false;  -- a placeholder, and nothing to bind it to
+    END IF;
+    expected := interlock.outbox_bind(comp -> 'payload', coalesce(ref, ''));
+    IF p_payload::jsonb IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION '%', 'interlock: the payload is not the compensation message '
+            || p_original::text || ' carried, bound to what its delivery created'
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'compensation', 'sink', comp ->> 'sink')::text;
+    END IF;
+    SELECT kk.operations, kk.max_payload_bytes, kk.not_after_seconds, kk.cost_per_call INTO k
+      FROM interlock.sinks AS kk WHERE kk.name = comp ->> 'sink' AND kk.enabled;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'interlock: no enabled sink named % is installed', comp ->> 'sink'
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'unregistered_sink', 'sink', comp ->> 'sink')::text;
+    END IF;
+    IF NOT ((comp ->> 'operation') = ANY (k.operations)) THEN
+        RAISE EXCEPTION 'interlock: sink % installs no operation %',
+            comp ->> 'sink', comp ->> 'operation'
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'unregistered_operation', 'sink', comp ->> 'sink')::text;
+    END IF;
+    IF pg_catalog.octet_length(bytes) > k.max_payload_bytes
+       OR pg_catalog.encode(pg_catalog.sha256(bytes), 'hex') <> p_payload_hash THEN
+        RAISE EXCEPTION 'interlock: the compensation exceeds its sink''s bound or its hash'
+            USING ERRCODE = 'IL004',
+                  DETAIL = pg_catalog.json_build_object(
+                      'reason', 'payload_hash', 'sink', comp ->> 'sink')::text;
+    END IF;
+    effect := 'compensate:' || o.effect_id;
+    waits := ARRAY(
+        SELECT c.effect_id
+          FROM interlock.outbox AS d
+          JOIN interlock.outbox AS c ON c.compensates = d.message_id
+         WHERE d.stage_id = o.stage_id AND o.effect_id = ANY (d.depends_on)
+         ORDER BY c.effect_id);
+    SELECT coalesce(max(x.seq), 0) + 1 INTO next_seq
+      FROM interlock.outbox AS x WHERE x.stage_id = o.stage_id;
+    INSERT INTO interlock.outbox (
+        message_id, stage_id, plan_id, scope_id, effect_id, seq, depends_on, sink,
+        operation, tenant_id, payload, payload_hash, idempotency_key, cost, compensation,
+        compensates, not_after, enqueued_at
+    ) VALUES (
+        p_message, o.stage_id, o.plan_id, o.scope_id, effect, next_seq, waits,
+        comp ->> 'sink', comp ->> 'operation', o.tenant_id, p_payload::jsonb, p_payload_hash,
+        p_idempotency_key, k.cost_per_call, NULL, p_original,
+        enqueued + pg_catalog.make_interval(
+            secs => coalesce((comp ->> 'not_after_seconds')::integer, k.not_after_seconds)),
+        enqueued
+    );
+    INSERT INTO interlock.outbox_state (message_id, log_head)
+    VALUES (
+        p_message,
+        interlock.outbox_genesis(p_message, o.stage_id, o.plan_id, o.scope_id, effect,
+                                 comp ->> 'sink', comp ->> 'operation', p_idempotency_key,
+                                 p_payload_hash)
+    );
+    PERFORM interlock.outbox_log(
+        p_original, NULL, 'compensated', p_actor, NULL, NULL,
+        'compensated by ' || p_message::text, NULL, NULL, p_authority);
+    RETURN true;
 END
 $fn$;
 """

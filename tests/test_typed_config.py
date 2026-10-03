@@ -17,6 +17,7 @@ import pytest
 from interlock import EscrowEngine, PlanBuilder, SqliteSubstrate
 from interlock.cli import main
 from interlock.config import ConfigError, load_config
+from interlock.operators import generate_key
 from interlock.outbound import SinkRegistry
 from interlock.sendgrid import CATALOG as SENDGRID_CATALOG
 from interlock.sendgrid import MAIL_SEND
@@ -215,6 +216,13 @@ def test_the_relay_command_delivers_to_stripe_and_sendgrid(
     stripe, sendgrid = vendors
     database = build_sqlite_back_office(tmp_path / "app.sqlite")
     path = write(tmp_path, CONFIG, database=database, stripe=stripe.url, sendgrid=sendgrid.url)
+    key = generate_key(tmp_path / "ops.key")
+    with path.open("a") as handle:
+        handle.write(
+            f'\n[operators]\nlog = "operators.ilok1"\n'
+            f'[operators.keys]\nops = "{key.public_key().spec()}"\n'
+        )
+    monkeypatch.setenv("INTERLOCK_OPERATOR_KEY", str(tmp_path / "ops.key"))
     code, out = cli("install", "--config", str(path))
     assert code == 0
     assert "registered sink: payments (stripe: payment_intents.create, refunds.create)" in out
@@ -266,6 +274,22 @@ def test_the_relay_command_delivers_to_stripe_and_sendgrid(
     (intent,) = stripe.of("payment_intent")
     assert intent["amount"] == 1200 and len(sendgrid.sent) == 1
     code, out = cli("outbox", "verify", "--config", str(path))
-    assert (code, out.strip()) == (0, "every delivery log verifies")
+    assert code == 0 and out.startswith("every delivery log verifies")
     code, out = cli("outbox", "list", "--state", "delivered", "--config", str(path))
     assert code == 0 and "payments.payment_intents.create" in out and "email.mail.send" in out
+
+    # The customer is refunded: the compensation the plan carried, bound to
+    # the payment intent Stripe made, signed, delivered.
+    (charged,) = [line.split()[0] for line in out.splitlines() if "payments." in line]
+    code, out = cli("outbox", "compensate", charged, "--config", str(path), "--reason", "refund")
+    assert code == 0 and "compensated" in out and "signed by ops" in out
+    code, out = cli("relay", "--config", str(path), "--once")
+    assert code == 0 and "claimed 1: delivered 1" in out
+    (refund,) = stripe.of("refund")
+    assert refund["payment_intent"] == intent["id"]
+    code, out = cli("outbox", "compensate", charged, "--config", str(path))
+    assert code == 1 and "already" in out
+    code, out = cli("outbox", "verify", "--config", str(path))
+    assert code == 0 and "every operator action is signed" in out
+    code, out = cli("outbox", "resolve", "--config", str(path))
+    assert (code, out.strip()) == (0, "resolved 0 intent(s)")

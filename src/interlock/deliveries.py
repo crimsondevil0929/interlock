@@ -16,34 +16,47 @@ message the breaker held is a person's decision, not a process's.
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
+from agentgov.receipts.canonical import loads_strict
+
+from interlock.exceptions import OutboundRequestError
+
 if TYPE_CHECKING:
     import psycopg
 
 __all__ = [
+    "ACTION_EVENTS",
+    "OPERATOR_EVENTS",
+    "AuthorizedRow",
+    "Compensable",
     "LogEvent",
     "LoggedMessage",
     "MessageView",
+    "OutboxOperations",
     "OutboxReader",
+    "PostgresOperations",
     "PostgresReader",
     "cancel",
+    "compensate",
     "event_hash",
     "frame",
     "genesis_hash",
     "message_log",
     "messages",
+    "operations",
     "parse_instant",
     "reader",
+    "registry_digest",
     "release",
-    "release_scope",
     "requeue",
     "state_counts",
     "verify_delivery_log",
@@ -61,6 +74,17 @@ OUTCOMES: Final = frozenset({"delivered", "retryable", "permanent", "unknown"})
 inference, by the relay that took the lease over, that nobody will report."""
 
 _OPERATIONAL: Final = frozenset({"pending", "leased"})
+
+ACTION_EVENTS: Final = {
+    "release": "released",
+    "cancel": "cancelled",
+    "requeue": "requeued",
+    "compensate": "compensated",
+}
+"""Each operator action, and the delivery-log event it writes."""
+OPERATOR_EVENTS: Final = frozenset(ACTION_EVENTS.values())
+"""Events only an operator writes, each under a signed intent's authority
+(schema version 3; docs/EPIC3_DESIGN.md §6)."""
 
 
 def frame(*fields: str | None) -> str:
@@ -287,6 +311,145 @@ class OutboxReader(Protocol):
 
     def counts(self) -> dict[str, int]: ...
 
+    def epoch(self) -> datetime | None:
+        """When schema version 3 was first installed: an operator's row without
+        an authority older than this is version 2's."""
+        ...
+
+    def registry(self) -> list[dict[str, Any]]:
+        """Every sink as the database mirrors it, every column, in one form
+        for both stores: what a signed install vouches for."""
+        ...
+
+
+def registry_digest(rows: Sequence[Mapping[str, Any]]) -> str:
+    """A digest of a sink registry as :meth:`OutboxReader.registry` reads it."""
+    from interlock.types import canonical_hash
+
+    ordered = sorted(rows, key=lambda row: str(row["name"]))
+    return canonical_hash([dict(row) for row in ordered])
+
+
+_REGISTRY_COLUMNS: Final = (
+    "name",
+    "kind",
+    "operations",
+    "cost_per_call",
+    "idempotency",
+    "max_payload_bytes",
+    "not_after_seconds",
+    "max_attempts",
+    "backoff_base_ms",
+    "backoff_cap_ms",
+    "unknown_outcome",
+    "config_hash",
+    "enabled",
+)
+
+
+def _registry_row(values: Sequence[Any]) -> dict[str, Any]:
+    row = dict(zip(_REGISTRY_COLUMNS, values, strict=True))
+    operations = row["operations"]
+    row["operations"] = sorted(
+        json.loads(operations) if isinstance(operations, str) else operations
+    )
+    for key in (
+        "max_payload_bytes",
+        "not_after_seconds",
+        "max_attempts",
+        "backoff_base_ms",
+        "backoff_cap_ms",
+    ):
+        row[key] = int(row[key])
+    row["enabled"] = bool(row["enabled"])
+    for key in ("name", "kind", "cost_per_call", "idempotency", "unknown_outcome", "config_hash"):
+        row[key] = str(row[key])
+    return row
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizedRow:
+    """A delivery-log row an operator's intent wrote: it carries its authority."""
+
+    message_id: uuid.UUID
+    seq: int
+    event: str
+    event_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class Compensable:
+    """A message of a plan, as compensating it needs it read."""
+
+    message_id: uuid.UUID
+    plan_id: str
+    stage_id: uuid.UUID
+    effect_id: str
+    depends_on: tuple[str, ...]
+    state: str
+    not_after: datetime
+    log_head: str
+    compensation: Mapping[str, Any] | None
+    """The request that undoes this one, as the plan carried it."""
+    remote_ref: str | None
+    """What its delivered call created, as the delivery log recorded it."""
+    compensated_by: uuid.UUID | None
+    """The compensation already enqueued for it."""
+    compensates: uuid.UUID | None
+    """The message this one is the compensation of."""
+
+
+class OutboxOperations(OutboxReader, Protocol):
+    """An operator's actions, on either store. Each writes its delivery-log
+    rows under ``authority``, the hash of the operator's signed intent, and
+    only while the message's log is at ``expected_head``: ``False`` (or 0)
+    when the message is not in a state the action applies to, or its log
+    moved. :class:`interlock.operators.Operator` is what calls them."""
+
+    def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]: ...
+
+    def authorized(self, authority: str) -> list[AuthorizedRow]:
+        """The rows that carry ``authority``, in log order."""
+        ...
+
+    def held(self, scope_id: str) -> list[uuid.UUID]:
+        """The held messages of a scope, oldest first."""
+        ...
+
+    def plan_of(self, message_id: uuid.UUID) -> str | None: ...
+
+    def compensables(self, plan_id: str) -> list[Compensable]: ...
+
+    def release(
+        self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str
+    ) -> bool: ...
+
+    def cancel(
+        self,
+        message_id: uuid.UUID,
+        *,
+        actor: str,
+        reason: str,
+        authority: str,
+        expected_head: str,
+    ) -> bool: ...
+
+    def requeue(
+        self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str
+    ) -> int: ...
+
+    def compensate(
+        self,
+        original: uuid.UUID,
+        *,
+        actor: str,
+        authority: str,
+        expected_head: str,
+        message_id: uuid.UUID,
+        payload: bytes,
+        idempotency_key: str,
+    ) -> bool: ...
+
 
 class PostgresReader:
     """An :class:`OutboxReader` over a PostgreSQL connection."""
@@ -345,6 +508,90 @@ class PostgresReader:
         ]
         events = [_event(row) for row in self._conn.execute(self._events(), params)]
         return found, events
+
+    def epoch(self) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT CASE WHEN pg_catalog.to_regclass('interlock.outbox_epochs') IS NULL "
+            "THEN NULL ELSE (SELECT at FROM interlock.outbox_epochs WHERE version = '3') END"
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def registry(self) -> list[dict[str, Any]]:
+        return [
+            _registry_row(r)
+            for r in self._conn.execute(
+                "SELECT name, kind, operations, cost_per_call, idempotency, max_payload_bytes, "
+                "not_after_seconds, max_attempts, backoff_base_ms, backoff_cap_ms, "
+                "unknown_outcome, config_hash, enabled FROM interlock.sinks ORDER BY name"
+            )
+        ]
+
+    def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
+        return {
+            r[0]: str(r[1])
+            for r in self._conn.execute(
+                "SELECT message_id, log_head FROM interlock.outbox_state "
+                "WHERE message_id = ANY (%s::uuid[])",
+                (list(message_ids),),
+            )
+        }
+
+    def authorized(self, authority: str) -> list[AuthorizedRow]:
+        return [
+            AuthorizedRow(r[0], int(r[1]), str(r[2]), str(r[3]))
+            for r in self._conn.execute(
+                "SELECT message_id, seq, event, event_hash FROM interlock.outbox_attempts "
+                "WHERE authority = %s ORDER BY message_id, seq",
+                (authority,),
+            )
+        ]
+
+    def held(self, scope_id: str) -> list[uuid.UUID]:
+        return [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT o.message_id FROM interlock.outbox o "
+                "JOIN interlock.outbox_state s USING (message_id) "
+                "WHERE o.scope_id = %s AND s.state = 'held' ORDER BY o.enqueued_at, o.seq",
+                (scope_id,),
+            )
+        ]
+
+    def plan_of(self, message_id: uuid.UUID) -> str | None:
+        row = self._conn.execute(
+            "SELECT plan_id FROM interlock.outbox WHERE message_id = %s", (message_id,)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def compensables(self, plan_id: str) -> list[Compensable]:
+        return [
+            Compensable(
+                message_id=r[0],
+                plan_id=str(r[1]),
+                stage_id=r[2],
+                effect_id=str(r[3]),
+                depends_on=tuple(r[4]),
+                state=str(r[5]),
+                not_after=r[6],
+                log_head=str(r[7]),
+                compensation=None if r[8] is None else loads_strict(str(r[8])),
+                remote_ref=_text(r[9]),
+                compensated_by=r[10],
+                compensates=r[11],
+            )
+            for r in self._conn.execute(
+                "SELECT o.message_id, o.plan_id, o.stage_id, o.effect_id, o.depends_on, "
+                "s.state, o.not_after, s.log_head, o.compensation::text, "
+                "(SELECT a.remote_ref FROM interlock.outbox_attempts a "
+                " WHERE a.message_id = o.message_id AND a.event = 'delivered' "
+                " ORDER BY a.seq DESC LIMIT 1), "
+                "(SELECT c.message_id FROM interlock.outbox c WHERE c.compensates = o.message_id), "
+                "o.compensates "
+                "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
+                "WHERE o.plan_id = %s ORDER BY o.seq",
+                (plan_id,),
+            )
+        ]
 
     def views(
         self, *, state: str | None, scope_id: str | None, limit: int
@@ -554,41 +801,176 @@ def state_counts(source: object) -> dict[str, int]:
 def _operator(actor: str) -> str:
     if not actor:
         raise ValueError("an operator action names who took it")
-    return f"operator:{actor}"
+    return actor if actor.startswith("operator:") else f"operator:{actor}"
 
 
-def release(conn: psycopg.Connection[Any], message_id: uuid.UUID, *, actor: str) -> bool:
-    """Release a held message for delivery. ``False`` if it was not held."""
+def release(
+    conn: psycopg.Connection[Any],
+    message_id: uuid.UUID,
+    *,
+    actor: str,
+    authority: str,
+    expected_head: str,
+) -> bool:
+    """Release a held message for delivery. ``False`` if it was not held, or
+    its log moved past ``expected_head``."""
     row = conn.execute(
-        "SELECT interlock.outbox_release(%s, %s)", (message_id, _operator(actor))
+        "SELECT interlock.outbox_release(%s, %s, %s, %s)",
+        (message_id, _operator(actor), authority, expected_head),
     ).fetchone()
     return bool(row and row[0])
-
-
-def release_scope(conn: psycopg.Connection[Any], scope_id: str, *, actor: str) -> int:
-    """Release every held message of a scope, oldest first. Returns how many."""
-    row = conn.execute(
-        "SELECT interlock.outbox_release_scope(%s, %s)", (scope_id, _operator(actor))
-    ).fetchone()
-    return int(row[0]) if row else 0
 
 
 def cancel(
-    conn: psycopg.Connection[Any], message_id: uuid.UUID, *, actor: str, reason: str
+    conn: psycopg.Connection[Any],
+    message_id: uuid.UUID,
+    *,
+    actor: str,
+    reason: str,
+    authority: str,
+    expected_head: str,
 ) -> bool:
     """Cancel a pending, held or dead message; the requests that wait for it
-    die with it. ``False`` if it is being delivered, or was."""
+    die with it. ``False`` if it is being delivered, or was, or its log moved."""
     row = conn.execute(
-        "SELECT interlock.outbox_cancel(%s, %s, %s)", (message_id, _operator(actor), reason)
+        "SELECT interlock.outbox_cancel(%s, %s, %s, %s, %s)",
+        (message_id, _operator(actor), reason, authority, expected_head),
     ).fetchone()
     return bool(row and row[0])
 
 
-def requeue(conn: psycopg.Connection[Any], message_id: uuid.UUID, *, actor: str) -> int:
+def requeue(
+    conn: psycopg.Connection[Any],
+    message_id: uuid.UUID,
+    *,
+    actor: str,
+    authority: str,
+    expected_head: str,
+) -> int:
     """Send a dead message back for delivery with a fresh budget of attempts,
     and the requests that died waiting for it. Returns how many were
-    requeued: none if it is not dead, or is past its deadline."""
+    requeued: none if it is not dead, is past its deadline, or its log moved."""
     row = conn.execute(
-        "SELECT interlock.outbox_requeue(%s, %s)", (message_id, _operator(actor))
+        "SELECT interlock.outbox_requeue(%s, %s, %s, %s)",
+        (message_id, _operator(actor), authority, expected_head),
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+def compensate(
+    conn: psycopg.Connection[Any],
+    original: uuid.UUID,
+    *,
+    actor: str,
+    authority: str,
+    expected_head: str,
+    message_id: uuid.UUID,
+    payload: bytes,
+    idempotency_key: str,
+) -> bool:
+    """Enqueue the compensation ``original`` carried, as ``message_id``, with
+    ``payload``: the compensation's own, its placeholder bound to what the
+    original's delivery created, as canonical bytes. ``False`` if the original
+    is not delivered, carries no compensation, has nothing to bind its
+    placeholder to, or its log moved.
+
+    :raises OutboundRequestError: If the payload is not that compensation, its
+        sink refuses it, or the original was compensated already.
+    """
+    import psycopg
+
+    try:
+        row = conn.execute(
+            "SELECT interlock.outbox_compensate(%s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                original,
+                _operator(actor),
+                authority,
+                expected_head,
+                message_id,
+                payload.decode("utf-8"),
+                hashlib.sha256(payload).hexdigest(),
+                idempotency_key,
+            ),
+        ).fetchone()
+    except psycopg.errors.UniqueViolation as exc:
+        raise OutboundRequestError(
+            f"message {original} was compensated already: a compensation is enqueued once",
+            reason="duplicate",
+        ) from exc
+    except psycopg.Error as exc:
+        if getattr(exc, "sqlstate", None) != "IL004":
+            raise
+        detail = getattr(getattr(exc, "diag", None), "message_detail", None) or "{}"
+        reason = str(json.loads(detail).get("reason", "compensation"))
+        raise OutboundRequestError(str(exc), reason=reason) from exc
+    return bool(row and row[0])
+
+
+class PostgresOperations(PostgresReader):
+    """:class:`OutboxOperations` over a PostgreSQL connection as the installer."""
+
+    __slots__ = ()
+
+    def release(
+        self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str
+    ) -> bool:
+        return release(
+            self._conn, message_id, actor=actor, authority=authority, expected_head=expected_head
+        )
+
+    def cancel(
+        self,
+        message_id: uuid.UUID,
+        *,
+        actor: str,
+        reason: str,
+        authority: str,
+        expected_head: str,
+    ) -> bool:
+        return cancel(
+            self._conn,
+            message_id,
+            actor=actor,
+            reason=reason,
+            authority=authority,
+            expected_head=expected_head,
+        )
+
+    def requeue(
+        self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str
+    ) -> int:
+        return requeue(
+            self._conn, message_id, actor=actor, authority=authority, expected_head=expected_head
+        )
+
+    def compensate(
+        self,
+        original: uuid.UUID,
+        *,
+        actor: str,
+        authority: str,
+        expected_head: str,
+        message_id: uuid.UUID,
+        payload: bytes,
+        idempotency_key: str,
+    ) -> bool:
+        return compensate(
+            self._conn,
+            original,
+            actor=actor,
+            authority=authority,
+            expected_head=expected_head,
+            message_id=message_id,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+
+
+def operations(source: object) -> OutboxOperations:
+    """``source`` as :class:`OutboxOperations`: a SQLite store opened with
+    ``writes=OPERATOR`` already is; a PostgreSQL connection, as the installer,
+    is wrapped."""
+    if hasattr(source, "compensate"):
+        return source  # type: ignore[return-value]
+    return PostgresOperations(source)  # type: ignore[arg-type]

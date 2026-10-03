@@ -731,8 +731,10 @@ def test_the_log_is_linked_by_the_database_not_the_writer(outbox: PostgresOutbox
         "INSERT INTO interlock.outbox_attempts (message_id, seq, event, actor, at, prev_hash, "
         "event_hash) SELECT message_id, 1, 'delivered', 'x', now(), '', '' "
         "FROM interlock.outbox",
-        "SELECT interlock.outbox_release(message_id, 'x') FROM interlock.outbox",
-        "SELECT interlock.outbox_requeue(message_id, 'x') FROM interlock.outbox",
+        "SELECT interlock.outbox_release(message_id, 'x', repeat('a', 64), '') "
+        "FROM interlock.outbox",
+        "SELECT interlock.outbox_requeue(message_id, 'x', repeat('a', 64), '') "
+        "FROM interlock.outbox",
         "SELECT interlock.outbox_log(message_id, 1, 'delivered', 'x', NULL, NULL, NULL, "
         "'delivered') FROM interlock.outbox",
         "UPDATE interlock.sinks SET enabled = true",
@@ -979,8 +981,20 @@ def write_config(outbox: PostgresOutbox, tmp_path: Path) -> Path:
             mail=outbox.sink("mail").url,
             sms=outbox.sink("sms").url,
         )
+        + operators_section(tmp_path)
     )
     return path
+
+
+def operators_section(tmp_path: Path, name: str = "ops") -> str:
+    """``[operators]``, with a key for ``name`` written beside the config."""
+    from interlock.operators import generate_key
+
+    key = generate_key(tmp_path / f"{name}.key")
+    return (
+        '\n[operators]\nlog = "operators.ilok1"\n'
+        f'[operators.keys]\n{name} = "{key.public_key().spec()}"\n'
+    )
 
 
 def cli(*argv: str) -> tuple[int, str]:
@@ -1018,6 +1032,7 @@ def test_interlock_outbox_inspects_verifies_and_acts(
 ) -> None:
     monkeypatch.setenv("INTERLOCK_TEST_MAIL_AUTH", "Bearer x")
     path = str(write_config(outbox, tmp_path))
+    monkeypatch.setenv("INTERLOCK_OPERATOR_KEY", str(tmp_path / "ops.key"))
     _, (held, failing) = outbox.commit(mail(1), sms(2))
     outbox.sink("sms").script(status(400))
     outbox.governor.trip(SCOPE, "ops halt")
@@ -1025,7 +1040,7 @@ def test_interlock_outbox_inspects_verifies_and_acts(
     code, out = cli("outbox", "status", "--config", path)
     assert code == 0 and "held       2" in out
     outbox.governor.reset(SCOPE)
-    assert cli("outbox", "release", str(failing), "--config", path, "--actor", "ops")[0] == 0
+    assert cli("outbox", "release", str(failing), "--config", path)[0] == 0
     assert cli("relay", "--config", path, "--once")[0] == 0
     code, out = cli("outbox", "list", "--config", path, "--state", "dead")
     assert code == 0 and str(failing) in out and "permanent failure" in out
@@ -1037,17 +1052,23 @@ def test_interlock_outbox_inspects_verifies_and_acts(
         "sending",
         "permanent",
     ]
-    assert cli("outbox", "requeue", str(failing), "--config", path, "--actor", "ops")[0] == 0
+    assert cli("outbox", "requeue", str(failing), "--config", path)[0] == 0
     assert (
         cli("outbox", "cancel", str(failing), "--config", path, "--reason", "wrong number")[0] == 0
     )
     assert cli("outbox", "cancel", str(failing), "--config", path, "--reason", "again")[0] == 1
-    code, out = cli("outbox", "release", "--scope", SCOPE, "--config", path, "--actor", "ops")
-    assert code == 0 and "released 1 message(s)" in out
+    code, out = cli("outbox", "release", "--scope", SCOPE, "--config", path)
+    assert code == 0 and "signed by ops" in out and f"released     {held}" in out
     assert cli("relay", "--config", path, "--once")[0] == 0
     assert (outbox.state(held), outbox.state(failing)) == ("delivered", "cancelled")
     code, out = cli("outbox", "verify", "--config", path)
-    assert (code, out.strip()) == (0, "every delivery log verifies")
+    assert (code, out.splitlines()) == (
+        0,
+        [
+            "every delivery log verifies",
+            "every operator action is signed, and the operator log verifies",
+        ],
+    )
     with outbox.admin() as conn:
         conn.execute("ALTER TABLE interlock.outbox_attempts DISABLE TRIGGER attempts_append_only")
         conn.execute("DELETE FROM interlock.outbox_attempts WHERE message_id = %s", (held,))

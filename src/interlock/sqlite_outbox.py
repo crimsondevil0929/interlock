@@ -45,9 +45,13 @@ from urllib.parse import quote
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 
 from interlock.deliveries import (
+    _REGISTRY_COLUMNS,
+    AuthorizedRow,
+    Compensable,
     LogEvent,
     LoggedMessage,
     MessageView,
+    _registry_row,
     event_hash,
     genesis_hash,
     parse_instant,
@@ -57,7 +61,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
-from interlock.outbound import typed_sink
+from interlock.outbound import bind, placeholders, typed_sink
 from interlock.outbox_store import Checkpoint, milliseconds
 from interlock.types import OutboundDelta, _frozen
 
@@ -81,7 +85,8 @@ SINKS: Final = "_interlock_sinks"
 OUTBOX: Final = "_interlock_outbox"
 STATE: Final = "_interlock_outbox_state"
 LOG: Final = "_interlock_outbox_attempts"
-OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG})
+EPOCHS: Final = "_interlock_outbox_epochs"
+OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG, EPOCHS})
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -194,6 +199,17 @@ _SCHEMA: Final = (
         UPDATE {STATE} SET log_seq = NEW.seq, log_head = NEW.event_hash
          WHERE message_id = NEW.message_id;
     END""",
+    # An operator's row carries the authority of a signed intent
+    # (docs/EPIC3_DESIGN.md §6): the hash of an operator.intent record.
+    f"""CREATE TRIGGER IF NOT EXISTS _interlock_log_authority BEFORE INSERT ON {LOG}
+    WHEN NEW.event IN ('released', 'cancelled', 'requeued', 'compensated')
+     AND (NEW.authority IS NULL OR length(NEW.authority) <> 64
+          OR NEW.authority GLOB '*[^0-9a-f]*')
+    BEGIN
+        SELECT RAISE(ABORT, 'interlock: an operator action needs a signed authority');
+    END""",
+    # When this outbox was installed: every operator row after it is signed.
+    f"CREATE TABLE IF NOT EXISTS main.{EPOCHS} (version TEXT PRIMARY KEY, at INTEGER NOT NULL)",
 )
 
 LOG_TRIGGERS: Final = (
@@ -203,6 +219,7 @@ LOG_TRIGGERS: Final = (
     "_interlock_log_no_delete",
     "_interlock_log_link",
     "_interlock_log_head",
+    "_interlock_log_authority",
 )
 
 
@@ -302,6 +319,9 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
         try:
             for statement in _SCHEMA:
                 conn.execute(statement)
+            conn.execute(
+                f"INSERT OR IGNORE INTO {EPOCHS} (version, at) VALUES ('3', ?)", (now_us(),)
+            )
             listed = list(sinks)
             for sink in listed:
                 conn.execute(
@@ -1047,71 +1067,40 @@ class SqliteOutboxStore:
         return True
 
     # -- operators ----------------------------------------------------------------
+    #
+    # Each writes its rows under the authority of the operator's signed intent
+    # (the trigger refuses an operator row without one), and only while the
+    # message's log is at the head the operator saw when they signed.
 
-    def _at_head(self, conn: sqlite3.Connection, message: str, expected: str | None) -> bool:
-        if expected is None:
-            return True
+    def _at(
+        self, conn: sqlite3.Connection, message: str, expected_head: str, states: Sequence[str]
+    ) -> bool:
         row = conn.execute(
-            f"SELECT log_head FROM {STATE} WHERE message_id = ?", (message,)
+            f"SELECT state, log_head FROM {STATE} WHERE message_id = ?", (message,)
         ).fetchone()
-        return row is not None and str(row[0]) == expected
+        return row is not None and row[0] in states and str(row[1]) == expected_head
 
     def release(
-        self,
-        message_id: uuid.UUID,
-        *,
-        actor: str,
-        authority: str | None = None,
-        expected_head: str | None = None,
+        self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str
     ) -> bool:
         """A held message back to pending. ``False`` if it was not held, or
         its log moved past ``expected_head``."""
         message = str(message_id)
         with self._writing() as conn:
-            if not self._release(conn, message, actor, authority, expected_head):
+            if not self._at(conn, message, expected_head, ("held",)):
                 return False
+            self._log(
+                conn,
+                message,
+                None,
+                "released",
+                _operator(actor),
+                state_after="pending",
+                detail="released by an operator",
+                authority=authority,
+            )
+            self._settle(conn, message, "pending", "released")
         return True
-
-    def _release(
-        self,
-        conn: sqlite3.Connection,
-        message: str,
-        actor: str,
-        authority: str | None,
-        expected_head: str | None,
-    ) -> bool:
-        state = conn.execute(
-            f"SELECT state FROM {STATE} WHERE message_id = ?", (message,)
-        ).fetchone()
-        if state is None or state[0] != "held" or not self._at_head(conn, message, expected_head):
-            return False
-        self._log(
-            conn,
-            message,
-            None,
-            "released",
-            actor,
-            state_after="pending",
-            detail="released by an operator",
-            authority=authority,
-        )
-        self._settle(conn, message, "pending", "released")
-        return True
-
-    def release_scope(self, scope_id: str, *, actor: str, authority: str | None = None) -> int:
-        """Release every held message of a scope, oldest first."""
-        released = 0
-        with self._writing() as conn:
-            held = conn.execute(
-                f"SELECT s.message_id FROM {STATE} AS s JOIN {OUTBOX} AS o "
-                f"ON o.message_id = s.message_id WHERE o.scope_id = ? AND s.state = 'held' "
-                f"ORDER BY o.enqueued_at, o.seq",
-                (scope_id,),
-            ).fetchall()
-            for (message,) in held:
-                if self._release(conn, str(message), actor, authority, None):
-                    released += 1
-        return released
 
     def cancel(
         self,
@@ -1119,20 +1108,13 @@ class SqliteOutboxStore:
         *,
         actor: str,
         reason: str,
-        authority: str | None = None,
-        expected_head: str | None = None,
+        authority: str,
+        expected_head: str,
     ) -> bool:
         """Cancel a pending, held or dead message; its dependants die."""
         message = str(message_id)
         with self._writing() as conn:
-            state = conn.execute(
-                f"SELECT state FROM {STATE} WHERE message_id = ?", (message,)
-            ).fetchone()
-            if (
-                state is None
-                or state[0] not in ("pending", "held", "dead")
-                or not self._at_head(conn, message, expected_head)
-            ):
+            if not self._at(conn, message, expected_head, ("pending", "held", "dead")):
                 return False
             why = reason or "cancelled by an operator"
             self._log(
@@ -1140,47 +1122,34 @@ class SqliteOutboxStore:
                 message,
                 None,
                 "cancelled",
-                actor,
+                _operator(actor),
                 state_after="cancelled",
                 detail=why,
                 authority=authority,
             )
             self._settle(conn, message, "cancelled", why)
-            self._fail_dependants(conn, message, actor)
+            self._fail_dependants(conn, message, _operator(actor))
         return True
 
     def requeue(
-        self,
-        message_id: uuid.UUID,
-        *,
-        actor: str,
-        authority: str | None = None,
-        expected_head: str | None = None,
+        self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str
     ) -> int:
         """A dead message back to pending with a fresh budget, and the requests
-        that died waiting for it. Not one past its deadline."""
+        that died waiting for it, under one authority. Not one past its
+        deadline."""
+        message = str(message_id)
         with self._writing() as conn:
-            return self._requeue(conn, str(message_id), actor, authority, expected_head)
+            if not self._at(conn, message, expected_head, ("dead",)):
+                return 0
+            return self._requeue(conn, message, _operator(actor), authority)
 
-    def _requeue(
-        self,
-        conn: sqlite3.Connection,
-        message: str,
-        actor: str,
-        authority: str | None,
-        expected_head: str | None,
-    ) -> int:
+    def _requeue(self, conn: sqlite3.Connection, message: str, actor: str, authority: str) -> int:
         row = conn.execute(
             f"SELECT s.state, o.not_after, o.effect_id, o.stage_id FROM {STATE} AS s "
             f"JOIN {OUTBOX} AS o ON o.message_id = s.message_id WHERE s.message_id = ?",
             (message,),
         ).fetchone()
-        if (
-            row is None
-            or row[0] != "dead"
-            or int(row[1]) <= now_us()
-            or not self._at_head(conn, message, expected_head)
-        ):
+        if row is None or row[0] != "dead" or int(row[1]) <= now_us():
             return 0
         self._log(
             conn,
@@ -1205,8 +1174,151 @@ class SqliteOutboxStore:
             f"AND ds.state = 'dead' AND ds.reason = ? ORDER BY d.seq",
             (stage, effect, f"dependency failed: {effect}"),
         ).fetchall():
-            requeued += self._requeue(conn, str(dependant), actor, authority, None)
+            requeued += self._requeue(conn, str(dependant), actor, authority)
         return requeued
+
+    def compensate(
+        self,
+        original: uuid.UUID,
+        *,
+        actor: str,
+        authority: str,
+        expected_head: str,
+        message_id: uuid.UUID,
+        payload: bytes,
+        idempotency_key: str,
+    ) -> bool:
+        """Enqueue the compensation ``original`` carried, as PostgreSQL's
+        ``outbox_compensate`` does: ``payload`` must be that compensation,
+        its placeholder bound to what the original's delivery created.
+
+        :raises OutboundRequestError: If it is not, its sink refuses it, or
+            the original was compensated already.
+        """
+        message = str(original)
+        with self._writing() as conn:
+            if not self._at(conn, message, expected_head, ("delivered",)):
+                return False
+            o = conn.execute(
+                f"SELECT stage_id, plan_id, scope_id, effect_id, tenant_id, compensation "
+                f"FROM {OUTBOX} WHERE message_id = ?",
+                (message,),
+            ).fetchone()
+            if o[5] is None:
+                return False
+            document = loads_strict(str(o[5]))
+            ref = conn.execute(
+                f"SELECT remote_ref FROM {LOG} WHERE message_id = ? AND event = 'delivered' "
+                f"ORDER BY seq DESC LIMIT 1",
+                (message,),
+            ).fetchone()
+            remote_ref = None if ref is None or ref[0] is None else str(ref[0])
+            if remote_ref is None and placeholders(document["payload"]):
+                return False
+            sink_name, operation = str(document["sink"]), str(document["operation"])
+            if loads_strict(payload) != bind(document["payload"], remote_ref or ""):
+                raise OutboundRequestError(
+                    f"the payload is not the compensation message {original} carried, bound to "
+                    f"what its delivery created",
+                    reason="compensation",
+                    sink=sink_name,
+                )
+            sink = conn.execute(
+                f"SELECT operations, max_payload_bytes, not_after_seconds, cost_per_call "
+                f"FROM {SINKS} WHERE name = ? AND enabled = 1",
+                (sink_name,),
+            ).fetchone()
+            if sink is None or operation not in json.loads(sink[0]):
+                raise OutboundRequestError(
+                    f"sink {sink_name!r} is not installed with operation {operation!r}",
+                    reason="unregistered_operation" if sink is not None else "unregistered_sink",
+                    sink=sink_name,
+                )
+            if len(payload) > int(sink[1]):
+                raise OutboundRequestError(
+                    "the compensation exceeds its sink's bound",
+                    reason="payload_size",
+                    sink=sink_name,
+                )
+            effect = f"compensate:{o[3]}"
+            waits = [
+                str(r[0])
+                for r in conn.execute(
+                    f"SELECT c.effect_id FROM {OUTBOX} AS d JOIN {OUTBOX} AS c "
+                    f"ON c.compensates = d.message_id WHERE d.stage_id = ? "
+                    f"AND ? IN (SELECT value FROM json_each(d.depends_on)) ORDER BY c.effect_id",
+                    (str(o[0]), str(o[3])),
+                ).fetchall()
+            ]
+            seq = conn.execute(
+                f"SELECT coalesce(max(seq), 0) + 1 FROM {OUTBOX} WHERE stage_id = ?", (str(o[0]),)
+            ).fetchone()[0]
+            enqueued = now_us()
+            window = document.get("not_after_seconds") or int(sink[2])
+            payload_hash = hashlib.sha256(payload).hexdigest()
+            try:
+                conn.execute(
+                    f"INSERT INTO {OUTBOX} (message_id, stage_id, plan_id, scope_id, effect_id, "
+                    f"seq, depends_on, sink, operation, tenant_id, payload, payload_hash, "
+                    f"idempotency_key, cost, compensation, compensates, not_after, enqueued_at) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                    (
+                        str(message_id),
+                        str(o[0]),
+                        str(o[1]),
+                        str(o[2]),
+                        effect,
+                        int(seq),
+                        json.dumps(waits),
+                        sink_name,
+                        operation,
+                        o[4],
+                        payload.decode("utf-8"),
+                        payload_hash,
+                        idempotency_key,
+                        str(sink[3]),
+                        message,
+                        enqueued + int(window) * 1_000_000,
+                        enqueued,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise OutboundRequestError(
+                    f"message {original} was compensated already: a compensation is enqueued once",
+                    reason="duplicate",
+                    sink=sink_name,
+                ) from exc
+            conn.execute(
+                f"INSERT INTO {STATE} (message_id, log_head, next_attempt_at, updated_at) "
+                f"VALUES (?, ?, ?, ?)",
+                (
+                    str(message_id),
+                    genesis_hash(
+                        message_id,
+                        uuid.UUID(str(o[0])),
+                        str(o[1]),
+                        str(o[2]),
+                        effect,
+                        sink_name,
+                        operation,
+                        idempotency_key,
+                        payload_hash,
+                    ),
+                    enqueued,
+                    enqueued,
+                ),
+            )
+            self._log(
+                conn,
+                message,
+                None,
+                "compensated",
+                _operator(actor),
+                state_after=None,
+                detail=f"compensated by {message_id}",
+                authority=authority,
+            )
+        return True
 
     # -- reading ---------------------------------------------------------------
 
@@ -1309,6 +1421,73 @@ class SqliteOutboxStore:
             ).fetchall()
         }
 
+    def registry(self) -> list[dict[str, Any]]:
+        return [
+            _registry_row(r)
+            for r in self._conn.execute(
+                f"SELECT {', '.join(_REGISTRY_COLUMNS)} FROM {SINKS} ORDER BY name"
+            ).fetchall()
+        ]
+
+    def epoch(self) -> datetime | None:
+        row = self._conn.execute(f"SELECT at FROM {EPOCHS} WHERE version = '3'").fetchone()
+        return None if row is None else instant(int(row[0]))
+
+    def authorized(self, authority: str) -> list[AuthorizedRow]:
+        return [
+            AuthorizedRow(uuid.UUID(str(r[0])), int(r[1]), str(r[2]), str(r[3]))
+            for r in self._conn.execute(
+                f"SELECT message_id, seq, event, event_hash FROM {LOG} WHERE authority = ? "
+                f"ORDER BY message_id, seq",
+                (authority,),
+            ).fetchall()
+        ]
+
+    def held(self, scope_id: str) -> list[uuid.UUID]:
+        return [
+            uuid.UUID(str(r[0]))
+            for r in self._conn.execute(
+                f"SELECT s.message_id FROM {STATE} AS s JOIN {OUTBOX} AS o "
+                f"ON o.message_id = s.message_id WHERE o.scope_id = ? AND s.state = 'held' "
+                f"ORDER BY o.enqueued_at, o.seq",
+                (scope_id,),
+            ).fetchall()
+        ]
+
+    def plan_of(self, message_id: uuid.UUID) -> str | None:
+        row = self._conn.execute(
+            f"SELECT plan_id FROM {OUTBOX} WHERE message_id = ?", (str(message_id),)
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def compensables(self, plan_id: str) -> list[Compensable]:
+        return [
+            Compensable(
+                message_id=uuid.UUID(str(r[0])),
+                plan_id=str(r[1]),
+                stage_id=uuid.UUID(str(r[2])),
+                effect_id=str(r[3]),
+                depends_on=tuple(json.loads(r[4])),
+                state=str(r[5]),
+                not_after=instant(int(r[6])),
+                log_head=str(r[7]),
+                compensation=None if r[8] is None else loads_strict(str(r[8])),
+                remote_ref=None if r[9] is None else str(r[9]),
+                compensated_by=None if r[10] is None else uuid.UUID(str(r[10])),
+                compensates=None if r[11] is None else uuid.UUID(str(r[11])),
+            )
+            for r in self._conn.execute(
+                f"SELECT o.message_id, o.plan_id, o.stage_id, o.effect_id, o.depends_on, "
+                f"s.state, o.not_after, s.log_head, o.compensation, "
+                f"(SELECT a.remote_ref FROM {LOG} AS a WHERE a.message_id = o.message_id "
+                f" AND a.event = 'delivered' ORDER BY a.seq DESC LIMIT 1), "
+                f"(SELECT c.message_id FROM {OUTBOX} AS c WHERE c.compensates = o.message_id), "
+                f"o.compensates FROM {OUTBOX} AS o JOIN {STATE} AS s "
+                f"ON s.message_id = o.message_id WHERE o.plan_id = ? ORDER BY o.seq",
+                (plan_id,),
+            ).fetchall()
+        ]
+
     def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
         """Each message's delivery-log head, as an operator sees it."""
         return {
@@ -1319,6 +1498,12 @@ class SqliteOutboxStore:
                 (json.dumps([str(m) for m in message_ids]),),
             ).fetchall()
         }
+
+
+def _operator(actor: str) -> str:
+    if not actor:
+        raise ValueError("an operator action names who took it")
+    return actor if actor.startswith("operator:") else f"operator:{actor}"
 
 
 def parse_payload(text: str) -> Any:
