@@ -922,8 +922,9 @@ an instruction injected through a tool result gets out.
 
 So Interlock does not let the plan make the call. It uses the **transactional outbox**
 pattern: the plan *enqueues a request* for the call, beside its SQL effects, and the request
-is handled like a row (PostgreSQL only; the design, and the proofs, are in
-[`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md)).
+is handled like a row, on PostgreSQL and on SQLite alike (the design, and the proofs, are in
+[`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md) and
+[`docs/EPIC3_DESIGN.md`](docs/EPIC3_DESIGN.md)).
 
 1. **Enqueue.** `PlanBuilder.enqueue()` adds the request to the plan. Admission holds it to
    the operator's `SinkRegistry`: a registered sink and operation, a payload that matches
@@ -1052,7 +1053,7 @@ interlock relay --config interlock.toml        # runs until SIGTERM; --once drai
 interlock outbox status  --config interlock.toml --database postgresql://owner@db/app
 interlock outbox list    --state dead --config interlock.toml --database postgresql://owner@db/app
 interlock outbox verify  --config interlock.toml --database postgresql://owner@db/app
-interlock outbox release --scope support-agent --actor alice --config interlock.toml ...
+interlock outbox release --scope support-agent --key ~/.interlock/alice.key --config interlock.toml ...
 ```
 
 Run as many relays as throughput needs, on as many hosts: they share the work through
@@ -1089,6 +1090,105 @@ What the relay guarantees, each with a test that fails without it:
 - **Failure is bounded.** Retries back off exponentially with deterministic jitter, honour
   `Retry-After`, and stop at `max_attempts` or the request's deadline. A dead request takes
   the requests waiting for it with it; `interlock outbox requeue` brings them back.
+
+### Stripe and SendGrid
+
+Two sinks are typed: they bring their operations, strict payload schemas of their own, and
+an adapter that speaks their vendor's API. Configuration names which operations to allow;
+it does not write their schemas.
+
+```toml
+[[sinks]]
+name = "payments"
+type = "stripe"                       # payment_intents.create, charges.create, refunds.create
+cost_per_call = "0.30"
+
+[[sinks.operations]]
+name = "payment_intents.create"       # takes money, so carries its refund...
+
+[[sinks.operations]]
+name = "refunds.create"               # ...which is registered too
+
+[[sinks]]
+name = "email"
+type = "sendgrid"                     # mail.send; at most once unless unknown_outcome = "redeliver"
+cost_per_call = "0.001"
+
+[[sinks.operations]]
+name = "mail.send"
+
+[[relay.endpoints]]
+sink = "payments"
+secret_env = "STRIPE_SECRET_KEY"      # the adapter knows the routes and the headers
+
+[[relay.endpoints]]
+sink = "email"
+secret_env = "SENDGRID_API_KEY"
+```
+
+- **A Stripe charge carries the refund that undoes exactly it.** The refund names the charge
+  by the placeholder `{"$bind": "delivered.id"}`, never a literal id, so a plan cannot point
+  its undo at another customer's payment; it refunds no more than was charged, and names no
+  currency. The rule is checked at admission and again by the database when the request is
+  written, so an engine configured with a laxer registry cannot stage the charge either.
+- **The adapter** sends Stripe's form encoding with the request's idempotency key and a
+  pinned `Stripe-Version`, and records the id of the payment intent it created in the
+  delivery log. A redelivered call is answered by Stripe's idempotent replay: one charge,
+  whatever the relay went through.
+- **SendGrid has no idempotency keys**, so its sinks are at most once by default: a call
+  whose outcome is unknown is not made again, and the message is dead for an operator to
+  resolve. Every email carries its message id and key in `custom_args`.
+- `tests/test_relay_crash.py` drives both through the relay's kill matrix, on both stores:
+  a charge is made once and an email is never sent twice.
+
+### On SQLite
+
+The outbox, the relay and every operator command work on a SQLite file as they do on
+PostgreSQL. `interlock install` switches the file to WAL and installs the outbox; the
+relay is `interlock relay` with the same configuration. SQLite admits one writer at a time,
+and that is the mechanism: every write is a short `BEGIN IMMEDIATE` transaction, so claims
+queue where PostgreSQL's skip, and a relay never holds the lock while it calls a sink. WAL
+means every process that opens the file runs on one host. SQLite has no roles: the file's
+permissions are the boundary, and verification is how an edit made around Interlock is
+found.
+
+### Operators: every action signed
+
+Releasing a held request, cancelling one, requeueing a dead one, and compensating a
+delivered one are a person's decisions about money and messages that leave the system.
+Each is signed with the operator's own Ed25519 key, in two phases: a signed intent names
+the targets and the delivery-log head of each, before the database is touched; the
+database acts under the intent's hash, only at those heads, and refuses an operator's row
+that carries no such authority; a signed outcome names the rows it wrote. A command killed
+between the phases is resolved by the next one.
+
+```bash
+interlock operator keygen --out ~/.interlock/alice.key --name alice   # prints the line below
+```
+
+```toml
+[operators]
+log = "operators.ilok1"               # the signed operator log, beside this file
+ledger = "governor.db"                # optional: every record anchored into AgentGov
+
+[operators.keys]                      # public halves only
+alice = "ed25519:5f0c..."
+```
+
+```bash
+export INTERLOCK_OPERATOR_KEY=~/.interlock/alice.key
+interlock outbox release   <message> --reason "the breaker tripped on a false alarm" --config ...
+interlock outbox compensate <message> --config ...       # the undo the plan carried, bound
+interlock outbox compensate --plan <plan> --late --config ...   # a whole plan, in reverse order
+interlock outbox verify    --config ...
+```
+
+`interlock outbox verify` holds every delivery log to the operator log, from public keys
+alone, and names each edit made around it: an operator row with no authority, an authority
+no signed intent holds or one replayed on another message, a row written at a head other
+than the one signed for, an operator log edited or cut short (its signatures, its AgentGov
+anchors), a sink re-enabled or widened since the last signed `interlock install`. A
+database's owner can still edit their own database; they cannot do it unnoticed.
 
 ## Unrecorded writes
 

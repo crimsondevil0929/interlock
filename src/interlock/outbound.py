@@ -13,7 +13,14 @@ anything is staged (``docs/OUTBOX_DESIGN.md`` §3):
   and a payload carrying one is an agent choosing its own;
 - an operation the operator says can be undone carries its undo, as a
   compensating request that passes the same rules (E4-3); one the operator
-  declares cannot be undone carries none.
+  declares cannot be undone carries none;
+- only a compensation holds a placeholder, ``{"$bind": "delivered.id"}``: the
+  id of what its original created, bound when the compensation is executed
+  (``interlock outbox compensate``). A request the relay sends is concrete;
+- a typed sink (``stripe``, ``sendgrid``: :mod:`interlock.stripe`,
+  :mod:`interlock.sendgrid`) adds its own rules: its operations and their
+  schemas are its own, and a Stripe charge carries the refund that undoes
+  exactly it.
 
 Endpoints and credentials are relay configuration. Nothing here holds either.
 
@@ -41,12 +48,19 @@ from interlock.types import MAX_NOT_AFTER, OutboundRequest, canonical_hash
 
 __all__ = [
     "DEAD_LETTER",
+    "HTTP",
+    "KINDS",
     "NONE_POSSIBLE",
+    "PLACEHOLDER",
     "REDELIVER",
+    "EnqueueOrder",
     "OperationSpec",
     "SinkRegistry",
     "SinkSpec",
+    "bind",
+    "placeholders",
     "schema_problems",
+    "typed_sink",
 ]
 
 REDELIVER: Final = "redeliver"
@@ -57,6 +71,17 @@ DEAD_LETTER: Final = "dead-letter"
 NONE_POSSIBLE: Final = "none-possible"
 """The ``compensation`` an operator declares for an operation nothing can
 undo. The declaration is part of the sink's configuration hash."""
+
+HTTP: Final = "http"
+"""The generic sink: JSON over HTTP, operations and schemas from configuration."""
+KINDS: Final = (HTTP, "stripe", "sendgrid")
+
+PLACEHOLDER: Final = "delivered.id"
+"""What ``{"$bind": "delivered.id"}`` stands for in a compensation: the id of
+what the original request created, as its delivered call recorded it."""
+_STAND_IN: Final = "bound_by_compensate"
+"""Put where a placeholder stands when a compensation is checked against its
+schema, as it will be when it is sent."""
 
 _NAME: Final = re.compile(r"\A[a-z][a-z0-9_-]{0,62}\Z")
 _OPERATION: Final = re.compile(r"\A[a-z][a-z0-9_.-]{0,126}\Z")
@@ -151,18 +176,27 @@ class SinkSpec:
         mid-call): ``"redeliver"`` with the same idempotency key, at least
         once; or ``"dead-letter"``, at most once, for an operator to resolve.
         A sink without idempotency duplicates on redelivery.
+    :ivar kind: ``"http"``, or a typed sink: ``"stripe"``, ``"sendgrid"``. A
+        typed sink's operations are the kind's own, schemas included
+        (:func:`interlock.stripe.stripe_sink`,
+        :func:`interlock.sendgrid.sendgrid_sink`), and so are its idempotency
+        (Stripe honours keys; SendGrid has none) and, unless given, its
+        ``unknown_outcome`` (SendGrid: ``"dead-letter"``).
+
+    ``idempotency`` and ``unknown_outcome`` left empty take the kind's.
     """
 
     name: str
     operations: tuple[OperationSpec, ...]
     cost_per_call: Decimal = Decimal(0)
-    idempotency: str = "header"
+    idempotency: str = ""
     max_payload_bytes: int = 16_384
     not_after: timedelta = timedelta(minutes=15)
     max_attempts: int = 10
     backoff_base: timedelta = timedelta(seconds=1)
     backoff_cap: timedelta = timedelta(minutes=10)
-    unknown_outcome: str = REDELIVER
+    unknown_outcome: str = ""
+    kind: str = HTTP
     _by_name: Mapping[str, OperationSpec] = field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -170,6 +204,30 @@ class SinkSpec:
     def __post_init__(self) -> None:
         if not _NAME.match(self.name):
             raise ValueError(f"sink name {self.name!r} is not a plain lowercase identifier")
+        if self.kind not in KINDS:
+            raise ValueError(f"sink {self.name!r}: kind is one of {', '.join(KINDS)}")
+        typed = typed_sink(self.kind)
+        if not self.idempotency:
+            object.__setattr__(
+                self, "idempotency", "header" if typed is None else typed.IDEMPOTENCY
+            )
+        if not self.unknown_outcome:
+            object.__setattr__(
+                self, "unknown_outcome", REDELIVER if typed is None else typed.UNKNOWN_OUTCOME
+            )
+        if typed is not None:
+            for op in self.operations:
+                if typed.CATALOG.get(op.name) != op:
+                    raise ValueError(
+                        f"sink {self.name!r}: a {self.kind} sink's operations are "
+                        f"{self.kind}'s own ({', '.join(sorted(typed.CATALOG))}), with their "
+                        f"schemas; {op.name!r} is not one of them as {self.kind} defines it"
+                    )
+            if self.idempotency != typed.IDEMPOTENCY:
+                raise ValueError(
+                    f"sink {self.name!r}: a {self.kind} sink's idempotency is "
+                    f"{typed.IDEMPOTENCY!r}: that is what {self.kind} does"
+                )
         if not self.operations:
             raise ValueError(f"sink {self.name!r} registers no operations")
         by_name = {op.name: op for op in self.operations}
@@ -191,6 +249,8 @@ class SinkSpec:
             raise ValueError(
                 f"sink {self.name!r}: not_after must be positive and at most {MAX_NOT_AFTER}"
             )
+        if self.not_after % timedelta(seconds=1):
+            raise ValueError(f"sink {self.name!r}: not_after is a whole number of seconds")
         if self.max_attempts < 1:
             raise ValueError(f"sink {self.name!r}: max_attempts must be at least 1")
         if not timedelta(milliseconds=1) <= self.backoff_base <= self.backoff_cap:
@@ -216,6 +276,7 @@ class SinkSpec:
             [
                 "sink",
                 self.name,
+                *(() if self.kind == HTTP else (["kind", self.kind],)),
                 str(self.cost_per_call),
                 self.idempotency,
                 self.max_payload_bytes,
@@ -268,9 +329,33 @@ class SinkRegistry:
         :returns: The sink it names.
         :raises OutboundRequestError: On the first rule it breaks.
         """
+        found = placeholders(request.payload)
+        if found:
+            raise OutboundRequestError(
+                f"{request.sink}.{request.operation} payload holds a placeholder at {found[0]}: "
+                f"only a compensation is bound to what its original created",
+                reason="placeholder",
+                sink=request.sink,
+            )
         sink = self._check_one(request)
         spec = sink.operation(request.operation)
         assert spec is not None  # checked above
+        typed = typed_sink(sink.kind)
+        if typed is not None:
+            problem = typed.payload_problem(request.operation, request.payload)
+            if problem is not None:
+                raise OutboundRequestError(
+                    f"{sink.name}.{spec.name}: {problem}", reason="payload_schema", sink=sink.name
+                )
+            problem = typed.compensation_problem(
+                request.operation,
+                request.payload,
+                None if request.compensation is None else request.compensation.to_json(),
+            )
+            if problem is not None:
+                raise OutboundRequestError(
+                    f"{sink.name}.{spec.name}: {problem}", reason="compensation", sink=sink.name
+                )
         compensation = request.compensation
         if spec.compensation == NONE_POSSIBLE:
             if compensation is not None:
@@ -301,7 +386,30 @@ class SinkRegistry:
                 reason="compensation",
                 sink=sink.name,
             )
-        self._check_one(compensation)
+        for where, node in _placeholders(compensation.payload, "$"):
+            if dict(node) != {"$bind": PLACEHOLDER}:
+                raise OutboundRequestError(
+                    f"the compensation's placeholder at {where} is not "
+                    f'{{"$bind": "{PLACEHOLDER}"}}, the only one there is',
+                    reason="placeholder",
+                    sink=sink.name,
+                )
+        # Checked as it will be sent: with the id it will be bound to.
+        bound = OutboundRequest(
+            compensation.sink,
+            compensation.operation,
+            bind(compensation.payload, _STAND_IN),
+            not_after=compensation.not_after,
+        )
+        self._check_one(bound)
+        if typed is not None:
+            problem = typed.payload_problem(bound.operation, bound.payload)
+            if problem is not None:
+                raise OutboundRequestError(
+                    f"{sink.name}.{spec.name}'s compensation: {problem}",
+                    reason="payload_schema",
+                    sink=sink.name,
+                )
         return sink
 
     def _check_one(self, request: OutboundRequest) -> SinkSpec:
@@ -343,6 +451,54 @@ class SinkRegistry:
                     sink=sink.name,
                 )
         return sink
+
+
+def placeholders(value: Any) -> list[str]:
+    """Where ``value`` holds a placeholder (any object with a ``$bind`` key),
+    as paths for a message."""
+    return [where for where, _ in _placeholders(value, "$")]
+
+
+def _placeholders(value: Any, path: str) -> list[tuple[str, Mapping[str, Any]]]:
+    if isinstance(value, Mapping):
+        if "$bind" in value:
+            return [(path, value)]
+        found: list[tuple[str, Mapping[str, Any]]] = []
+        for key, item in value.items():
+            found += _placeholders(item, f"{path}.{key}")
+        return found
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        found = []
+        for index, item in enumerate(value):
+            found += _placeholders(item, f"{path}[{index}]")
+        return found
+    return []
+
+
+def bind(value: Any, remote_ref: str) -> Any:
+    """``value`` with every ``{"$bind": "delivered.id"}`` replaced by
+    ``remote_ref``, as plain JSON values."""
+    if isinstance(value, Mapping):
+        if dict(value) == {"$bind": PLACEHOLDER}:
+            return remote_ref
+        return {key: bind(item, remote_ref) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        return [bind(item, remote_ref) for item in value]
+    return value
+
+
+def typed_sink(kind: str) -> Any:
+    """The module that defines a typed sink kind (:mod:`interlock.stripe`,
+    :mod:`interlock.sendgrid`), or ``None`` for ``http``."""
+    if kind == "stripe":
+        from interlock import stripe
+
+        return stripe
+    if kind == "sendgrid":
+        from interlock import sendgrid
+
+        return sendgrid
+    return None
 
 
 def _credential_field(value: Any, path: str) -> str | None:
@@ -495,3 +651,43 @@ def _number(value: Any) -> Decimal | None:
             return None
         return number if number.is_finite() else None
     return None
+
+
+class EnqueueOrder:
+    """Within one stage: the order requests are written in, and which earlier
+    requests each one waits for.
+
+    An effect waits for the requests it depends on directly, and, through a
+    SQL effect between them, for the requests that effect waited for: a
+    request after an ``UPDATE`` after a request waits for the first request.
+    The engine applies effects in topological order, so every dependency is
+    recorded before its dependant. Both substrates keep one per stage.
+    """
+
+    __slots__ = ("_enqueued", "_seq", "_upstream")
+
+    def __init__(self) -> None:
+        self._seq = 0
+        self._upstream: dict[str, frozenset[str]] = {}
+        self._enqueued: set[str] = set()
+
+    def waits_for(self, depends_on: Iterable[str]) -> frozenset[str]:
+        """The requests an effect with these dependencies waits for."""
+        found: set[str] = set()
+        for dependency in depends_on:
+            if dependency in self._enqueued:
+                found.add(dependency)
+            else:
+                found |= self._upstream.get(dependency, frozenset())
+        return frozenset(found)
+
+    def next_seq(self) -> int:
+        """The position of the next request written."""
+        self._seq += 1
+        return self._seq
+
+    def applied(self, effect_id: str, depends_on: Iterable[str], *, request: bool) -> None:
+        """Record an applied effect, a request or a statement."""
+        self._upstream[effect_id] = self.waits_for(depends_on)
+        if request:
+            self._enqueued.add(effect_id)

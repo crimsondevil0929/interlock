@@ -52,9 +52,9 @@ from agentgov.receipts.canonical import canonical_bytes, loads_strict
 
 from interlock.anchor import _halted
 from interlock.exceptions import SubstrateUnavailableError
+from interlock.outbox_store import OutboxStore, PostgresOutboxStore
 
 if TYPE_CHECKING:
-    import psycopg
     from agentgov.core import BudgetManager
 
 __all__ = [
@@ -138,6 +138,9 @@ class DeliveryResult:
         never stored: it may hold personal data.
     :ivar retry_after: The sink's ``Retry-After``, in seconds: the soonest the
         next call may be made.
+    :ivar remote_ref: The id of what a delivered call created (a Stripe
+        payment intent's ``pi_...``), recorded in the delivery log: what a
+        compensation is bound to.
     """
 
     outcome: str
@@ -145,6 +148,7 @@ class DeliveryResult:
     response_digest: str | None = None
     detail: str = ""
     retry_after: float | None = None
+    remote_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in _OUTCOMES:
@@ -387,9 +391,11 @@ class Relay:
     they share the work through ``FOR UPDATE SKIP LOCKED`` and never wait on
     each other.
 
-    :param dsn: A connection string for a relay role (``relay_roles`` at
-        install): it can read the outbox and call the relay functions, and
-        nothing else.
+    :param store: Where delivery state is kept: an :class:`OutboxStore`, or a
+        PostgreSQL connection string for a relay role (``relay_roles`` at
+        install), which can read the outbox and call the relay functions and
+        nothing else. For SQLite, an
+        :class:`interlock.sqlite_outbox.SqliteOutboxStore`.
     :param adapters: One per sink this relay delivers to. It claims only
         messages for these sinks.
     :param breaker: Read before every call. :class:`LedgerBreaker` for
@@ -412,16 +418,15 @@ class Relay:
         "_batch",
         "_breaker",
         "_breaker_retry",
-        "_conn",
-        "_dsn",
         "_lease",
         "_relay_id",
+        "_store",
         "_timeout",
     )
 
     def __init__(
         self,
-        dsn: str,
+        store: OutboxStore | str,
         *,
         adapters: Mapping[str, SinkAdapter],
         breaker: Breaker,
@@ -440,7 +445,6 @@ class Relay:
             )
         if batch < 1:
             raise ValueError("a relay claims at least one message at a time")
-        self._dsn = dsn
         self._adapters = dict(adapters)
         self._breaker = breaker
         self._relay_id = (
@@ -450,8 +454,8 @@ class Relay:
         self._timeout = timeout
         self._batch = batch
         self._breaker_retry = breaker_retry
-        self._conn: psycopg.Connection[Any] | None = None
-        self._connect()
+        self._store: OutboxStore = PostgresOutboxStore(store) if isinstance(store, str) else store
+        self._store.checkpoint = self._reached
 
     @property
     def relay_id(self) -> str:
@@ -459,34 +463,13 @@ class Relay:
         credential: the database role is what is trusted."""
         return self._relay_id
 
-    def _connect(self) -> psycopg.Connection[Any]:
-        import psycopg
-
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except psycopg.Error:
-                pass
-        try:
-            conn = psycopg.connect(self._dsn, autocommit=True, application_name="interlock-relay")
-            conn.execute("SET statement_timeout = '30s'")
-            conn.execute("SET lock_timeout = '10s'")
-            conn.execute("SET idle_in_transaction_session_timeout = '60s'")
-        except psycopg.Error as exc:
-            raise SubstrateUnavailableError(f"the relay cannot reach its database: {exc}") from exc
-        self._conn = conn
-        return conn
-
-    def _connection(self) -> psycopg.Connection[Any]:
-        if self._conn is None or self._conn.closed:
-            return self._connect()
-        return self._conn
+    @property
+    def store(self) -> OutboxStore:
+        return self._store
 
     def close(self) -> None:
-        """Close the connection. Leases this relay holds run out on their own."""
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        """Close the store. Leases this relay holds run out on their own."""
+        self._store.close()
 
     def __enter__(self) -> Relay:
         return self
@@ -504,16 +487,10 @@ class Relay:
             held then run out, and another relay, or this one later, takes
             the messages over.
         """
-        import psycopg
-
-        try:
-            leases = self._claim(limit or self._batch)
-            report = RelayReport(claimed=len(leases))
-            for lease in leases:
-                report = report.counted(self._deliver(lease))
-        except psycopg.OperationalError as exc:
-            self.close()
-            raise SubstrateUnavailableError(f"the relay lost its database: {exc}") from exc
+        leases = self._claim(limit or self._batch)
+        report = RelayReport(claimed=len(leases))
+        for lease in leases:
+            report = report.counted(self._deliver(lease))
         return report
 
     def run(self, stop: threading.Event, *, poll: float = 1.0) -> RelayReport:
@@ -542,17 +519,10 @@ class Relay:
     # -- one message -----------------------------------------------------------
 
     def _claim(self, limit: int) -> list[Lease]:
-        conn = self._connection()
-        seconds = self._lease.total_seconds()
-        deadline = time.monotonic() + seconds
-        with conn.transaction():
-            rows = conn.execute(
-                "SELECT * FROM interlock.relay_claim(%s, %s, %s, %s)",
-                (self._relay_id, seconds, limit, sorted(self._adapters)),
-            ).fetchall()
-            self._reached("claim-uncommitted", None)
-        leases = [Lease.from_row(row, deadline) for row in rows]
-        return leases
+        deadline = time.monotonic() + self._lease.total_seconds()
+        return self._store.claim(
+            self._relay_id, self._lease, limit, sorted(self._adapters), deadline
+        )
 
     def _deliver(self, lease: Lease) -> str:
         """Deliver one leased message. Returns what became of it: the state it
@@ -618,91 +588,22 @@ class Relay:
         return state if state is not None else SKIPPED
 
     def _sending(self, lease: Lease, detail: str) -> int | None:
-        conn = self._connection()
-        with conn.transaction():
-            row = conn.execute(
-                "SELECT interlock.relay_sending(%s, %s, %s, %s)",
-                (lease.message_id, self._relay_id, lease.fence, detail),
-            ).fetchone()
-            self._reached("sending-uncommitted", lease)
-        return None if row is None or row[0] is None else int(row[0])
+        return self._store.sending(lease, self._relay_id, detail)
 
     def _outcome(
         self, lease: Lease, attempt: int, result: DeliveryResult, delay: timedelta
     ) -> str | None:
-        """Record what the call returned. The call already happened, so this
-        is retried through a lost connection: a reply lost after the commit
-        finds the outcome already recorded, which is success."""
-        import psycopg
-
-        for tries in range(3):
-            try:
-                conn = self._connection()
-                with conn.transaction():
-                    row = conn.execute(
-                        "SELECT interlock.relay_outcome(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                        (
-                            lease.message_id,
-                            self._relay_id,
-                            lease.fence,
-                            attempt,
-                            result.outcome,
-                            result.status_code,
-                            result.response_digest,
-                            result.detail or None,
-                            int(delay / timedelta(milliseconds=1)),
-                        ),
-                    ).fetchone()
-                    self._reached("outcome-uncommitted", lease)
-                return None if row is None or row[0] is None else str(row[0])
-            except psycopg.OperationalError:
-                if tries == 2:
-                    raise
-                logger.warning(
-                    "relay %s: lost the database recording message %s, attempt %d; retrying",
-                    self._relay_id,
-                    lease.message_id,
-                    attempt,
-                )
-                self._connect()
-            except psycopg.Error as exc:
-                if getattr(exc, "sqlstate", None) == "IL002" and "already has an outcome" in str(
-                    exc
-                ):
-                    return None
-                raise
-        return None  # pragma: no cover - the loop returns or raises
+        return self._store.outcome(lease, self._relay_id, attempt, result, delay)
 
     def _hold(self, lease: Lease, reason: str) -> str:
-        return HELD if self._fenced("relay_hold", lease, reason) else SKIPPED
+        return HELD if self._store.hold(lease, self._relay_id, reason) else SKIPPED
 
     def _refuse(self, lease: Lease, reason: str) -> str:
         logger.error("relay %s: refusing message %s: %s", self._relay_id, lease.message_id, reason)
-        return REFUSED if self._fenced("relay_refuse", lease, reason) else SKIPPED
+        return REFUSED if self._store.refuse(lease, self._relay_id, reason) else SKIPPED
 
     def _defer(self, lease: Lease, reason: str, delay: timedelta) -> str:
-        conn = self._connection()
-        with conn.transaction():
-            row = conn.execute(
-                "SELECT interlock.relay_defer(%s, %s, %s, %s, %s)",
-                (
-                    lease.message_id,
-                    self._relay_id,
-                    lease.fence,
-                    reason,
-                    int(delay / timedelta(milliseconds=1)),
-                ),
-            ).fetchone()
-        return DEFERRED if row is not None and row[0] else SKIPPED
-
-    def _fenced(self, function: str, lease: Lease, reason: str) -> bool:
-        conn = self._connection()
-        with conn.transaction():
-            row = conn.execute(
-                f"SELECT interlock.{function}(%s, %s, %s, %s)",
-                (lease.message_id, self._relay_id, lease.fence, reason),
-            ).fetchone()
-        return bool(row is not None and row[0])
+        return DEFERRED if self._store.defer(lease, self._relay_id, reason, delay) else SKIPPED
 
     def _reached(self, point: str, lease: Lease | None) -> None:
         """A point on the delivery path. Nothing happens here; the crash tests

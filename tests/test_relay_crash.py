@@ -1,4 +1,4 @@
-"""Crash consistency for the relay (Epic 2, phase 4).
+"""Crash consistency for the relay (Epic 2, phase 4; on SQLite, Epic 3).
 
 A relay is a separate process, and processes die: SIGKILL, power, the OOM
 killer. Each test here runs a relay in a child process
@@ -34,6 +34,15 @@ idempotency keys, set to redeliver, whose relay died between the sink acting
 and the outcome committing. And it is never silent: the delivery log records
 the lost call it came from.
 
+Every test runs against both stores. On SQLite the two relays of a pair
+are two processes contending for one file's write lock, and a kill can land
+while a relay holds it: the kernel releases it, and what the relay had written
+of its transaction never committed.
+
+**Through Stripe's and SendGrid's adapters**, the same matrix, against fakes
+that keep each vendor's protocol: a charge is made once, its payment intent's
+id is the one the delivery log records, and an email is never sent twice.
+
 **At random instants**, relays racing in pairs over a sink that fails, drops
 connections and hangs at random, killed over and over. Whatever the
 interleaving: every message is delivered; every call the sinks received is in
@@ -63,16 +72,29 @@ from typing import Any
 
 import pytest
 
-psycopg = pytest.importorskip("psycopg")
-
-from interlock.deliveries import OUTCOMES, LogEvent  # noqa: E402
-from interlock.outbound import OperationSpec, SinkSpec  # noqa: E402
-from interlock.postgres import install  # noqa: E402
-from interlock.types import outbound_key  # noqa: E402
-from tests.conftest import OBSERVED, Pg  # noqa: E402
-from tests.fakesink import DROP, HOLD, OK, hang, status  # noqa: E402
-from tests.outbox_env import RELAY_SINKS, Outbox, build_outbox, mail, page, sms  # noqa: E402
-from tests.schemas import MAIL_SEND_SCHEMA, specs  # noqa: E402
+from interlock import PlanBuilder
+from interlock.deliveries import OUTCOMES, LogEvent
+from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
+from interlock.relay import NoBreaker, Relay
+from interlock.sendgrid import MAIL_SEND, SendGridAdapter, sendgrid_sink
+from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE, StripeAdapter, stripe_sink
+from interlock.types import EffectId, OutboundRequest, outbound_key
+from tests.fakesendgrid import KEY as SENDGRID_KEY
+from tests.fakesendgrid import FakeSendGrid
+from tests.fakesink import DROP, HOLD, OK, FakeSink, hang, status
+from tests.fakestripe import KEY as STRIPE_KEY
+from tests.fakestripe import FakeStripe
+from tests.outbox_env import (
+    BACKENDS,
+    RELAY_SINKS,
+    SCOPE,
+    Outbox,
+    build_either,
+    mail,
+    page,
+    sms,
+)
+from tests.schemas import MAIL_SEND_SCHEMA
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is POSIX")
 
@@ -81,9 +103,10 @@ LEASE = 1.5
 TIMEOUT = 0.5
 
 
-@pytest.fixture
-def outbox(pg: Pg, tmp_path: Path) -> Iterator[Outbox]:
-    yield from build_outbox(pg, tmp_path)
+@pytest.fixture(params=BACKENDS)
+def outbox(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Outbox]:
+    """Every crash test runs against both stores."""
+    yield from build_either(request, tmp_path)
 
 
 # --------------------------------------------------------------------------
@@ -150,7 +173,7 @@ def scenario(
     idle_rounds: int = 25,
 ) -> dict[str, Any]:
     return {
-        "dsn": outbox.relay_dsn,
+        **outbox.relay_target(),
         "ledger": outbox.ledger_path,
         "sinks": {name: outbox.sink(name).url for name in sinks},
         "relay_id": relay_id,
@@ -161,22 +184,6 @@ def scenario(
         "message": "" if message is None else str(message),
         "idle_rounds": idle_rounds,
     }
-
-
-def settle(outbox: Outbox) -> None:
-    """Wait for the server to end every session the dead relays left, and so
-    roll back whatever transaction each had open."""
-    deadline = time.monotonic() + 30
-    with outbox.admin() as conn:
-        while True:
-            row = conn.execute(
-                "SELECT count(*) FROM pg_stat_activity WHERE usename = %s", (outbox.relay_role,)
-            ).fetchone()
-            if row == (0,):
-                return
-            if time.monotonic() > deadline:
-                raise AssertionError("the dead relays' sessions did not end")
-            time.sleep(0.02)
 
 
 # --------------------------------------------------------------------------
@@ -280,12 +287,16 @@ def test_a_relay_killed_at_each_point_is_recovered_exactly(
             sink.release.set()
         else:
             child.wait_killed()
-    settle(outbox)
+    outbox.settle()
 
     if point.leased and not point.recorded:
         # A dead relay's lease is not taken early: nobody may assume it died.
-        with outbox.relay(relay_id="early") as early:
-            assert early.run_once(limit=10).claimed == 0
+        # Checked while every lease has time left: on a loaded machine the
+        # first may have run out by the time the third relay is dead.
+        left = min(outbox.lease_left(messages[name]) for name in SINKS)
+        if left > 0.3:
+            with outbox.relay(relay_id="early") as early:
+                assert early.run_once(limit=10).claimed == 0
     time.sleep(LEASE + 0.3)
     with outbox.relay(relay_id="survivor") as survivor:
         outbox.drain(survivor)
@@ -306,6 +317,147 @@ def test_a_relay_killed_at_each_point_is_recovered_exactly(
         lost = sum(1 for e, _ in outbox.events(message) if e == "lost")
         assert sink.effects[key] <= 1 + lost
     outbox.verify()
+
+
+# --------------------------------------------------------------------------
+# the same matrix, through Stripe's and SendGrid's adapters
+# --------------------------------------------------------------------------
+
+TYPED_SINKS = (
+    *RELAY_SINKS,
+    stripe_sink(
+        "stripe",
+        (PAYMENT_INTENTS_CREATE, REFUNDS_CREATE),
+        cost_per_call=Decimal("0.30"),
+        backoff_base=timedelta(milliseconds=20),
+        backoff_cap=timedelta(milliseconds=160),
+    ),
+    sendgrid_sink(
+        "sendgrid",
+        backoff_base=timedelta(milliseconds=20),
+        backoff_cap=timedelta(milliseconds=160),
+    ),
+)
+LIKE = {"stripe": "mail", "sendgrid": "pager"}
+"""Stripe honours keys and redelivers, as ``mail`` does; SendGrid has no
+keys and dead-letters, as ``pager`` does."""
+
+
+@pytest.mark.parametrize("point", POINTS, ids=lambda p: p.at)
+def test_a_charge_is_made_once_and_an_email_never_twice_through_each_kill(
+    outbox: Outbox, tmp_path: Path, point: Point
+) -> None:
+    """The matrix, against fakes that keep each vendor's protocol: Stripe's
+    replays answer a redelivered charge with the payment intent already
+    made; SendGrid sends every call it accepts."""
+    outbox.reinstall(TYPED_SINKS)
+    engine = outbox.engine(sinks=SinkRegistry(TYPED_SINKS))
+    charge = (
+        PlanBuilder(SCOPE)
+        .enqueue(
+            sink="stripe",
+            operation=PAYMENT_INTENTS_CREATE,
+            payload={"amount": 5000, "currency": "usd", "customer": "cus_ann"},
+            compensation=OutboundRequest(
+                "stripe", REFUNDS_CREATE, {"payment_intent": {"$bind": "delivered.id"}}
+            ),
+            effect_id=EffectId("charge"),
+        )
+        .build()
+    )
+    email = (
+        PlanBuilder(SCOPE)
+        .enqueue(
+            sink="sendgrid",
+            operation=MAIL_SEND,
+            payload={
+                "to": [{"email": "ann@acme.test"}],
+                "from": {"email": "orders@shop.test"},
+                "subject": "Charged",
+                "text": "We charged your card.",
+            },
+            effect_id=EffectId("notify"),
+        )
+        .build()
+    )
+    for plan in (charge, email):
+        assert engine.execute(plan).committed
+    messages = {
+        "stripe": outbox.messages(charge.plan_id)[0],
+        "sendgrid": outbox.messages(email.plan_id)[0],
+    }
+    keys = {
+        "stripe": outbound_key(charge.plan_id, EffectId("charge")),
+        "sendgrid": outbound_key(email.plan_id, EffectId("notify")),
+    }
+    stripe, sendgrid = FakeStripe(), FakeSendGrid()
+    fakes: dict[str, FakeSink] = {"stripe": stripe, "sendgrid": sendgrid}
+    typed = {
+        "stripe": {"kind": "stripe", "key": STRIPE_KEY},
+        "sendgrid": {"kind": "sendgrid", "key": SENDGRID_KEY},
+    }
+    try:
+        for number, name in enumerate(("stripe", "sendgrid")):
+            fake = fakes[name]
+            if point.by_parent:
+                fake.script(HOLD, key=keys[name])
+            child = RelayChild(
+                {
+                    **outbox.relay_target(),
+                    "ledger": outbox.ledger_path,
+                    "sinks": {name: fake.url},
+                    "typed": {name: typed[name]},
+                    "relay_id": f"dying-{name}",
+                    "lease": LEASE,
+                    "timeout": TIMEOUT,
+                    "batch": 1,
+                    "kill_at": "" if point.by_parent else point.at,
+                    "message": str(messages[name]),
+                    "idle_rounds": 25,
+                },
+                tmp_path,
+                number,
+            )
+            if point.by_parent:
+                assert fake.arrived.wait(60), child.stderr()
+                child.kill()
+                fake.release.set()
+            else:
+                child.wait_killed()
+        outbox.settle()
+        time.sleep(LEASE + 0.3)
+        survivor = Relay(
+            outbox.store(),
+            adapters={
+                "stripe": StripeAdapter(STRIPE_KEY, base_url=stripe.url),
+                "sendgrid": SendGridAdapter(SENDGRID_KEY, base_url=sendgrid.url),
+            },
+            breaker=NoBreaker(),
+            relay_id="survivor",
+            lease=timedelta(seconds=10),
+            timeout=timedelta(seconds=2),
+        )
+        with survivor:
+            outbox.drain(survivor)
+
+        for name, like in LIKE.items():
+            want = expected(point, like)
+            message, key, fake = messages[name], keys[name], fakes[name]
+            assert outbox.state(message) == want.state, name
+            assert outbox.events(message) == want.events, name
+            assert len(fake.calls_for(key)) == want.calls, name
+            assert fake.effects[key] == want.effects, name
+        # One payment intent, whatever the kill, and its id is the one the
+        # delivery log recorded: what the refund will be bound to.
+        (intent,) = stripe.of("payment_intent")
+        delivered = [e for e in outbox.log(messages["stripe"]) if e.event == "delivered"]
+        assert [e.remote_ref for e in delivered] == [intent["id"]]
+        # Never two emails.
+        assert len(sendgrid.sent) <= 1
+        outbox.verify()
+    finally:
+        stripe.close()
+        sendgrid.close()
 
 
 # --------------------------------------------------------------------------
@@ -334,14 +486,7 @@ SOAK_SINKS = (
 
 def test_relays_killed_at_random_instants_lose_nothing(outbox: Outbox, tmp_path: Path) -> None:
     rng = random.Random(20261001)  # noqa: S311 - a reproducible schedule, not a secret
-    with outbox.admin() as conn:
-        install(
-            conn,
-            specs(*OBSERVED),
-            stage_roles=[outbox.pg.role],
-            sinks=SOAK_SINKS,
-            relay_roles=[outbox.relay_role],
-        )
+    outbox.reinstall(SOAK_SINKS)
     # Eight plans of three requests, each waiting for the one before it.
     plans: list[list[uuid.UUID]] = []
     keys: dict[uuid.UUID, tuple[str, str]] = {}
@@ -384,7 +529,7 @@ def test_relays_killed_at_random_instants_lose_nothing(outbox: Outbox, tmp_path:
             child.kill()
         if not outbox.unsettled():
             break
-    settle(outbox)
+    outbox.settle()
 
     for name in ("mail", "sms"):
         outbox.sink(name).chaos = None

@@ -7,8 +7,12 @@
 ``interlock relay``              deliver committed outbound requests, until
                                  stopped (``--once``: until none is due)
 ``interlock outbox ACTION``      ``status``, ``list``, ``show``, ``verify`` the
-                                 delivery logs; ``release``, ``cancel``,
-                                 ``requeue`` a message (as the installer)
+                                 delivery logs (and the operator log);
+                                 ``release``, ``cancel``, ``requeue``,
+                                 ``compensate``, ``resolve``: an operator's
+                                 actions, each signed with their key
+``interlock operator keygen``    a new operator key, and its public half for
+                                 ``[operators.keys]``
 
 Every command reads a TOML configuration file (see :mod:`interlock.config`).
 Exit codes, for scripts and CI:
@@ -29,25 +33,21 @@ Exit codes, for scripts and CI:
 from __future__ import annotations
 
 import argparse
-import getpass
 import os
 import signal
 import sys
 import threading
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any, TextIO
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from typing import Any, Final, TextIO
 
 from interlock.cascade import CascadeReport, analyze_cascades, read_postgres_foreign_keys
 from interlock.chain import EscrowChain, EscrowRecord
-from interlock.config import ConfigError, InterlockConfig, RelayConfig, load_config
+from interlock.config import ConfigError, Endpoint, InterlockConfig, RelayConfig, load_config
 from interlock.deliveries import (
-    cancel,
     message_log,
     messages,
-    release,
-    release_scope,
-    requeue,
     state_counts,
     verify_delivery_log,
 )
@@ -80,6 +80,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     stream = out if out is not None else sys.stdout
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command == "operator":
+        return _keygen(args, stream)
     relaying = args.command == "relay"
     try:
         config = load_config(
@@ -92,7 +94,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
         return EXIT_USAGE
     try:
         if args.command == "install":
-            return _install(config, stream)
+            return _install(config, args, stream)
         if args.command == "reconcile-effects":
             return _reconcile(config, args.chain, args.after, stream)
         if relaying:
@@ -117,6 +119,11 @@ def _common(command: argparse.ArgumentParser, database: str) -> None:
 
 
 _DATABASE_HELP = "overrides the file's database (DSN or SQLite path), as does INTERLOCK_DATABASE"
+
+OPERATOR_KEY_ENV = "INTERLOCK_OPERATOR_KEY"
+"""The path to an operator's key file, when ``--key`` is not given."""
+SIGNED: Final = frozenset({"release", "cancel", "requeue", "compensate", "resolve"})
+"""The outbox actions an operator signs."""
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -143,10 +150,12 @@ def _parser() -> argparse.ArgumentParser:
         ("status", "count messages in each state"),
         ("list", "list messages, oldest first"),
         ("show", "show one message and its delivery log"),
-        ("verify", "verify every delivery log; exit 1 if one does not"),
+        ("verify", "verify every delivery log, and the operator log; exit 1 on a problem"),
         ("release", "release a held message, or every held message of a scope"),
         ("cancel", "cancel a pending, held or dead message"),
         ("requeue", "send a dead message back for delivery"),
+        ("compensate", "enqueue the compensation a delivered request carried"),
+        ("resolve", "resolve the intents an operator command killed mid-way left open"),
     ):
         action = actions.add_parser(name, help=text, description=text)
         _common(action, _DATABASE_HELP)
@@ -156,16 +165,36 @@ def _parser() -> argparse.ArgumentParser:
             target = action.add_mutually_exclusive_group(required=True)
             target.add_argument("message", nargs="?", type=uuid.UUID, help="the message id")
             target.add_argument("--scope", help="release every held message of this scope")
+        if name == "compensate":
+            target = action.add_mutually_exclusive_group(required=True)
+            target.add_argument("message", nargs="?", type=uuid.UUID, help="the message id")
+            target.add_argument("--plan", help="every delivered request of this plan")
+            action.add_argument(
+                "--late", action="store_true", help="compensate past the original's deadline"
+            )
         if name == "list":
             action.add_argument("--state", help="only messages in this state")
             action.add_argument("--scope", help="only this scope's messages")
             action.add_argument("--limit", type=int, default=100)
-        if name == "cancel":
-            action.add_argument("--reason", required=True, help="recorded in the delivery log")
-        if name in ("release", "cancel", "requeue"):
+        if name in SIGNED:
             action.add_argument(
-                "--actor", default=None, help="who is acting; recorded in the delivery log"
+                "--key", help=f"your operator key file (default: ${OPERATOR_KEY_ENV})"
             )
+            action.add_argument(
+                "--reason",
+                required=name == "cancel",
+                help="recorded in the signed intent and the delivery log",
+            )
+    operator = commands.add_parser("operator", help="operator keys", description="Operator keys.")
+    keys = operator.add_subparsers(dest="action", required=True)
+    keygen = keys.add_parser(
+        "keygen",
+        help="write a new Ed25519 operator key; print its public half",
+        description="Write a new Ed25519 operator key (readable by you only), and print the "
+        "line that registers its public half in [operators.keys].",
+    )
+    keygen.add_argument("--out", required=True, help="where to write the key: never overwritten")
+    keygen.add_argument("--name", required=True, help="the operator's name")
     for name, text in (
         ("install", "install Interlock's schema and triggers (run as the tables' owner)"),
         ("check", "verify the setup and print what the cascade check refuses"),
@@ -173,6 +202,12 @@ def _parser() -> argparse.ArgumentParser:
     ):
         command = commands.add_parser(name, help=text, description=text)
         _common(command, _DATABASE_HELP)
+        if name == "install":
+            command.add_argument(
+                "--key",
+                help=f"with [operators]: your operator key, to sign the sink registry "
+                f"(default: ${OPERATOR_KEY_ENV})",
+            )
         if name == "reconcile-effects":
             command.add_argument(
                 "--chain",
@@ -189,11 +224,60 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _install(config: InterlockConfig, out: TextIO) -> int:
+def _install(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    signer = None
+    if config.operators is not None:
+        # A change to the sink registry is an operator's, and signed: the key
+        # is read before anything is installed.
+        try:
+            signer = _signer(config, args.key)
+        except _RefusedError as exc:
+            print(f"interlock: install changes the sink registry: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+    code = _install_schema(config, out)
+    if signer is not None:
+        _vouch(config, signer, out)
+    return code
+
+
+def _vouch(config: InterlockConfig, signer: Any, out: TextIO) -> None:
+    """Sign the registry the database now mirrors."""
+    if config.substrate != "postgres":
+        from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore
+
+        store = SqliteOutboxStore(config.database, writes=OPERATOR)
+        try:
+            with _session(config, store, signer) as operator:
+                record = operator.installed()
+        finally:
+            store.close()
+    else:
+        import psycopg
+
+        with (
+            psycopg.connect(config.database, autocommit=True) as conn,
+            _session(config, conn, signer) as operator,
+        ):
+            record = operator.installed()
+    print(
+        f"signed by {operator.name}: the sink registry, operator record {record.seq} "
+        f"({record.record_hash[:16]})",
+        file=out,
+    )
+
+
+def _install_schema(config: InterlockConfig, out: TextIO) -> int:
     names = ", ".join(t.name for t in config.tables)
     if config.substrate != "postgres":
+        from interlock.sqlite_outbox import install_sqlite_outbox
+
         install_sqlite_journal(config.database, config.tables)
+        install_sqlite_outbox(config.database, config.sinks)
         print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
+        print("installed: the outbox, and WAL mode", file=out)
+        for sink in config.sinks:
+            operations = ", ".join(op.name for op in sink.operations)
+            print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
         _print_report(_sqlite(config).check_cascades(), out)
         return EXIT_OK
     import psycopg
@@ -225,7 +309,7 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
         print(f"granted to audit role: {role}", file=out)
     for sink in config.sinks:
         operations = ", ".join(op.name for op in sink.operations)
-        print(f"registered sink: {sink.name} ({operations})", file=out)
+        print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
     for role in config.relay_roles:
         print(f"granted to relay role: {role}", file=out)
     _print_report(report, out)
@@ -234,11 +318,13 @@ def _install(config: InterlockConfig, out: TextIO) -> int:
 
 def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
     from interlock.relay import LedgerBreaker, NoBreaker, Relay, RelayReport
+    from interlock.sqlite_outbox import SqliteOutboxStore
 
     settings = config.relay
     if settings is None:
         raise SubstrateConfigurationError("the configuration file has no [relay] section")
-    dsn = args.database or settings.database
+    sqlite = config.substrate != "postgres"
+    dsn = args.database or settings.database or (config.database if sqlite else "")
     if not dsn:
         raise SubstrateConfigurationError(
             "no database for the relay: set [relay] database, pass --database, or set "
@@ -257,7 +343,7 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             breakers.append(breaker)
             relays.append(
                 Relay(
-                    dsn,
+                    SqliteOutboxStore(dsn) if sqlite else dsn,
                     adapters=_adapters(settings),
                     breaker=breaker,
                     relay_id=f"{args.relay_id}:{index}" if args.relay_id else None,
@@ -303,26 +389,66 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             breaker.close()
 
 
-def _adapters(settings: RelayConfig) -> dict[str, Any]:
-    from interlock.adapters import HttpAdapter
+def _kind(sink: Any) -> str:
+    return "" if sink.kind == "http" else f"{sink.kind}: "
 
+
+def _adapters(settings: RelayConfig) -> dict[str, Any]:
     missing = sorted(
-        f"{variable} (sink {endpoint.sink}, header {header})"
-        for endpoint in settings.endpoints
-        for header, variable in endpoint.header_env.items()
-        if variable not in os.environ
+        [
+            f"{variable} (sink {endpoint.sink}, header {header})"
+            for endpoint in settings.endpoints
+            for header, variable in endpoint.header_env.items()
+            if variable not in os.environ
+        ]
+        + [
+            f"{endpoint.secret_env} (sink {endpoint.sink}, its API key)"
+            for endpoint in settings.endpoints
+            if endpoint.secret_env and endpoint.secret_env not in os.environ
+        ]
     )
     if missing:
         raise SubstrateConfigurationError(
             f"the relay's credentials come from its environment, and these are not set: "
             f"{', '.join(missing)}"
         )
-    return {
-        endpoint.sink: HttpAdapter(
-            endpoint.url, routes=endpoint.routes, headers=_environment(endpoint.header_env)
+    return {endpoint.sink: _adapter(endpoint) for endpoint in settings.endpoints}
+
+
+def _adapter(endpoint: Endpoint) -> Any:
+    """The adapter for one endpoint: the generic one, or its vendor's."""
+    if endpoint.kind == "stripe":
+        from interlock.stripe import API, STRIPE_VERSION, StripeAdapter
+
+        return StripeAdapter(
+            _variable(endpoint.secret_env),
+            base_url=endpoint.url or API,
+            version=endpoint.stripe_version or STRIPE_VERSION,
         )
-        for endpoint in settings.endpoints
-    }
+    if endpoint.kind == "sendgrid":
+        from interlock.sendgrid import API as SENDGRID_API
+        from interlock.sendgrid import SendGridAdapter
+
+        return SendGridAdapter(
+            _variable(endpoint.secret_env),
+            base_url=endpoint.url or SENDGRID_API,
+            sandbox=endpoint.sandbox,
+        )
+    from interlock.adapters import HttpAdapter
+
+    return HttpAdapter(
+        endpoint.url, routes=endpoint.routes, headers=_environment(endpoint.header_env)
+    )
+
+
+def _variable(name: str) -> Callable[[], str]:
+    """A secret read from the environment on every call, so a rotated key
+    takes effect without a restart."""
+
+    def value() -> str:
+        return os.environ[name]
+
+    return value
 
 
 def _environment(names: Mapping[str, str]) -> Callable[[], dict[str, str]]:
@@ -356,65 +482,216 @@ def _print_relay(report: Any, out: TextIO) -> None:
     )
 
 
+def _keygen(args: argparse.Namespace, out: TextIO) -> int:
+    from interlock.operators import generate_key
+
+    try:
+        signer = generate_key(args.out)
+    except FileExistsError:
+        print(f"interlock: {args.out} exists; a key is never overwritten", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"wrote {args.out} (keep it to yourself). Register its public half:", file=out)
+    print("[operators.keys]", file=out)
+    print(f'{args.name} = "{signer.public_key().spec()}"', file=out)
+    return EXIT_OK
+
+
 def _outbox(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    if config.substrate != "postgres":
+        from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore
+
+        store = SqliteOutboxStore(config.database, writes=OPERATOR)
+        try:
+            return _outbox_action(config, store, args, out)
+        finally:
+            store.close()
     import psycopg
 
-    if config.substrate != "postgres":
-        raise SubstrateConfigurationError("the outbox is PostgreSQL's; substrate is not")
-    actor = getattr(args, "actor", None) or getpass.getuser()
     try:
         with psycopg.connect(config.database, autocommit=True) as conn:
-            if args.action == "status":
-                counts = state_counts(conn)
-                for state in ("pending", "leased", "held", "delivered", "dead", "cancelled"):
-                    print(f"{state:<10} {counts.get(state, 0)}", file=out)
-                return EXIT_OK
-            if args.action == "list":
-                for m in messages(conn, state=args.state, scope_id=args.scope, limit=args.limit):
-                    print(
-                        f"{m.message_id}  {m.state:<9} {m.sink}.{m.operation}  scope "
-                        f"{m.scope_id}  plan {m.plan_id}  calls {m.attempts}"
-                        + (f"  ({m.reason})" if m.reason else ""),
-                        file=out,
-                    )
-                return EXIT_OK
-            if args.action == "show":
-                log = message_log(conn, args.message)
-                for event in log:
-                    print(
-                        f"{event.seq:>3} {event.at.isoformat()} {event.event:<17} "
-                        f"call {event.attempt or '-'}  {event.actor}"
-                        + (f"  HTTP {event.status_code}" if event.status_code else "")
-                        + (f"  -> {event.state_after}" if event.state_after else "")
-                        + (f"  {event.detail}" if event.detail else ""),
-                        file=out,
-                    )
-                return EXIT_OK if log else EXIT_FINDINGS
-            if args.action == "verify":
-                problems = verify_delivery_log(conn)
-                for problem in problems:
-                    print(problem, file=out)
-                if problems:
-                    return EXIT_FINDINGS
-                print("every delivery log verifies", file=out)
-                return EXIT_OK
-            if args.action == "release":
-                if args.scope:
-                    count = release_scope(conn, args.scope, actor=actor)
-                    print(f"released {count} message(s) of scope {args.scope}", file=out)
-                    return EXIT_OK if count else EXIT_FINDINGS
-                done = release(conn, args.message, actor=actor)
-                print("released" if done else "not held; nothing released", file=out)
-                return EXIT_OK if done else EXIT_FINDINGS
-            if args.action == "cancel":
-                done = cancel(conn, args.message, actor=actor, reason=args.reason)
-                print("cancelled" if done else "not cancellable; nothing done", file=out)
-                return EXIT_OK if done else EXIT_FINDINGS
-            count = requeue(conn, args.message, actor=actor)
-            print(f"requeued {count} message(s)", file=out)
-            return EXIT_OK if count else EXIT_FINDINGS
+            return _outbox_action(config, conn, args, out)
     except psycopg.Error as exc:
         raise SubstrateUnavailableError(f"outbox {args.action} failed: {exc}") from exc
+
+
+def _outbox_action(
+    config: InterlockConfig, source: Any, args: argparse.Namespace, out: TextIO
+) -> int:
+    if args.action in SIGNED:
+        return _signed(config, source, args, out)
+    if args.action == "status":
+        counts = state_counts(source)
+        for state in ("pending", "leased", "held", "delivered", "dead", "cancelled"):
+            print(f"{state:<10} {counts.get(state, 0)}", file=out)
+        return EXIT_OK
+    if args.action == "list":
+        for m in messages(source, state=args.state, scope_id=args.scope, limit=args.limit):
+            print(
+                f"{m.message_id}  {m.state:<9} {m.sink}.{m.operation}  scope "
+                f"{m.scope_id}  plan {m.plan_id}  calls {m.attempts}"
+                + (f"  ({m.reason})" if m.reason else ""),
+                file=out,
+            )
+        return EXIT_OK
+    if args.action == "show":
+        log = message_log(source, args.message)
+        for event in log:
+            print(
+                f"{event.seq:>3} {event.at.isoformat()} {event.event:<17} "
+                f"call {event.attempt or '-'}  {event.actor}"
+                + (f"  HTTP {event.status_code}" if event.status_code else "")
+                + (f"  -> {event.state_after}" if event.state_after else "")
+                + (f"  ref {event.remote_ref}" if event.remote_ref else "")
+                + (f"  authority {event.authority[:16]}" if event.authority else "")
+                + (f"  {event.detail}" if event.detail else ""),
+                file=out,
+            )
+        return EXIT_OK if log else EXIT_FINDINGS
+    return _verify(config, source, out)
+
+
+def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
+    problems = list(verify_delivery_log(source))
+    settings = config.operators
+    legacy = 0
+    if settings is not None:
+        from interlock.operators import verify_operators
+        from interlock.records import read_records
+
+        records = read_records(settings.log) if settings.log.exists() else ()
+        entries = None
+        if settings.ledger is not None:
+            governor = _ledger(settings.ledger, read_only=True)
+            try:
+                entries = list(governor.audit_trail())
+            finally:
+                governor.close()
+        report = verify_operators(source, records, settings.keyring(), ledger=entries)
+        problems += report.problems
+        legacy = report.legacy
+    for problem in problems:
+        print(problem, file=out)
+    if problems:
+        return EXIT_FINDINGS
+    print("every delivery log verifies", file=out)
+    if settings is not None:
+        print(
+            "every operator action is signed, and the operator log verifies"
+            + (f" ({legacy} unsigned from before version 3)" if legacy else ""),
+            file=out,
+        )
+    return EXIT_OK
+
+
+def _ledger(ledger: str, *, read_only: bool = False) -> Any:
+    from agentgov import BudgetManager
+
+    if ledger.startswith(("postgres://", "postgresql://")):
+        return BudgetManager.open_postgres(ledger, read_only=read_only)
+    return BudgetManager.open_sqlite(ledger, read_only=read_only)
+
+
+class _RefusedError(Exception):
+    """An operator command refused before it began: usage, not the outbox."""
+
+
+def _signer(config: InterlockConfig, key: str | None) -> Any:
+    """The operator's key, or why there is none."""
+    from interlock.operators import load_key
+
+    if config.operators is None:
+        raise _RefusedError(
+            "operator actions are signed: configure [operators] with each operator's public "
+            "key (docs/EPIC3_DESIGN.md §6)"
+        )
+    path = key or os.environ.get(OPERATOR_KEY_ENV)
+    if not path:
+        raise _RefusedError(f"sign with your operator key: --key PATH, or {OPERATOR_KEY_ENV}")
+    try:
+        return load_key(path)
+    except (OSError, ValueError) as exc:
+        raise _RefusedError(f"cannot read the operator key: {exc}") from exc
+
+
+@contextmanager
+def _session(config: InterlockConfig, source: Any, signer: Any) -> Iterator[Any]:
+    """An operator, signing into the operator log, anchoring into its ledger
+    when the ledger can be written now."""
+    from interlock.deliveries import operations
+    from interlock.operators import Operator, OperatorLog
+
+    settings = config.operators
+    assert settings is not None
+    governor = None
+    if settings.ledger is not None:
+        try:
+            governor = _ledger(settings.ledger)
+        except Exception as exc:  # anchored the next time the ledger can be written
+            print(f"interlock: not anchoring now ({exc})", file=sys.stderr)
+    try:
+        try:
+            log = OperatorLog(
+                settings.log, signer, settings.keyring(), ledger=governor, scope=settings.scope
+            )
+        except ValueError as exc:
+            raise _RefusedError(str(exc)) from exc
+        try:
+            yield Operator(log, operations(source))
+        finally:
+            log.close()
+    finally:
+        if governor is not None:
+            governor.close()
+
+
+def _signed(config: InterlockConfig, source: Any, args: argparse.Namespace, out: TextIO) -> int:
+    from interlock.operators import OperatorRefusedError
+
+    try:
+        signer = _signer(config, args.key)
+        with _session(config, source, signer) as operator:
+            if args.action == "resolve":
+                resolved = operator.resolve()
+                for record in resolved:
+                    print(f"record {record.seq}: {record.kind}", file=out)
+                print(f"resolved {len(resolved)} intent(s)", file=out)
+                return EXIT_OK
+            try:
+                outcome = _act(operator, config, args)
+            except OperatorRefusedError as exc:
+                print(f"refused, nothing signed: {exc}", file=out)
+                return EXIT_FINDINGS
+    except _RefusedError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    print(
+        f"signed by {operator.name}: intent {outcome.intent.seq} "
+        f"({outcome.intent.record_hash[:16]}), {outcome.record.kind}",
+        file=out,
+    )
+    for row in outcome.rows:
+        print(f"  {row.event:<12} {row.message_id}  row {row.seq}", file=out)
+    for message, why in outcome.skipped:
+        print(f"  not done     {message}: {why}", file=out)
+    return EXIT_OK if outcome.applied else EXIT_FINDINGS
+
+
+def _act(operator: Any, config: InterlockConfig, args: argparse.Namespace) -> Any:
+    if args.action == "release":
+        if args.scope:
+            return operator.release_scope(args.scope, reason=args.reason)
+        return operator.release([args.message], reason=args.reason)
+    if args.action == "cancel":
+        return operator.cancel(args.message, reason=args.reason)
+    if args.action == "requeue":
+        return operator.requeue(args.message, reason=args.reason)
+    return operator.compensate(
+        [] if args.message is None else [args.message],
+        plan_id=args.plan,
+        late=args.late,
+        reason=args.reason,
+        registry=config.sink_registry(),
+    )
 
 
 def _check(config: InterlockConfig, out: TextIO) -> int:

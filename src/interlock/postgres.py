@@ -71,7 +71,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
-from interlock.outbound import SinkSpec
+from interlock.outbound import EnqueueOrder, SinkSpec
 from interlock.outbox_sql import (
     OUTBOX_FUNCTIONS,
     OUTBOX_GUARD,
@@ -108,7 +108,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "2"
+INSTALL_VERSION: Final = "3"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -367,12 +367,13 @@ _OUTBOX_TABLES: Final = (
     "interlock.outbox",
     "interlock.outbox_state",
     "interlock.outbox_attempts",
+    "interlock.outbox_epochs",
 )
 
 _RELAY_FUNCTIONS: Final = (
     "interlock.relay_claim(text, double precision, integer, text[])",
     "interlock.relay_sending(uuid, text, bigint, text)",
-    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text)",
     "interlock.relay_hold(uuid, text, bigint, text)",
     "interlock.relay_defer(uuid, text, bigint, text, bigint)",
     "interlock.relay_refuse(uuid, text, bigint, text)",
@@ -420,6 +421,12 @@ def install(
     Installing it over version 1 upgrades in place, in the same transaction:
     ``interlock.stages`` gains ``enqueue_hash``, and ``begin_stage`` its fourth
     argument.
+
+    Version 3 (``docs/EPIC3_DESIGN.md`` §3) adds sink kinds, the id of what a
+    delivered call created, operator authority and compensations. Installing
+    it over version 2 upgrades in place, in the same transaction, and every
+    delivery log written under version 2 still verifies. Stop the relays
+    first: a relay of version 2 cannot record an outcome in version 3.
     """
     from psycopg import sql
 
@@ -515,11 +522,11 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
     """Mirror the registry into ``interlock.sinks``: what ``enqueue`` checks."""
     for sink in sinks:
         conn.execute(
-            "INSERT INTO interlock.sinks (name, operations, cost_per_call, idempotency, "
+            "INSERT INTO interlock.sinks (name, kind, operations, cost_per_call, idempotency, "
             "max_payload_bytes, not_after_seconds, max_attempts, backoff_base_ms, "
             "backoff_cap_ms, unknown_outcome, config_hash, enabled) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true) "
-            "ON CONFLICT (name) DO UPDATE SET "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true) "
+            "ON CONFLICT (name) DO UPDATE SET kind = EXCLUDED.kind, "
             "operations = EXCLUDED.operations, cost_per_call = EXCLUDED.cost_per_call, "
             "idempotency = EXCLUDED.idempotency, "
             "max_payload_bytes = EXCLUDED.max_payload_bytes, "
@@ -531,6 +538,7 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
             "config_hash = EXCLUDED.config_hash, enabled = true",
             (
                 sink.name,
+                sink.kind,
                 [op.name for op in sink.operations],
                 str(sink.cost_per_call),
                 sink.idempotency,
@@ -547,6 +555,17 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
         "UPDATE interlock.sinks SET enabled = false WHERE NOT (name = ANY (%s))",
         ([sink.name for sink in sinks],),
     )
+
+
+def installed_v3(conn: psycopg.Connection[Any]) -> bool:
+    """Whether the outbox in this database is version 3's: its delivery log
+    records what a call created."""
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+        "WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
+        "AND attname = 'remote_ref' AND NOT attisdropped)"
+    ).fetchone()
+    return bool(row is not None and row[0])
 
 
 def _milliseconds(span: timedelta) -> int:
@@ -588,15 +607,13 @@ class PostgresSubstrate:
         "_handle",
         "_lock_seconds",
         "_max_rows",
-        "_outbound_effects",
+        "_order",
         "_report",
         "_schema",
         "_scope",
-        "_seq",
         "_stage_seconds",
         "_tables",
         "_token",
-        "_upstream",
         "_xid",
     )
 
@@ -691,9 +708,7 @@ class PostgresSubstrate:
     def _reset_outbound(self) -> None:
         self._token: bytes | None = None
         self._scope: str | None = None
-        self._seq = 0
-        self._upstream: dict[EffectId, frozenset[EffectId]] = {}
-        self._outbound_effects: set[EffectId] = set()
+        self._order = EnqueueOrder()
 
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
@@ -851,25 +866,10 @@ class PostgresSubstrate:
                 rows_affected=max(cursor.rowcount, 0),
                 applied_at=datetime.now(UTC),
             )
-        self._upstream[effect.effect_id] = self._requests_before(effect)
-        if effect.kind is EffectKind.ENQUEUE:
-            self._outbound_effects.add(effect.effect_id)
+        self._order.applied(
+            effect.effect_id, effect.depends_on, request=effect.kind is EffectKind.ENQUEUE
+        )
         return outcome
-
-    def _requests_before(self, effect: Effect) -> frozenset[EffectId]:
-        """The plan's outbound requests ``effect`` depends on, directly or
-        through SQL effects: what the relay must deliver before it.
-
-        The engine applies effects in topological order, so every dependency
-        has been applied, and recorded, before its dependant.
-        """
-        found: set[EffectId] = set()
-        for dependency in effect.depends_on:
-            if dependency in self._outbound_effects:
-                found.add(dependency)
-            else:
-                found |= self._upstream.get(dependency, frozenset())
-        return frozenset(found)
 
     def _enqueue(
         self, conn: psycopg.Connection[Any], handle: StageHandle, effect: Effect
@@ -885,7 +885,6 @@ class PostgresSubstrate:
         request = effect.request
         if request is None or self._token is None or not self._scope:
             raise StageError(f"effect {effect.effect_id!r} cannot be enqueued outside a stage")
-        self._seq += 1
         compensation = (
             None
             if request.compensation is None
@@ -899,8 +898,8 @@ class PostgresSubstrate:
                     self._token,
                     uuid.uuid4(),
                     effect.effect_id,
-                    self._seq,
-                    sorted(self._requests_before(effect)),
+                    self._order.next_seq(),
+                    sorted(self._order.waits_for(effect.depends_on)),
                     request.sink,
                     request.operation,
                     effect.tenant_id,
@@ -1281,6 +1280,11 @@ class PostgresSubstrate:
             raise SubstrateConfigurationError(
                 "Interlock in this database was installed by an older version, without "
                 "the outbox. Run `interlock install` to upgrade it in place"
+            )
+        if not installed_v3(conn):
+            raise SubstrateConfigurationError(
+                "Interlock in this database was installed by version 2. Run "
+                "`interlock install` to upgrade it in place to version 3"
             )
         guards = {
             (str(r[0]), str(r[1])): (str(r[2]), str(r[3]))

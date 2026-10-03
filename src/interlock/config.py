@@ -49,6 +49,36 @@ TOML, so the standard library reads it::
     routes = { send = "POST /v3/mail/send" }        # every operation of the sink
     header_env = { Authorization = "MAIL_AUTHORIZATION" }
 
+A typed sink (``docs/EPIC3_DESIGN.md`` §4) brings its operations' schemas
+and its relay adapter; configuration names which of its operations to allow::
+
+    [[sinks]]
+    name = "payments"
+    type = "stripe"                   # or "sendgrid"; "http" by default
+    cost_per_call = "0.30"
+
+    [[sinks.operations]]
+    name = "payment_intents.create"   # undone by refunds.create, so it is listed too
+
+    [[sinks.operations]]
+    name = "refunds.create"
+
+    [[relay.endpoints]]
+    sink = "payments"
+    secret_env = "STRIPE_SECRET_KEY"  # the variable holding the API key
+    # url = "https://api.stripe.com"  # the vendor's own, unless given
+    # stripe_version = "2024-06-20"   # stripe; sandbox = true for sendgrid
+
+Operators sign every action on the outbox (``docs/EPIC3_DESIGN.md`` §6)::
+
+    [operators]
+    log = "operators.ilok1"           # the signed operator log, beside this file
+    ledger = "governor.db"            # optional: anchor every record in AgentGov
+    scope = "interlock-operators"     # the ledger scope the anchors go to
+
+    [operators.keys]                  # public halves only: `interlock operator keygen`
+    alice = "ed25519:5f0c..."
+
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
 relay's in ``INTERLOCK_RELAY_DATABASE``. A sink has no endpoint or credential
@@ -68,7 +98,16 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from interlock.outbound import NONE_POSSIBLE, REDELIVER, OperationSpec, SinkRegistry, SinkSpec
+from interlock.outbound import (
+    HTTP,
+    KINDS,
+    NONE_POSSIBLE,
+    OperationSpec,
+    SinkRegistry,
+    SinkSpec,
+    typed_sink,
+)
+from interlock.records import Keyring
 from interlock.substrate import TableSpec
 
 __all__ = [
@@ -76,6 +115,7 @@ __all__ = [
     "RELAY_DATABASE_ENV",
     "Endpoint",
     "InterlockConfig",
+    "OperatorsConfig",
     "RelayConfig",
     "load_config",
 ]
@@ -92,15 +132,23 @@ class ConfigError(ValueError):
 class Endpoint:
     """Where the relay delivers one sink's requests.
 
-    :ivar routes: ``"METHOD /path"`` for every operation of the sink.
-    :ivar header_env: Each header sent with every call, mapped to the
-        environment variable that holds its value.
+    :ivar routes: ``"METHOD /path"`` for every operation of an ``http`` sink.
+    :ivar header_env: Each header sent with every call to an ``http`` sink,
+        mapped to the environment variable that holds its value.
+    :ivar kind: The sink's kind, which picks the adapter.
+    :ivar secret_env: A typed sink's API key: the variable that holds it.
+    :ivar stripe_version: The ``Stripe-Version`` a Stripe adapter pins.
+    :ivar sandbox: A SendGrid adapter validates and sends nothing.
     """
 
     sink: str
     url: str
     routes: Mapping[str, str]
     header_env: Mapping[str, str]
+    kind: str = HTTP
+    secret_env: str = ""
+    stripe_version: str = ""
+    sandbox: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +168,29 @@ class RelayConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class OperatorsConfig:
+    """``[operators]``: who may act on the outbox, and the signed log of what
+    they did (``docs/EPIC3_DESIGN.md`` §6).
+
+    :ivar log: The operator log's file.
+    :ivar keys: Each operator's name and Ed25519 public key
+        (``ed25519:<hex>``). Only public halves: each operator holds their own
+        private key, and verifying needs none.
+    :ivar ledger: An AgentGov ledger every record is anchored into: a SQLite
+        file or a ``postgresql://`` DSN.
+    :ivar scope: The ledger scope the anchors are written to.
+    """
+
+    log: Path
+    keys: Mapping[str, str]
+    ledger: str | None = None
+    scope: str = "interlock-operators"
+
+    def keyring(self) -> Keyring:
+        return Keyring(self.keys)
+
+
+@dataclass(frozen=True, slots=True)
 class InterlockConfig:
     substrate: str
     database: str
@@ -131,6 +202,7 @@ class InterlockConfig:
     sinks: tuple[SinkSpec, ...] = ()
     relay_roles: tuple[str, ...] = ()
     relay: RelayConfig | None = None
+    operators: OperatorsConfig | None = None
 
     def with_database(self, database: str | None) -> InterlockConfig:
         if not database:
@@ -187,12 +259,14 @@ def load_config(
         except ValueError as exc:
             raise ConfigError(f"tables[{index}]: {exc}") from exc
     sinks = _sinks(raw.get("sinks", []), Path(path).parent)
-    if sinks and substrate != "postgres":
+    relay_roles = tuple(_strings(raw, "relay_roles", required=False))
+    if relay_roles and substrate != "postgres":
         raise ConfigError(
-            "[[sinks]] need substrate = 'postgres': the outbox is a PostgreSQL table, "
-            "written in the stage's transaction"
+            "relay_roles are PostgreSQL roles; a SQLite relay is bounded by the file's "
+            "permissions instead"
         )
     relay = _relay(raw.get("relay"), sinks)
+    operators = _operators(raw.get("operators"), Path(path).parent)
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -202,9 +276,31 @@ def load_config(
         audit_roles=tuple(_strings(raw, "audit_roles", required=False)),
         acknowledge_cascades=tuple(_strings(raw, "acknowledge_cascades", required=False)),
         sinks=sinks,
-        relay_roles=tuple(_strings(raw, "relay_roles", required=False)),
+        relay_roles=relay_roles,
         relay=relay,
+        operators=operators,
     )
+
+
+def _operators(raw: object, base: Path) -> OperatorsConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("'operators' must be a table ([operators])")
+    try:
+        keys = _table_of_strings(raw, "keys")
+        config = OperatorsConfig(
+            log=base / _string(raw, "log"),
+            keys=keys,
+            ledger=_string(raw, "ledger", default="") or None,
+            scope=_string(raw, "scope", default="interlock-operators"),
+        )
+        config.keyring()
+    except ValueError as exc:
+        raise ConfigError(f"[operators]: {exc}") from exc
+    if config.ledger is not None and not config.ledger.startswith(("postgres://", "postgresql://")):
+        config = replace(config, ledger=str(base / config.ledger))
+    return config
 
 
 def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
@@ -236,6 +332,14 @@ def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
             sink = registered.get(sink_name)
             if sink is None:
                 raise ConfigError(f"{where}: no [[sinks]] entry named {sink_name!r}")
+            if sink.kind != HTTP:
+                endpoints.append(_typed_endpoint(entry, sink, where))
+                continue
+            for key in ("secret_env", "stripe_version", "sandbox"):
+                if key in entry:
+                    raise ConfigError(
+                        f"{where}: {key!r} is for a typed sink; {sink_name!r} is http"
+                    )
             routes = _table_of_strings(entry, "routes")
             missing = sorted({op.name for op in sink.operations} - set(routes))
             extra = sorted(set(routes) - {op.name for op in sink.operations})
@@ -274,6 +378,35 @@ def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
         raise ConfigError(f"[relay]: {exc}") from exc
 
 
+def _typed_endpoint(entry: Mapping[str, Any], sink: SinkSpec, where: str) -> Endpoint:
+    """A Stripe or SendGrid sink's endpoint: the adapter knows its routes and
+    how to present its key; configuration says where the key is."""
+    for key in ("routes", "header_env"):
+        if key in entry:
+            raise ConfigError(
+                f"{where}: a {sink.kind} sink's adapter knows its routes and credentials; "
+                f"give 'secret_env', not {key!r}"
+            )
+    if "stripe_version" in entry and sink.kind != "stripe":
+        raise ConfigError(f"{where}: 'stripe_version' is for a stripe sink")
+    sandbox = entry.get("sandbox", False)
+    if not isinstance(sandbox, bool) or (sandbox and sink.kind != "sendgrid"):
+        raise ConfigError(f"{where}: 'sandbox' is true or false, for a sendgrid sink")
+    url = _string(entry, "url", default="")
+    if url and not url.startswith(("http://", "https://")):
+        raise ConfigError(f"{where}: 'url' is an http(s) URL")
+    return Endpoint(
+        sink=sink.name,
+        url=url,
+        routes={},
+        header_env={},
+        kind=sink.kind,
+        secret_env=_string(entry, "secret_env"),
+        stripe_version=_string(entry, "stripe_version", default=""),
+        sandbox=sandbox,
+    )
+
+
 def _table_of_strings(raw: Mapping[str, Any], key: str, *, required: bool = True) -> dict[str, str]:
     value = raw.get(key)
     if value is None and not required:
@@ -297,20 +430,27 @@ def _sinks(entries: object, base: Path) -> tuple[SinkSpec, ...]:
             operations = entry.get("operations")
             if not isinstance(operations, list) or not operations:
                 raise ConfigError("lists no [[sinks.operations]]")
+            kind = _string(entry, "type", default=HTTP)
+            if kind not in KINDS:
+                raise ConfigError(f"'type' is one of {', '.join(KINDS)}")
             sinks.append(
                 SinkSpec(
                     _string(entry, "name"),
                     operations=tuple(
-                        _operation(op, base, f"operations[{i}]") for i, op in enumerate(operations)
+                        _operation(op, base, f"operations[{i}]")
+                        if kind == HTTP
+                        else _typed_operation(op, kind, f"operations[{i}]")
+                        for i, op in enumerate(operations)
                     ),
                     cost_per_call=_decimal(entry, "cost_per_call"),
-                    idempotency=_string(entry, "idempotency", default="header"),
+                    idempotency=_string(entry, "idempotency", default=""),
                     max_payload_bytes=_integer(entry, "max_payload_bytes", 16_384),
                     not_after=timedelta(seconds=_integer(entry, "not_after_seconds", 900)),
                     max_attempts=_integer(entry, "max_attempts", 10),
                     backoff_base=timedelta(seconds=_seconds(entry, "backoff_base_seconds", 1)),
                     backoff_cap=timedelta(seconds=_seconds(entry, "backoff_cap_seconds", 600)),
-                    unknown_outcome=_string(entry, "unknown_outcome", default=REDELIVER),
+                    unknown_outcome=_string(entry, "unknown_outcome", default=""),
+                    kind=kind,
                 )
             )
         except ConfigError as exc:
@@ -350,6 +490,27 @@ def _operation(raw: object, base: Path, where: str) -> OperationSpec:
         )
     except ValueError as exc:
         raise ConfigError(f"{where}: {exc}") from exc
+
+
+def _typed_operation(raw: object, kind: str, where: str) -> OperationSpec:
+    """One of a typed sink's own operations, by name: its schema and its
+    compensation are the kind's."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} is not a table")
+    extra = sorted(set(raw) - {"name"})
+    if extra:
+        raise ConfigError(
+            f"{where}: a {kind} sink's operations bring their own schema and compensation; "
+            f"give only 'name', not {', '.join(extra)}"
+        )
+    name = _string(raw, "name")
+    catalog = typed_sink(kind).CATALOG
+    if name not in catalog:
+        raise ConfigError(
+            f"{where}: {kind} has no operation {name!r}; it has {', '.join(sorted(catalog))}"
+        )
+    spec: OperationSpec = catalog[name]
+    return spec
 
 
 def _decimal(raw: Mapping[str, Any], key: str) -> Decimal:

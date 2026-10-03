@@ -3,10 +3,12 @@
 **Status: phases 0 to 4 built** (see §12): requests are admitted, staged in the
 outbox, charged at commit, and delivered by the relay, which is proven against crashes
 at every point of its path; and a request is checked against the rows it rides with
-(`CrossEffectAgreement`, §5.2). Not built yet: the other outbound checkers and the rate
-windows of §5.2 and §5.3, compensation and operator records in the escrow chain (§8),
-delivery receipts (§9), and SQLite (Phase 6). Where a section describes what was built, it says
-so; where the build departed from the design, the section was changed to match it. This
+(`CrossEffectAgreement`, §5.2). Epic 3 ([`EPIC3_DESIGN.md`](EPIC3_DESIGN.md)) built
+SQLite parity (Phase 6), compensation, and signed operator records, in an operator log of
+their own rather than the escrow chain (§8). Not built yet: the other outbound checkers and
+the rate windows of §5.2 and §5.3, and delivery receipts (§9). Where a section describes what
+was built, it says so; where the build departed from the design, the section was changed to
+match it. This
 document turns the outbox sketch in
 [`ESCROW_SPEC.md` §4.4](ESCROW_SPEC.md#44-non-transactional-sinks) (requirements
 E4-1 to E4-5) into an architecture, a schema and an implementation plan.

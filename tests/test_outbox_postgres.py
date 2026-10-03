@@ -144,6 +144,7 @@ def test_install_mirrors_the_registry_without_endpoints_or_credentials(pg: Pg) -
     assert installed == [
         {
             "name": sink.name,
+            "kind": sink.kind,
             "operations": [op.name for op in sink.operations],
             "cost_per_call": str(sink.cost_per_call),
             "idempotency": sink.idempotency,
@@ -172,7 +173,7 @@ def test_a_sink_no_longer_listed_is_disabled_not_deleted(pg: Pg) -> None:
 
 
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
-OUTBOX_TABLES = ("sinks", "outbox", "outbox_state", "outbox_attempts", "stages")
+OUTBOX_TABLES = ("sinks", "outbox", "outbox_state", "outbox_attempts", "outbox_epochs", "stages")
 
 
 def privileges(env: Pg, grantee: str) -> dict[str, set[str]]:
@@ -203,16 +204,16 @@ ENQUEUE = (
 RELAY_CALLS = (
     "interlock.relay_claim(text, double precision, integer, text[])",
     "interlock.relay_sending(uuid, text, bigint, text)",
-    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text)",
     "interlock.relay_hold(uuid, text, bigint, text)",
     "interlock.relay_defer(uuid, text, bigint, text, bigint)",
     "interlock.relay_refuse(uuid, text, bigint, text)",
 )
 OPERATOR_CALLS = (
-    "interlock.outbox_release(uuid, text)",
-    "interlock.outbox_release_scope(text, text)",
-    "interlock.outbox_cancel(uuid, text, text)",
-    "interlock.outbox_requeue(uuid, text)",
+    "interlock.outbox_release(uuid, text, text, text)",
+    "interlock.outbox_cancel(uuid, text, text, text, text)",
+    "interlock.outbox_requeue(uuid, text, text, text)",
+    "interlock.outbox_compensate(uuid, text, text, text, uuid, text, text, text)",
 )
 
 
@@ -231,6 +232,7 @@ def test_each_role_holds_exactly_its_part(pg: Pg) -> None:
             "outbox": {"SELECT"},
             "outbox_state": {"SELECT"},
             "outbox_attempts": {"SELECT"},
+            "outbox_epochs": {"SELECT"},
             "stages": set(),
         }
         assert all(may_execute(pg, relay, f) for f in RELAY_CALLS)
@@ -282,7 +284,9 @@ def test_installing_over_version_1_upgrades_in_place(pg: Pg) -> None:
     with pytest.raises(SubstrateConfigurationError, match="older version"):
         engine(pg).execute(ship().build())
     reinstall(pg)
-    assert scalar(pg.admin, "SELECT DISTINCT version FROM interlock.installation") == "2"
+    assert scalar(pg.admin, "SELECT DISTINCT version FROM interlock.installation") == (
+        INSTALL_VERSION
+    )
     overloads = scalar(
         pg.admin,
         "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -325,6 +329,7 @@ def test_a_committed_plan_leaves_its_request_in_the_outbox(pg: Pg) -> None:
         "idempotency_key": outbound_key(plan.plan_id, EffectId("notify")),
         "cost": "0.002",
         "compensation": None,
+        "compensates": None,
     }
     # The sink's default: fifteen minutes from staging.
     assert row["not_after"] - row["enqueued_at"] == timedelta(minutes=15)
