@@ -22,6 +22,13 @@ from decimal import Decimal
 from typing import Final, Protocol, runtime_checkable
 
 from interlock.feedback import FeedbackHint, Guidance
+from interlock.outbound_checks import (
+    OutboundCount,
+    OutboundTenantIsolation,
+    PayloadAmountCap,
+    RecipientAllowlist,
+    SinkAllowlist,
+)
 from interlock.types import (
     EffectDiff,
     EffectKind,
@@ -854,6 +861,11 @@ def _percent(fraction: Decimal) -> int:
 BUILT_IN_CHECKERS: frozenset[type] = frozenset(
     {
         CrossEffectAgreement,
+        SinkAllowlist,
+        OutboundCount,
+        PayloadAmountCap,
+        RecipientAllowlist,
+        OutboundTenantIsolation,
         RateWindowCheck,
         BlastRadius,
         TenantIsolation,

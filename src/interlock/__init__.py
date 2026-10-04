@@ -102,6 +102,13 @@ from interlock.invariants import (
     default_checkers,
 )
 from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
+from interlock.outbound_checks import (
+    OutboundCount,
+    OutboundTenantIsolation,
+    PayloadAmountCap,
+    RecipientAllowlist,
+    SinkAllowlist,
+)
 from interlock.postgres import PostgresSubstrate
 from interlock.receipts import ReceiptIssuer
 from interlock.records import RecordKind, RecordLog, SignedRecord, check_anchors, verify_records
@@ -204,8 +211,11 @@ __all__ = [
     "NoSchemaChange",
     "OperationSpec",
     "OperatorEvidence",
+    "OutboundCount",
     "OutboundRequest",
     "OutboundRequestError",
+    "OutboundTenantIsolation",
+    "PayloadAmountCap",
     "PlanBuilder",
     "PlanError",
     "PlanId",
@@ -215,6 +225,7 @@ __all__ = [
     "RateWindow",
     "RateWindowCheck",
     "ReceiptIssuer",
+    "RecipientAllowlist",
     "RecordIntegrityError",
     "RecordKind",
     "RecordLog",
@@ -241,6 +252,7 @@ __all__ = [
     "ShadowSubstrate",
     "SignedRecord",
     "SinkAdapter",
+    "SinkAllowlist",
     "SinkRegistry",
     "SinkSpec",
     "Spend",

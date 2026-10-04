@@ -37,14 +37,15 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Final
 
 from interlock.exceptions import OutboundRequestError
-from interlock.types import MAX_NOT_AFTER, OutboundRequest, canonical_hash
+from interlock.types import MAX_NOT_AFTER, OutboundRequest, canonical_hash, exact_number
 
 __all__ = [
     "DEAD_LETTER",
@@ -504,7 +505,9 @@ def typed_sink(kind: str) -> Any:
 def _credential_field(value: Any, path: str) -> str | None:
     if isinstance(value, Mapping):
         for key, item in value.items():
-            folded = re.sub(r"[^a-z0-9]", "", key.lower())
+            # NFKC first, so a fullwidth or styled spelling folds to the
+            # letters it reads as.
+            folded = re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKC", key).lower())
             if folded in _CREDENTIAL_NAMES or any(part in folded for part in _CREDENTIAL_PARTS):
                 return f"{path}.{key}"
             found = _credential_field(item, f"{path}.{key}")
@@ -581,9 +584,9 @@ def schema_problems(value: Any, schema: Mapping[str, Any], path: str = "$") -> l
         listed = [kinds] if isinstance(kinds, str) else list(kinds)
         if _type_of(value) not in listed:
             return [f"{path} is {_type_of(value)}, not {' or '.join(listed)}"]
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _json_equal(value, schema["const"]):
         problems.append(f"{path} is not the required constant")
-    if "enum" in schema and value not in schema["enum"]:
+    if "enum" in schema and not any(_json_equal(value, item) for item in schema["enum"]):
         problems.append(f"{path} is not one of the allowed values")
     if isinstance(value, str):
         if "minLength" in schema and len(value) < schema["minLength"]:
@@ -623,6 +626,18 @@ def schema_problems(value: Any, schema: Mapping[str, Any], path: str = "$") -> l
     return problems
 
 
+def _json_equal(a: Any, b: Any) -> bool:
+    """Equality as JSON has it: ``true`` is not ``1``, as Python's ``==``
+    would say, and an array is equal to a list of the same items."""
+    if _type_of(a) != _type_of(b):
+        return False
+    if isinstance(a, Mapping):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, tuple | list):
+        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b, strict=True))
+    return bool(a == b)
+
+
 def _type_of(value: Any) -> str:
     if value is None:
         return "null"
@@ -640,17 +655,11 @@ def _type_of(value: Any) -> str:
 
 
 def _number(value: Any) -> Decimal | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return Decimal(value)
-    if isinstance(value, str):
-        try:
-            number = Decimal(value)
-        except (InvalidOperation, ValueError):
-            return None
-        return number if number.is_finite() else None
-    return None
+    """A payload number, strictly (:func:`interlock.types.exact_number`): an
+    integer, or a plain decimal numeral. ``Decimal`` alone would read
+    ``"1_000"``, ``" 5"``, ``"1e3"`` and non-ASCII digits, which a sink may
+    read otherwise, so a bound checked here would not be the bound sent."""
+    return exact_number(value)
 
 
 class EnqueueOrder:

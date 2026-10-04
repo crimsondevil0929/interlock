@@ -729,9 +729,10 @@ class EffectDiff:
         return canonical_hash(fields)
 
 
-_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?", re.ASCII)
 """A decimal numeral as money travels in a payload: ``"50.00"``, ``"-3"``. No
-exponent, no leading zeros, so ``"007"`` stays an identifier."""
+exponent, no leading zeros, so ``"007"`` stays an identifier. ASCII digits
+only: ``re``'s ``[0-9]`` is ASCII already, and the flag says so."""
 
 
 def field_path(field: str) -> tuple[str, ...]:
@@ -753,9 +754,32 @@ def value_at(payload: object, path: tuple[str, ...]) -> tuple[bool, object]:
     return True, current
 
 
+def values_at(payload: object, path: tuple[str, ...]) -> list[tuple[str, object]]:
+    """Every value at ``path`` in a payload, with where it was found: a ``*``
+    part stands for every item of a list, or every value of an object, there.
+    Empty when there is none: a path through a missing field finds nothing."""
+    found: list[tuple[str, object]] = [("$", payload)]
+    for part in path:
+        following: list[tuple[str, object]] = []
+        for where, current in found:
+            if part == "*":
+                if isinstance(current, Mapping):
+                    following += [(f"{where}.{k}", v) for k, v in current.items()]
+                elif isinstance(current, tuple | list):
+                    following += [(f"{where}[{i}]", v) for i, v in enumerate(current)]
+            elif isinstance(current, Mapping) and part in current:
+                following.append((f"{where}.{part}", current[part]))
+            elif isinstance(current, tuple | list) and part.isdigit() and int(part) < len(current):
+                following.append((f"{where}[{part}]", current[int(part)]))
+        found = following
+    return found
+
+
 def exact_number(value: object) -> Decimal | None:
     """A number, exactly: an integer, a ``Decimal``, or a decimal numeral. A
-    float, a boolean or anything else is none."""
+    float, a boolean or anything else is none: so is a string Python's own
+    ``Decimal`` would read (``"1_000"``, ``" 5"``, ``"1e3"``, ``"+5"``,
+    ``"١٢٣"``) but a sink might read otherwise."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int | Decimal):

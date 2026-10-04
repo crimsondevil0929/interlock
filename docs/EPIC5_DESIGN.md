@@ -1,6 +1,6 @@
 # Epic 5: the zero-trust inbox, cryptographic compaction, the last checkers
 
-**Status: designed**, to be built step by step on `feat/epic5-inbox-compaction`; §8 will
+**Status: building**, step by step on `feat/epic5-inbox-compaction`; §8 will
 record where the build settled what the design leaves open. Builds on
 [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md) (Epic 2), [`EPIC3_DESIGN.md`](EPIC3_DESIGN.md) and
 [`EPIC4_DESIGN.md`](EPIC4_DESIGN.md). Three parts:
@@ -506,4 +506,20 @@ Upgraded in place from version 4. No relay needs a restart: no relay function ch
 
 ## 8. As built
 
-To be written as each step lands.
+Where the implementation settled what the design left open, or refined it.
+
+### Step 2: the outbound checkers
+
+- **`interlock.outbound_checks`** holds the five, exported from `interlock`, and listed among
+  the built-in checkers whose hints are trusted with bucketed counts. A hint names sinks only
+  as the plan's own requests name them (`FeedbackHint.sinks`, filtered like tables), and the
+  five kinds have templates of their own (`sink_allowlist`, `outbound_count`,
+  `payload_amount_cap`, `recipient_allowlist`, `outbound_tenant_isolation`).
+- **A cap is never told**, nor an amount: a cap told is a target. `outbound_count` tells the
+  plan's own count and its limit, bucketed.
+- **Paths with `*`** (`interlock.types.values_at`) reach every item of a list, or every value
+  of an object: `to.*.email`.
+- **Two more payload rules made strict**, found while writing these. The schema subset's
+  `enum` and `const` compared with Python's equality, under which `true` is `1`; they now
+  compare as JSON does. And a field named like a credential is folded through NFKC before
+  it is compared, so `ＡＰＩ_ＫＥＹ` is `api_key`.

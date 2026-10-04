@@ -18,6 +18,9 @@ A refused plan produces two records, built from the same adjudication:
     configured limit, as a whole percentage: policy, not data;
   * **windows** only by name, as the operator configured them, and only from
     the built-in rate-window check;
+  * **sinks** only as the plan's own requests name them;
+  * **payload values and facts never**: no amount, recipient or tenant field a
+    request carries, no value an inbound fact holds;
   * **text** chosen by the constraint's :class:`Guidance` kind from a fixed set
     of templates.
 
@@ -126,6 +129,12 @@ class Guidance(StrEnum):
     OUTBOUND_AGREEMENT = "outbound_agreement"
     # Raised by a checker over the measured diff and its windows' history.
     RATE_WINDOW = "rate_window"
+    # Raised by a checker over the outbound requests (docs/OUTBOX_DESIGN.md §5.2).
+    OUTBOUND_SCOPE = "outbound_scope"
+    OUTBOUND_COUNT = "outbound_count"
+    OUTBOUND_AMOUNT = "outbound_amount"
+    OUTBOUND_RECIPIENT = "outbound_recipient"
+    OUTBOUND_TENANT = "outbound_tenant"
 
 
 _LABELS: Final[Mapping[Guidance, str]] = {
@@ -153,6 +162,11 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.OUTBOUND_REQUEST: "outbound_request",
     Guidance.OUTBOUND_AGREEMENT: "cross_effect_agreement",
     Guidance.RATE_WINDOW: "rate_window",
+    Guidance.OUTBOUND_SCOPE: "sink_allowlist",
+    Guidance.OUTBOUND_COUNT: "outbound_count",
+    Guidance.OUTBOUND_AMOUNT: "payload_amount_cap",
+    Guidance.OUTBOUND_RECIPIENT: "recipient_allowlist",
+    Guidance.OUTBOUND_TENANT: "outbound_tenant_isolation",
 }
 """The public name of each kind. Derived from the kind, never from a checker's
 own ``name``, which can embed configuration (``column_value_guard:orders.total``)
@@ -181,6 +195,8 @@ class FeedbackHint:
         whole percentage. Built-in checkers only.
     :ivar window: The name of the rate window that refused the plan. Kept
         only from the built-in rate-window check, and only as an identifier.
+    :ivar sinks: Sinks involved. Kept only where the plan's own requests name
+        them.
     """
 
     kind: Guidance
@@ -191,6 +207,7 @@ class FeedbackHint:
     limit: int | None = None
     percent: int | None = None
     window: str = ""
+    sinks: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------
@@ -218,6 +235,7 @@ class ConstraintFeedback:
     withheld_tables: bool = False
     withheld_tenants: bool = False
     window: str = ""
+    sinks: tuple[str, ...] = ()
 
     @property
     def constraint(self) -> str:
@@ -228,7 +246,9 @@ class ConstraintFeedback:
         return f"{self.constraint}: {_TEMPLATES[self.guidance](self)}"
 
     def to_json(self) -> dict[str, Any]:
-        named = {"window": self.window} if self.window else {}
+        named: dict[str, Any] = {"window": self.window} if self.window else {}
+        if self.sinks:
+            named["sinks"] = list(self.sinks)
         return {
             "constraint": self.constraint,
             "guidance": self.guidance.value,
@@ -300,6 +320,10 @@ def _column(c: ConstraintFeedback) -> str:
     if len(c.tables) == 1 and len(c.columns) == 1 and not c.withheld_tables:
         return f"{c.tables[0]}.{c.columns[0]}"
     return "a guarded column"
+
+
+def _sinks(c: ConstraintFeedback) -> str:
+    return ", ".join(c.sinks) or "a sink"
 
 
 def _percent(c: ConstraintFeedback) -> str:
@@ -381,6 +405,28 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         + (f" for tenant {', '.join(c.tenants)}" if c.tenants else "")
         + ". The window slides: what earlier plans added stops counting as it ages."
     ),
+    Guidance.OUTBOUND_SCOPE: lambda c: (
+        f"a request to {_sinks(c)} uses a sink or operation this plan may not call."
+    ),
+    Guidance.OUTBOUND_COUNT: lambda c: (
+        f"the plan enqueues {c.measured or 'too many'} outbound request(s)"
+        + (f" to {_sinks(c)}" if c.sinks else "")
+        + f"; the limit is {c.limit or 'lower'}. Split the work."
+    ),
+    Guidance.OUTBOUND_AMOUNT: lambda c: (
+        f"a request to {_sinks(c)} carries an amount over its cap, or one that is not a "
+        f"plain non-negative number."
+    ),
+    Guidance.OUTBOUND_RECIPIENT: lambda c: (
+        f"a request to {_sinks(c)} addresses a recipient outside the allowed ones, or one "
+        f"that is not a single plain address."
+    ),
+    Guidance.OUTBOUND_TENANT: lambda c: (
+        f"the plan's outbound requests reach beyond its tenants "
+        f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. A "
+        f"request goes only to a tenant the plan's rows involve, and its payload names that "
+        f"tenant where it names one."
+    ),
 }
 
 
@@ -448,6 +494,8 @@ class _Scope:
     tables: Mapping[str, str]
     """Lowercased table name -> the plan's spelling."""
     tenants: frozenset[str]
+    sinks: frozenset[str] = frozenset()
+    """The sinks the plan's own requests name."""
 
     @classmethod
     def of(cls, plan: EffectPlan) -> _Scope:
@@ -455,7 +503,8 @@ class _Scope:
         for effect in plan.effects:
             tables.setdefault(effect.table.lower(), effect.table)
         tenants = frozenset(e.tenant_id for e in plan.effects if e.tenant_id is not None)
-        return cls(tables=tables, tenants=tenants)
+        sinks = frozenset(e.request.sink for e in plan.effects if e.request is not None)
+        return cls(tables=tables, tenants=tenants, sinks=sinks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +564,9 @@ def sanitize(
             and _IDENTIFIER.fullmatch(hint.window)
         ):
             window = hint.window
+    # Sinks only as the plan's own requests name them: anything else could
+    # spell a payload value as a "sink".
+    sinks = tuple(sorted({str(s) for s in hint.sinks if str(s) in scope.sinks}))
     return ConstraintFeedback(
         guidance=kind,
         blocking=blocking,
@@ -527,6 +579,7 @@ def sanitize(
         withheld_tables=withheld_tables,
         withheld_tenants=withheld_tenants,
         window=window,
+        sinks=sinks,
     )
 
 
