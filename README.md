@@ -435,6 +435,75 @@ assert runtime.execute(repair.proposal).committed
 Both substrates have savepoints. A repair's trials all run inside one stage, so the
 stage's locks are held for the whole search.
 
+## Rate windows
+
+A checker sees one plan. An agent that keeps every plan under every per-plan limit, a
+refund of 50 a hundred times over, passes every one. A rate window measures a plan with
+what came before it (`docs/EPIC4_DESIGN.md` §3):
+
+```python
+from datetime import timedelta
+
+from interlock import (
+    BlastRadius,
+    EscrowEngine,
+    OperationSpec,
+    RateWindow,
+    Requests,
+    RequestSum,
+    SinkRegistry,
+    SinkSpec,
+    SqliteSubstrate,
+    TableSpec,
+)
+
+engine = EscrowEngine(
+    SqliteSubstrate(
+        "prod.db",
+        tables=[TableSpec("orders", columns=["id", "tenant", "total"], tenant_column="tenant")],
+    ),
+    checkers=[BlastRadius(100)],
+    sinks=SinkRegistry(
+        [
+            SinkSpec("mail", (OperationSpec("send"),)),
+            SinkSpec("payments", (OperationSpec("refunds.create"),)),
+        ]
+    ),
+    windows=[
+        RateWindow("mail_per_tenant_hour", timedelta(hours=1), 10, Requests("mail"), per="tenant"),
+        RateWindow("mail_per_agent_hour", timedelta(hours=1), 50, Requests("mail")),
+        RateWindow(
+            "refunds_per_agent_day",
+            timedelta(days=1),
+            "10000",
+            RequestSum("payments", "refunds.create", "amount"),
+        ),
+    ],
+)
+```
+
+A window counts requests (`Requests`), sums a payload amount (`RequestSum`) or a column
+over the plan's rows (`RowSum`, inserted or net), or counts plans (`Plans`), per scope,
+per tenant or globally, and slides: what a plan added stops counting a span after it
+committed. Pair a per-tenant window with a per-scope one: a request's tenant is the
+plan's to declare.
+
+Each plan is measured with the history of every window key it adds to, read with the key
+locked: on PostgreSQL a transaction-scoped advisory lock held to `COMMIT`, the history read
+on a second, `READ COMMITTED` connection; on SQLite the stage's own write lock. Plans
+racing into one window commit exactly up to its limit. The history and what the plan adds
+are part of the diff, so the verdict replays from it; what the plan adds is written beside
+its commit marker, or not at all. Statements of a plan can neither read nor write window
+history. The agent is told which window refused it, never what the window holds:
+
+```text
+- rate_window: the plan would take rate window mail_per_agent_hour past its limit. The
+  window slides: what earlier plans added stops counting as it ages.
+```
+
+`[[windows]]` in `interlock.toml` configures them, checked against `[[sinks]]` and
+`[[tables]]`, for `EscrowEngine(windows=config.windows)`.
+
 ## AgentGov integration
 
 Interlock imports [`agentgov`](https://github.com/crimsondevil0929/agentgov) as a
@@ -1032,6 +1101,7 @@ agent is told which rule it broke, never the amounts.
 
 ```toml
 [relay]
+key = "relay.key"                                  # this relay's Ed25519 key; or INTERLOCK_RELAY_KEY
 database = "postgresql://interlock_relay@db/app"   # a relay role; or INTERLOCK_RELAY_DATABASE
 ledger = "postgresql://interlock_relay@db/app"     # AgentGov, read-only, for the breaker
 lease_seconds = 60                                 # at least twice timeout_seconds
@@ -1190,6 +1260,72 @@ than the one signed for, an operator log edited or cut short (its signatures, it
 anchors), a sink re-enabled or widened since the last signed `interlock install`. A
 database's owner can still edit their own database; they cannot do it unnoticed.
 
+### Relays sign every outcome
+
+What a sink answered is recorded only as the relay that heard it signed it: an ARC1 1.1
+attestation, with the relay's own Ed25519 key, over the request as the outbox committed it
+and the outcome as the row records it. The database refuses an outcome without one, and a
+relay starts only with a key registered for verification:
+
+```bash
+interlock keygen --role relay --out ~/.interlock/east-1.key --name east-1   # prints the line below
+```
+
+```toml
+[relays.keys]
+east-1 = "ed25519:9a1b..."
+```
+
+`interlock outbox verify` rebuilds each outcome's attestation from the outbox row and the
+log row, and names every outcome no registered relay signed: a delivery written around
+Interlock, linked and hashed perfectly, is named all the same, and so is a genuine row
+rewritten after it was signed. Outcomes recorded before schema version 4 carry no
+attestation. They are the legacy set the install that brought version 4 recorded, once,
+and the signed `interlock install` vouches for it: a row forged into an old log later is
+not in it, however early it is dated.
+
+### Settlement: delivery receipts, and credits for compensations
+
+The process that holds the receipt log and the ledger (the engine's) settles each
+delivered request once (`docs/EPIC4_DESIGN.md` §4):
+
+<!-- readme-test: skip reason="needs a settler role, and the engine's receipt log and ledger" -->
+```python
+import psycopg
+
+from interlock import Settler
+
+settler = Settler(
+    psycopg.connect(SETTLER_DSN, autocommit=True),  # a role in settler_roles
+    receipts=issuer,  # the engine's ReceiptIssuer
+    chain=engine.chain,
+    relays=config.relay_keyring(),
+    ledger=governor,  # the engine's AgentGov ledger
+    operator_log="operators.ilok1",
+    operators=config.operators.keyring(),
+    sinks=registry,  # the engine's SinkRegistry, which priced every request
+)
+report = settler.settle()  # as often as you like
+```
+
+- **A delivery receipt** for each delivered request: an ARC1 `DeliveryReceipt` signed by
+  the receipt log, carrying the relay's attestation, bound to the action receipt of the
+  plan that committed the request by that receipt's leaf hash: the plan its attested
+  idempotency key was derived from, not merely the one its row names. agentgov's verifier
+  checks it: `agentgov verify-receipt delivery.json --relay-key ... --action action.json`.
+- **A credit** for a delivered compensation: AgentGov `refund()` of the `cost_per_call`
+  the engine's sink registry prices the request at, which is what its plan was charged
+  for it, to the scope the ledger charged; never the money the request moved. Only when a
+  registered relay attested the compensation's delivery; the original's `compensated` row
+  carries the authority of a signed operator intent that names exactly this compensation,
+  recorded applied; and the outbox row agrees with the registry's price and the
+  compensation's signed key. No column the database's owner can rewrite sets the amount
+  or the scope: the plan's charge caps the credits, and nothing is credited when the row
+  and the registry disagree.
+- **Exactly once.** Each step finds what a crashed run left of it. Killed after the
+  receipt, the credit, or the settlement row, the next run settles every request once: no
+  receipt twice, no orphaned receipt, no second credit.
+
 ## Unrecorded writes
 
 The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
@@ -1322,7 +1458,8 @@ section listing implemented, partial and unimplemented requirements.
 
 ## Install
 
-`agentgov` resolves from git, so a clone needs no sibling checkout:
+`agentgov` comes from PyPI (`interlock-agentgov>=0.4.0`, ARC1 1.1), so a clone needs
+nothing beside it:
 
 ```bash
 git clone https://github.com/crimsondevil0929/interlock
@@ -1335,37 +1472,21 @@ Or install the package directly:
 uv pip install git+https://github.com/crimsondevil0929/interlock
 ```
 
-The `agentgov` dependency is a PEP 508 direct reference, which is what makes the second
-form work. Two consequences worth knowing before you depend on this:
+Signing, a relay's attestations and an operator's records, needs the `sign` extra
+(`cryptography`); verifying never does.
 
-- **Interlock cannot be published to PyPI as-is.** PyPI rejects direct-URL dependencies.
-  Publishing means putting `agentgov` on PyPI and pinning a version range instead.
-- **The pin is an agentgov release tag, never a branch.** A resolver cache is keyed on
-  name and version, and `@main` is a moving target: interlock 0.1.1 locked an agentgov
-  commit that reported itself as 0.1.0 and lacked APIs this README relied on. Interlock
-  0.1.2 pinned the agentgov tag `v0.1.2`; 0.2.0 pins `v0.2.0`, the first release with
-  `agentgov.receipts`. That tag's package metadata still reports version 0.1.2, so tell
-  the two apart by the commit, `6d3cac2`, which `uv.lock` records. 0.2.1 pins agentgov's
-  `v0.2.1` (`35788dd`), whose package metadata correctly reports 0.2.1. Pin a tag or a
-  commit for anything reproducible, and use `uv sync --refresh-package agentgov` when you
-  suspect a stale build.
-
-**Developing on both repos at once.** Because the dependency is git-pinned, `uv sync` (or
-`uv add --editable`) in a plain interlock checkout always fetches agentgov from GitHub --
-a sibling `../agentgov` checkout on disk is not consulted on its own, so edits there have
-no effect until you say so explicitly. To point `uv` at it instead, add to interlock's
-`pyproject.toml`:
+**Developing on both repos at once.** `uv sync` resolves agentgov from PyPI, and a sibling
+`../agentgov` checkout is not consulted on its own. To point `uv` at one, add to
+interlock's `pyproject.toml`:
 
 ```toml
 [tool.uv.sources]
-agentgov = { path = "../agentgov", editable = true }
+interlock-agentgov = { path = "../agentgov", editable = true }
 ```
 
-then `uv lock && uv sync`. This is workspace configuration, not written into built
-distribution metadata (the direct-reference `dependencies` entry above is what ships), so
-it is safe to keep on a local branch while iterating and drop before merging. Remember to
-revert it (and rerun `uv lock`) once you are done, or a later `uv sync` on that branch
-keeps resolving against your local checkout instead of the pinned tag.
+then `uv lock && uv sync`. It is workspace configuration, not written into the built
+wheel. Drop it, and rerun `uv lock`, before merging: CI resolves a clean clone from the
+lockfile, with no sibling checkout, and fails on a path source.
 
 ## Development
 

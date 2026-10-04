@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -56,6 +57,7 @@ __all__ = [
     "StageState",
     "SubstrateCapabilities",
     "Verdict",
+    "WindowMeasure",
     "canonical_hash",
     "iso",
     "outbound_key",
@@ -542,6 +544,30 @@ class OutboundDelta:
 
 
 @dataclass(frozen=True, slots=True)
+class WindowMeasure:
+    """One rate window, as the stage found it: what the window already held
+    for one key, and what the plan adds to it (``docs/EPIC4_DESIGN.md`` §3).
+
+    Measured with the window's key locked, so nothing can be added to it
+    between the measurement and the stage's commit. See
+    :mod:`interlock.windows`.
+
+    :ivar window: The window's name.
+    :ivar key: Whose history: the plan's scope, a tenant, or ``""`` for a
+        global window (and for what carries no tenant, in a per-tenant one).
+    :ivar history: What the window held for ``key`` when measured: the
+        contributions of every plan committed within its span.
+    :ivar amount: What this plan adds. Written beside its commit marker when
+        it commits.
+    """
+
+    window: str
+    key: str
+    history: Decimal
+    amount: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class EffectDiff:
     """The delta a stage would commit, as measured by the substrate.
 
@@ -551,6 +577,9 @@ class EffectDiff:
     :ivar outbound: The outbound requests the stage wrote to the outbox, in
         the order it wrote them. Not rows of an observed table, so not in
         ``deltas`` or the blast radius.
+    :ivar windows: The rate windows the plan adds to, each measured with its
+        history (:class:`WindowMeasure`). Part of the measurement, so the
+        diff's hash covers it and a verdict replays from the diff alone.
     """
 
     plan_id: PlanId
@@ -560,6 +589,11 @@ class EffectDiff:
     deltas: tuple[RowDelta, ...]
     truncated: bool = False
     outbound: tuple[OutboundDelta, ...] = ()
+    windows: tuple[WindowMeasure, ...] = ()
+
+    def window(self, name: str, key: str) -> WindowMeasure | None:
+        """The measure of window ``name`` for ``key``, if the stage took one."""
+        return next((w for w in self.windows if w.window == name and w.key == key), None)
 
     @property
     def rows_inserted(self) -> int:
@@ -675,7 +709,60 @@ class EffectDiff:
                     ],
                 ]
             )
+        # Likewise only when present: a diff measured with no window keeps
+        # the hash it always had.
+        if self.windows:
+            fields.append(
+                [
+                    "windows",
+                    [
+                        [
+                            w.window,
+                            w.key,
+                            format(w.history.normalize(), "f"),
+                            format(w.amount.normalize(), "f"),
+                        ]
+                        for w in sorted(self.windows, key=lambda w: (w.window, w.key))
+                    ],
+                ]
+            )
         return canonical_hash(fields)
+
+
+_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+"""A decimal numeral as money travels in a payload: ``"50.00"``, ``"-3"``. No
+exponent, no leading zeros, so ``"007"`` stays an identifier."""
+
+
+def field_path(field: str) -> tuple[str, ...]:
+    """A payload field's dotted path (``"refund.amount"``, ``"lines.0.amount"``)
+    as its parts."""
+    return tuple(part for part in field.removeprefix("$.").split(".") if part)
+
+
+def value_at(payload: object, path: tuple[str, ...]) -> tuple[bool, object]:
+    """The value at ``path`` in a payload, and whether there is one."""
+    current = payload
+    for part in path:
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        elif isinstance(current, tuple | list) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+        else:
+            return False, None
+    return True, current
+
+
+def exact_number(value: object) -> Decimal | None:
+    """A number, exactly: an integer, a ``Decimal``, or a decimal numeral. A
+    float, a boolean or anything else is none."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | Decimal):
+        return Decimal(value)
+    if isinstance(value, str) and _NUMERAL.fullmatch(value):
+        return Decimal(value)
+    return None
 
 
 def _as_decimal(value: object) -> Decimal:

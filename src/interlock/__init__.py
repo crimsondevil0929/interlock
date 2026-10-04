@@ -127,6 +127,7 @@ from interlock.relay import (
 )
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
+from interlock.settlement import SettlementReport, Settler, verify_settlements
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.types import (
     Compensation,
@@ -142,6 +143,15 @@ from interlock.types import (
     Severity,
     StageState,
     Verdict,
+    WindowMeasure,
+)
+from interlock.windows import (
+    Plans,
+    RateWindow,
+    RateWindowCheck,
+    Requests,
+    RequestSum,
+    RowSum,
 )
 
 __version__ = "0.3.0"
@@ -199,8 +209,11 @@ __all__ = [
     "PlanBuilder",
     "PlanError",
     "PlanId",
+    "Plans",
     "PostgresSubstrate",
     "Progress",
+    "RateWindow",
+    "RateWindowCheck",
     "ReceiptIssuer",
     "RecordIntegrityError",
     "RecordKind",
@@ -216,9 +229,14 @@ __all__ = [
     "RelayReport",
     "Repair",
     "RepairFeedback",
+    "RequestSum",
+    "Requests",
     "RowDelta",
+    "RowSum",
     "Rung",
     "ScopeHaltedError",
+    "SettlementReport",
+    "Settler",
     "Severity",
     "ShadowSubstrate",
     "SignedRecord",
@@ -245,6 +263,7 @@ __all__ = [
     "TruncationGuard",
     "UncompensatableEffectError",
     "Verdict",
+    "WindowMeasure",
     "__version__",
     "check_anchors",
     "default_checkers",
@@ -253,4 +272,5 @@ __all__ = [
     "retry_delay",
     "verify_delivery_log",
     "verify_records",
+    "verify_settlements",
 ]

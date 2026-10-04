@@ -571,11 +571,11 @@ wheels = [
 
 [[package]]
 name = "interlock-agentgov"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c8/8d/d7a99d4c4fae8533ba4aec294922b017029c6dfc1c4d6d3da217f56c6801/interlock_agentgov-0.3.0.tar.gz", hash = "sha256:6d82e06697455d993a0d155188dc19139682c5c93c5c14fd7bb394680d39d71b", size = 604728, upload-time = "2026-09-28T03:29:37.368Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/16/0ebbe13fe7018c54cbabcdac129f3e2711bcda7cabe13a0bc96d7db8d422/interlock_agentgov-0.4.0.tar.gz", hash = "sha256:73978a9b1757a12e99ef052effb6fa6a167ed423acb0b16ab900ca3c60257c44", size = 620706, upload-time = "2026-10-04T04:53:29.039Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/b8/920337f7e9c4aec94b9721f766a12d4ea98ff439a4cc0605d5441fca6fbb/interlock_agentgov-0.3.0-py3-none-any.whl", hash = "sha256:9c6bd362d8242cde518034d56b6f105bec9a238c2445979fd130cc519e354500", size = 207493, upload-time = "2026-09-28T03:29:35.306Z" },
+    { url = "https://files.pythonhosted.org/packages/61/c9/4ac4482de5c1f05b3442f817a38206f4b17b47ad0d5d972fdff4e3e4793b/interlock_agentgov-0.4.0-py3-none-any.whl", hash = "sha256:275e64bc5bd655af2c1ccbb00237163721c5411e59a4c6fe031080a0101da0f4", size = 212149, upload-time = "2026-10-04T04:53:27.373Z" },
 ]
 
 [package.optional-dependencies]
@@ -613,8 +613,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "interlock-agentgov", specifier = ">=0.3.0" },
-    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", specifier = ">=0.3.0" },
+    { name = "interlock-agentgov", specifier = ">=0.4.0" },
+    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", specifier = ">=0.4.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres", "sign"]

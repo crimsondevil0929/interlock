@@ -106,6 +106,7 @@ from tests.crash_child import (  # noqa: E402
     WITNESS_ID,
     Refund,
     checkers,
+    windows,
 )
 from tests.schemas import BACK_OFFICE_ROWS, TEST_SINKS, specs  # noqa: E402
 
@@ -213,6 +214,9 @@ def snapshot(env: Pg) -> dict[str, list[tuple[Any, ...]]]:
         tables["interlock.outbox"] = conn.execute(
             "SELECT message_id, stage_id, plan_id, idempotency_key FROM interlock.outbox ORDER BY 1"
         ).fetchall()
+        tables["interlock.window_ledger"] = conn.execute(
+            "SELECT stage_id, window_name, key, amount FROM interlock.window_ledger ORDER BY 1, 2"
+        ).fetchall()
         return tables
 
 
@@ -227,6 +231,8 @@ class Books:
     markers: frozenset[str]
     outbox: frozenset[str]
     """The plans with a request in the outbox."""
+    windowed: dict[str, Decimal]
+    """What each plan added to the refunds window, by its stage's plan."""
 
     @classmethod
     def read(cls, env: Pg) -> Books:
@@ -257,6 +263,15 @@ class Books:
                         "JOIN interlock.stages s USING (stage_id) WHERE o.plan_id = s.plan_id"
                     )
                 ),
+                windowed={
+                    str(r[0]): Decimal(r[1])
+                    for r in conn.execute(
+                        # Bound to the stage that committed it, by foreign key.
+                        "SELECT s.plan_id, w.amount FROM interlock.window_ledger w "
+                        "JOIN interlock.stages s USING (stage_id) "
+                        "WHERE w.window_name = 'refunds_per_agent'"
+                    )
+                },
             )
 
     @classmethod
@@ -271,6 +286,7 @@ class Books:
             refunds={r.refund_id: r.amount for r in done},
             markers=frozenset(markers),
             outbox=frozenset(r.plan_id for r in done if r.outbound),
+            windowed={r.plan_id: r.amount for r in done},
         )
 
 
@@ -432,6 +448,7 @@ class Crash:
             settle_cost="0.25",
             receipts=ReceiptIssuer(log, row_secret=self.row_secret),
             sinks=SinkRegistry(TEST_SINKS),
+            windows=windows(),
         )
         return Restarted(chain, governor, log, witness, engine)
 
@@ -550,6 +567,7 @@ def check_receipts(env: Crash, opened: Restarted, records: Sequence[EscrowRecord
             ledger=opened.governor,
         )
         assert report.passed, (index, report.to_json())
+        assert isinstance(receipt, ActionReceipt)
         check_link(records, receipt)
 
 

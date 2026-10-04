@@ -60,6 +60,8 @@ PROSE_EXEMPT = frozenset(
         # PostgreSQL substrate.
         "pg_current_xact_id",
         "pg_xact_status",
+        # AgentGov's own method, named where the README explains settlement.
+        "refund",
     }
 )
 

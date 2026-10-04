@@ -19,8 +19,9 @@ The points are :meth:`interlock.relay.Relay._reached`'s:
 ==========================  ==============================================
 
 The scenario names its store: ``postgres`` (``dsn`` a relay role's connection
-string) or ``sqlite`` (``dsn`` the file); and, under ``typed``, the sinks it
-delivers to through Stripe's or SendGrid's adapter rather than the generic one.
+string) or ``sqlite`` (``dsn`` the file); the relay's key (``key``, its seed in
+hex); and, under ``typed``, the sinks it delivers to through Stripe's or
+SendGrid's adapter rather than the generic one.
 
 A SIGKILL runs nothing after it: no ``finally``, no ``atexit``, no
 connection close. PostgreSQL finds the session gone and rolls back whatever
@@ -43,6 +44,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, NoReturn
+
+from agentgov.receipts.signing import Ed25519Signer
 
 from interlock.adapters import HttpAdapter
 from interlock.relay import Lease, LedgerBreaker, Relay
@@ -107,6 +110,7 @@ def run(scenario: dict[str, Any]) -> NoReturn:
         lease=timedelta(seconds=scenario["lease"]),
         timeout=timedelta(seconds=scenario["timeout"]),
         batch=int(scenario.get("batch", 1)),
+        signer=Ed25519Signer(bytes.fromhex(scenario["key"])),
     )
     relay._kill = Kill(
         at=str(scenario.get("kill_at", "")), message=str(scenario.get("message", ""))

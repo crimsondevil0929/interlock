@@ -8,6 +8,7 @@ TOML, so the standard library reads it::
     stage_roles = ["interlock_agent"] # PostgreSQL install only
     audit_roles = ["interlock_audit"] # PostgreSQL install only
     relay_roles = ["interlock_relay"] # PostgreSQL install only
+    settler_roles = ["interlock_settle"]  # PostgreSQL install only; interlock.settlement
     acknowledge_cascades = []
 
     [[tables]]
@@ -33,6 +34,7 @@ TOML, so the standard library reads it::
     schema = "schemas/mail-send.json" # relative to this file; omit for any object
 
     [relay]                           # interlock relay; see interlock.relay
+    key = "relay.key"                 # this relay's Ed25519 key (interlock keygen --role relay)
     database = "postgresql://interlock_relay@db/app"  # a relay role
     ledger = "postgresql://interlock_relay@db/app"    # AgentGov, for the breaker
     ledger_schema = "agentgov"
@@ -68,6 +70,29 @@ and its relay adapter; configuration names which of its operations to allow::
     secret_env = "STRIPE_SECRET_KEY"  # the variable holding the API key
     # url = "https://api.stripe.com"  # the vendor's own, unless given
     # stripe_version = "2024-06-20"   # stripe; sandbox = true for sendgrid
+
+Rate windows (``docs/EPIC4_DESIGN.md`` §3) bound what plans add up to over
+time, whatever each plan alone may do; an engine takes them as
+``EscrowEngine(windows=config.windows)``::
+
+    [[windows]]
+    name = "refunds_per_agent_day"    # what the agent a window refuses is told
+    span_seconds = 86400              # it slides
+    limit = "10000"                   # a decimal string, or an integer
+    per = "scope"                     # or "tenant", "global"
+    measure = "request_sum"           # requests, request_sum, row_sum or plans
+    sink = "payments"                 # requests, request_sum: a [[sinks]] name...
+    operation = "refunds.create"      # ...and one of its operations
+    field = "amount"                  # request_sum: the payload's number
+    # table = "refunds"               # row_sum: a [[tables]] name...
+    # column = "amount"               # ...and one of its columns
+    # rows = "inserted"               # row_sum: or "net"
+
+Relays sign every outcome they record (``docs/EPIC4_DESIGN.md`` §2); their
+public keys are registered for verification::
+
+    [relays.keys]
+    east-1 = "ed25519:9a1b..."
 
 Operators sign every action on the outbox (``docs/EPIC3_DESIGN.md`` §6)::
 
@@ -109,6 +134,7 @@ from interlock.outbound import (
 )
 from interlock.records import Keyring
 from interlock.substrate import TableSpec
+from interlock.windows import Measure, Plans, RateWindow, Requests, RequestSum, RowSum
 
 __all__ = [
     "DATABASE_ENV",
@@ -165,6 +191,9 @@ class RelayConfig:
     poll_seconds: float = 1.0
     batch: int = 1
     workers: int = 1
+    key: Path | None = None
+    """This relay's own Ed25519 key file (``interlock keygen --role relay``),
+    or ``INTERLOCK_RELAY_KEY``: it signs every outcome the relay records."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,8 +230,18 @@ class InterlockConfig:
     acknowledge_cascades: tuple[str, ...] = ()
     sinks: tuple[SinkSpec, ...] = ()
     relay_roles: tuple[str, ...] = ()
+    settler_roles: tuple[str, ...] = ()
     relay: RelayConfig | None = None
     operators: OperatorsConfig | None = None
+    relays: Mapping[str, str] | None = None
+    """``[relays.keys]``: each relay's name and Ed25519 public key. A relay
+    starts only with a key registered here, and verification holds every
+    outcome to one of them."""
+    windows: tuple[RateWindow, ...] = ()
+    """``[[windows]]``: the rate windows, as an engine takes them."""
+
+    def relay_keyring(self) -> Keyring | None:
+        return None if self.relays is None else Keyring(self.relays)
 
     def with_database(self, database: str | None) -> InterlockConfig:
         if not database:
@@ -260,13 +299,16 @@ def load_config(
             raise ConfigError(f"tables[{index}]: {exc}") from exc
     sinks = _sinks(raw.get("sinks", []), Path(path).parent)
     relay_roles = tuple(_strings(raw, "relay_roles", required=False))
-    if relay_roles and substrate != "postgres":
+    settler_roles = tuple(_strings(raw, "settler_roles", required=False))
+    if (relay_roles or settler_roles) and substrate != "postgres":
         raise ConfigError(
-            "relay_roles are PostgreSQL roles; a SQLite relay is bounded by the file's "
-            "permissions instead"
+            f"{'relay_roles' if relay_roles else 'settler_roles'} are PostgreSQL roles; on "
+            f"SQLite the file's permissions bound who writes it instead"
         )
-    relay = _relay(raw.get("relay"), sinks)
+    relay = _relay(raw.get("relay"), sinks, Path(path).parent)
     operators = _operators(raw.get("operators"), Path(path).parent)
+    relays = _relays(raw.get("relays"))
+    windows = _windows(raw.get("windows", []), tuple(tables), sinks)
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -277,9 +319,101 @@ def load_config(
         acknowledge_cascades=tuple(_strings(raw, "acknowledge_cascades", required=False)),
         sinks=sinks,
         relay_roles=relay_roles,
+        settler_roles=settler_roles,
         relay=relay,
         operators=operators,
+        relays=relays,
+        windows=windows,
     )
+
+
+_MEASURES = ("requests", "request_sum", "row_sum", "plans")
+
+
+def _windows(
+    entries: object, tables: tuple[TableSpec, ...], sinks: tuple[SinkSpec, ...]
+) -> tuple[RateWindow, ...]:
+    if not isinstance(entries, list):
+        raise ConfigError("[[windows]] must be an array of tables")
+    windows: list[RateWindow] = []
+    for index, entry in enumerate(entries):
+        where = f"windows[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} is not a table")
+        try:
+            name = _string(entry, "name")
+            where = f"window {name}"
+            if any(w.name == name for w in windows):
+                raise ConfigError("is configured twice")
+            limit = entry.get("limit")
+            if not isinstance(limit, str | int) or isinstance(limit, bool):
+                raise ConfigError("'limit' must be a decimal string or an integer, such as \"10\"")
+            windows.append(
+                RateWindow(
+                    name,
+                    timedelta(seconds=_seconds(entry, "span_seconds", 0)),
+                    limit,
+                    _measure(entry, tables, sinks),
+                    _string(entry, "per", default="scope"),
+                )
+            )
+        except (ConfigError, ValueError) as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    return tuple(windows)
+
+
+def _measure(
+    entry: Mapping[str, Any], tables: tuple[TableSpec, ...], sinks: tuple[SinkSpec, ...]
+) -> Measure:
+    kind = _string(entry, "measure")
+    allowed = {
+        "requests": {"sink", "operation"},
+        "request_sum": {"sink", "operation", "field"},
+        "row_sum": {"table", "column", "rows"},
+        "plans": set(),
+    }.get(kind)
+    if allowed is None:
+        raise ConfigError(f"'measure' is one of {', '.join(_MEASURES)}, not {kind!r}")
+    extra = sorted(set(entry) - {"name", "span_seconds", "limit", "per", "measure"} - allowed)
+    if extra:
+        raise ConfigError(f"a {kind} window takes no {', '.join(map(repr, extra))}")
+    if kind == "plans":
+        return Plans()
+    if kind == "row_sum":
+        name = _string(entry, "table")
+        spec = next((t for t in tables if t.name.lower() == name.lower()), None)
+        if spec is None:
+            raise ConfigError(f"table {name!r} is not one of [[tables]]")
+        column = _string(entry, "column")
+        if column not in spec.columns:
+            raise ConfigError(f"{name} has no column {column!r} in [[tables]]")
+        return RowSum(name, column, _string(entry, "rows", default="inserted"))
+    sink_name = _string(entry, "sink")
+    sink = next((s for s in sinks if s.name == sink_name), None)
+    if sink is None:
+        raise ConfigError(f"sink {sink_name!r} is not one of [[sinks]]")
+    operation = (
+        _string(entry, "operation") if kind == "request_sum" or "operation" in entry else None
+    )
+    if operation is not None and operation not in {op.name for op in sink.operations}:
+        raise ConfigError(f"sink {sink_name} has no operation {operation!r}")
+    if kind == "requests":
+        return Requests(sink_name, operation)
+    assert operation is not None
+    return RequestSum(sink_name, operation, _string(entry, "field"))
+
+
+def _relays(raw: object) -> Mapping[str, str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"keys"}:
+        raise ConfigError("[relays] holds one table, [relays.keys]: each relay's public key")
+    try:
+        keys = _table_of_strings(raw, "keys")
+        Keyring(keys)
+    except ValueError as exc:
+        raise ConfigError(f"[relays.keys]: {exc}") from exc
+    return keys
 
 
 def _operators(raw: object, base: Path) -> OperatorsConfig | None:
@@ -303,7 +437,7 @@ def _operators(raw: object, base: Path) -> OperatorsConfig | None:
     return config
 
 
-def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
+def _relay(raw: object, sinks: tuple[SinkSpec, ...], base: Path) -> RelayConfig | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -373,6 +507,7 @@ def _relay(raw: object, sinks: tuple[SinkSpec, ...]) -> RelayConfig | None:
             poll_seconds=_seconds(raw, "poll_seconds", 1),
             batch=_integer(raw, "batch", 1),
             workers=_integer(raw, "workers", 1),
+            key=base / _string(raw, "key") if "key" in raw else None,
         )
     except ConfigError as exc:
         raise ConfigError(f"[relay]: {exc}") from exc

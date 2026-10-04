@@ -29,6 +29,7 @@ from tests.fakesendgrid import KEY as SENDGRID_KEY
 from tests.fakesendgrid import FakeSendGrid
 from tests.fakestripe import KEY as STRIPE_KEY
 from tests.fakestripe import FakeStripe
+from tests.outbox_env import relays_section
 from tests.schemas import specs
 
 CONFIG = """
@@ -62,6 +63,7 @@ cost_per_call = "0.001"
 name = "mail.send"
 
 [relay]
+key = "relay.key"
 breaker = "none"
 lease_seconds = 4
 timeout_seconds = 1
@@ -220,7 +222,7 @@ def test_the_relay_command_delivers_to_stripe_and_sendgrid(
     with path.open("a") as handle:
         handle.write(
             f'\n[operators]\nlog = "operators.ilok1"\n'
-            f'[operators.keys]\nops = "{key.public_key().spec()}"\n'
+            f'[operators.keys]\nops = "{key.public_key().spec()}"\n' + relays_section(tmp_path)
         )
     monkeypatch.setenv("INTERLOCK_OPERATOR_KEY", str(tmp_path / "ops.key"))
     code, out = cli("install", "--config", str(path))

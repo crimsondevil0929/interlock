@@ -64,6 +64,7 @@ from tests.outbox_env import (
     SqliteOutbox,
     build_either,
     mail,
+    relay_signer,
     sms,
 )
 
@@ -266,7 +267,7 @@ def test_an_intent_a_killed_command_left_is_resolved_by_the_next(outbox: Outbox)
 @pytest.mark.parametrize(
     ("edit", "named"),
     [
-        ("unsigned", "carries no authority: it was written around Interlock"),
+        ("unsigned", "carries no authority, and is not in the legacy set version 4 recorded"),
         ("unknown authority", "which no signed intent holds"),
         ("replayed authority", "carries the authority of an intent that does not name it"),
         ("another action", "is under the authority of a release intent"),
@@ -470,6 +471,7 @@ def deliver(outbox: Outbox, stripe: FakeStripe) -> None:
         breaker=NoBreaker(),
         lease=timedelta(seconds=10),
         timeout=timedelta(seconds=2),
+        signer=relay_signer(),
     )
     with relay:
         outbox.drain(relay)
@@ -606,6 +608,7 @@ def test_a_placeholder_with_nothing_to_bind_is_refused(outbox: Outbox) -> None:
             "orders": HttpAdapter(sink.url, routes={"hold": "POST /h", "release": "POST /r"})
         },
         breaker=NoBreaker(),
+        signer=relay_signer(),
     )
     with relay:
         outbox.drain(relay)

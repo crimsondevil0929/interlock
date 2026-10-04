@@ -204,7 +204,8 @@ ENQUEUE = (
 RELAY_CALLS = (
     "interlock.relay_claim(text, double precision, integer, text[])",
     "interlock.relay_sending(uuid, text, bigint, text)",
-    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text, "
+    "text)",
     "interlock.relay_hold(uuid, text, bigint, text)",
     "interlock.relay_defer(uuid, text, bigint, text, bigint)",
     "interlock.relay_refuse(uuid, text, bigint, text)",
@@ -263,8 +264,9 @@ def downgrade_to_version_1(env: Pg) -> None:
     column, and the three-argument ``begin_stage``."""
     with psycopg.connect(env.admin, autocommit=True) as conn:
         conn.execute(
-            "DROP TABLE interlock.outbox_attempts, interlock.outbox_state, interlock.outbox, "
-            "interlock.sinks"
+            "DROP TABLE interlock.outbox_settlements, interlock.outbox_legacy, "
+            "interlock.outbox_epochs, interlock.outbox_attempts, interlock.outbox_state, "
+            "interlock.outbox, interlock.sinks"
         )
         conn.execute(f"DROP FUNCTION interlock.enqueue{ENQUEUE.removeprefix('interlock.enqueue')}")
         conn.execute("DROP FUNCTION interlock.stage_outbox(bigint)")

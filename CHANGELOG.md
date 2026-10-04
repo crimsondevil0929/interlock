@@ -9,6 +9,59 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 4: delivery receipts, rate windows, ledger-integrated compensations; `docs/EPIC4_DESIGN.md`)
+
+- **Relays sign every outcome** (schema version 4). Each `delivered`, `retryable`,
+  `permanent` or `unknown` row carries the relay's Ed25519 attestation, an ARC1 1.1
+  `Attestation` over the request as committed and the outcome as recorded, hashed into the
+  delivery log under a new framing; the database refuses an outcome without one.
+  `Relay(signer=...)` is required, Ed25519 only; `interlock relay` starts only with a key
+  registered in `[relays.keys]` (`[relay] key`, `--key`, `INTERLOCK_RELAY_KEY`);
+  `interlock keygen --role relay|operator` makes one; `outbox show` names who attested.
+- **Ghost deliveries are named.** `interlock.attestations.verify_attestations` (run by
+  `interlock outbox verify` with `[relays.keys]`) rebuilds each outcome's attestation and
+  names one with none, one by an unregistered key, one copied from another call, and a row
+  rewritten after it was signed.
+- **The legacy set.** The install that first brings version 4 records, once, the rows
+  written before the proof their kind now carries (unattested outcomes, version 2's
+  unsigned operator rows), then seals it; `interlock install` under `[operators]` signs its
+  digest into the install record, and the first such record pins it. Unattested outcomes
+  and unsigned operator rows are legacy only if they are in it, as recorded, and it is the
+  set vouched for; anything else is named, however it is dated.
+- **Rate windows** (`interlock.windows`; `EscrowEngine(windows=...)`, `[[windows]]`).
+  `RateWindow(name, span, limit, measure, per)` with `Requests`, `RequestSum`, `RowSum`
+  (inserted or net) and `Plans`, per scope, tenant or globally, sliding. Each plan is
+  measured with its windows' history read with the keys locked (PostgreSQL: sorted
+  transaction-scoped advisory locks and a `READ COMMITTED` read; SQLite: the stage's write
+  lock), so racing plans commit exactly up to a limit. The measures are part of the diff
+  (`EffectDiff.windows`, `WindowMeasure`) and its hash; the built-in `RateWindowCheck`
+  refuses a plan past a limit; what a plan adds is written beside its commit marker. The
+  agent is told the window (`rate_window` guidance), never what it holds. Agent statements
+  can neither read nor write window history.
+- **Settlement** (`interlock.settlement.Settler`). Each delivered request gets an ARC1
+  delivery receipt, signed by the receipt log, carrying the relay's attestation, bound to
+  the action receipt of the plan its relay-attested idempotency key was derived from;
+  each delivered compensation credits, through AgentGov `refund()`, the `cost_per_call`
+  the engine's sink registry (`Settler(sinks=...)`) prices the original at, which is what
+  its plan was charged for it, to the scope the ledger charged, only under a signed
+  operator intent naming it, and only when the outbox row agrees with the registry and
+  the compensation's signed key. No outbox column sets the amount or the scope. Exactly
+  once across crashes: `tests/test_settlement_crash.py` kills a settler after the
+  receipt, the credit and the settlement row, on both stores. `settler_roles` at
+  install; `verify_settlements`; `ReceiptIssuer.issue_delivery`.
+
+### Changed (Epic 4)
+
+- **Breaking:** schema version 4. Stop the relays, run `interlock install`, start them
+  again: an older relay cannot record an outcome in version 4. Versions 2 and 3 upgrade in
+  place, every log still verifying.
+- **Breaking:** `Relay` requires `signer=`, and `interlock relay` a registered key.
+- **Breaking:** `OutboxStore.outcome` takes the attestation.
+- An unsigned operator row from before version 3 is held to the legacy set, not to when
+  version 3 was installed.
+- `install()` and `install_sqlite_outbox()` return the legacy set their transaction read.
+- `interlock-agentgov>=0.4.0`, from PyPI.
+
 ### Added (Epic 3: adapters, signed operator logs, SQLite parity; `docs/EPIC3_DESIGN.md`)
 
 - **The outbox on SQLite.** `interlock install` switches a SQLite file to WAL and installs

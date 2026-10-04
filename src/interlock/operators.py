@@ -50,6 +50,8 @@ from interlock.deliveries import (
     OPERATOR_EVENTS,
     AuthorizedRow,
     Compensable,
+    LegacySet,
+    LegacyVouch,
     OutboxOperations,
     reader,
     registry_digest,
@@ -78,6 +80,7 @@ __all__ = [
     "OperatorReport",
     "Outcome",
     "generate_key",
+    "legacy_vouch",
     "load_key",
     "verify_operators",
 ]
@@ -349,16 +352,43 @@ class Operator:
             resolved.append(record)
         return resolved
 
-    def installed(self) -> SignedRecord:
-        """Vouch for the sink registry as the database mirrors it now: signed
-        after ``interlock install``. A registry that differs from the last one
-        vouched for was changed around Interlock (:func:`verify_operators`)."""
+    def installed(self, legacy: LegacySet | None = None) -> SignedRecord:
+        """Vouch for the sink registry as the database mirrors it now, and for
+        the legacy set version 4 recorded: signed after ``interlock install``.
+
+        A registry that differs from the last one vouched for was changed
+        around Interlock (:func:`verify_operators`). The legacy set is vouched
+        for once and for good: the first record that carries it pins it, and
+        a later install signs it again only unchanged.
+
+        :param legacy: The legacy set as the install's own transaction read
+            it. The set the database holds now must be the same: one edited in
+            between is not signed for.
+        :raises OperatorRefusedError: If the outbox records no legacy set
+            (older than version 4), or one other than ``legacy``, or than the
+            one this log already vouched for. Nothing is signed.
+        """
         rows = self._outbox.registry()
+        recorded = self._outbox.legacy()
+        if recorded is None:
+            raise OperatorRefusedError(
+                "the outbox is older than version 4 and records no legacy set: run "
+                "`interlock install` to upgrade it first; nothing signed"
+            )
+        if legacy is not None and legacy.digest != recorded.digest:
+            raise OperatorRefusedError(
+                "the legacy set changed between the install that recorded it and this "
+                "signature: it was edited around Interlock; nothing signed"
+            )
+        pinned = _pinned(self._log.records())
+        if pinned is not None and pinned.problem(recorded) is not None:
+            raise OperatorRefusedError(f"{pinned.problem(recorded)}; nothing signed")
         return self._log.append(
             INSTALLED,
             {
                 "registry": registry_digest(rows),
                 "sinks": {str(row["name"]): registry_digest([row]) for row in rows},
+                "legacy": {"rows": len(recorded), "digest": recorded.digest},
             },
         )
 
@@ -678,7 +708,8 @@ class OperatorReport:
     actions: int
     """Delivery-log rows written under an operator's authority."""
     legacy: int
-    """Operator rows from before schema version 3, which carry no authority."""
+    """Operator rows from before schema version 3, which carry no authority:
+    rows of the legacy set a signed install vouched for."""
 
 
 def verify_operators(
@@ -744,6 +775,18 @@ def verify_operators(
 
     source_reader = reader(source)
     installs = [r for r in trusted if r.kind == INSTALLED.value]
+    pinned = _pinned(installs)
+    for record in installs:
+        legacy_body = record.body.get("legacy")
+        if (
+            pinned is not None
+            and isinstance(legacy_body, Mapping)
+            and str(legacy_body.get("digest")) != pinned.digest
+        ):
+            problems.append(
+                f"operator record {record.seq} vouches for another legacy set than record "
+                f"{pinned.record} did: the set changed after it was first vouched for"
+            )
     if installs:
         vouched = installs[-1].body
         rows = source_reader.registry()
@@ -756,10 +799,15 @@ def verify_operators(
                 f"for: sink {', '.join(changed)} changed around Interlock"
             )
     messages, events = source_reader.snapshot(None)
-    epoch = source_reader.epoch()
+    recorded = source_reader.legacy()
+    epoch = source_reader.epoch() if recorded is None else None
+    mismatch = pinned.problem(recorded) if pinned is not None and recorded is not None else None
+    if mismatch is not None:
+        problems.append(mismatch)
+    pinned_holds = pinned is not None and mismatch is None
     stage_of = {m.message_id: m.stage_id for m in messages}
     by_row = {(e.message_id, e.seq): e for e in events}
-    actions = legacy = 0
+    actions = legacy = unvouched = 0
     for event in events:
         where = f"message {event.message_id}: row {event.seq} ({event.event})"
         if event.event not in OPERATOR_EVENTS:
@@ -767,10 +815,24 @@ def verify_operators(
                 problems.append(f"{where} carries an authority, and is no operator's")
             continue
         if event.authority is None:
-            if epoch is not None and event.at < epoch:
+            if recorded is None:
+                # Before version 4 there is no legacy set: version 2's rows
+                # are told by when version 3 was installed.
+                if epoch is not None and event.at < epoch:
+                    legacy += 1
+                else:
+                    problems.append(
+                        f"{where} carries no authority: it was written around Interlock"
+                    )
+            elif not recorded.holds(event):
+                problems.append(
+                    f"{where} carries no authority, and is not in the legacy set version 4 "
+                    f"recorded: it was written around Interlock"
+                )
+            elif pinned_holds:
                 legacy += 1
             else:
-                problems.append(f"{where} carries no authority: it was written around Interlock")
+                unvouched += 1
             continue
         actions += 1
         signed = intents.get(event.authority)
@@ -814,7 +876,30 @@ def verify_operators(
                     f"operator record {outcome.seq} names row {row.get('seq')} of message "
                     f"{row.get('message')}, which the delivery log does not hold as recorded"
                 )
+    if unvouched:
+        problems.append(
+            f"{unvouched} operator row(s) from before version 3 carry no authority, and no "
+            f"signed install vouches for the legacy set they are in: they rest on the "
+            f"database's word. Vouch for it with `interlock install`"
+        )
+    if recorded is not None:
+        problems += recorded.vanished(events)
     return OperatorReport(tuple(problems), len(trusted), actions, legacy)
+
+
+def legacy_vouch(records: Sequence[SignedRecord], keyring: Keyring) -> LegacyVouch | None:
+    """The legacy set a signed install vouched for: the first
+    ``operator.installed`` record carrying one, among the records that verify
+    under ``keyring``. ``None`` when no install vouched for one."""
+    return _pinned(_verified_prefix(records, keyring, []))
+
+
+def _pinned(records: Iterable[SignedRecord]) -> LegacyVouch | None:
+    for record in records:
+        legacy = record.body.get("legacy") if record.kind == INSTALLED.value else None
+        if isinstance(legacy, Mapping):
+            return LegacyVouch(record.seq, int(legacy.get("rows", -1)), str(legacy.get("digest")))
+    return None
 
 
 def _verified_prefix(

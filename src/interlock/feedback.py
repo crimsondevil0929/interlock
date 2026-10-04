@@ -13,9 +13,11 @@ A refused plan produces two records, built from the same adjudication:
   * **tenants** only as the plan's own effects declare them;
   * **row counts** only as buckets: 0, 1, 2-9, 10-99, 100-999, 1000+;
   * **no aggregate, ever**: no column total, no fraction of one, no count of
-    tenants or tables the plan did not name. The one number that is not a
-    bucketed row count is a built-in checker's configured limit, as a whole
-    percentage: policy, not data;
+    tenants or tables the plan did not name, nothing a rate window holds. The
+    one number that is not a bucketed row count is a built-in checker's
+    configured limit, as a whole percentage: policy, not data;
+  * **windows** only by name, as the operator configured them, and only from
+    the built-in rate-window check;
   * **text** chosen by the constraint's :class:`Guidance` kind from a fixed set
     of templates.
 
@@ -122,6 +124,8 @@ class Guidance(StrEnum):
     OUTBOUND_REQUEST = "outbound_request"
     # Raised by a checker over the measured diff and the outbox.
     OUTBOUND_AGREEMENT = "outbound_agreement"
+    # Raised by a checker over the measured diff and its windows' history.
+    RATE_WINDOW = "rate_window"
 
 
 _LABELS: Final[Mapping[Guidance, str]] = {
@@ -148,6 +152,7 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.UNAVAILABLE: "unavailable",
     Guidance.OUTBOUND_REQUEST: "outbound_request",
     Guidance.OUTBOUND_AGREEMENT: "cross_effect_agreement",
+    Guidance.RATE_WINDOW: "rate_window",
 }
 """The public name of each kind. Derived from the kind, never from a checker's
 own ``name``, which can embed configuration (``column_value_guard:orders.total``)
@@ -174,6 +179,8 @@ class FeedbackHint:
         built-in checkers only.
     :ivar percent: A fractional limit the checker was configured with, as a
         whole percentage. Built-in checkers only.
+    :ivar window: The name of the rate window that refused the plan. Kept
+        only from the built-in rate-window check, and only as an identifier.
     """
 
     kind: Guidance
@@ -183,6 +190,7 @@ class FeedbackHint:
     measured: int | None = None
     limit: int | None = None
     percent: int | None = None
+    window: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +217,7 @@ class ConstraintFeedback:
     percent: int | None = None
     withheld_tables: bool = False
     withheld_tenants: bool = False
+    window: str = ""
 
     @property
     def constraint(self) -> str:
@@ -219,6 +228,7 @@ class ConstraintFeedback:
         return f"{self.constraint}: {_TEMPLATES[self.guidance](self)}"
 
     def to_json(self) -> dict[str, Any]:
+        named = {"window": self.window} if self.window else {}
         return {
             "constraint": self.constraint,
             "guidance": self.guidance.value,
@@ -231,6 +241,7 @@ class ConstraintFeedback:
             "percent": self.percent,
             "withheld_tables": self.withheld_tables,
             "withheld_tenants": self.withheld_tenants,
+            **named,
             "text": self.render(),
         }
 
@@ -364,6 +375,12 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"an outbound request disagrees with {_column(c)} as this plan wrote it. A request "
         f"must carry what the rows it goes with record: make the two agree, or drop both."
     ),
+    Guidance.RATE_WINDOW: lambda c: (
+        f"the plan would take {'rate window ' + c.window if c.window else 'a rate window'} "
+        f"past its limit"
+        + (f" for tenant {', '.join(c.tenants)}" if c.tenants else "")
+        + ". The window slides: what earlier plans added stops counting as it ages."
+    ),
 }
 
 
@@ -484,11 +501,20 @@ def sanitize(
         )
     measured = limit = None
     percent: int | None = None
+    window = ""
     if trusted:
         measured = bucket(hint.measured) if isinstance(hint.measured, int) else None
         limit = bucket(hint.limit) if isinstance(hint.limit, int) else None
         if isinstance(hint.percent, int) and 0 <= hint.percent <= 100:
             percent = hint.percent
+        # A window's name only for a window's guidance, from the built-in
+        # check: anything else could spell data as a "name".
+        if (
+            kind is Guidance.RATE_WINDOW
+            and isinstance(hint.window, str)
+            and _IDENTIFIER.fullmatch(hint.window)
+        ):
+            window = hint.window
     return ConstraintFeedback(
         guidance=kind,
         blocking=blocking,
@@ -500,6 +526,7 @@ def sanitize(
         percent=percent,
         withheld_tables=withheld_tables,
         withheld_tenants=withheld_tenants,
+        window=window,
     )
 
 

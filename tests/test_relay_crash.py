@@ -92,6 +92,7 @@ from tests.outbox_env import (
     build_either,
     mail,
     page,
+    relay_signer,
     sms,
 )
 from tests.schemas import MAIL_SEND_SCHEMA
@@ -436,6 +437,7 @@ def test_a_charge_is_made_once_and_an_email_never_twice_through_each_kill(
             relay_id="survivor",
             lease=timedelta(seconds=10),
             timeout=timedelta(seconds=2),
+            signer=relay_signer(),
         )
         with survivor:
             outbox.drain(survivor)

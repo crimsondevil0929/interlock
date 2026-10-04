@@ -10,10 +10,14 @@ Three sinks, one per delivery guarantee the relay can give:
 - ``pager`` does not, and dead-letters an unknown outcome: at most once.
 
 And ``payments``, which honours keys, for refunds checked against their rows.
+
+Every relay signs what it records with :data:`RELAY_SEED`'s key, registered
+as ``relay``: the relays' keyring is :meth:`Outbox.relays`.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import time
@@ -39,7 +43,9 @@ from interlock import (
     deliveries,
 )
 from interlock.adapters import HttpAdapter
+from interlock.attestations import AttestationReport, verify_attestations
 from interlock.deliveries import (
+    LegacyVouch,
     LogEvent,
     OutboxOperations,
     event_hash,
@@ -52,15 +58,17 @@ from interlock.operators import (
     OperatorLog,
     OperatorRefusedError,
     OperatorReport,
+    legacy_vouch,
     verify_operators,
 )
 from interlock.outbound import DEAD_LETTER, OperationSpec, SinkRegistry, SinkSpec
 from interlock.outbox_store import OutboxStore, PostgresOutboxStore
 from interlock.postgres import install
 from interlock.records import Keyring, read_records
-from interlock.relay import Breaker, LedgerBreaker, Relay
+from interlock.relay import DELIVERED, Breaker, Delivery, DeliveryResult, LedgerBreaker, Relay
 from interlock.sqlite_outbox import (
     OPERATOR,
+    SETTLER,
     SqliteOutboxStore,
     install_sqlite_outbox,
     instant_text,
@@ -79,6 +87,44 @@ from tests.fakesink import FakeSink
 from tests.schemas import MAIL_SEND_SCHEMA, specs
 
 SCOPE = "agent"
+
+RELAY_SEED = bytes.fromhex("5e" * 32)
+"""The tests' relays' key: one for every relay, as one fleet might share it."""
+
+
+def relay_signer() -> Ed25519Signer:
+    return Ed25519Signer(RELAY_SEED)
+
+
+RELAYS = Keyring({"relay": relay_signer().public_key()})
+"""``[relays.keys]``, as the tests register their relays."""
+
+
+INSTALLER = Ed25519Signer(bytes.fromhex("1e" * 32))
+"""The operator who signs installs in the tests."""
+INSTALLERS = Keyring({"installer": INSTALLER.public_key()})
+
+
+def vouch(source: object, log: Path) -> LegacyVouch:
+    """Sign an install record over ``source`` into the operator log at
+    ``log``, as ``interlock install`` under ``[operators]`` does after it
+    installs; the legacy set it vouches for."""
+    with OperatorLog(log, INSTALLER, INSTALLERS) as signed:
+        Operator(signed, deliveries.operations(source)).installed()
+        found = legacy_vouch(signed.records(), INSTALLERS)
+    assert found is not None
+    return found
+
+
+def relays_section(directory: Path) -> str:
+    """The tests' relay key written to ``relay.key`` in ``directory``, beside a
+    configuration file whose ``[relay]`` says ``key = "relay.key"``; and the
+    ``[relays.keys]`` table that registers it."""
+    path = directory / "relay.key"
+    if not path.exists():
+        path.write_text(RELAY_SEED.hex() + "\n")
+    return f'\n[relays.keys]\nrelay = "{relay_signer().public_key().spec()}"\n'
+
 
 _FAST: dict[str, Any] = {
     "backoff_base": timedelta(milliseconds=20),
@@ -127,6 +173,20 @@ def page(n: int = 0) -> OutboundRequest:
     return OutboundRequest("pager", "page", {"service": "billing", "note": f"note {n}"})
 
 
+class Scripted:
+    """An adapter answering from a list, then delivering; a delivered call
+    records a reference, as a sink names what it made."""
+
+    def __init__(self, *outcomes: str) -> None:
+        self._outcomes = list(outcomes)
+
+    def send(self, delivery: Delivery) -> DeliveryResult:
+        outcome = self._outcomes.pop(0) if self._outcomes else DELIVERED
+        if outcome == DELIVERED:
+            return DeliveryResult(DELIVERED, status_code=200, remote_ref=f"ref_{delivery.attempt}")
+        return DeliveryResult(outcome, status_code=503, detail="scripted")
+
+
 class Outbox:
     """An outbox to test the relay against, on either store. The shared part
     of a test environment: the sinks, the ledger and its breaker, committing
@@ -169,6 +229,11 @@ class Outbox:
         append-only guard."""
         raise NotImplementedError
 
+    def tamper(self, message: uuid.UUID, **columns: object) -> None:
+        """Rewrite a stored request's columns around Interlock (``cost``,
+        ``plan_id``, ``scope_id``): its owner lifting the append-only guard."""
+        raise NotImplementedError
+
     def operations(self) -> OutboxOperations:
         """What an operator's actions go through, on this store."""
         raise NotImplementedError
@@ -181,12 +246,29 @@ class Outbox:
         authority: str | None,
         state_after: str | None,
         actor: str = "operator:dba",
+        **columns: Any,
     ) -> None:
         """A ghost edit, as the database's owner could make one: a delivery-log
         row written around Interlock's triggers, linked and hashed exactly as
         Interlock would have, the head advanced and the state set to match.
-        The delivery log alone cannot tell it from a real one."""
+        The delivery log alone cannot tell it from a real one.
+
+        ``columns`` writes a relay's columns too, for a ghost delivery:
+        ``attempt``, ``status_code``, ``response_digest``, ``remote_ref``,
+        ``attestation``, ``detail``; and ``at``, to backdate the row. A forged
+        ``sending`` counts as a call."""
         raise NotImplementedError
+
+    def rewrite_last(self, message: uuid.UUID, **changes: Any) -> None:
+        """A ghost rewrite: the message's last delivery-log row changed in place
+        around Interlock's triggers, rehashed, the head and the state set to
+        match. The delivery log alone cannot tell."""
+        raise NotImplementedError
+
+    def _rewritten(self, message: uuid.UUID, changes: Mapping[str, Any]) -> LogEvent:
+        last = self.log(message)[-1]
+        changed = dataclasses.replace(last, **changes)
+        return dataclasses.replace(changed, event_hash=changed.recomputed())
 
     def _forged(
         self,
@@ -196,25 +278,48 @@ class Outbox:
         state_after: str | None,
         actor: str,
         at: datetime | str,
-    ) -> tuple[int, str, str]:
+        columns: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """The forged row, every column, hashed and linked to the head."""
         head = self.row(message)
         seq, prev = int(head["log_seq"]) + 1, str(head["log_head"])
+        row: dict[str, Any] = {
+            "attempt": None,
+            "status_code": None,
+            "response_digest": None,
+            "detail": "edited",
+            "remote_ref": None,
+            "attestation": None,
+            **columns,
+        }
         digest = event_hash(
             prev,
             message,
             seq,
-            None,
+            row["attempt"],
             event,
             actor,
             at,
-            None,
-            None,
-            "edited",
+            row["status_code"],
+            row["response_digest"],
+            row["detail"],
             state_after,
-            None,
+            row["remote_ref"],
             authority,
+            row["attestation"],
         )
-        return seq, prev, digest
+        return {
+            **row,
+            "message_id": message,
+            "seq": seq,
+            "event": event,
+            "actor": actor,
+            "at": at,
+            "state_after": state_after,
+            "authority": authority,
+            "prev_hash": prev,
+            "event_hash": digest,
+        }
 
     # -- operators: every action signed, as `interlock outbox` signs it ---------
 
@@ -272,6 +377,16 @@ class Outbox:
     def relay_target(self) -> dict[str, str]:
         """Where a relay in another process finds the outbox: the store's
         kind, and its connection string or file."""
+        raise NotImplementedError
+
+    def settler(self) -> Any:
+        """The outbox as settlement reads and writes it: a connection as the
+        settler role, or a store that writes settlements only. The caller
+        closes it."""
+        raise NotImplementedError
+
+    def settler_target(self) -> dict[str, str]:
+        """Where settlement in another process finds the outbox."""
         raise NotImplementedError
 
     def lease_left(self, message: uuid.UUID) -> float:
@@ -355,9 +470,14 @@ class Outbox:
     def breaker(self) -> LedgerBreaker:
         return LedgerBreaker.open(self.ledger_path)
 
+    def relays(self) -> Keyring:
+        """``[relays.keys]``: the key every test relay signs with."""
+        return RELAYS
+
     def relay(self, *, breaker: Breaker | None = None, **kwargs: Any) -> Relay:
         kwargs.setdefault("lease", timedelta(seconds=10))
         kwargs.setdefault("timeout", timedelta(seconds=2))
+        kwargs.setdefault("signer", relay_signer())
         return Relay(
             self.store(),
             adapters=self.adapters(),
@@ -396,13 +516,19 @@ class Outbox:
         return [(e.event, e.attempt) for e in self.log(message)]
 
     def verify(self) -> None:
-        """Every delivery log verifies, and every operator row is signed."""
+        """Every delivery log verifies, every outcome is a registered relay's,
+        and every operator row is signed."""
         assert self.verify_operators().problems == ()
         self.verify_logs()
 
     def verify_logs(self) -> None:
         problems = verify_delivery_log(self.operator())
         assert problems == (), problems
+        report = self.attestations()
+        assert report.problems == (), report.problems
+
+    def attestations(self) -> AttestationReport:
+        return verify_attestations(self.operator(), self.relays())
 
     def close(self) -> None:
         for sink in self.sinks.values():
@@ -414,12 +540,21 @@ class PostgresOutbox(Outbox):
     backend = "postgres"
 
     def __init__(
-        self, pg: Pg, relay_dsn: str, relay_role: str, ledger_path: str, governor: BudgetManager
+        self,
+        pg: Pg,
+        relay_dsn: str,
+        relay_role: str,
+        ledger_path: str,
+        governor: BudgetManager,
+        settler_dsn: str = "",
+        settler_role: str = "",
     ) -> None:
         super().__init__(ledger_path, governor)
         self.pg = pg
         self.relay_dsn = relay_dsn
         self.relay_role = relay_role
+        self.settler_dsn = settler_dsn
+        self.settler_role = settler_role
         self._admin: psycopg.Connection[Any] | None = None
 
     def substrate(self, kind: type[Any] | None = None) -> Any:
@@ -472,6 +607,16 @@ class PostgresOutbox(Outbox):
         )
         conn.execute("ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only")
 
+    def tamper(self, message: uuid.UUID, **columns: object) -> None:
+        conn = self.operator()
+        conn.execute("ALTER TABLE interlock.outbox DISABLE TRIGGER outbox_append_only")
+        conn.execute(
+            f"UPDATE interlock.outbox SET {', '.join(f'{name} = %({name})s' for name in columns)} "
+            f"WHERE message_id = %(message)s",
+            {**columns, "message": message},
+        )
+        conn.execute("ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only")
+
     def operations(self) -> OutboxOperations:
         return deliveries.operations(self.operator())
 
@@ -483,26 +628,51 @@ class PostgresOutbox(Outbox):
         authority: str | None,
         state_after: str | None,
         actor: str = "operator:dba",
+        **columns: Any,
     ) -> None:
-        at = datetime.now(UTC)
-        seq, prev, digest = self._forged(message, event, authority, state_after, actor, at)
+        at = columns.pop("at", None) or datetime.now(UTC)
+        row = self._forged(message, event, authority, state_after, actor, at, columns)
         conn = self.operator()
         conn.execute("ALTER TABLE interlock.outbox_attempts DISABLE TRIGGER outbox_log_link")
         conn.execute(
-            "INSERT INTO interlock.outbox_attempts (message_id, seq, event, actor, at, detail, "
-            "state_after, authority, prev_hash, event_hash) "
-            "VALUES (%s, %s, %s, %s, %s, 'edited', %s, %s, %s, %s)",
-            (message, seq, event, actor, at, state_after, authority, prev, digest),
+            f"INSERT INTO interlock.outbox_attempts ({', '.join(row)}) "
+            f"VALUES ({', '.join(f'%({name})s' for name in row)})",
+            row,
         )
         conn.execute(
             "UPDATE interlock.outbox_state SET log_seq = %s, log_head = %s, "
-            "state = coalesce(%s, state) WHERE message_id = %s",
-            (seq, digest, state_after, message),
+            "state = coalesce(%s, state), attempts = attempts + %s WHERE message_id = %s",
+            (row["seq"], row["event_hash"], state_after, int(event == "sending"), message),
         )
         conn.execute("ALTER TABLE interlock.outbox_attempts ENABLE ALWAYS TRIGGER outbox_log_link")
 
+    def rewrite_last(self, message: uuid.UUID, **changes: Any) -> None:
+        row = self._rewritten(message, changes)
+        conn = self.operator()
+        conn.execute("ALTER TABLE interlock.outbox_attempts DISABLE TRIGGER attempts_append_only")
+        conn.execute(
+            f"UPDATE interlock.outbox_attempts SET "
+            f"{', '.join(f'{name} = %({name})s' for name in changes)}, "
+            f"event_hash = %(event_hash)s WHERE message_id = %(message)s AND seq = %(seq)s",
+            {**changes, "event_hash": row.event_hash, "message": message, "seq": row.seq},
+        )
+        conn.execute(
+            "UPDATE interlock.outbox_state SET log_head = %s, state = coalesce(%s, state) "
+            "WHERE message_id = %s",
+            (row.event_hash, row.state_after, message),
+        )
+        conn.execute(
+            "ALTER TABLE interlock.outbox_attempts ENABLE ALWAYS TRIGGER attempts_append_only"
+        )
+
     def relay_target(self) -> dict[str, str]:
-        return {"store": "postgres", "dsn": self.relay_dsn}
+        return {"store": "postgres", "dsn": self.relay_dsn, "key": RELAY_SEED.hex()}
+
+    def settler(self) -> Any:
+        return psycopg.connect(self.settler_dsn, autocommit=True)
+
+    def settler_target(self) -> dict[str, str]:
+        return {"store": "postgres", "dsn": self.settler_dsn}
 
     def operator_target(self) -> dict[str, str]:
         return {"store": "postgres", "dsn": self.pg.admin}
@@ -544,6 +714,7 @@ class PostgresOutbox(Outbox):
             stage_roles=[self.pg.role],
             sinks=sinks,
             relay_roles=[self.relay_role],
+            settler_roles=[self.settler_role] if self.settler_role else [],
         )
 
     def fetch(self, sql: str, *params: object) -> list[tuple[Any, ...]]:
@@ -620,6 +791,16 @@ class SqliteOutbox(Outbox):
                 (payload, str(message)),
             )
 
+    def tamper(self, message: uuid.UUID, **columns: object) -> None:
+        values = {k: str(v) if isinstance(v, Decimal) else v for k, v in columns.items()}
+        with closing(self.raw()) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS _interlock_outbox_no_update")
+            conn.execute(
+                f"UPDATE _interlock_outbox SET {', '.join(f'{name} = :{name}' for name in values)} "
+                f"WHERE message_id = :message",
+                {**values, "message": str(message)},
+            )
+
     def operations(self) -> OutboxOperations:
         return self.operator()
 
@@ -631,29 +812,54 @@ class SqliteOutbox(Outbox):
         authority: str | None,
         state_after: str | None,
         actor: str = "operator:dba",
+        **columns: Any,
     ) -> None:
-        at = instant_text(now_us())
-        seq, prev, digest = self._forged(message, event, authority, state_after, actor, at)
+        when = columns.pop("at", None)
+        at = instant_text(now_us() if when is None else _microseconds(when))
+        row = self._forged(message, event, authority, state_after, actor, at, columns)
+        row["message_id"] = str(message)
         with closing(self.raw()) as conn:
             for trigger in (
                 "_interlock_log_link",
+                "_interlock_log_attested",
                 "_interlock_log_authority",
                 "_interlock_log_head",
             ):
                 conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             conn.execute(
-                "INSERT INTO _interlock_outbox_attempts (message_id, seq, event, actor, at, "
-                "detail, state_after, authority, prev_hash, event_hash) "
-                "VALUES (?, ?, ?, ?, ?, 'edited', ?, ?, ?, ?)",
-                (str(message), seq, event, actor, at, state_after, authority, prev, digest),
+                f"INSERT INTO _interlock_outbox_attempts ({', '.join(row)}) "
+                f"VALUES ({', '.join(f':{name}' for name in row)})",
+                row,
             )
             conn.execute(
                 "UPDATE _interlock_outbox_state SET log_seq = ?, log_head = ?, "
-                "state = coalesce(?, state) WHERE message_id = ?",
-                (seq, digest, state_after, str(message)),
+                "state = coalesce(?, state), attempts = attempts + ? WHERE message_id = ?",
+                (row["seq"], row["event_hash"], state_after, int(event == "sending"), str(message)),
+            )
+
+    def rewrite_last(self, message: uuid.UUID, **changes: Any) -> None:
+        row = self._rewritten(message, changes)
+        with closing(self.raw()) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS _interlock_log_no_update")
+            conn.execute(
+                f"UPDATE _interlock_outbox_attempts SET "
+                f"{', '.join(f'{name} = :{name}' for name in changes)}, "
+                f"event_hash = :event_hash WHERE message_id = :message AND seq = :seq",
+                {**changes, "event_hash": row.event_hash, "message": str(message), "seq": row.seq},
+            )
+            conn.execute(
+                "UPDATE _interlock_outbox_state SET log_head = ?, state = coalesce(?, state) "
+                "WHERE message_id = ?",
+                (row.event_hash, row.state_after, str(message)),
             )
 
     def relay_target(self) -> dict[str, str]:
+        return {"store": "sqlite", "dsn": self.path, "key": RELAY_SEED.hex()}
+
+    def settler(self) -> Any:
+        return SqliteOutboxStore(self.path, writes=SETTLER)
+
+    def settler_target(self) -> dict[str, str]:
         return {"store": "sqlite", "dsn": self.path}
 
     def operator_target(self) -> dict[str, str]:
@@ -692,6 +898,10 @@ class SqliteOutbox(Outbox):
         super().close()
 
 
+def _microseconds(at: datetime) -> int:
+    return (at - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)
+
+
 def _ledger(tmp_path: Path) -> tuple[str, BudgetManager]:
     ledger = tmp_path / "governor.db"
     governor = BudgetManager.open_sqlite(str(ledger))
@@ -701,7 +911,9 @@ def _ledger(tmp_path: Path) -> tuple[str, BudgetManager]:
 
 def build_outbox(pg: Pg, tmp_path: Path) -> Iterator[PostgresOutbox]:
     role = f"il_relay_{uuid.uuid4().hex[:8]}"
+    settler = f"il_settle_{uuid.uuid4().hex[:8]}"
     create_role(pg.cluster, role)
+    create_role(pg.cluster, settler)
     try:
         with psycopg.connect(pg.admin, autocommit=True) as conn:
             install(
@@ -710,6 +922,7 @@ def build_outbox(pg: Pg, tmp_path: Path) -> Iterator[PostgresOutbox]:
                 stage_roles=[pg.role],
                 sinks=RELAY_SINKS,
                 relay_roles=[role],
+                settler_roles=[settler],
             )
         ledger, governor = _ledger(tmp_path)
         env = PostgresOutbox(
@@ -718,12 +931,15 @@ def build_outbox(pg: Pg, tmp_path: Path) -> Iterator[PostgresOutbox]:
             relay_role=role,
             ledger_path=ledger,
             governor=governor,
+            settler_dsn=make_conninfo(pg.admin, user=settler, password=PASSWORD),
+            settler_role=settler,
         )
         try:
             yield env
         finally:
             env.close()
     finally:
+        drop_role(pg.cluster, pg.admin, settler)
         drop_role(pg.cluster, pg.admin, role)
 
 

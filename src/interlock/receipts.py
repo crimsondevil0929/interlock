@@ -41,6 +41,7 @@ from decimal import Decimal
 from typing import Any
 
 from agentgov.receipts import (
+    ActionBinding,
     ActionReceipt,
     Anchors,
     Authority,
@@ -50,6 +51,9 @@ from agentgov.receipts import (
     Cost,
     Coverage,
     Decision,
+    DeliveredRequest,
+    Delivery,
+    DeliveryReceipt,
     Effect,
     EffectSummary,
     Intent,
@@ -60,6 +64,7 @@ from agentgov.receipts import (
     StatedFootprint,
     commit_rows,
 )
+from agentgov.receipts.schema import Signature
 
 from interlock.anchor import AnchorPoint
 from interlock.cascade import CascadeReport
@@ -200,6 +205,33 @@ class ReceiptIssuer:
                 ),
                 escrow=ChainAnchor(seq=escrow.sequence, head=escrow.record_hash),
             ),
+        )
+        return self._log.issue(draft)
+
+    def issue_delivery(
+        self,
+        *,
+        action: ActionReceipt,
+        request: DeliveredRequest,
+        delivery: Delivery,
+        attestation: Signature,
+    ) -> DeliveryReceipt:
+        """Build, sign and log the delivery receipt for one delivered request
+        (ARC1 1.1, ``docs/EPIC4_DESIGN.md`` §1): the relay's attestation of
+        the call, bound by its leaf hash to ``action``, the receipt of the
+        plan that committed the request, which this log holds.
+
+        :raises agentgov.exceptions.ReceiptError: If the log refuses it: an
+            action receipt it does not hold as bound, for one.
+        """
+        draft = DeliveryReceipt(
+            receipt_id=self.new_id(),
+            issued_at=datetime.now(UTC),
+            issuer=self._issuer,
+            action=ActionBinding.of(action),
+            request=request,
+            delivery=delivery,
+            attestation=attestation,
         )
         return self._log.issue(draft)
 

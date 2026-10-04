@@ -129,12 +129,12 @@ jobs:
         with:
           enable-cache: true
 
-      # The path source this replaced resolved only when agentgov happened to
-      # sit next to the checkout, so a third party's clone never built. Clone
-      # into a directory with no sibling checkout and resolve from scratch.
+      # A path source resolves only when agentgov happens to sit next to the
+      # checkout, so a third party's clone never builds. agentgov comes from
+      # PyPI (interlock-agentgov>=0.4.0): clone into a directory with no
+      # sibling checkout and resolve from scratch, from the lockfile.
       #
-      # Gates `git clone` + `uv sync`. The standalone-wheel path is gated
-      # separately below, now that the direct reference travels in metadata.
+      # Gates `git clone` + `uv sync`. The standalone wheel is gated below.
       - name: Resolve and import from an isolated clone
         run: |
           set -euo pipefail
@@ -162,14 +162,11 @@ jobs:
         with:
           enable-cache: true
 
-      # A PEP 508 direct reference is written into distribution metadata, so
-      # unlike a [tool.uv.sources] entry it survives into the wheel. Assert
-      # that: build, install the artifact into a bare venv outside the source
-      # tree, and import it with nothing else on the path.
-      #
-      # This is also the check that fails the day interlock is submitted to
-      # PyPI, which rejects direct-URL dependencies. Putting agentgov on PyPI
-      # and pinning a version range is what replaces this.
+      # The wheel's metadata must name agentgov by a version range PyPI can
+      # resolve: a [tool.uv.sources] entry does not survive into it, and PyPI
+      # rejects a direct-URL dependency. Build, check that, install the
+      # artifact into a bare venv outside the source tree, and import it with
+      # nothing else on the path.
       - name: Build a wheel and install it standalone
         run: |
           set -euo pipefail
@@ -179,8 +176,10 @@ jobs:
           z = zipfile.ZipFile(glob.glob('dist/*.whl')[0])
           name = [n for n in z.namelist() if n.endswith('METADATA')][0]
           meta = z.read(name).decode()
-          assert 'Requires-Dist: interlock-agentgov' in meta, meta
-          print('wheel metadata carries the direct reference')
+          requires = [l.split(': ', 1)[1] for l in meta.splitlines() if l.startswith('Requires-Dist: interlock-agentgov')]
+          assert 'interlock-agentgov>=0.4.0' in requires, requires
+          assert not any(' @ ' in r for r in requires), requires  # no direct reference
+          print('wheel metadata requires', requires)
           "
           uv venv /tmp/bare
           VIRTUAL_ENV=/tmp/bare uv pip install dist/*.whl

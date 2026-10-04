@@ -50,7 +50,7 @@ from interlock.deliveries import verify_delivery_log
 from interlock.exceptions import OutboundRequestError, SubstrateUnavailableError
 from interlock.operators import generate_key
 from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
-from interlock.relay import DeliveryResult, NoBreaker, Relay
+from interlock.relay import DeliveryResult, NoBreaker, Relay, attest
 from interlock.sqlite_outbox import (
     LOG_TRIGGERS,
     SqliteOutboxStore,
@@ -58,7 +58,15 @@ from interlock.sqlite_outbox import (
 )
 from interlock.types import EffectId, OutboundRequest
 from tests.conftest import OBSERVED, build_sqlite_back_office
-from tests.outbox_env import REGISTRY, RELAY_SINKS, SqliteOutbox, build_sqlite_outbox, mail
+from tests.outbox_env import (
+    REGISTRY,
+    RELAY_SINKS,
+    SqliteOutbox,
+    build_sqlite_outbox,
+    mail,
+    relay_signer,
+    relays_section,
+)
 from tests.schemas import MAIL_SEND_SCHEMA, specs
 
 
@@ -342,6 +350,7 @@ def test_an_open_stage_holds_the_relay_off(outbox: SqliteOutbox) -> None:
             breaker=NoBreaker(),
             lease=timedelta(seconds=5),
             timeout=timedelta(seconds=2),
+            signer=relay_signer(),
         )
         with pytest.raises(SubstrateUnavailableError, match="locked"):
             impatient.run_once()
@@ -407,7 +416,8 @@ def test_an_outcome_waits_out_a_lock_held_past_its_busy_timeout(outbox: SqliteOu
         blocker.execute("BEGIN IMMEDIATE")
         threading.Timer(0.25, lambda: blocker.execute("ROLLBACK")).start()
         result = DeliveryResult("delivered", status_code=202)
-        assert store.outcome(lease, "r", attempt, result, timedelta(0)) == "delivered"
+        attestation = attest(lease, attempt, result, relay_signer())
+        assert store.outcome(lease, "r", attempt, result, timedelta(0), attestation) == "delivered"
     finally:
         store.close()
         blocker.close()
@@ -427,8 +437,10 @@ def test_an_outcome_that_never_gets_the_lock_is_left_to_the_lease(
         attempt = store.sending(lease, "r", "breaker clear at test")
         assert attempt == 1
         blocker.execute("BEGIN IMMEDIATE")
+        result = DeliveryResult("delivered")
+        attestation = attest(lease, attempt, result, relay_signer())
         with pytest.raises(SubstrateUnavailableError, match="locked"):
-            store.outcome(lease, "r", attempt, DeliveryResult("delivered"), timedelta(0))
+            store.outcome(lease, "r", attempt, result, timedelta(0), attestation)
         blocker.execute("ROLLBACK")
     finally:
         store.close()
@@ -564,6 +576,7 @@ backoff_cap_seconds = 0.16
 name = "send"
 
 [relay]
+key = "relay.key"
 breaker = "none"
 lease_seconds = 4
 timeout_seconds = 1
@@ -593,7 +606,7 @@ def test_the_command_line_on_a_sqlite_file(tmp_path: Path) -> None:
         path.write_text(
             CONFIG.format(database=database, url=sink.url)
             + f'\n[operators]\nlog = "operators.ilok1"\n'
-            f'[operators.keys]\nops = "{key.public_key().spec()}"\n'
+            f'[operators.keys]\nops = "{key.public_key().spec()}"\n' + relays_section(tmp_path)
         )
         # With [operators], installing changes the registry an operator signs for.
         assert cli("install", "--config", str(path))[0] == 2

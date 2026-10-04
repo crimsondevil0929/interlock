@@ -53,7 +53,7 @@ from interlock.stripe import (
 from interlock.types import EffectId, OutboundRequest, outbound_key
 from tests.fakesink import DROP, hang, status
 from tests.fakestripe import KEY, FakeStripe, act_then, parse_form, stripe_error
-from tests.outbox_env import BACKENDS, RELAY_SINKS, SCOPE, Outbox, build_either
+from tests.outbox_env import BACKENDS, RELAY_SINKS, SCOPE, Outbox, build_either, relay_signer
 from tests.schemas import TEST_SINKS
 
 CHARGE: dict[str, Any] = {
@@ -443,6 +443,7 @@ def test_a_charge_commits_with_its_refund_and_is_charged_once(
         breaker=NoBreaker(),
         lease=timedelta(seconds=10),
         timeout=timedelta(seconds=2),
+        signer=relay_signer(),
     )
     with relay:
         outbox.drain(relay)

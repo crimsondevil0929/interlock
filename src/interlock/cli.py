@@ -5,14 +5,18 @@
 ``interlock reconcile-effects``  fail on any write to an observed table that no
                                  escrow chain records
 ``interlock relay``              deliver committed outbound requests, until
-                                 stopped (``--once``: until none is due)
+                                 stopped (``--once``: until none is due),
+                                 attesting each outcome with the relay's key
 ``interlock outbox ACTION``      ``status``, ``list``, ``show``, ``verify`` the
-                                 delivery logs (and the operator log);
+                                 delivery logs, the relays' attestations, and
+                                 the operator log;
                                  ``release``, ``cancel``, ``requeue``,
                                  ``compensate``, ``resolve``: an operator's
                                  actions, each signed with their key
-``interlock operator keygen``    a new operator key, and its public half for
-                                 ``[operators.keys]``
+``interlock keygen``             a new relay or operator key, and its public
+                                 half for ``[relays.keys]`` or
+                                 ``[operators.keys]`` (``interlock operator
+                                 keygen``: an operator's)
 
 Every command reads a TOML configuration file (see :mod:`interlock.config`).
 Exit codes, for scripts and CI:
@@ -21,9 +25,10 @@ Exit codes, for scripts and CI:
 0     done; for ``check``, the setup is sound; for
       ``reconcile-effects``, every write is accounted for
 1     ``reconcile-effects`` found an unrecorded write; ``outbox verify``
-      found a delivery log that does not verify; an ``outbox`` action
-      found nothing to act on
-2     usage, or the configuration file is wrong
+      found a delivery log, an attestation or an operator record that
+      does not verify; an ``outbox`` action found nothing to act on
+2     usage, or the configuration file is wrong; a relay without a key
+      registered in ``[relays.keys]``
 3     the database is not set up (not installed, grants)
 4     the database cannot be reached
 5     an escrow chain failed verification, so it proves nothing
@@ -33,6 +38,7 @@ Exit codes, for scripts and CI:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -40,6 +46,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Final, TextIO
 
 from interlock.cascade import CascadeReport, analyze_cascades, read_postgres_foreign_keys
@@ -80,7 +87,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     stream = out if out is not None else sys.stdout
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.command == "operator":
+    if args.command in ("operator", "keygen"):
         return _keygen(args, stream)
     relaying = args.command == "relay"
     try:
@@ -122,6 +129,9 @@ _DATABASE_HELP = "overrides the file's database (DSN or SQLite path), as does IN
 
 OPERATOR_KEY_ENV = "INTERLOCK_OPERATOR_KEY"
 """The path to an operator's key file, when ``--key`` is not given."""
+RELAY_KEY_ENV = "INTERLOCK_RELAY_KEY"
+"""The path to a relay's key file, when ``--key`` is not given; it overrides
+``[relay] key``."""
 SIGNED: Final = frozenset({"release", "cancel", "requeue", "compensate", "resolve"})
 """The outbox actions an operator signs."""
 
@@ -140,6 +150,9 @@ def _parser() -> argparse.ArgumentParser:
     relay.add_argument("--once", action="store_true", help="stop when nothing is due")
     relay.add_argument("--workers", type=int, help="overrides [relay]'s workers")
     relay.add_argument("--relay-id", help="this relay's name in leases and delivery logs")
+    relay.add_argument(
+        "--key", help=f"overrides [relay]'s key, this relay's own, as does {RELAY_KEY_ENV}"
+    )
     outbox = commands.add_parser(
         "outbox",
         help="inspect and act on the outbox (as the installer)",
@@ -195,6 +208,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     keygen.add_argument("--out", required=True, help="where to write the key: never overwritten")
     keygen.add_argument("--name", required=True, help="the operator's name")
+    keygen.set_defaults(role="operator")
+    keygen = commands.add_parser(
+        "keygen",
+        help="write a new Ed25519 key for a relay or an operator; print its public half",
+        description="Write a new Ed25519 key (readable by you only), and print the line that "
+        "registers its public half: in [relays.keys] for a relay, which signs every outcome "
+        "it records; in [operators.keys] for an operator, who signs every action.",
+    )
+    keygen.add_argument("--role", required=True, choices=("relay", "operator"))
+    keygen.add_argument("--out", required=True, help="where to write the key: never overwritten")
+    keygen.add_argument("--name", required=True, help="the relay's or the operator's name")
     for name, text in (
         ("install", "install Interlock's schema and triggers (run as the tables' owner)"),
         ("check", "verify the setup and print what the cascade check refuses"),
@@ -234,21 +258,28 @@ def _install(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> 
         except _RefusedError as exc:
             print(f"interlock: install changes the sink registry: {exc}", file=sys.stderr)
             return EXIT_USAGE
-    code = _install_schema(config, out)
+    code, legacy = _install_schema(config, out)
     if signer is not None:
-        _vouch(config, signer, out)
+        from interlock.operators import OperatorRefusedError
+
+        try:
+            _vouch(config, signer, legacy, out)
+        except OperatorRefusedError as exc:
+            print(f"interlock: install is not vouched for: {exc}", file=sys.stderr)
+            return EXIT_FINDINGS
     return code
 
 
-def _vouch(config: InterlockConfig, signer: Any, out: TextIO) -> None:
-    """Sign the registry the database now mirrors."""
+def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> None:
+    """Sign the registry the database now mirrors, and the legacy set the
+    install's own transaction read."""
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore
 
         store = SqliteOutboxStore(config.database, writes=OPERATOR)
         try:
             with _session(config, store, signer) as operator:
-                record = operator.installed()
+                record = operator.installed(legacy)
         finally:
             store.close()
     else:
@@ -258,33 +289,34 @@ def _vouch(config: InterlockConfig, signer: Any, out: TextIO) -> None:
             psycopg.connect(config.database, autocommit=True) as conn,
             _session(config, conn, signer) as operator,
         ):
-            record = operator.installed()
+            record = operator.installed(legacy)
     print(
-        f"signed by {operator.name}: the sink registry, operator record {record.seq} "
-        f"({record.record_hash[:16]})",
+        f"signed by {operator.name}: the sink registry and the legacy set "
+        f"({record.body['legacy']['rows']} row(s) from before version 4), operator record "
+        f"{record.seq} ({record.record_hash[:16]})",
         file=out,
     )
 
 
-def _install_schema(config: InterlockConfig, out: TextIO) -> int:
+def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         install_sqlite_journal(config.database, config.tables)
-        install_sqlite_outbox(config.database, config.sinks)
+        legacy = install_sqlite_outbox(config.database, config.sinks)
         print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
         print("installed: the outbox, and WAL mode", file=out)
         for sink in config.sinks:
             operations = ", ".join(op.name for op in sink.operations)
             print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
         _print_report(_sqlite(config).check_cascades(), out)
-        return EXIT_OK
+        return EXIT_OK, legacy
     import psycopg
 
     try:
         with psycopg.connect(config.database, autocommit=True) as conn:
-            install(
+            legacy = install(
                 conn,
                 config.tables,
                 schema=config.schema,
@@ -292,6 +324,7 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> int:
                 audit_roles=config.audit_roles,
                 sinks=config.sinks,
                 relay_roles=config.relay_roles,
+                settler_roles=config.settler_roles,
             )
             report = analyze_cascades(
                 read_postgres_foreign_keys(conn, config.schema),
@@ -312,8 +345,10 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> int:
         print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
     for role in config.relay_roles:
         print(f"granted to relay role: {role}", file=out)
+    for role in config.settler_roles:
+        print(f"granted to settler role: {role}", file=out)
     _print_report(report, out)
-    return EXIT_OK
+    return EXIT_OK, legacy
 
 
 def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
@@ -330,6 +365,11 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             "no database for the relay: set [relay] database, pass --database, or set "
             "INTERLOCK_RELAY_DATABASE"
         )
+    try:
+        signer = _relay_signer(config, args.key or os.environ.get(RELAY_KEY_ENV) or settings.key)
+    except _RefusedError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     workers = args.workers or settings.workers
     relays: list[Relay] = []
     breakers: list[Any] = []
@@ -350,6 +390,7 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
                     lease=settings.lease,
                     timeout=settings.timeout,
                     batch=settings.batch,
+                    signer=signer,
                 )
             )
         if args.once:
@@ -387,6 +428,33 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             relay.close()
         for breaker in breakers:
             breaker.close()
+
+
+def _relay_signer(config: InterlockConfig, path: str | Path | None) -> Any:
+    """The relay's key, registered in ``[relays.keys]``; or why the relay
+    may not start. An attestation no registered key verifies proves nothing,
+    so a relay does not make one."""
+    from agentgov.exceptions import SignerUnavailableError
+
+    from interlock.operators import load_key
+
+    if not path:
+        raise _RefusedError(
+            f"a relay signs every outcome it records: give it its key with [relay] key, "
+            f"--key PATH or {RELAY_KEY_ENV} (a new one: interlock keygen --role relay)"
+        )
+    try:
+        signer = load_key(path)
+    except (OSError, ValueError, SignerUnavailableError) as exc:
+        raise _RefusedError(f"cannot read the relay key: {exc}") from exc
+    keyring = config.relay_keyring()
+    if keyring is None or signer.key_id not in keyring:
+        raise _RefusedError(
+            f"the relay's key {signer.key_id} is not registered, so nothing it signs would "
+            f"verify: register it in [relays.keys] under the relay's name, as "
+            f'"{signer.public_key().spec()}"'
+        )
+    return signer
 
 
 def _kind(sink: Any) -> str:
@@ -491,7 +559,7 @@ def _keygen(args: argparse.Namespace, out: TextIO) -> int:
         print(f"interlock: {args.out} exists; a key is never overwritten", file=sys.stderr)
         return EXIT_USAGE
     print(f"wrote {args.out} (keep it to yourself). Register its public half:", file=out)
-    print("[operators.keys]", file=out)
+    print("[relays.keys]" if args.role == "relay" else "[operators.keys]", file=out)
     print(f'{args.name} = "{signer.public_key().spec()}"', file=out)
     return EXIT_OK
 
@@ -535,6 +603,7 @@ def _outbox_action(
         return EXIT_OK
     if args.action == "show":
         log = message_log(source, args.message)
+        keyring = config.relay_keyring()
         for event in log:
             print(
                 f"{event.seq:>3} {event.at.isoformat()} {event.event:<17} "
@@ -543,6 +612,7 @@ def _outbox_action(
                 + (f"  -> {event.state_after}" if event.state_after else "")
                 + (f"  ref {event.remote_ref}" if event.remote_ref else "")
                 + (f"  authority {event.authority[:16]}" if event.authority else "")
+                + _attester(event.attestation, keyring)
                 + (f"  {event.detail}" if event.detail else ""),
                 file=out,
             )
@@ -550,15 +620,38 @@ def _outbox_action(
     return _verify(config, source, out)
 
 
+def _attester(attestation: str | None, keyring: Any) -> str:
+    """Whose key an outcome's attestation names: the relay registered with
+    it, or the key's id. ``outbox verify`` checks the signature."""
+    if attestation is None:
+        return ""
+    try:
+        key_id = str(json.loads(attestation)["key_id"])
+    except (ValueError, KeyError, TypeError):
+        return "  attested (unreadable)"
+    name = keyring.name(key_id) if keyring is not None else None
+    return f"  attested by {name}" if name else f"  attested by key {key_id}"
+
+
 def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
+    from interlock.operators import legacy_vouch
+    from interlock.records import read_records
+
     problems = list(verify_delivery_log(source))
     settings = config.operators
+    records = read_records(settings.log) if settings is not None and settings.log.exists() else ()
+    vouch = legacy_vouch(records, settings.keyring()) if settings is not None else None
+    keyring = config.relay_keyring()
+    attestations = None
+    if keyring is not None:
+        from interlock.attestations import verify_attestations
+
+        attestations = verify_attestations(source, keyring, legacy=vouch)
+        problems += attestations.problems
     legacy = 0
     if settings is not None:
         from interlock.operators import verify_operators
-        from interlock.records import read_records
 
-        records = read_records(settings.log) if settings.log.exists() else ()
         entries = None
         if settings.ledger is not None:
             governor = _ledger(settings.ledger, read_only=True)
@@ -569,15 +662,37 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
         report = verify_operators(source, records, settings.keyring(), ledger=entries)
         problems += report.problems
         legacy = report.legacy
+    # The legacy set is both verifiers' to check: say what is wrong with it once.
+    problems = list(dict.fromkeys(problems))
     for problem in problems:
         print(problem, file=out)
     if problems:
         return EXIT_FINDINGS
     print("every delivery log verifies", file=out)
+    if attestations is None:
+        print("relays' attestations not checked: register their keys in [relays.keys]", file=out)
+    else:
+        print(
+            f"every outcome is attested by a registered relay ({attestations.attested})"
+            + (
+                f", and {attestations.legacy} from before version 4 are in the legacy set "
+                f"operator record {vouch.record} vouched for"
+                if attestations.legacy and vouch is not None
+                else ""
+            ),
+            file=out,
+        )
     if settings is not None:
         print(
             "every operator action is signed, and the operator log verifies"
-            + (f" ({legacy} unsigned from before version 3)" if legacy else ""),
+            + (
+                f" ({legacy} from before version 3, in the legacy set operator record "
+                f"{vouch.record} vouched for)"
+                if legacy and vouch is not None
+                else f" ({legacy} unsigned from before version 3)"
+                if legacy
+                else ""
+            ),
             file=out,
         )
     return EXIT_OK

@@ -28,6 +28,7 @@ import uuid
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from interlock.cascade import (
@@ -45,7 +46,13 @@ from interlock.exceptions import (
     SubstrateUnavailableError,
 )
 from interlock.outbound import EnqueueOrder
-from interlock.sqlite_outbox import OUTBOX_TABLES, enqueue, outbox_installed, stage_requests
+from interlock.sqlite_outbox import (
+    OUTBOX_TABLES,
+    enqueue,
+    now_us,
+    outbox_installed,
+    stage_requests,
+)
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -56,8 +63,10 @@ from interlock.types import (
     RowDelta,
     StageHandle,
     SubstrateCapabilities,
+    WindowMeasure,
     outbound_key,
 )
+from interlock.windows import WindowCharge
 
 __all__ = [
     "FORBIDDEN_VERBS",
@@ -84,6 +93,21 @@ substrate inside the stage's own transaction."""
 _MARKER_DDL = (
     f"CREATE TABLE IF NOT EXISTS main.{_MARKER_TABLE} "
     f"(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)"
+)
+
+WINDOWS_TABLE = "_interlock_windows"
+"""What each committed plan added to each rate window (:mod:`interlock.windows`),
+written beside its commit marker, which it references: a row exists exactly
+when its stage committed. ``amount`` is a decimal numeral, ``at`` microseconds
+since the epoch."""
+_WINDOWS_DDL = (
+    f"CREATE TABLE IF NOT EXISTS main.{WINDOWS_TABLE} ("
+    f"stage_id TEXT NOT NULL REFERENCES {_MARKER_TABLE} (stage_id) "
+    f"DEFERRABLE INITIALLY DEFERRED, "
+    f"window_name TEXT NOT NULL, key TEXT NOT NULL, amount TEXT NOT NULL, "
+    f"at INTEGER NOT NULL, PRIMARY KEY (stage_id, window_name, key))",
+    f"CREATE INDEX IF NOT EXISTS main.{WINDOWS_TABLE}_by_key "
+    f"ON {WINDOWS_TABLE} (window_name, key, at)",
 )
 
 FORBIDDEN_VERBS: frozenset[str] = frozenset(
@@ -307,7 +331,8 @@ class SqliteSubstrate:
         exactly when the stage's effects do, so after a crash between a
         commit intent and its record, :meth:`resolve_intent` answers whether
         that commit landed. The table is created in the database on first use
-        and gains one row per committed stage.
+        and gains one row per committed stage. Rate windows' history
+        (``_interlock_windows``) is bound to it, so windows need it on.
     :param acknowledge_cascades: Unobserved tables a foreign-key action may
         write, unmeasured. By default an operation whose referential actions
         reach an unobserved table is refused (see :meth:`check_cascades`);
@@ -333,6 +358,7 @@ class SqliteSubstrate:
         "_acknowledged",
         "_by_name",
         "_capture_triggers",
+        "_charges",
         "_conn",
         "_denied",
         "_enforce",
@@ -398,6 +424,7 @@ class SqliteSubstrate:
         self._order = EnqueueOrder()
         self._scope: str | None = None
         self._outbox = False
+        self._charges: tuple[WindowCharge, ...] = ()
 
     @property
     def substrate_id(self) -> str:
@@ -512,6 +539,8 @@ class SqliteSubstrate:
             # means someone removed it, not that nothing ever committed.
             try:
                 conn.execute(_MARKER_DDL)
+                for statement in _WINDOWS_DDL:
+                    conn.execute(statement)
             except sqlite3.Error as exc:
                 conn.close()
                 raise StageConflictError(
@@ -557,6 +586,7 @@ class SqliteSubstrate:
         self._handle = handle
         self._order = EnqueueOrder()
         self._scope = plan.scope_id
+        self._charges = ()
         return handle
 
     def reject_reason(self, effect: Effect) -> str | None:
@@ -731,18 +761,74 @@ class SqliteSubstrate:
             outbound=tuple(requests[: self._max_rows]),
         )
 
+    def measure_windows(
+        self, handle: StageHandle, charges: Sequence[WindowCharge]
+    ) -> tuple[WindowMeasure, ...]:
+        """What each window holds for each key the plan adds to.
+
+        Read in the stage, which is exact: the stage has held the database's
+        write lock since ``BEGIN IMMEDIATE``, so no other stage has committed
+        since its snapshot or can until it ends. What the plan adds is
+        written with its commit marker, if it commits.
+
+        :raises StageError: If commit markers are off: window history is
+            bound to them.
+        """
+        conn = self._require(handle)
+        self._assert_live(handle)
+        if not self._markers:
+            raise StageError(
+                "rate windows keep their history beside the commit marker; this "
+                "substrate has commit_markers=False"
+            )
+        now = now_us()
+        measures: list[WindowMeasure] = []
+        try:
+            with self._substrate_statements():
+                for charge in charges:
+                    rows = conn.execute(
+                        f"SELECT amount FROM main.{WINDOWS_TABLE} "
+                        f"WHERE window_name = ? AND key = ? AND at > ?",
+                        (charge.window, charge.key, now - _microseconds(charge.span)),
+                    ).fetchall()
+                    history = sum((Decimal(str(r[0])) for r in rows), Decimal(0))
+                    measures.append(
+                        WindowMeasure(charge.window, charge.key, history, charge.amount)
+                    )
+        except sqlite3.Error as exc:
+            raise StageError(f"could not read the rate windows' history: {exc}") from exc
+        self._charges = tuple(charges)
+        return tuple(measures)
+
     def commit(self, handle: StageHandle) -> CommitReceipt:
         """Make the staged work durable.
 
         With commit markers on, the stage's marker row is written inside the
         same transaction immediately before ``COMMIT``, so it becomes durable
-        with the effects or not at all.
+        with the effects or not at all; and with it, what the plan adds to
+        each rate window it was measured against.
         """
         conn = self._require(handle)
         self._assert_live(handle)
         committed_at = datetime.now(UTC)
         try:
             with self._substrate_statements():
+                if self._charges:
+                    at = now_us()
+                    conn.executemany(
+                        f"INSERT INTO main.{WINDOWS_TABLE} "
+                        f"(stage_id, window_name, key, amount, at) VALUES (?, ?, ?, ?, ?)",
+                        [
+                            (
+                                str(handle.stage_id),
+                                c.window,
+                                c.key,
+                                format(c.amount.normalize(), "f"),
+                                at,
+                            )
+                            for c in self._charges
+                        ],
+                    )
                 if self._journal_start is not None:
                     # Exact: BEGIN IMMEDIATE admits one writer, so every
                     # journal row numbered after the stage opened is its own.
@@ -938,9 +1024,11 @@ class SqliteSubstrate:
         - A cascade-gated delete or key update (see :mod:`interlock.cascade`),
           and a foreign-key action SQLite compiles into an unobserved table.
 
-        Reads are left alone. A statement may legitimately join or subquery a
-        table it does not write, and denying reads would break correct plans
-        without bounding any effect.
+        Reads are left alone, but for one table. A statement may legitimately
+        join or subquery a table it does not write, and denying reads would
+        break correct plans without bounding any effect. The exception is the
+        rate windows' history, which records what every plan, of every agent
+        and tenant, added to each window: no statement of a plan reads it.
 
         :returns: ``SQLITE_OK`` or ``SQLITE_DENY``.
         """
@@ -958,6 +1046,14 @@ class SqliteSubstrate:
                 f"statement attempts {_REACH_ACTIONS[action]} on {arg1 or ''!r}, which "
                 f"reaches outside the database being measured",
                 "reach",
+            )
+        if action == sqlite3.SQLITE_READ and (arg1 or "").lower() == WINDOWS_TABLE:
+            # The one table a stage may not read: what every plan, of every
+            # agent and tenant, added to each rate window.
+            return self._deny(
+                f"statement reads {arg1!r}, the rate windows' history, which holds other "
+                f"plans' activity",
+                "protected",
             )
         if action not in _WRITE_ACTIONS:
             return sqlite3.SQLITE_OK
@@ -999,6 +1095,15 @@ class SqliteSubstrate:
             return self._deny(
                 f"statement attempts {verb} on {table!r}, which only the substrate, the "
                 f"relay and operators write",
+                "protected",
+            )
+        if key == WINDOWS_TABLE:
+            # Written by commit() alone, with the marker. A statement that
+            # deleted from it would reopen a window; one that wrote to it would
+            # close another's.
+            return self._deny(
+                f"statement attempts {verb} on {table!r}, the rate windows' history, which "
+                f"only the substrate writes",
                 "protected",
             )
         if key == _MARKER_TABLE:
@@ -1101,6 +1206,10 @@ class SqliteSubstrate:
                 END;
                 """
             )
+
+
+def _microseconds(span: timedelta) -> int:
+    return span // timedelta(microseconds=1)
 
 
 def _load(raw: object) -> Mapping[str, Any] | None:

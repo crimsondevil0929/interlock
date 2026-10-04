@@ -65,6 +65,9 @@ __all__ = [
 GENESIS_TAG: Final = "interlock-outbox-genesis-v1"
 EVENT_TAG: Final = "interlock-outbox-event-v1"
 EVENT_TAG_V2: Final = "interlock-outbox-event-v2"
+EVENT_TAG_V3: Final = "interlock-outbox-event-v3"
+"""Rows that carry a relay's attestation (schema version 4) are framed with
+it, after the remote reference and the authority."""
 """Rows that carry a ``remote_ref`` or an ``authority`` (schema version 3)
 are framed with both; every other row as in version 2, so no hash written
 before them changes."""
@@ -154,6 +157,7 @@ def event_hash(
     state_after: str | None,
     remote_ref: str | None = None,
     authority: str | None = None,
+    attestation: str | None = None,
 ) -> str:
     """The hash of one delivery-log row, as ``interlock.outbox_event_hash``
     computes it, and SQLite's ``interlock_event_hash``."""
@@ -170,6 +174,8 @@ def event_hash(
         detail,
         state_after,
     ]
+    if attestation is not None:
+        return _digest(EVENT_TAG_V3, *fields, remote_ref, authority, attestation)
     if remote_ref is None and authority is None:
         return _digest(EVENT_TAG, *fields)
     return _digest(EVENT_TAG_V2, *fields, remote_ref, authority)
@@ -204,6 +210,9 @@ class LogEvent:
     event_hash: str
     remote_ref: str | None = None
     authority: str | None = None
+    attestation: str | None = None
+    """The relay's signature of an outcome (schema version 4):
+    ``{alg, key_id, signature}`` as canonical JSON."""
 
     def recomputed(self) -> str:
         return event_hash(
@@ -220,6 +229,7 @@ class LogEvent:
             self.state_after,
             self.remote_ref,
             self.authority,
+            self.attestation,
         )
 
 
@@ -230,15 +240,17 @@ _EVENTS: Final = (
     "WHERE %(ids)s::uuid[] IS NULL OR message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY message_id, seq"
 )
-_EXTRA_V3: Final = "remote_ref, authority"
-_EXTRA_V2: Final = "NULL::text, NULL::text"
+_EXTRA_V4: Final = "remote_ref, authority, attestation"
+_EXTRA_V3: Final = "remote_ref, authority, NULL::text"
+_EXTRA_V2: Final = "NULL::text, NULL::text, NULL::text"
 """Version 2 had neither column; its logs are read, and verified, as they are
 before an upgrade."""
 
 _MESSAGES: Final = (
     "SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
     "o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, s.log_seq, "
-    "s.log_head FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
+    "s.log_head, o.cost, {compensates} "
+    "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
     "WHERE %(ids)s::uuid[] IS NULL OR o.message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY o.enqueued_at, o.message_id"
 )
@@ -260,6 +272,7 @@ def _event(row: Sequence[Any]) -> LogEvent:
         event_hash=str(row[11]),
         remote_ref=_text(row[12]),
         authority=_text(row[13]),
+        attestation=_text(row[14]),
     )
 
 
@@ -281,6 +294,11 @@ class LoggedMessage:
     attempts: int
     log_seq: int
     log_head: str
+    cost: Decimal = Decimal(0)
+    """What the request cost, as the sink registry priced it when its plan
+    committed: what the plan was charged for it."""
+    compensates: uuid.UUID | None = None
+    """The request this one compensates, when it is a compensation."""
 
     def genesis(self) -> str:
         return genesis_hash(
@@ -311,14 +329,122 @@ class OutboxReader(Protocol):
 
     def counts(self) -> dict[str, int]: ...
 
-    def epoch(self) -> datetime | None:
-        """When schema version 3 was first installed: an operator's row without
-        an authority older than this is version 2's."""
+    def epoch(self, version: str = "3") -> datetime | None:
+        """When schema ``version`` was first installed here. An operator's row
+        without an authority older than version 3's is version 2's; an outcome
+        without a relay's attestation older than version 4's, version 3's."""
         ...
 
     def registry(self) -> list[dict[str, Any]]:
         """Every sink as the database mirrors it, every column, in one form
         for both stores: what a signed install vouches for."""
+        ...
+
+    def legacy(self) -> LegacySet | None:
+        """The legacy set version 4 recorded as it was installed, or ``None``
+        before version 4."""
+        ...
+
+    def settlements(self) -> dict[uuid.UUID, Settled]:
+        """Every delivered request settled so far, by message."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class Settled:
+    """A delivered request, settled (:mod:`interlock.settlement`): its
+    delivery receipt and its credit, or why there is none."""
+
+    message_id: uuid.UUID
+    receipt_id: str | None
+    credit: str | None
+    """The ledger entry that credited the agent, by hash."""
+    note: str
+    settled_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class LegacySet:
+    """The delivery-log rows written before the proof their kind now carries:
+    outcomes without a relay's attestation (before version 4), operators' rows
+    without an authority (before version 3).
+
+    Recorded once, in the transaction that first installs version 4, from the
+    rows the log held then; never added to after, since from then on the
+    database refuses such a row. A signed install vouches for its digest
+    (:meth:`interlock.operators.Operator.installed`), so a row forged into an
+    old log later, dated as early as it likes, is not in it: no one who can
+    write the database can pass a new row off as an old one.
+
+    :ivar rows: Each row's ``(message_id, seq)`` and its event hash, which
+        binds everything the row says.
+    """
+
+    rows: Mapping[tuple[uuid.UUID, int], str]
+
+    @property
+    def digest(self) -> str:
+        """What a signed install vouches for: every row, in order, by hash."""
+        from interlock.types import canonical_hash
+
+        return canonical_hash(
+            [
+                "interlock-legacy-v1",
+                [[str(m), seq, digest] for (m, seq), digest in sorted(self.rows.items())],
+            ]
+        )
+
+    def holds(self, event: LogEvent) -> bool:
+        """Whether ``event`` is one of these rows, exactly as it was written."""
+        return self.rows.get((event.message_id, event.seq)) == event.event_hash
+
+    def vanished(self, events: Iterable[LogEvent]) -> list[str]:
+        """These rows, where the logs no longer hold them as recorded."""
+        held = {(e.message_id, e.seq): e.event_hash for e in events}
+        return [
+            f"the legacy set names row {seq} of message {message}, which its log no longer "
+            f"holds as it was recorded"
+            for (message, seq), digest in sorted(self.rows.items())
+            if held.get((message, seq)) != digest
+        ]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyVouch:
+    """The legacy set a signed install vouched for: the first
+    ``operator.installed`` record that carries one pins it for good
+    (:func:`interlock.operators.legacy_vouch`).
+
+    :ivar record: That record's sequence in the operator log.
+    :ivar rows: How many rows the set held.
+    :ivar digest: :attr:`LegacySet.digest` as it was signed.
+    """
+
+    record: int
+    rows: int
+    digest: str
+
+    def problem(self, recorded: LegacySet) -> str | None:
+        """Why ``recorded`` is not the set this vouched for, or ``None``."""
+        if recorded.digest == self.digest and len(recorded) == self.rows:
+            return None
+        return (
+            f"the legacy set ({len(recorded)} row(s)) is not the one operator record "
+            f"{self.record} vouched for ({self.rows} row(s)): it was edited around Interlock"
+        )
+
+
+class OutboxSettlements(OutboxReader, Protocol):
+    """What :class:`~interlock.settlement.Settler` reads and writes."""
+
+    def settle(
+        self, message_id: uuid.UUID, *, receipt_id: str | None, credit: str | None, note: str
+    ) -> bool:
+        """Record a delivered request's settlement, once. ``False`` when it
+        was settled already."""
         ...
 
 
@@ -473,12 +599,11 @@ class PostgresReader:
             yield
 
     def _events(self) -> str:
-        row = self._conn.execute(
-            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
-            "WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
-            "AND attname = 'remote_ref' AND NOT attisdropped)"
-        ).fetchone()
-        return _EVENTS.format(extra=_EXTRA_V3 if row is not None and row[0] else _EXTRA_V2)
+        from interlock.postgres import installed_version
+
+        version = installed_version(self._conn)
+        extra = _EXTRA_V4 if version >= 4 else _EXTRA_V3 if version == 3 else _EXTRA_V2
+        return _EVENTS.format(extra=extra)
 
     def snapshot(
         self, message_ids: Sequence[uuid.UUID] | None
@@ -503,16 +628,26 @@ class PostgresReader:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
+                cost=Decimal(str(m[13])),
+                compensates=m[14],
             )
-            for m in self._conn.execute(_MESSAGES, params).fetchall()
+            for m in self._conn.execute(self._messages(), params).fetchall()
         ]
         events = [_event(row) for row in self._conn.execute(self._events(), params)]
         return found, events
 
-    def epoch(self) -> datetime | None:
+    def _messages(self) -> str:
+        from interlock.postgres import installed_version
+
+        # Compensations arrived with version 3.
+        compensates = "o.compensates" if installed_version(self._conn) >= 3 else "NULL::uuid"
+        return _MESSAGES.format(compensates=compensates)
+
+    def epoch(self, version: str = "3") -> datetime | None:
         row = self._conn.execute(
             "SELECT CASE WHEN pg_catalog.to_regclass('interlock.outbox_epochs') IS NULL "
-            "THEN NULL ELSE (SELECT at FROM interlock.outbox_epochs WHERE version = '3') END"
+            "THEN NULL ELSE (SELECT at FROM interlock.outbox_epochs WHERE version = %s) END",
+            (version,),
         ).fetchone()
         return None if row is None else row[0]
 
@@ -525,6 +660,35 @@ class PostgresReader:
                 "unknown_outcome, config_hash, enabled FROM interlock.sinks ORDER BY name"
             )
         ]
+
+    def settlements(self) -> dict[uuid.UUID, Settled]:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.outbox_settlements') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return {}
+        return {
+            r[0]: Settled(r[0], r[1], r[2], str(r[3]), r[4])
+            for r in self._conn.execute(
+                "SELECT message_id, receipt_id, credit, note, settled_at "
+                "FROM interlock.outbox_settlements"
+            )
+        }
+
+    def legacy(self) -> LegacySet | None:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.outbox_legacy') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return LegacySet(
+            {
+                (r[0], int(r[1])): str(r[2])
+                for r in self._conn.execute(
+                    "SELECT message_id, seq, event_hash FROM interlock.outbox_legacy"
+                )
+            }
+        )
 
     def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
         return {
@@ -965,6 +1129,29 @@ class PostgresOperations(PostgresReader):
             payload=payload,
             idempotency_key=idempotency_key,
         )
+
+
+class PostgresSettlements(PostgresReader):
+    """:class:`OutboxSettlements` over a PostgreSQL connection as a settler role."""
+
+    __slots__ = ()
+
+    def settle(
+        self, message_id: uuid.UUID, *, receipt_id: str | None, credit: str | None, note: str
+    ) -> bool:
+        row = self._conn.execute(
+            "SELECT interlock.outbox_settle(%s, %s, %s, %s)",
+            (message_id, receipt_id, credit, note),
+        ).fetchone()
+        return bool(row and row[0])
+
+
+def settlements(source: object) -> OutboxSettlements:
+    """``source`` as :class:`OutboxSettlements`: a SQLite store opened with
+    ``writes=SETTLER`` already is; a PostgreSQL connection is wrapped."""
+    if hasattr(source, "settle"):
+        return source  # type: ignore[return-value]
+    return PostgresSettlements(source)  # type: ignore[arg-type]
 
 
 def operations(source: object) -> OutboxOperations:

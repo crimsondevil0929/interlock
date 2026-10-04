@@ -39,6 +39,7 @@ substrate's connection can reach; do not rely on this layer for containment.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import threading
@@ -90,6 +91,7 @@ from interlock.types import (
     Verdict,
     outbound_key,
 )
+from interlock.windows import RateWindow, RateWindowCheck, charges
 
 if TYPE_CHECKING:
     from agentgov.receipts import ActionReceipt
@@ -203,8 +205,14 @@ class EscrowEngine:
         A committed plan is charged each request's ``cost_per_call`` on top
         of its settle cost, in the same settlement; its hold covers both. See
         :mod:`interlock.outbound`.
-    :raises ValueError: If ``settle_cost`` is negative, or ``chain`` is a
-        read-only snapshot from :meth:`EscrowChain.load`.
+    :param windows: Rate windows: each plan is measured with the history of
+        every window it adds to, read with the window's key locked, and
+        refused if it would take one past its limit. A
+        :class:`~interlock.windows.RateWindowCheck` is added to ``checkers``
+        for each. See :mod:`interlock.windows`.
+    :raises ValueError: If ``settle_cost`` is negative, ``chain`` is a
+        read-only snapshot from :meth:`EscrowChain.load`, two windows share a
+        name, or the substrate keeps no window history.
     """
 
     __slots__ = (
@@ -219,6 +227,7 @@ class EscrowEngine:
         "_settle_cost",
         "_sinks",
         "_substrate",
+        "_windows",
     )
 
     def __init__(
@@ -231,11 +240,22 @@ class EscrowEngine:
         settle_cost: Decimal | str = "0",
         receipts: ReceiptIssuer | None = None,
         sinks: SinkRegistry | None = None,
+        windows: Sequence[RateWindow] = (),
     ) -> None:
         self._substrate = substrate
         self._sinks = sinks
         self._receipts = receipts
-        self._checkers = tuple(checkers)
+        self._windows = tuple(windows)
+        names = [w.name for w in self._windows]
+        twice = sorted({n for n in names if names.count(n) > 1})
+        if twice:
+            raise ValueError(f"windows share a name: {', '.join(twice)}")
+        if self._windows and not callable(getattr(substrate, "measure_windows", None)):
+            raise ValueError(
+                f"substrate {substrate.substrate_id!r} keeps no window history, so a rate "
+                f"window could not be measured on it"
+            )
+        self._checkers = tuple(checkers) + tuple(RateWindowCheck(w) for w in self._windows)
         self._chain = chain if chain is not None else EscrowChain()
         if self._chain.read_only:
             raise ValueError(
@@ -448,13 +468,14 @@ class EscrowEngine:
                 outcomes.append(self._substrate.apply(handle, effect))
             state = StageState.STAGED
 
-            diff = self._substrate.diff(handle)
+            diff = self._windowed(handle, plan, self._substrate.diff(handle))
             self._record(
                 RecordType.DIFF_COMPUTED,
                 plan,
                 diff.content_hash(),
                 stage=handle.stage_id,
-                note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)",
+                note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)"
+                + (f", {len(diff.windows)} window key(s)" if diff.windows else ""),
             )
             # What the commit will charge for: the requests the stage wrote,
             # which must be exactly the ones the plan declared, at the price
@@ -723,7 +744,7 @@ class EscrowEngine:
                 try:
                     for effect in sub.topological_order():
                         self._substrate.apply(handle, effect)
-                    diff = self._substrate.diff(handle)
+                    diff = self._windowed(handle, sub, self._substrate.diff(handle))
                 except SubstrateUnavailableError:
                     raise
                 except InterlockError as exc:
@@ -824,6 +845,22 @@ class EscrowEngine:
             whole=whole,
             receipt=receipt,
         )
+
+    def _windowed(self, handle: StageHandle, plan: EffectPlan, diff: EffectDiff) -> EffectDiff:
+        """The diff, with the history of every window the plan adds to.
+
+        The substrate locks each window key before reading what it holds, so
+        nothing can be added to it until this stage ends; what the plan adds
+        is written when it commits. A plan that adds to no window is measured
+        as it was, and locks nothing.
+        """
+        if not self._windows:
+            return diff
+        due = charges(self._windows, plan, diff)
+        if not due:
+            return diff
+        measure = getattr(self._substrate, "measure_windows")  # noqa: B009
+        return dataclasses.replace(diff, windows=tuple(measure(handle, due)))
 
     def _effect_problem(self, effect: Effect) -> InterlockError | None:
         """Why admission would refuse this one effect, or ``None``."""

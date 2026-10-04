@@ -49,7 +49,18 @@ from interlock.types import (
     StageHandle,
 )
 from tests.conftest import OBSERVED
-from tests.crash_child import ACKNOWLEDGED, SCOPE, Anchor, Chain, Kill, Refund, checkers, say, stop
+from tests.crash_child import (
+    ACKNOWLEDGED,
+    SCOPE,
+    Anchor,
+    Chain,
+    Kill,
+    Refund,
+    checkers,
+    say,
+    stop,
+    windows,
+)
 from tests.schemas import TEST_SINKS, specs
 
 
@@ -163,6 +174,7 @@ def build(scenario: Mapping[str, Any], kill: Kill) -> EscrowEngine:
         anchor=Anchor(governor, kill, same_transaction=False),
         settle_cost=str(scenario.get("settle", "0.25")),
         sinks=SinkRegistry(TEST_SINKS),
+        windows=windows(),
     )
 
 
