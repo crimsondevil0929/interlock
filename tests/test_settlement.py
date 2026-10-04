@@ -306,3 +306,20 @@ def test_a_compensation_attested_by_no_registered_relay_earns_nothing(bench: Ben
     (problem,) = report.problems
     assert f"message {cancel}" in problem and "not attested by a registered relay" in problem
     assert credits(bench) == []
+
+
+def test_a_compensation_with_an_attestation_copied_from_another_delivery_earns_nothing(
+    bench: Bench,
+) -> None:
+    """A registered relay's genuine signature, over another request: the
+    signature does not hold for this one, so nothing is settled or credited."""
+    booked, other = bench.book(1), bench.book(2)
+    bench.deliver()
+    cancel = bench.compensate(booked)
+    (delivered,) = [e for e in bench.outbox.log(other) if e.event == "delivered"]
+    ghost(bench.outbox, cancel, delivered.attestation)
+    report = bench.settler().settle()
+    assert sorted(report.settled) == sorted([booked, other]) and report.credits == 0
+    (problem,) = report.problems
+    assert f"message {cancel}" in problem and "not attested by a registered relay" in problem
+    assert credits(bench) == []

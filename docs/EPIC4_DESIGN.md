@@ -336,3 +336,19 @@ Where the implementation settled what the design left open, or refined it.
 - `verify_settlements` holds the three to each other: every settlement's receipt in the
   log, for its message, attested and bound; every delivery receipt named by a settlement;
   every credit named by one, once, of its original's cost.
+
+### Step 6: the mutation pass
+
+Every mechanism of this epic was removed in turn, and a test failed for each: 36 of 36.
+The relays' attestations (the database's refusal on both stores, what the relay signs, the
+verifier's signature check, the command's key check); the rate windows (the read and the
+write closed to plans, history written with the commit, the token and the read's gate on
+PostgreSQL, the advisory lock, the limit, the fail-closed check, the diff's hash, the
+feedback's name, the repair's measure); the legacy set (recorded once and sealed on both
+stores, the install's two refusals, the records' agreement, the vouch, membership, a row
+rewritten); and settlement (the receipt and the credit a crashed run left, reused; the
+credit's amount, its wait for an intent's outcome, the relay's signature, the charge; only
+a delivered request settled, on both stores; a double credit named). One mutation first
+survived, a settler that skipped the signature check, since the test's forger used an
+unregistered key; a test with a registered relay's signature copied from another delivery
+now kills it.

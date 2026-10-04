@@ -5,8 +5,9 @@ outbox, charged at commit, and delivered by the relay, which is proven against c
 at every point of its path; and a request is checked against the rows it rides with
 (`CrossEffectAgreement`, §5.2). Epic 3 ([`EPIC3_DESIGN.md`](EPIC3_DESIGN.md)) built
 SQLite parity (Phase 6), compensation, and signed operator records, in an operator log of
-their own rather than the escrow chain (§8). Not built yet: the other outbound checkers and
-the rate windows of §5.2 and §5.3, and delivery receipts (§9). Where a section describes what
+their own rather than the escrow chain (§8). Epic 4 ([`EPIC4_DESIGN.md`](EPIC4_DESIGN.md))
+built the rate windows of §5.3 and delivery receipts (§9), with relays' attestations and
+settlement. Not built yet: the other outbound checkers of §5.2. Where a section describes what
 was built, it says so; where the build departed from the design, the section was changed to
 match it. This
 document turns the outbox sketch in
@@ -757,8 +758,8 @@ including tests.
 
 *As built, Phase 2 was narrowed to the budget (§5.4): the sum reserved, priced,
 checked and charged at commit; then `CrossEffectAgreement`, the flagship of §5.2,
-was built after the relay. The other checkers of §5.2 and the windows of §5.3
-remain.*
+was built after the relay. The other checkers of §5.2 remain; Epic 4 built the
+windows of §5.3, as rate windows (`EPIC4_DESIGN.md` §3).*
 
 
 - The seven checkers of §5.2, with feedback hints and property tests that their
