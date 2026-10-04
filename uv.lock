@@ -572,30 +572,15 @@ wheels = [
 [[package]]
 name = "interlock-agentgov"
 version = "0.4.0"
-source = { directory = "../agentgov" }
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6e/16/0ebbe13fe7018c54cbabcdac129f3e2711bcda7cabe13a0bc96d7db8d422/interlock_agentgov-0.4.0.tar.gz", hash = "sha256:73978a9b1757a12e99ef052effb6fa6a167ed423acb0b16ab900ca3c60257c44", size = 620706, upload-time = "2026-10-04T04:53:29.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/61/c9/4ac4482de5c1f05b3442f817a38206f4b17b47ad0d5d972fdff4e3e4793b/interlock_agentgov-0.4.0-py3-none-any.whl", hash = "sha256:275e64bc5bd655af2c1ccbb00237163721c5411e59a4c6fe031080a0101da0f4", size = 212149, upload-time = "2026-10-04T04:53:27.373Z" },
+]
 
 [package.optional-dependencies]
 sign = [
     { name = "cryptography" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "cryptography", marker = "extra == 'sign'", specifier = ">=42" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
-    { name = "streamlit", marker = "extra == 'ui'", specifier = ">=1.63" },
-]
-provides-extras = ["ui", "sign", "postgres"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "anthropic", specifier = ">=1.0.0" },
-    { name = "cryptography", specifier = ">=42" },
-    { name = "mypy", specifier = ">=1.11.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
-    { name = "pytest", specifier = ">=8.0.0" },
-    { name = "pytest-cov", specifier = ">=5.0.0" },
-    { name = "ruff", specifier = ">=0.6.0" },
 ]
 
 [[package]]
@@ -628,8 +613,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "interlock-agentgov", directory = "../agentgov" },
-    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", directory = "../agentgov" },
+    { name = "interlock-agentgov", specifier = ">=0.4.0" },
+    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", specifier = ">=0.4.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres", "sign"]

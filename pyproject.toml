@@ -37,12 +37,6 @@ postgres = ["psycopg[binary]>=3.2"]
 # either needs nothing extra.
 sign = ["interlock-agentgov[sign]>=0.4.0"]
 
-[tool.uv.sources]
-# ARC1 1.1 (delivery receipts, docs/EPIC4_DESIGN.md) is in agentgov 0.4.0, not yet on
-# PyPI: until it is, resolve agentgov from its sibling checkout, on branch
-# feat/arc1-v1.1-delivery (451c874). Delete this table once 0.4.0 is published.
-interlock-agentgov = { path = "../agentgov" }
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
