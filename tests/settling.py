@@ -21,11 +21,11 @@ from agentgov.receipts import ActionReceipt, DeliveryReceipt, HmacKey, ReceiptLo
 
 from interlock import BlastRadius, EscrowChain, EscrowEngine, LedgerAnchor, PlanBuilder
 from interlock.adapters import HttpAdapter
-from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
+from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec, bind
 from interlock.receipts import ReceiptIssuer
 from interlock.relay import NoBreaker, Relay
 from interlock.settlement import Settler
-from interlock.types import OutboundRequest
+from interlock.types import EffectId, OutboundRequest, outbound_key
 from tests.outbox_env import RELAY_SINKS, RELAYS, SCOPE, Outbox, relay_signer
 
 BOOKINGS = SinkSpec(
@@ -46,13 +46,17 @@ FIAT = "500.00"
 """What a booking moves: the customer's money, never the agent's budget."""
 
 
-def booking(n: int) -> PlanBuilder:
-    return PlanBuilder(SCOPE).enqueue(
-        sink="bookings",
-        operation="book",
-        payload={"booking": n, "amount": FIAT},
-        compensation=OutboundRequest("bookings", "cancel", {"booking": n}),
-    )
+def booking(*ns: int) -> PlanBuilder:
+    """A plan that books each of ``ns``, one request each."""
+    builder = PlanBuilder(SCOPE)
+    for n in ns:
+        builder = builder.enqueue(
+            sink="bookings",
+            operation="book",
+            payload={"booking": n, "amount": FIAT},
+            compensation=OutboundRequest("bookings", "cancel", {"booking": n}),
+        )
+    return builder
 
 
 class Bench:
@@ -88,11 +92,15 @@ class Bench:
 
     def book(self, n: int, *, charged: bool = True) -> uuid.UUID:
         """Commit a plan that books ``n``: its one request."""
-        plan = booking(n).build()
+        (message,) = self.book_together(n, charged=charged)
+        return message
+
+    def book_together(self, *ns: int, charged: bool = True) -> list[uuid.UUID]:
+        """Commit one plan that books each of ``ns``: its requests."""
+        plan = booking(*ns).build()
         result = self.engine(charged=charged).execute(plan)
         assert result.committed, result.feedback
-        (message,) = self.outbox.messages(plan.plan_id)
-        return message
+        return self.outbox.messages(plan.plan_id)
 
     def deliver(self) -> None:
         sink = self.outbox.sink("bookings", honour_keys=True)
@@ -115,6 +123,36 @@ class Bench:
         (target,) = outcome.intent.body["targets"]
         return uuid.UUID(str(target["compensation"]["message"]))
 
+    def compensate_around(
+        self, message: uuid.UUID, authority: str, *, key: str | None = None
+    ) -> uuid.UUID:
+        """A compensation of ``message`` enqueued around the operators, as the
+        database's owner could: through the outbox's own function, under
+        ``authority``, with no signed intent naming it; under the key an
+        operator would derive, or ``key``. The compensation."""
+        operations = self.outbox.operations()
+        plan = operations.plan_of(message)
+        assert plan is not None
+        (original,) = [c for c in operations.compensables(plan) if c.message_id == message]
+        document = original.compensation
+        assert document is not None
+        request = OutboundRequest(
+            str(document["sink"]),
+            str(document["operation"]),
+            bind(document["payload"], original.remote_ref or ""),
+        )
+        forged = uuid.uuid4()
+        assert operations.compensate(
+            message,
+            actor="operator:dba",
+            authority=authority,
+            expected_head=original.log_head,
+            message_id=forged,
+            payload=request.canonical_payload,
+            idempotency_key=key or outbound_key(plan, EffectId(f"compensate:{original.effect_id}")),
+        )
+        return forged
+
     def source(self) -> Any:
         source = self.outbox.settler()
         self._sources.append(source)
@@ -125,6 +163,7 @@ class Bench:
         *,
         ledger: bool = True,
         operators: bool = True,
+        sinks: SinkRegistry | None = REGISTRY,
         checkpoint: Callable[[str, uuid.UUID], None] | None = None,
     ) -> Settler:
         return Settler(
@@ -135,6 +174,7 @@ class Bench:
             ledger=self.outbox.governor if ledger else None,
             operator_log=self.outbox.operator_log if operators else None,
             operators=self.outbox.keyring() if operators else None,
+            sinks=sinks,
             checkpoint=checkpoint,
         )
 

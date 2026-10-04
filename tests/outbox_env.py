@@ -229,6 +229,11 @@ class Outbox:
         append-only guard."""
         raise NotImplementedError
 
+    def tamper(self, message: uuid.UUID, **columns: object) -> None:
+        """Rewrite a stored request's columns around Interlock (``cost``,
+        ``plan_id``, ``scope_id``): its owner lifting the append-only guard."""
+        raise NotImplementedError
+
     def operations(self) -> OutboxOperations:
         """What an operator's actions go through, on this store."""
         raise NotImplementedError
@@ -602,6 +607,16 @@ class PostgresOutbox(Outbox):
         )
         conn.execute("ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only")
 
+    def tamper(self, message: uuid.UUID, **columns: object) -> None:
+        conn = self.operator()
+        conn.execute("ALTER TABLE interlock.outbox DISABLE TRIGGER outbox_append_only")
+        conn.execute(
+            f"UPDATE interlock.outbox SET {', '.join(f'{name} = %({name})s' for name in columns)} "
+            f"WHERE message_id = %(message)s",
+            {**columns, "message": message},
+        )
+        conn.execute("ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only")
+
     def operations(self) -> OutboxOperations:
         return deliveries.operations(self.operator())
 
@@ -774,6 +789,16 @@ class SqliteOutbox(Outbox):
             conn.execute(
                 "UPDATE _interlock_outbox SET payload = ? WHERE message_id = ?",
                 (payload, str(message)),
+            )
+
+    def tamper(self, message: uuid.UUID, **columns: object) -> None:
+        values = {k: str(v) if isinstance(v, Decimal) else v for k, v in columns.items()}
+        with closing(self.raw()) as conn:
+            conn.execute("DROP TRIGGER IF EXISTS _interlock_outbox_no_update")
+            conn.execute(
+                f"UPDATE _interlock_outbox SET {', '.join(f'{name} = :{name}' for name in values)} "
+                f"WHERE message_id = :message",
+                {**values, "message": str(message)},
             )
 
     def operations(self) -> OutboxOperations:

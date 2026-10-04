@@ -1303,19 +1303,25 @@ settler = Settler(
     ledger=governor,  # the engine's AgentGov ledger
     operator_log="operators.ilok1",
     operators=config.operators.keyring(),
+    sinks=registry,  # the engine's SinkRegistry, which priced every request
 )
 report = settler.settle()  # as often as you like
 ```
 
 - **A delivery receipt** for each delivered request: an ARC1 `DeliveryReceipt` signed by
   the receipt log, carrying the relay's attestation, bound to the action receipt of the
-  plan that committed the request by that receipt's leaf hash. agentgov's verifier checks
-  it: `agentgov verify-receipt delivery.json --relay-key ... --action action.json`.
-- **A credit** for a delivered compensation: AgentGov `refund()` to the agent's scope of
-  the `cost_per_call` the ledger charged for the original request, never the money the
-  request moved. Only when a registered relay attested the compensation's delivery, and
-  the original's `compensated` row carries the authority of a signed operator intent that
-  names exactly this compensation, recorded applied.
+  plan that committed the request by that receipt's leaf hash: the plan its attested
+  idempotency key was derived from, not merely the one its row names. agentgov's verifier
+  checks it: `agentgov verify-receipt delivery.json --relay-key ... --action action.json`.
+- **A credit** for a delivered compensation: AgentGov `refund()` of the `cost_per_call`
+  the engine's sink registry prices the request at, which is what its plan was charged
+  for it, to the scope the ledger charged; never the money the request moved. Only when a
+  registered relay attested the compensation's delivery; the original's `compensated` row
+  carries the authority of a signed operator intent that names exactly this compensation,
+  recorded applied; and the outbox row agrees with the registry's price and the
+  compensation's signed key. No column the database's owner can rewrite sets the amount
+  or the scope: the plan's charge caps the credits, and nothing is credited when the row
+  and the registry disagree.
 - **Exactly once.** Each step finds what a crashed run left of it. Killed after the
   receipt, the credit, or the settlement row, the next run settles every request once: no
   receipt twice, no orphaned receipt, no second credit.

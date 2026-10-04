@@ -160,11 +160,12 @@ that would take a window past its limit; the agent is told which window, never t
 
 The process that holds the ledger (the engine's, beside the receipt log) settles each
 delivered message: issues its delivery receipt and, for a compensation, posts an AgentGov
-`refund()` crediting the original's scope with the `cost_per_call` the ledger charged for
-the original request. Relays stay read-only on the ledger. A credit is posted only when the
-compensation's delivery is attested by a registered relay and the original's `compensated`
-row carries a signed operator intent naming that compensation. Receipt, then credit, then a
-settlement row: a crash between any two is resumed without a second receipt or credit.
+`refund()` of the `cost_per_call` the original request was charged, as the engine's sink
+registry prices it, to the scope the ledger charged. Relays stay read-only on the ledger.
+A credit is posted only when the compensation's delivery is attested by a registered relay
+and the original's `compensated` row carries a signed operator intent naming that
+compensation. Receipt, then credit, then a settlement row: a crash between any two is
+resumed without a second receipt or credit.
 
 ## 5. Proofs
 
@@ -310,36 +311,54 @@ Where the implementation settled what the design left open, or refined it.
   opened with `writes=SETTLER`.
 - **The delivery receipt** binds to the action receipt the plan that committed the request
   was issued, found through the escrow chain (its `COMMITTED` record names the receipt) and
-  read from the log. A compensation binds to its original's plan: the plan carried and the
-  checkers judged the compensation; an operator's signed intent only set it off. A plan
-  with no action receipt (receipts off, or a commit recovered after a crash, which issues
-  none) is settled without one, and the settlement says so.
-- **The credit** is AgentGov `refund()` to the original's scope of the original's
-  `cost_per_call`, the amount its plan was charged for it, under a memo naming the
-  compensation and the charge it reverses. The charge is the plan's reverse-anchor spend,
-  whose memo names its commit record; the credits for one plan never exceed it. The
-  authority is checked in full: the original's `compensated` row carries the hash of a
-  signed intent, under a registered operator key, of action `compensate`, naming this
-  compensation's message, sink, operation, payload hash and idempotency key, and recorded
-  applied with that row.
+  read from the log. The plan is the one the relay's attestation commits to: the attested
+  idempotency key must be `outbound_key(plan, effect)` for the plan and effect the row
+  names, or the request is not settled. A compensation binds to its original's plan: the
+  plan carried and the checkers judged the compensation; an operator's signed intent only
+  set it off. A plan with no action receipt (receipts off, or a commit recovered after a
+  crash, which issues none) is settled without one, and the settlement says so.
+- **The credit** is AgentGov `refund()` of the `cost_per_call` the engine's sink registry
+  (`Settler(sinks=...)`) prices the compensation's sink at, the sink the relay attested and
+  the signed intent names, which is its original's: what the plan was charged for the
+  original. It goes to the scope the ledger charged, under a memo naming the compensation
+  and the charge it reverses. The charge is the plan's reverse-anchor spend, found by its
+  memo alone, which names the plan's commit record; the credits for one plan never exceed
+  it. No column the outbox's owner can rewrite sets the amount or the scope: the row's
+  `cost` must equal the registry's price (a raised cost, or a registry repriced since the
+  commit, credits nothing); its plan and effect must be the ones the compensation's key
+  was derived from (`outbound_key(plan, "compensate:" + effect)`, attested and signed); its
+  sink and operation must be ones the registry undoes with the compensation's; its scope
+  is never read. The authority is checked in full: the original's `compensated` row
+  carries the hash of a signed intent, under a registered operator key, of action
+  `compensate`, naming this compensation's message, sink, operation, payload hash and
+  idempotency key, and recorded applied with that row.
 - **Decided, or deferred.** A credit is refused for good, and the request settled without
-  one and saying why, when there is no ledger, the original cost nothing, the plan was
-  never charged, or the authority does not hold. It is deferred, the request left
-  unsettled and reported, while the decision may still change: the intent behind the
-  compensation has no outcome yet (the next operator command resolves it), or no operator
-  log is configured. A delivery no registered relay attested is never settled.
+  one and saying why, when there is no ledger, the authority does not hold, the original's
+  row disagrees with the compensation's key or with the registry, the original cost
+  nothing, the plan was never charged, or its charge has no room left. It is deferred, the
+  request left unsettled and reported, while the decision may still change: the intent
+  behind the compensation has no outcome yet (the next operator command resolves it), or
+  no operator log or sink registry is configured. A delivery no registered relay attested,
+  or whose attested key its row's plan did not derive, is never settled.
+- **A limit.** Which plan a request belongs to is the outbox's word until a relay first
+  attests its idempotency key. A database owner who rewrites a request's plan and key
+  together between its commit and its first delivery leaves a forgery the settler cannot
+  tell; the plan's action receipt commits to each request's key in its row commitment, so
+  a disclosure of that plan's rows would show it, but the settler does not hold them. The
+  amount stays the registry's price, and the credits for any plan stay within its charge.
 - **Exactly once.** Each step looks for what a crashed run left of it: the log's delivery
   receipt for the message, the ledger's credit for the compensation; the settlement row
   is written once, for a delivered request only, never changed. Killed after the receipt,
   after the credit, or after the row, on either store, the next run settles every message
   once: `tests/test_settlement_crash.py`.
 - `verify_settlements` holds the three to each other: every settlement's receipt in the
-  log, for its message, attested and bound; every delivery receipt named by a settlement;
-  every credit named by one, once, of its original's cost.
+  log, for its message, bound, its attestation verified under the relay's own key rather
+  than taken on the log's signature; every delivery receipt named by a settlement; every
+  credit named by one, once, of its original's cost.
 
 ### Step 6: the mutation pass
 
-Every mechanism of this epic was removed in turn, and a test failed for each: 36 of 36.
+Every mechanism of this epic was removed in turn, and a test failed for each: 55 of 55.
 The relays' attestations (the database's refusal on both stores, what the relay signs, the
 verifier's signature check, the command's key check); the rate windows (the read and the
 write closed to plans, history written with the commit, the token and the read's gate on
@@ -348,7 +367,17 @@ feedback's name, the repair's measure); the legacy set (recorded once and sealed
 stores, the install's two refusals, the records' agreement, the vouch, membership, a row
 rewritten); and settlement (the receipt and the credit a crashed run left, reused; the
 credit's amount, its wait for an intent's outcome, the relay's signature, the charge; only
-a delivered request settled, on both stores; a double credit named). One mutation first
-survived, a settler that skipped the signature check, since the test's forger used an
-unregistered key; a test with a registered relay's signature copied from another delivery
-now kills it.
+a delivered request settled, on both stores; a double credit named); and settlement's
+hardening (a receipt bound only to the plan its attested key derives from; a credit held
+to its original's plan and effect, sink and operation, the price the registry and the row
+agree on, the scope and the charge the ledger names, the room left in the charge, the
+sink registry's presence; the authority's kind and naming; every finding of
+`verify_settlements`). One mutation first survived, a settler that skipped the signature
+check, since the test's forger used an unregistered key; a test with a registered relay's
+signature copied from another delivery now kills it.
+
+Writing tests for settlement's refusals found a gap the first build left: the credit's
+amount was the original's `cost` column and its scope the `scope_id` column, which the
+outbox's owner can rewrite, bounded only by the plan's charge (settle cost included). A
+credit is now the registry's price for the attested, signed sink, to the scope the ledger
+charged; the row must agree, or nothing is credited.

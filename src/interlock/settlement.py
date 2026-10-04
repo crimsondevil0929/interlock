@@ -7,16 +7,24 @@ A delivered request is settled once, by the process that holds the receipt log
    receipt log, carrying the relay's attestation of the call and bound to the
    action receipt of the plan that committed the request by that receipt's
    leaf hash (:class:`agentgov.receipts.ActionBinding`). Only a delivery a
-   registered relay attested is receipted. A compensation is receipted against
-   its original's plan, which committed it: the compensation was adjudicated
-   with the plan, and an operator's signed intent only set it off.
+   registered relay attested is receipted, and only against the plan its
+   attested idempotency key was derived from (:func:`~interlock.types.outbound_key`):
+   the plan the outbox row names is the database's word, the key the relay's.
+   A compensation is receipted against its original's plan, which committed
+   it: the compensation was adjudicated with the plan, and an operator's
+   signed intent only set it off.
 2. **The credit**, for a compensation: AgentGov ``refund()`` crediting the
-   original request's scope with the ``cost_per_call`` the ledger charged for
-   it, never the money the request moved. Posted only when the compensation's
-   delivery is attested by a registered relay; the original's ``compensated``
-   row carries the authority of a signed operator intent that names this very
-   compensation, recorded applied; and the ledger holds the plan's charge, with
-   room left in it for the credit.
+   scope the ledger charged for the plan with the ``cost_per_call`` the
+   engine's sink registry prices the request at, which is what the plan was
+   charged for it; never the money the request moved. Posted only when the
+   compensation's delivery is attested by a registered relay; the original's
+   ``compensated`` row carries the authority of a signed operator intent that
+   names this very compensation, recorded applied; the compensation's
+   attested key was derived from the original's plan and effect; the registry
+   undoes the original's operation with the compensation's; the outbox
+   records the original at the registry's price; and the ledger holds the
+   plan's charge, with room left in it for the credit. No column the
+   database's owner can rewrite sets the amount, or the scope credited.
 3. **The settlement row**, in the outbox: the receipt and the credit, or why
    there is none.
 
@@ -55,10 +63,12 @@ from interlock.attestations import attestation_of
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.deliveries import LogEvent, LoggedMessage, settlements, verify_delivery_log
 from interlock.records import Keyring, SignedRecord, read_records
+from interlock.types import EffectId, outbound_key
 
 if TYPE_CHECKING:
     from agentgov import BudgetManager
 
+    from interlock.outbound import SinkRegistry, SinkSpec
     from interlock.receipts import ReceiptIssuer
 
 __all__ = ["CREDIT_MEMO", "SettlementReport", "Settler", "verify_settlements"]
@@ -103,7 +113,11 @@ class Settler:
         it, nothing is credited.
     :param operator_log: The signed operator log, and ``operators``, every
         operator's public key: what a compensation's authority is held to.
-        Without them, nothing is credited.
+        Without them, a compensation is not settled.
+    :param sinks: The engine's sink registry, which priced every request its
+        plans committed: a credit is the ``cost_per_call`` it names for the
+        compensation's sink, never the price the outbox row records. Without
+        it, a compensation is not settled.
     :param checkpoint: Called with ``"receipt"``, ``"credit"`` and
         ``"settled"`` and the message, once each step of its settlement is
         durable: the crash tests stop the process there.
@@ -118,6 +132,7 @@ class Settler:
         "_outbox",
         "_receipts",
         "_relays",
+        "_sinks",
     )
 
     def __init__(
@@ -130,6 +145,7 @@ class Settler:
         ledger: BudgetManager | None = None,
         operator_log: str | Path | None = None,
         operators: Keyring | None = None,
+        sinks: SinkRegistry | None = None,
         checkpoint: Callable[[str, uuid.UUID], None] | None = None,
     ) -> None:
         self._outbox = settlements(outbox)
@@ -139,6 +155,7 @@ class Settler:
         self._ledger = ledger
         self._operator_log = operator_log
         self._operators = operators
+        self._sinks = sinks
         self._checkpoint = checkpoint or (lambda point, message: None)
 
     def settle(self) -> SettlementReport:
@@ -201,6 +218,13 @@ class Settler:
             raise _UnsettledError(
                 f"its delivery is not attested by a registered relay ({exc}): not settled"
             ) from exc
+        # The plan a delivery receipt binds to: the one the attested key was
+        # derived from, which the row's plan must be.
+        if message.idempotency_key != outbound_key(message.plan_id, EffectId(message.effect_id)):
+            raise _UnsettledError(
+                f"its row names plan {message.plan_id}, which its attested idempotency key "
+                f"was not derived from: not settled"
+            )
 
         # Whether a compensation earns its credit is decided before anything is
         # issued: one not decided yet leaves the message alone, unreceipted.
@@ -279,8 +303,9 @@ class Settler:
         does.
 
         :raises _UnsettledError: When the answer is not final yet: the operator log
-            is not configured, or the intent behind the compensation awaits
-            resolution. The message stays unsettled until it is.
+            or the sink registry is not configured, or the intent behind the
+            compensation awaits resolution. The message stays unsettled until
+            it is.
         """
         assert message.compensates is not None
         original = context.messages.get(message.compensates)
@@ -288,26 +313,56 @@ class Settler:
             return "its original is not in the outbox"
         if self._ledger is None:
             return "no ledger to credit"
-        if context.operators is None:
+        if context.operators is None or self._sinks is None:
+            missing = "signed operator log" if context.operators is None else "sink registry"
             raise _UnsettledError(
-                "a compensation's credit is held to the signed operator log, and none is "
-                "configured: not settled"
+                f"a compensation's credit is held to the {missing}, and none is configured: "
+                f"not settled"
             )
         authority, pending = context.operators.authorizes(original, message, context.logs)
         if pending:
             raise _UnsettledError(f"{authority}: not settled until it is resolved")
         if authority is not None:
             return f"its authority does not hold: {authority}"
-        if original.cost <= 0:
+        # Its key, attested and named in the signed intent, was derived from
+        # its original's plan and effect: those the original's row names must
+        # be they, or the row was moved to another plan.
+        if (message.plan_id, message.effect_id) != (
+            original.plan_id,
+            f"compensate:{original.effect_id}",
+        ):
+            return (
+                f"its original's row names plan {original.plan_id}, effect "
+                f"{original.effect_id!r}; its key was derived from plan {message.plan_id}, "
+                f"effect {message.effect_id!r}"
+            )
+        sink = self._sinks.get(message.sink)
+        undoes = None if sink is None else sink.operation(original.operation)
+        if (
+            sink is None
+            or original.sink != message.sink
+            or undoes is None
+            or undoes.compensation != message.operation
+        ):
+            return (
+                f"the sink registry does not undo {original.sink}.{original.operation} with "
+                f"{message.sink}.{message.operation}"
+            )
+        if sink.cost_per_call <= 0:
             return "its original cost nothing"
+        if original.cost != sink.cost_per_call:
+            return (
+                f"the outbox records its original at {original.cost}, and the sink registry "
+                f"prices a {sink.name} request at {sink.cost_per_call}"
+            )
         charge = context.charge(original)
         if charge is None:
             return f"the ledger holds no charge for plan {original.plan_id}"
         room = charge.amount - context.credited(original.plan_id)
-        if original.cost > room:
+        if sink.cost_per_call > room:
             return (
                 f"plan {original.plan_id}'s charge of {charge.amount} has {room} left, less "
-                f"than the {original.cost} the original cost"
+                f"than the {sink.cost_per_call} the original cost"
             )
         return None
 
@@ -315,10 +370,13 @@ class Settler:
         assert self._ledger is not None and message.compensates is not None
         original = context.messages[message.compensates]
         charge = context.charge(original)
-        assert charge is not None
+        sink: SinkSpec | None = None if self._sinks is None else self._sinks.get(message.sink)
+        assert charge is not None and sink is not None
+        # The scope the ledger charged, at the registry's price: what
+        # _why_no_credit held the outbox's columns to, not the columns.
         entry = self._ledger.refund(
-            original.scope_id,
-            original.cost,
+            charge.scope_id,
+            sink.cost_per_call,
             memo=(
                 f"{CREDIT_MEMO}{message.message_id} compensates {original.message_id} under "
                 f"{charge.entry_hash[:16]}"
@@ -372,8 +430,10 @@ class _Context:
     """Each committed plan's action receipt id, from the chain."""
     plan_records: dict[str, list[str]]
     """The hashes of each plan's commit records, which its charge's memo names."""
+    spends: dict[str, LedgerEntry]
+    """The ledger's first spend under each memo, in whatever scope it was
+    charged to."""
     log: ReceiptLog
-    ledger: BudgetManager | None
     operators: _Operators | None
     legacy: Any
 
@@ -404,8 +464,11 @@ class _Context:
                     plan_receipts[str(record.plan_id)] = found.group(1)
         credits: dict[uuid.UUID, LedgerEntry] = {}
         plan_credits: dict[str, Decimal] = {}
+        spends: dict[str, LedgerEntry] = {}
         if ledger is not None:
             for entry in ledger.audit_trail():
+                if entry.entry_type is EntryType.SPEND:
+                    spends.setdefault(entry.memo, entry)
                 compensation = _credited(entry)
                 if compensation is None:
                     continue
@@ -428,8 +491,8 @@ class _Context:
             plan_credits=plan_credits,
             plan_receipts=plan_receipts,
             plan_records=plan_records,
+            spends=spends,
             log=log,
-            ledger=ledger,
             operators=operators,
             legacy=legacy,
         )
@@ -446,19 +509,15 @@ class _Context:
         return document
 
     def charge(self, original: LoggedMessage) -> LedgerEntry | None:
-        """The ledger's charge for the plan that committed ``original``: the
-        spend whose memo names one of its commit records."""
-        if self.ledger is None:
-            return None
-        memos = {f"interlock:{h[:16]}" for h in self.plan_records.get(original.plan_id, ())}
-        return next(
-            (
-                entry
-                for entry in self.ledger.audit_trail(original.scope_id)
-                if entry.entry_type is EntryType.SPEND and entry.memo in memos
-            ),
-            None,
-        )
+        """The ledger's charge for the plan that committed ``original``: its
+        first spend whose memo names one of the plan's commit records. Found by
+        the memo alone; the scope the outbox row names is not consulted."""
+        found = [
+            self.spends[memo]
+            for memo in (f"interlock:{h[:16]}" for h in self.plan_records.get(original.plan_id, ()))
+            if memo in self.spends
+        ]
+        return min(found, key=lambda entry: entry.sequence, default=None)
 
     def credited(self, plan_id: str) -> Decimal:
         return self.plan_credits.get(plan_id, Decimal(0))

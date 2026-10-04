@@ -40,12 +40,15 @@ Releases before 0.1.2 are described by their tags and commit history.
   can neither read nor write window history.
 - **Settlement** (`interlock.settlement.Settler`). Each delivered request gets an ARC1
   delivery receipt, signed by the receipt log, carrying the relay's attestation, bound to
-  the action receipt of the plan that committed it; each delivered compensation credits
-  the agent's scope, through AgentGov `refund()`, the `cost_per_call` the ledger charged
-  for the original request, only under a signed operator intent naming it. Exactly once
-  across crashes: `tests/test_settlement_crash.py` kills a settler after the receipt, the
-  credit and the settlement row, on both stores. `settler_roles` at install;
-  `verify_settlements`; `ReceiptIssuer.issue_delivery`.
+  the action receipt of the plan its relay-attested idempotency key was derived from;
+  each delivered compensation credits, through AgentGov `refund()`, the `cost_per_call`
+  the engine's sink registry (`Settler(sinks=...)`) prices the original at, which is what
+  its plan was charged for it, to the scope the ledger charged, only under a signed
+  operator intent naming it, and only when the outbox row agrees with the registry and
+  the compensation's signed key. No outbox column sets the amount or the scope. Exactly
+  once across crashes: `tests/test_settlement_crash.py` kills a settler after the
+  receipt, the credit and the settlement row, on both stores. `settler_roles` at
+  install; `verify_settlements`; `ReceiptIssuer.issue_delivery`.
 
 ### Changed (Epic 4)
 
