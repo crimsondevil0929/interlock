@@ -45,6 +45,7 @@ from interlock import (
 from interlock.adapters import HttpAdapter
 from interlock.attestations import AttestationReport, verify_attestations
 from interlock.deliveries import (
+    LegacyVouch,
     LogEvent,
     OutboxOperations,
     event_hash,
@@ -57,6 +58,7 @@ from interlock.operators import (
     OperatorLog,
     OperatorRefusedError,
     OperatorReport,
+    legacy_vouch,
     verify_operators,
 )
 from interlock.outbound import DEAD_LETTER, OperationSpec, SinkRegistry, SinkSpec
@@ -95,6 +97,22 @@ def relay_signer() -> Ed25519Signer:
 
 RELAYS = Keyring({"relay": relay_signer().public_key()})
 """``[relays.keys]``, as the tests register their relays."""
+
+
+INSTALLER = Ed25519Signer(bytes.fromhex("1e" * 32))
+"""The operator who signs installs in the tests."""
+INSTALLERS = Keyring({"installer": INSTALLER.public_key()})
+
+
+def vouch(source: object, log: Path) -> LegacyVouch:
+    """Sign an install record over ``source`` into the operator log at
+    ``log``, as ``interlock install`` under ``[operators]`` does after it
+    installs; the legacy set it vouches for."""
+    with OperatorLog(log, INSTALLER, INSTALLERS) as signed:
+        Operator(signed, deliveries.operations(source)).installed()
+        found = legacy_vouch(signed.records(), INSTALLERS)
+    assert found is not None
+    return found
 
 
 def relays_section(directory: Path) -> str:

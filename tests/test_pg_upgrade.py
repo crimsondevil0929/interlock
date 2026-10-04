@@ -22,6 +22,7 @@ it, and:
 
 from __future__ import annotations
 
+import dataclasses
 import time
 import uuid
 from collections.abc import Iterator
@@ -39,9 +40,16 @@ from psycopg.conninfo import make_conninfo  # noqa: E402
 import interlock.postgres as installer  # noqa: E402
 from interlock import EscrowEngine, PlanBuilder, PostgresSubstrate  # noqa: E402
 from interlock.attestations import verify_attestations  # noqa: E402
-from interlock.deliveries import message_log, verify_delivery_log  # noqa: E402
+from interlock.deliveries import (  # noqa: E402
+    LegacyVouch,
+    PostgresReader,
+    message_log,
+    verify_delivery_log,
+)
 from interlock.exceptions import SubstrateConfigurationError  # noqa: E402
+from interlock.operators import verify_operators  # noqa: E402
 from interlock.outbox_store import PostgresOutboxStore, milliseconds  # noqa: E402
+from interlock.records import read_records  # noqa: E402
 from interlock.relay import (  # noqa: E402
     DELIVERED,
     RETRYABLE,
@@ -53,6 +61,7 @@ from tests import outbox_v2 as v2  # noqa: E402
 from tests import outbox_v3 as v3  # noqa: E402
 from tests.conftest import OBSERVED, PASSWORD, create_role, drop_role  # noqa: E402
 from tests.outbox_env import (  # noqa: E402
+    INSTALLERS,
     REGISTRY,
     RELAY_SINKS,
     RELAYS,
@@ -60,6 +69,7 @@ from tests.outbox_env import (  # noqa: E402
     Scripted,
     mail,
     relay_signer,
+    vouch,
 )
 from tests.schemas import specs  # noqa: E402
 
@@ -98,6 +108,8 @@ class Upgrade:
     relay: str
     stage_role: str
     relay_role: str
+    operators: Path
+    """The operator log the upgrade's install is signed into."""
 
     def install(self) -> None:
         with psycopg.connect(self.admin, autocommit=True) as conn:
@@ -125,7 +137,11 @@ class Upgrade:
 
 
 def _installed(
-    pg_admin_dsn: str, back_office: str, monkeypatch: pytest.MonkeyPatch, version: dict[str, Any]
+    pg_admin_dsn: str,
+    back_office: str,
+    monkeypatch: pytest.MonkeyPatch,
+    version: dict[str, Any],
+    operators: Path,
 ) -> Iterator[Upgrade]:
     stage_role = f"il_agent_{uuid.uuid4().hex[:10]}"
     relay_role = f"il_relay_{uuid.uuid4().hex[:10]}"
@@ -137,6 +153,7 @@ def _installed(
         relay=make_conninfo(back_office, user=relay_role, password=PASSWORD),
         stage_role=stage_role,
         relay_role=relay_role,
+        operators=operators,
     )
     try:
         with monkeypatch.context() as patch:
@@ -156,18 +173,22 @@ def _installed(
 
 @pytest.fixture
 def upgrade(
-    pg_admin_dsn: str, pg_back_office: str, monkeypatch: pytest.MonkeyPatch
+    pg_admin_dsn: str, pg_back_office: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> Iterator[Upgrade]:
     """A back office version 2 installed, its outbox included."""
-    yield from _installed(pg_admin_dsn, pg_back_office, monkeypatch, VERSION_2)
+    yield from _installed(
+        pg_admin_dsn, pg_back_office, monkeypatch, VERSION_2, tmp_path / "operators.ilok1"
+    )
 
 
 @pytest.fixture
 def upgrade3(
-    pg_admin_dsn: str, pg_back_office: str, monkeypatch: pytest.MonkeyPatch
+    pg_admin_dsn: str, pg_back_office: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> Iterator[Upgrade]:
     """A back office version 3 installed."""
-    yield from _installed(pg_admin_dsn, pg_back_office, monkeypatch, VERSION_3)
+    yield from _installed(
+        pg_admin_dsn, pg_back_office, monkeypatch, VERSION_3, tmp_path / "operators.ilok1"
+    )
 
 
 class OldStore(PostgresOutboxStore):
@@ -287,11 +308,12 @@ def _old_traffic(
     return Traffic(delivered, failed, untried, rows)
 
 
-def _upgraded(upgrade: Upgrade, traffic: Traffic) -> None:
-    """Version 4, in place: every old row unchanged, every log verifying, every
-    old outcome counted as legacy."""
+def _upgraded(upgrade: Upgrade, traffic: Traffic, *, operator_rows: int = 0) -> LegacyVouch:
+    """Version 4, in place: every old row unchanged, every log verifying, the
+    old outcomes (and ``operator_rows`` unsigned operator rows) the legacy set,
+    recorded once and vouched for by the install's signature."""
     upgrade.install()
-    with psycopg.connect(upgrade.admin) as conn:
+    with psycopg.connect(upgrade.admin, autocommit=True) as conn:
         version = conn.execute("SELECT DISTINCT version FROM interlock.installation").fetchall()
         assert version == [("4",)]
         assert installer.installed_version(conn) == 4
@@ -299,10 +321,21 @@ def _upgraded(upgrade: Upgrade, traffic: Traffic) -> None:
         assert set(kinds.values()) == {"http"}
         assert upgrade.log_rows() == traffic.rows
         assert verify_delivery_log(conn) == ()
-        report = verify_attestations(conn, RELAYS)
+        recorded = PostgresReader(conn).legacy()
+        assert recorded is not None and len(recorded) == 2 + operator_rows
+        (unvouched,) = verify_attestations(conn, RELAYS).problems
+        assert "no signed install vouches" in unvouched
+        vouched = vouch(conn, upgrade.operators)
+        report = verify_attestations(conn, RELAYS, legacy=vouched)
         assert (report.problems, report.attested, report.legacy) == ((), 0, 2)
+        operators = verify_operators(conn, read_records(upgrade.operators), INSTALLERS)
+        assert (operators.problems, operators.legacy) == ((), operator_rows)
     upgrade.install()  # and again: nothing changes
     assert upgrade.log_rows() == traffic.rows
+    with psycopg.connect(upgrade.admin, autocommit=True) as conn:
+        again = PostgresReader(conn).legacy()
+        assert again is not None and again.digest == vouched.digest
+    return vouched
 
 
 def _deliver_all(upgrade: Upgrade) -> None:
@@ -320,7 +353,8 @@ def _deliver_all(upgrade: Upgrade) -> None:
             new.run_once(limit=10)
             with psycopg.connect(upgrade.admin) as conn:
                 left = conn.execute(
-                    "SELECT count(*) FROM interlock.outbox_state WHERE state <> 'delivered'"
+                    "SELECT count(*) FROM interlock.outbox_state "
+                    "WHERE state IN ('pending', 'leased', 'held')"
                 ).fetchone()
             if left == (0,):
                 return
@@ -332,7 +366,22 @@ def test_version_4_over_version_2_keeps_every_log_and_carries_on(
     upgrade: Upgrade, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     traffic = _old_traffic(upgrade, Version2Store, 2, monkeypatch)
-    _upgraded(upgrade, traffic)
+    # And an operator's action under version 2, which had no operator log:
+    # a cancel no one signed.
+    with monkeypatch.context() as patch:
+        patch.setattr(installer, "installed_version", lambda conn: 4)
+        plan = PlanBuilder(SCOPE).enqueue(**_mail(9)).build()
+        assert upgrade.engine().execute(plan).committed
+    with psycopg.connect(upgrade.admin, autocommit=True) as conn:
+        found = conn.execute(
+            "SELECT message_id FROM interlock.outbox WHERE plan_id = %s", (plan.plan_id,)
+        ).fetchone()
+        assert found is not None
+        cancelled = found[0]
+        cancel = "SELECT interlock.outbox_cancel(%s, 'operator:dba', 'version 2')"
+        assert conn.execute(cancel, (cancelled,)).fetchone() == (True,)
+    traffic = dataclasses.replace(traffic, rows=upgrade.log_rows())
+    vouched = _upgraded(upgrade, traffic, operator_rows=1)
     _deliver_all(upgrade)
     with psycopg.connect(upgrade.admin) as conn:
         assert verify_delivery_log(conn) == ()
@@ -348,7 +397,7 @@ def test_version_4_over_version_2_keeps_every_log_and_carries_on(
             ("delivered", "ref_1"),
         ]
         assert [e.event for e in message_log(conn, traffic.delivered)] == ["sending", "delivered"]
-        report = verify_attestations(conn, RELAYS)
+        report = verify_attestations(conn, RELAYS, legacy=vouched)
         assert (report.problems, report.attested, report.legacy) == ((), 2, 2)
     after = upgrade.log_rows()
     assert set(traffic.rows) <= set(after) and len(after) == len(traffic.rows) + 4
@@ -363,7 +412,7 @@ def test_version_4_over_version_3_keeps_every_log_and_carries_on(
             ("sending", None),
             ("delivered", "ref_1"),
         ]
-    _upgraded(upgrade3, traffic)
+    vouched = _upgraded(upgrade3, traffic)
 
     # A relay of version 3 left running claims and starts a call, but cannot
     # record what came back: version 4 records no outcome unattested. The
@@ -389,7 +438,7 @@ def test_version_4_over_version_3_keeps_every_log_and_carries_on(
             ("sending", "version-4"),
             ("delivered", "version-4"),
         ]
-        report = verify_attestations(conn, RELAYS)
+        report = verify_attestations(conn, RELAYS, legacy=vouched)
         assert (report.problems, report.attested, report.legacy) == ((), 2, 2)
 
 

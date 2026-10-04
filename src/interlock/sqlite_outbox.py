@@ -48,6 +48,7 @@ from interlock.deliveries import (
     _REGISTRY_COLUMNS,
     AuthorizedRow,
     Compensable,
+    LegacySet,
     LogEvent,
     LoggedMessage,
     MessageView,
@@ -86,7 +87,8 @@ OUTBOX: Final = "_interlock_outbox"
 STATE: Final = "_interlock_outbox_state"
 LOG: Final = "_interlock_outbox_attempts"
 EPOCHS: Final = "_interlock_outbox_epochs"
-OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG, EPOCHS})
+LEGACY: Final = "_interlock_outbox_legacy"
+OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY})
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -225,6 +227,18 @@ _SCHEMA: Final = (
     END""",
     # When this outbox was installed: every operator row after it is signed.
     f"CREATE TABLE IF NOT EXISTS main.{EPOCHS} (version TEXT PRIMARY KEY, at INTEGER NOT NULL)",
+    # The legacy set (interlock.deliveries.LegacySet): recorded once, as
+    # version 4 is first installed, and never written again.
+    f"CREATE TABLE IF NOT EXISTS main.{LEGACY} (message_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+    f"event_hash TEXT NOT NULL, PRIMARY KEY (message_id, seq))",
+    f"CREATE TRIGGER IF NOT EXISTS _interlock_legacy_no_update BEFORE UPDATE ON {LEGACY} "
+    f"BEGIN SELECT RAISE(ABORT, 'interlock: {LEGACY} is append-only'); END",
+    f"CREATE TRIGGER IF NOT EXISTS _interlock_legacy_no_delete BEFORE DELETE ON {LEGACY} "
+    f"BEGIN SELECT RAISE(ABORT, 'interlock: {LEGACY} is append-only'); END",
+    f"CREATE TRIGGER IF NOT EXISTS _interlock_legacy_sealed BEFORE INSERT ON {LEGACY} "
+    f"WHEN EXISTS (SELECT 1 FROM {EPOCHS} WHERE version = '4') "
+    f"BEGIN SELECT RAISE(ABORT, 'interlock: the legacy set was recorded when version 4 was "
+    f"installed'); END",
 )
 
 LOG_TRIGGERS: Final = (
@@ -325,7 +339,7 @@ def outbox_installed(conn: sqlite3.Connection) -> bool:
     return bool(row and row[0] == 4)
 
 
-def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> None:
+def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> LegacySet:
     """Install the outbox in a SQLite file, and mirror the sink registry. Idempotent.
 
     Switches the file to WAL first, so a relay's and an operator's reads never
@@ -333,6 +347,11 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
     the file must then be on this host. A sink installed before and not listed
     now is disabled, not deleted: requests in the outbox name it.
 
+    The install that first brings version 4 records the legacy set
+    (:class:`~interlock.deliveries.LegacySet`); no later one adds to it.
+
+    :returns: The legacy set, as this install's transaction read it: what a
+        signed install vouches for.
     :raises SubstrateConfigurationError: If the file cannot be put in WAL mode
         (an in-memory database, say).
     """
@@ -355,6 +374,18 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
                 conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             for statement in _SCHEMA:
                 conn.execute(statement)
+            if conn.execute(f"SELECT 1 FROM {EPOCHS} WHERE version = '4'").fetchone() is None:
+                # Version 4 is being installed: the rows written before the
+                # proof their kind now carries are the legacy set, recorded
+                # here once, under the write lock this transaction holds.
+                conn.execute(
+                    f"INSERT INTO {LEGACY} (message_id, seq, event_hash) "
+                    f"SELECT message_id, seq, event_hash FROM {LOG} "
+                    f"WHERE (event IN ('delivered', 'retryable', 'permanent', 'unknown') "
+                    f"       AND attestation IS NULL) "
+                    f"   OR (event IN ('released', 'cancelled', 'requeued', 'compensated') "
+                    f"       AND authority IS NULL)"
+                )
             for version in ("3", "4"):
                 conn.execute(
                     f"INSERT OR IGNORE INTO {EPOCHS} (version, at) VALUES (?, ?)",
@@ -397,6 +428,8 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
                 f"WHERE name NOT IN (SELECT value FROM json_each(?))",
                 (json.dumps([s.name for s in listed]),),
             )
+            legacy = _legacy(conn)
+            assert legacy is not None
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -404,6 +437,23 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> N
             raise
     finally:
         conn.close()
+    return legacy
+
+
+def _legacy(conn: sqlite3.Connection) -> LegacySet | None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (LEGACY,)
+        ).fetchone()
+        is None
+    ):
+        return None
+    return LegacySet(
+        {
+            (uuid.UUID(str(r[0])), int(r[1])): str(r[2])
+            for r in conn.execute(f"SELECT message_id, seq, event_hash FROM {LEGACY}")
+        }
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1395,12 +1445,11 @@ class SqliteOutboxStore:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
-                enqueued_at=instant(int(m[13])),
             )
             for m in self._conn.execute(
                 f"SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
                 f"o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, "
-                f"s.log_seq, s.log_head, o.enqueued_at FROM {OUTBOX} AS o JOIN {STATE} AS s "
+                f"s.log_seq, s.log_head FROM {OUTBOX} AS o JOIN {STATE} AS s "
                 f"ON s.message_id = o.message_id "
                 f"WHERE ?1 IS NULL OR o.message_id IN (SELECT value FROM json_each(?1)) "
                 f"ORDER BY o.enqueued_at, o.message_id",
@@ -1490,6 +1539,9 @@ class SqliteOutboxStore:
             f"SELECT at FROM {EPOCHS} WHERE version = ?", (version,)
         ).fetchone()
         return None if row is None else instant(int(row[0]))
+
+    def legacy(self) -> LegacySet | None:
+        return _legacy(self._conn)
 
     def authorized(self, authority: str) -> list[AuthorizedRow]:
         return [

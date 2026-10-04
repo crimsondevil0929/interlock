@@ -175,10 +175,37 @@ ALTER TABLE interlock.outbox_attempts
 
 -- Version 4, in place over version 3: every outcome a relay records carries
 -- its Ed25519 attestation (docs/EPIC4_DESIGN.md §2). The column is NULL in
--- every row written before, and a row without one hashes as before. Outcome
--- rows older than version 4's epoch are version 3's, unattested.
+-- every row written before, and a row without one hashes as before.
 ALTER TABLE interlock.outbox_attempts ADD COLUMN IF NOT EXISTS attestation text;
-INSERT INTO interlock.outbox_epochs (version) VALUES ('4') ON CONFLICT (version) DO NOTHING;
+
+-- The legacy set: the rows written before the proof their kind now carries,
+-- an outcome without an attestation, an operator's row without an authority.
+-- Recorded once, in the transaction that first installs version 4, with the
+-- log held still; from then on the database refuses such a row, so nothing is
+-- ever added. A signed install vouches for it (interlock.operators), so a row
+-- forged into an old log later is not in it, however early it is dated.
+CREATE TABLE IF NOT EXISTS interlock.outbox_legacy (
+    message_id uuid NOT NULL,
+    seq        integer NOT NULL,
+    event_hash text NOT NULL,
+    PRIMARY KEY (message_id, seq)
+);
+REVOKE ALL ON interlock.outbox_legacy FROM PUBLIC;
+DO $legacy$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
+        LOCK TABLE interlock.outbox_attempts IN SHARE MODE;
+        INSERT INTO interlock.outbox_legacy (message_id, seq, event_hash)
+        SELECT a.message_id, a.seq, a.event_hash
+          FROM interlock.outbox_attempts AS a
+         WHERE (a.event IN ('delivered', 'retryable', 'permanent', 'unknown')
+                AND a.attestation IS NULL)
+            OR (a.event IN ('released', 'cancelled', 'requeued', 'compensated')
+                AND a.authority IS NULL);
+        INSERT INTO interlock.outbox_epochs (version) VALUES ('4');
+    END IF;
+END
+$legacy$;
 DO $upgrade$
 BEGIN
     IF NOT EXISTS (
@@ -489,6 +516,22 @@ AS $fn$
 BEGIN
     RAISE EXCEPTION 'interlock: % is append-only; % refused', TG_TABLE_NAME, TG_OP
         USING ERRCODE = 'IL002';
+END
+$fn$;
+
+-- The legacy set is written once, by the install that first brings version
+-- 4, before its epoch is: after that, not a row more.
+CREATE OR REPLACE FUNCTION interlock.outbox_legacy_sealed()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    IF EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
+        RAISE EXCEPTION 'interlock: the legacy set was recorded when version 4 was installed'
+            USING ERRCODE = 'IL002';
+    END IF;
+    RETURN NEW;
 END
 $fn$;
 
@@ -1264,6 +1307,18 @@ CREATE TRIGGER outbox_log_link BEFORE INSERT ON interlock.outbox_attempts
 ALTER TABLE interlock.outbox_attempts ENABLE ALWAYS TRIGGER attempts_append_only,
     ENABLE ALWAYS TRIGGER attempts_append_only_truncate,
     ENABLE ALWAYS TRIGGER outbox_log_link;
+DROP TRIGGER IF EXISTS legacy_append_only ON interlock.outbox_legacy;
+CREATE TRIGGER legacy_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_legacy
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS legacy_append_only_truncate ON interlock.outbox_legacy;
+CREATE TRIGGER legacy_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_legacy
+    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS legacy_sealed ON interlock.outbox_legacy;
+CREATE TRIGGER legacy_sealed BEFORE INSERT ON interlock.outbox_legacy
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_legacy_sealed();
+ALTER TABLE interlock.outbox_legacy ENABLE ALWAYS TRIGGER legacy_append_only,
+    ENABLE ALWAYS TRIGGER legacy_append_only_truncate,
+    ENABLE ALWAYS TRIGGER legacy_sealed;
 """
 
 OUTBOX_TRIGGER_NAMES: Final = (

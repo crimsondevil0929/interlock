@@ -46,6 +46,7 @@ from interlock.attestations import attestation_of, verify_attestations
 from interlock.cli import main
 from interlock.deliveries import OUTCOMES, LogEvent, reader, verify_delivery_log
 from interlock.exceptions import SubstrateConfigurationError
+from interlock.operators import OperatorRefusedError
 from interlock.relay import DELIVERED, RETRYABLE, DeliveryResult, NoBreaker, Relay
 from interlock.sqlite_outbox import (
     OPERATOR,
@@ -58,11 +59,14 @@ from tests.conftest import OBSERVED, build_sqlite_back_office
 from tests.fakesink import DROP, FakeSink, status
 from tests.outbox_env import (
     BACKENDS,
+    INSTALLER,
+    INSTALLERS,
     REGISTRY,
     RELAY_SINKS,
     RELAYS,
     SCOPE,
     Outbox,
+    PostgresOutbox,
     Scripted,
     SqliteOutbox,
     build_either,
@@ -71,6 +75,7 @@ from tests.outbox_env import (
     relay_signer,
     relays_section,
     sms,
+    vouch,
 )
 from tests.schemas import specs
 
@@ -262,11 +267,12 @@ def test_a_failure_rewritten_as_a_delivery_is_named(outbox: Outbox) -> None:
     assert f"message {message}: row 2 (delivered) says what relay relay never attested" in found
 
 
-def test_an_outcome_backdated_past_version_4_is_named(outbox: Outbox) -> None:
-    """An unattested outcome dated before version 4 was installed is version
-    3's only if it could be: never on a message enqueued since, whether its
-    log was empty or a relay had started a call. (After a row of version 4's
-    on an older message: ``test_backdating_on_a_message_of_version_3``.)"""
+def test_an_unattested_outcome_outside_the_legacy_set_is_named_however_dated(
+    outbox: Outbox,
+) -> None:
+    """Dated before version 4 was installed, on an empty log or after a call a
+    relay started: neither is in the legacy set version 4 recorded, and the
+    date buys nothing."""
     epoch = reader(outbox.operator()).epoch("4")
     assert epoch is not None
     before = epoch - timedelta(hours=1)
@@ -293,8 +299,11 @@ def test_an_outcome_backdated_past_version_4_is_named(outbox: Outbox) -> None:
     found = problems(outbox)
     assert len(found) == 2
     for message in (untried, started):
-        assert any(f"{message}: row 2 (delivered) is dated before" in p for p in found)
-    assert all("on a message enqueued after it" in p for p in found)
+        assert any(
+            f"{message}: row 2 (delivered) carries no relay attestation, and is not in the "
+            f"legacy set" in p
+            for p in found
+        )
     assert outbox.attestations().legacy == 0
 
 
@@ -534,7 +543,17 @@ def test_version_4_over_version_3_on_sqlite(tmp_path: Path) -> None:
     operator = SqliteOutboxStore(path, writes=OPERATOR)
     try:
         assert verify_delivery_log(operator) == ()
-        report = verify_attestations(operator, RELAYS)
+        # Version 3's two outcomes are the legacy set, recorded once: the
+        # second install added nothing.
+        recorded = operator.legacy()
+        assert recorded is not None and len(recorded) == 2
+        # Until a signed install vouches for it, it rests on the database's word.
+        (unvouched,) = verify_attestations(operator, RELAYS).problems
+        assert "2 outcome(s) from before version 4" in unvouched
+        assert "no signed install vouches" in unvouched
+        vouched = vouch(operator, tmp_path / "operators.ilok1")
+        assert (vouched.rows, vouched.digest) == (2, recorded.digest)
+        report = verify_attestations(operator, RELAYS, legacy=vouched)
         assert (report.problems, report.attested, report.legacy) == ((), 0, 2)
     finally:
         operator.close()
@@ -575,43 +594,61 @@ def test_version_4_over_version_3_on_sqlite(tmp_path: Path) -> None:
     operator = SqliteOutboxStore(path, writes=OPERATOR)
     try:
         assert verify_delivery_log(operator) == ()
-        report = verify_attestations(operator, RELAYS)
+        report = verify_attestations(operator, RELAYS, legacy=vouched)
         assert (report.problems, report.attested, report.legacy) == ((), 2, 2)
     finally:
         operator.close()
     assert Path(v3.__file__).name == "sqlite_outbox_v3.py"
 
 
-def test_backdating_on_a_message_of_version_3(tmp_path: Path) -> None:
-    """On a message version 3 enqueued: an unattested outcome backdated after
-    a row of version 4's is named; one in a log version 4 never wrote to is
-    what verification cannot tell from version 3's, and counts as legacy. It
-    rests on the database's word, as every row did before version 4."""
-    path = build_sqlite_back_office(tmp_path / "app.sqlite")
+def _version_3_traffic(path: str) -> uuid.UUID:
+    """Three requests staged under version 3, one delivered by its relay: the
+    delivered message."""
     v3.install_sqlite_outbox(path, RELAY_SINKS)
     engine = EscrowEngine(
         SqliteSubstrate(path, tables=specs(*OBSERVED)), checkers=[], sinks=REGISTRY
     )
-    for n in range(2):
+    for n in range(3):
         request = mail(n)
         plan = PlanBuilder(SCOPE).enqueue(
             sink=request.sink, operation=request.operation, payload=request.payload
         )
         assert engine.execute(plan.build()).committed
+    with Relay(
+        Version3Store(path),
+        adapters={"mail": Scripted(DELIVERED)},
+        breaker=NoBreaker(),
+        relay_id="version-3",
+        signer=relay_signer(),
+    ) as old:
+        (lease,) = old._claim(1)
+        assert old._deliver(lease) == "delivered"
+        return lease.message_id
+
+
+def test_a_row_forged_into_an_old_log_is_not_legacy(tmp_path: Path) -> None:
+    """The gap the legacy set closes: on messages version 3 enqueued, an
+    unattested outcome dated before version 4, in a log version 4 never wrote
+    to, or after a call it started, is not in the set version 4 recorded and
+    an install vouched for. Version 3's own outcome is."""
+    path = build_sqlite_back_office(tmp_path / "app.sqlite")
+    delivered = _version_3_traffic(path)
     install_sqlite_outbox(path, RELAY_SINKS)
-    store = SqliteOutboxStore(path)
-    try:
-        (lease,) = store.claim("r", timedelta(seconds=10), 1, ["mail"], 0.0)
-        assert store.sending(lease, "r", "breaker clear at test") == 1
-    finally:
-        store.close()
     owner = owned(path, tmp_path)
     try:
+        vouched = vouch(owner.operator(), tmp_path / "operators.ilok1")
+        assert vouched.rows == 1
+        store = SqliteOutboxStore(path)
+        try:
+            (lease,) = store.claim("r", timedelta(seconds=10), 1, ["mail"], 0.0)
+            assert store.sending(lease, "r", "breaker clear at test") == 1
+        finally:
+            store.close()
         messages = [m.message_id for m in reader(owner.operator()).snapshot(None)[0]]
-        (untried,) = [m for m in messages if m != lease.message_id]
+        (untried,) = [m for m in messages if m not in (delivered, lease.message_id)]
         epoch = reader(owner.operator()).epoch("4")
         assert epoch is not None
-        ghost(owner, untried, None, at=epoch - timedelta(seconds=1))
+        ghost(owner, untried, None, at=epoch - timedelta(days=30))
         owner.forge(
             lease.message_id,
             DELIVERED,
@@ -623,10 +660,193 @@ def test_backdating_on_a_message_of_version_3(tmp_path: Path) -> None:
             detail=None,
             at=epoch - timedelta(seconds=1),
         )
-        report = owner.attestations()
-        (found,) = report.problems
-        assert f"{lease.message_id}: row 2 (delivered)" in found
-        assert "after a row of version 4's" in found
+        report = verify_attestations(owner.operator(), RELAYS, legacy=vouched)
+        assert len(report.problems) == 2
+        for message in (untried, lease.message_id):
+            assert any(
+                f"{message}: row 2 (delivered) carries no relay attestation, and is not in "
+                f"the legacy set" in p
+                for p in report.problems
+            )
         assert report.legacy == 1
     finally:
         owner.close()
+
+
+def test_a_legacy_row_rewritten_after_the_upgrade_is_named(tmp_path: Path) -> None:
+    """Version 3's delivered row, rewritten and its log relinked to match: the
+    log verifies, but the legacy set names the row as it was, and the row as it
+    is now is in no set."""
+    path = build_sqlite_back_office(tmp_path / "app.sqlite")
+    delivered = _version_3_traffic(path)
+    install_sqlite_outbox(path, RELAY_SINKS)
+    owner = owned(path, tmp_path)
+    try:
+        vouched = vouch(owner.operator(), tmp_path / "operators.ilok1")
+        owner.rewrite_last(delivered, status_code=299)
+        assert verify_delivery_log(owner.operator()) == ()
+        report = verify_attestations(owner.operator(), RELAYS, legacy=vouched)
+        assert len(report.problems) == 2
+        assert any("is not in the legacy set" in p for p in report.problems)
+        assert any(
+            f"names row 2 of message {delivered}, which its log no longer holds" in p
+            for p in report.problems
+        )
+    finally:
+        owner.close()
+
+
+def test_the_legacy_set_is_recorded_once(outbox: Outbox, tmp_path: Path) -> None:
+    """A row forged after version 4 is installed is not swept into the legacy
+    set by installing again."""
+    vouched = vouch(outbox.operator(), tmp_path / "operators.ilok1")
+    _, (message,) = outbox.commit(mail(1))
+    ghost(outbox, message, None)
+    outbox.reinstall(RELAY_SINKS)
+    recorded = reader(outbox.operator()).legacy()
+    assert recorded is not None and len(recorded) == 0
+    report = verify_attestations(outbox.operator(), RELAYS, legacy=vouched)
+    (found,) = report.problems
+    assert "is not in the legacy set" in found
+
+
+def test_the_legacy_set_takes_no_row_after_version_4(outbox: Outbox) -> None:
+    """Sealed: the owner's plain insert is refused."""
+    _, (message,) = outbox.commit(mail(1))
+    ghost(outbox, message, None)
+    (last,) = outbox.log(message)[-1:]
+    if isinstance(outbox, PostgresOutbox):
+        import psycopg
+
+        with pytest.raises(psycopg.Error, match="recorded when version 4 was installed"):
+            outbox.operator().execute(
+                "INSERT INTO interlock.outbox_legacy VALUES (%s, %s, %s)",
+                (message, last.seq, last.event_hash),
+            )
+    else:
+        assert isinstance(outbox, SqliteOutbox)
+        with closing(outbox.raw()) as conn, pytest.raises(sqlite3.Error, match="version 4"):
+            conn.execute(
+                "INSERT INTO _interlock_outbox_legacy VALUES (?, ?, ?)",
+                (str(message), last.seq, last.event_hash),
+            )
+
+
+def _admit_to_legacy(outbox: Outbox, message: uuid.UUID) -> None:
+    """The owner writes a row into the legacy set itself, around its seal."""
+    (last,) = outbox.log(message)[-1:]
+    if isinstance(outbox, PostgresOutbox):
+        conn = outbox.operator()
+        conn.execute("ALTER TABLE interlock.outbox_legacy DISABLE TRIGGER legacy_sealed")
+        conn.execute(
+            "INSERT INTO interlock.outbox_legacy (message_id, seq, event_hash) VALUES (%s, %s, %s)",
+            (message, last.seq, last.event_hash),
+        )
+    else:
+        assert isinstance(outbox, SqliteOutbox)
+        with closing(outbox.raw()) as conn:
+            conn.execute("DROP TRIGGER _interlock_legacy_sealed")
+            conn.execute(
+                "INSERT INTO _interlock_outbox_legacy (message_id, seq, event_hash) "
+                "VALUES (?, ?, ?)",
+                (str(message), last.seq, last.event_hash),
+            )
+
+
+def test_a_legacy_set_edited_after_its_vouch_is_named_and_never_vouched_again(
+    outbox: Outbox, tmp_path: Path
+) -> None:
+    log = tmp_path / "operators.ilok1"
+    vouched = vouch(outbox.operator(), log)
+    _, (message,) = outbox.commit(mail(1))
+    ghost(outbox, message, None)
+    _admit_to_legacy(outbox, message)
+    report = verify_attestations(outbox.operator(), RELAYS, legacy=vouched)
+    (found,) = report.problems
+    assert found == (
+        f"the legacy set (1 row(s)) is not the one operator record {vouched.record} vouched "
+        f"for (0 row(s)): it was edited around Interlock"
+    )
+    assert report.legacy == 0
+    with pytest.raises(OperatorRefusedError, match="is not the one operator record 1"):
+        vouch(outbox.operator(), log)
+
+
+def test_an_install_vouches_only_for_the_set_its_transaction_read(
+    outbox: Outbox, tmp_path: Path
+) -> None:
+    from interlock.deliveries import LegacySet, operations
+    from interlock.operators import Operator, OperatorLog
+
+    other = LegacySet({(uuid.uuid4(), 2): "0" * 64})
+    with OperatorLog(tmp_path / "operators.ilok1", INSTALLER, INSTALLERS) as log:
+        operator = Operator(log, operations(outbox.operator()))
+        with pytest.raises(OperatorRefusedError, match="changed between the install"):
+            operator.installed(other)
+        assert log.records() == ()
+
+
+def test_an_install_record_vouching_for_another_legacy_set_is_named(
+    outbox: Outbox, tmp_path: Path
+) -> None:
+    """The first install that vouches for the legacy set pins it: a later
+    record vouching for another, however it came to be signed, is named."""
+    from interlock.deliveries import registry_digest
+    from interlock.operators import INSTALLED, OperatorLog, verify_operators
+    from interlock.records import read_records
+
+    log = tmp_path / "operators.ilok1"
+    vouch(outbox.operator(), log)
+    with OperatorLog(log, INSTALLER, INSTALLERS) as signed:
+        signed.append(
+            INSTALLED,
+            {
+                "registry": registry_digest(reader(outbox.operator()).registry()),
+                "sinks": {},
+                "legacy": {"rows": 7, "digest": "0" * 64},
+            },
+        )
+    report = verify_operators(outbox.operator(), read_records(log), INSTALLERS)
+    assert report.problems == (
+        "operator record 2 vouches for another legacy set than record 1 did: the set "
+        "changed after it was first vouched for",
+    )
+
+
+def test_install_signs_the_legacy_set_and_verify_holds_the_database_to_it(
+    tmp_path: Path, sink: FakeSink, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from interlock.operators import generate_key
+
+    database = build_sqlite_back_office(tmp_path / "app.sqlite")
+    key = generate_key(tmp_path / "ops.key")
+    path = tmp_path / "interlock.toml"
+    path.write_text(
+        CONFIG.format(database=database, url=sink.url)
+        + relays_section(tmp_path)
+        + f'\n[operators]\nlog = "operators.ilok1"\n'
+        f'[operators.keys]\nops = "{key.public_key().spec()}"\n'
+    )
+    monkeypatch.setenv("INTERLOCK_OPERATOR_KEY", str(tmp_path / "ops.key"))
+    code, out = cli("install", "--config", str(path))
+    assert code == 0
+    assert "signed by ops: the sink registry and the legacy set (0 row(s)" in out
+    code, out = cli("outbox", "verify", "--config", str(path))
+    assert code == 0 and "every outcome is attested by a registered relay (0)" in out
+
+    # The owner writes a row of their own into the set, and a delivery to go with it.
+    _commit(database, 1)
+    owner = owned(database, tmp_path)
+    try:
+        (message,) = [m.message_id for m in reader(owner.operator()).snapshot(None)[0]]
+        ghost(owner, message, None)
+        _admit_to_legacy(owner, message)
+    finally:
+        owner.close()
+    code, out = cli("outbox", "verify", "--config", str(path))
+    assert code == 1
+    assert "the legacy set (1 row(s)) is not the one operator record 1 vouched for" in out
+    assert out.count("is not the one operator record 1 vouched for") == 1
+    # And no install will vouch for it now.
+    code, _ = cli("install", "--config", str(path))
+    assert code == 1

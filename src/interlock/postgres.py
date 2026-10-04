@@ -61,6 +61,7 @@ from interlock.cascade import (
     log_report,
     read_postgres_foreign_keys,
 )
+from interlock.deliveries import LegacySet, PostgresReader
 from interlock.exceptions import (
     CommitUnsettledError,
     ForbiddenStatementError,
@@ -466,6 +467,7 @@ _OUTBOX_TABLES: Final = (
     "interlock.outbox_state",
     "interlock.outbox_attempts",
     "interlock.outbox_epochs",
+    "interlock.outbox_legacy",
 )
 
 _RELAY_FUNCTIONS: Final = (
@@ -489,7 +491,7 @@ def install(
     audit_roles: Iterable[str] = (),
     sinks: Iterable[SinkSpec] = (),
     relay_roles: Iterable[str] = (),
-) -> None:
+) -> LegacySet:
     """Install Interlock's schema, functions and triggers. Idempotent.
 
     Run once, and again whenever ``tables`` change, as a role that owns the
@@ -529,7 +531,12 @@ def install(
 
     Version 4 (``docs/EPIC4_DESIGN.md`` §2) records each relay's attestation
     with every outcome, and refuses an outcome without one. It upgrades
-    version 3 in place the same way; again, stop the relays first.
+    version 3 in place the same way; again, stop the relays first. The install
+    that brings it records the legacy set
+    (:class:`~interlock.deliveries.LegacySet`), which no later one adds to.
+
+    :returns: The legacy set, as this install's transaction read it: what a
+        signed install vouches for.
     """
     from psycopg import sql
 
@@ -620,6 +627,8 @@ def install(
             conn.execute(f"GRANT SELECT ON {', '.join(_OUTBOX_TABLES)} TO {role}")
             for signature in _RELAY_FUNCTIONS:
                 conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
+        legacy = PostgresReader(conn).legacy()
+    return legacy or LegacySet({})
 
 
 def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> None:

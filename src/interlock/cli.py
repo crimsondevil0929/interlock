@@ -258,21 +258,28 @@ def _install(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> 
         except _RefusedError as exc:
             print(f"interlock: install changes the sink registry: {exc}", file=sys.stderr)
             return EXIT_USAGE
-    code = _install_schema(config, out)
+    code, legacy = _install_schema(config, out)
     if signer is not None:
-        _vouch(config, signer, out)
+        from interlock.operators import OperatorRefusedError
+
+        try:
+            _vouch(config, signer, legacy, out)
+        except OperatorRefusedError as exc:
+            print(f"interlock: install is not vouched for: {exc}", file=sys.stderr)
+            return EXIT_FINDINGS
     return code
 
 
-def _vouch(config: InterlockConfig, signer: Any, out: TextIO) -> None:
-    """Sign the registry the database now mirrors."""
+def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> None:
+    """Sign the registry the database now mirrors, and the legacy set the
+    install's own transaction read."""
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore
 
         store = SqliteOutboxStore(config.database, writes=OPERATOR)
         try:
             with _session(config, store, signer) as operator:
-                record = operator.installed()
+                record = operator.installed(legacy)
         finally:
             store.close()
     else:
@@ -282,33 +289,34 @@ def _vouch(config: InterlockConfig, signer: Any, out: TextIO) -> None:
             psycopg.connect(config.database, autocommit=True) as conn,
             _session(config, conn, signer) as operator,
         ):
-            record = operator.installed()
+            record = operator.installed(legacy)
     print(
-        f"signed by {operator.name}: the sink registry, operator record {record.seq} "
-        f"({record.record_hash[:16]})",
+        f"signed by {operator.name}: the sink registry and the legacy set "
+        f"({record.body['legacy']['rows']} row(s) from before version 4), operator record "
+        f"{record.seq} ({record.record_hash[:16]})",
         file=out,
     )
 
 
-def _install_schema(config: InterlockConfig, out: TextIO) -> int:
+def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         install_sqlite_journal(config.database, config.tables)
-        install_sqlite_outbox(config.database, config.sinks)
+        legacy = install_sqlite_outbox(config.database, config.sinks)
         print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
         print("installed: the outbox, and WAL mode", file=out)
         for sink in config.sinks:
             operations = ", ".join(op.name for op in sink.operations)
             print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
         _print_report(_sqlite(config).check_cascades(), out)
-        return EXIT_OK
+        return EXIT_OK, legacy
     import psycopg
 
     try:
         with psycopg.connect(config.database, autocommit=True) as conn:
-            install(
+            legacy = install(
                 conn,
                 config.tables,
                 schema=config.schema,
@@ -337,7 +345,7 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> int:
     for role in config.relay_roles:
         print(f"granted to relay role: {role}", file=out)
     _print_report(report, out)
-    return EXIT_OK
+    return EXIT_OK, legacy
 
 
 def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
@@ -623,21 +631,24 @@ def _attester(attestation: str | None, keyring: Any) -> str:
 
 
 def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
+    from interlock.operators import legacy_vouch
+    from interlock.records import read_records
+
     problems = list(verify_delivery_log(source))
+    settings = config.operators
+    records = read_records(settings.log) if settings is not None and settings.log.exists() else ()
+    vouch = legacy_vouch(records, settings.keyring()) if settings is not None else None
     keyring = config.relay_keyring()
     attestations = None
     if keyring is not None:
         from interlock.attestations import verify_attestations
 
-        attestations = verify_attestations(source, keyring)
+        attestations = verify_attestations(source, keyring, legacy=vouch)
         problems += attestations.problems
-    settings = config.operators
     legacy = 0
     if settings is not None:
         from interlock.operators import verify_operators
-        from interlock.records import read_records
 
-        records = read_records(settings.log) if settings.log.exists() else ()
         entries = None
         if settings.ledger is not None:
             governor = _ledger(settings.ledger, read_only=True)
@@ -648,6 +659,8 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
         report = verify_operators(source, records, settings.keyring(), ledger=entries)
         problems += report.problems
         legacy = report.legacy
+    # The legacy set is both verifiers' to check: say what is wrong with it once.
+    problems = list(dict.fromkeys(problems))
     for problem in problems:
         print(problem, file=out)
     if problems:
@@ -659,8 +672,9 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
         print(
             f"every outcome is attested by a registered relay ({attestations.attested})"
             + (
-                f", but {attestations.legacy} unsigned from before version 4"
-                if attestations.legacy
+                f", and {attestations.legacy} from before version 4 are in the legacy set "
+                f"operator record {vouch.record} vouched for"
+                if attestations.legacy and vouch is not None
                 else ""
             ),
             file=out,
@@ -668,7 +682,14 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
     if settings is not None:
         print(
             "every operator action is signed, and the operator log verifies"
-            + (f" ({legacy} unsigned from before version 3)" if legacy else ""),
+            + (
+                f" ({legacy} from before version 3, in the legacy set operator record "
+                f"{vouch.record} vouched for)"
+                if legacy and vouch is not None
+                else f" ({legacy} unsigned from before version 3)"
+                if legacy
+                else ""
+            ),
             file=out,
         )
     return EXIT_OK

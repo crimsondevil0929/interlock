@@ -249,8 +249,7 @@ before an upgrade."""
 _MESSAGES: Final = (
     "SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
     "o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, s.log_seq, "
-    "s.log_head, o.enqueued_at "
-    "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
+    "s.log_head FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
     "WHERE %(ids)s::uuid[] IS NULL OR o.message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY o.enqueued_at, o.message_id"
 )
@@ -294,7 +293,6 @@ class LoggedMessage:
     attempts: int
     log_seq: int
     log_head: str
-    enqueued_at: datetime | None = None
 
     def genesis(self) -> str:
         return genesis_hash(
@@ -335,6 +333,85 @@ class OutboxReader(Protocol):
         """Every sink as the database mirrors it, every column, in one form
         for both stores: what a signed install vouches for."""
         ...
+
+    def legacy(self) -> LegacySet | None:
+        """The legacy set version 4 recorded as it was installed, or ``None``
+        before version 4."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class LegacySet:
+    """The delivery-log rows written before the proof their kind now carries:
+    outcomes without a relay's attestation (before version 4), operators' rows
+    without an authority (before version 3).
+
+    Recorded once, in the transaction that first installs version 4, from the
+    rows the log held then; never added to after, since from then on the
+    database refuses such a row. A signed install vouches for its digest
+    (:meth:`interlock.operators.Operator.installed`), so a row forged into an
+    old log later, dated as early as it likes, is not in it: no one who can
+    write the database can pass a new row off as an old one.
+
+    :ivar rows: Each row's ``(message_id, seq)`` and its event hash, which
+        binds everything the row says.
+    """
+
+    rows: Mapping[tuple[uuid.UUID, int], str]
+
+    @property
+    def digest(self) -> str:
+        """What a signed install vouches for: every row, in order, by hash."""
+        from interlock.types import canonical_hash
+
+        return canonical_hash(
+            [
+                "interlock-legacy-v1",
+                [[str(m), seq, digest] for (m, seq), digest in sorted(self.rows.items())],
+            ]
+        )
+
+    def holds(self, event: LogEvent) -> bool:
+        """Whether ``event`` is one of these rows, exactly as it was written."""
+        return self.rows.get((event.message_id, event.seq)) == event.event_hash
+
+    def vanished(self, events: Iterable[LogEvent]) -> list[str]:
+        """These rows, where the logs no longer hold them as recorded."""
+        held = {(e.message_id, e.seq): e.event_hash for e in events}
+        return [
+            f"the legacy set names row {seq} of message {message}, which its log no longer "
+            f"holds as it was recorded"
+            for (message, seq), digest in sorted(self.rows.items())
+            if held.get((message, seq)) != digest
+        ]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyVouch:
+    """The legacy set a signed install vouched for: the first
+    ``operator.installed`` record that carries one pins it for good
+    (:func:`interlock.operators.legacy_vouch`).
+
+    :ivar record: That record's sequence in the operator log.
+    :ivar rows: How many rows the set held.
+    :ivar digest: :attr:`LegacySet.digest` as it was signed.
+    """
+
+    record: int
+    rows: int
+    digest: str
+
+    def problem(self, recorded: LegacySet) -> str | None:
+        """Why ``recorded`` is not the set this vouched for, or ``None``."""
+        if recorded.digest == self.digest and len(recorded) == self.rows:
+            return None
+        return (
+            f"the legacy set ({len(recorded)} row(s)) is not the one operator record "
+            f"{self.record} vouched for ({self.rows} row(s)): it was edited around Interlock"
+        )
 
 
 def registry_digest(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -517,7 +594,6 @@ class PostgresReader:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
-                enqueued_at=m[13],
             )
             for m in self._conn.execute(_MESSAGES, params).fetchall()
         ]
@@ -541,6 +617,21 @@ class PostgresReader:
                 "unknown_outcome, config_hash, enabled FROM interlock.sinks ORDER BY name"
             )
         ]
+
+    def legacy(self) -> LegacySet | None:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.outbox_legacy') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return LegacySet(
+            {
+                (r[0], int(r[1])): str(r[2])
+                for r in self._conn.execute(
+                    "SELECT message_id, seq, event_hash FROM interlock.outbox_legacy"
+                )
+            }
+        )
 
     def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
         return {

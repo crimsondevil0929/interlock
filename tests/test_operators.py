@@ -267,7 +267,7 @@ def test_an_intent_a_killed_command_left_is_resolved_by_the_next(outbox: Outbox)
 @pytest.mark.parametrize(
     ("edit", "named"),
     [
-        ("unsigned", "carries no authority: it was written around Interlock"),
+        ("unsigned", "carries no authority, and is not in the legacy set version 4 recorded"),
         ("unknown authority", "which no signed intent holds"),
         ("replayed authority", "carries the authority of an intent that does not name it"),
         ("another action", "is under the authority of a release intent"),

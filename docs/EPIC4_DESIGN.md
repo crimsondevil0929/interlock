@@ -208,13 +208,11 @@ Where the implementation settled what the design left open, or refined it.
   the ten-argument `relay_outcome` is gone, so it records a call and never its outcome;
   the next relay finds the call lost and makes it again. On SQLite it records nothing:
   the link trigger hashes the attestation through a function only version 4 registers.
-- **Legacy, narrowly.** An unattested outcome counts as version 3's only if it is dated
-  before version 4 was installed, on a message enqueued before then, and not after a row
-  of version 4's in its log; otherwise it is named, backdated. What remains: such an
-  outcome forged into a log version 4 never wrote to, on a message version 3 enqueued, is
-  indistinguishable from version 3's own, and is counted, not trusted. `outbox verify`
-  prints the count. Pinning the legacy set outside the database (the install's signed
-  operator record could vouch for it) would close it; it is left open.
+- **Legacy, pinned.** Outcomes recorded before version 4 carry no attestation. As first
+  built, they were told from forgeries by timestamps, which left one gap: an outcome forged
+  into a log version 4 never wrote to, dated early, passed for version 3's. The gap is
+  closed by the legacy set (below): an unattested outcome is legacy only if the install
+  that brought version 4 recorded it, and a signed install vouches for that record.
 - **A copied attestation is caught twice.** On another call its signature fails; on the
   same call it is a second outcome, which `verify_delivery_log` names.
 - `outbox show` names the relay that attested each outcome; `outbox verify` counts the
@@ -275,3 +273,29 @@ Where the implementation settled what the design left open, or refined it.
 - **Left open:** history is never pruned. Rows older than the longest span are read by no
   check, but they are a record of what each plan added; removing them is the operator's
   call.
+
+### The legacy set: what came before, vouched for
+
+- **Recorded once.** The install that first brings version 4 records, in its own
+  transaction and with the delivery log held still, every row written before the proof
+  its kind now carries: outcomes without a relay's attestation, operators' rows without an
+  authority (version 2's). `interlock.outbox_legacy` on PostgreSQL,
+  `_interlock_outbox_legacy` on SQLite: each row's message, position and event hash, which
+  binds everything the row says. The capture runs only while version 4's epoch does not
+  exist yet; once it does, the table is sealed against inserts, updates and deletes, so a
+  later install never sweeps a forgery into it.
+- **Vouched for.** `interlock install` under `[operators]` signs the set's digest and size
+  into its `operator.installed` record, from the set its own transaction read; one edited
+  in between is not signed. The first record that carries a legacy set pins it: a later
+  install signs it again only unchanged, and `verify_operators` names a record that
+  vouches for another.
+- **Held to it.** An unattested outcome, or an unsigned operator row, is legacy only if it
+  is in the set exactly as recorded, and the set is the one vouched for. Any other is
+  named, however it is dated. A set edited since its vouch, or naming a row its log no
+  longer holds as recorded, is named. Without any vouch, legacy rows rest on the
+  database's word, and verification says so, once, as a finding.
+- **What remains** is what any upgrade has: the set vouches for the database as it stood
+  when version 4 was installed. A forgery made before that is in it; nothing can be added
+  after.
+- A fresh install records an empty set, so on a database that never ran an older version,
+  every outcome must be attested and every operator row signed.
