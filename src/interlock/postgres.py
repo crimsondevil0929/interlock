@@ -112,7 +112,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "4"
+INSTALL_VERSION: Final = "5"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -140,6 +140,9 @@ it does not install, a payload over its bound or not matching its hash."""
 _WINDOWS: Final = "IL009"
 """``interlock.window_totals`` was called inside a stage: the rate windows'
 history is never a stage's to read."""
+_PRUNED: Final = "IL011"
+"""A rate window reaches back past the history a checkpoint pruned
+(``docs/EPIC5_DESIGN.md`` §1.8): it cannot be measured honestly."""
 _UNIQUE: Final = "23505"
 _CANCELLED: Final = "57014"
 _PRIVILEGE: Final = "42501"
@@ -331,6 +334,16 @@ BEGIN
         RAISE EXCEPTION 'interlock: the rate windows'' history is read outside every stage'
             USING ERRCODE = 'IL009';
     END IF;
+    -- A window reaching back before the latest checkpoint's window horizon
+    -- would be read short: what it held there was pruned. Fail closed.
+    IF EXISTS (
+        SELECT 1
+          FROM pg_catalog.unnest(p_spans_us) AS w(span)
+         WHERE now_at - w.span * interval '1 microsecond' < (
+                   SELECT max(c.windows_horizon) FROM interlock.checkpoints AS c)) THEN
+        RAISE EXCEPTION 'interlock: a rate window reaches back past the history a checkpoint '
+            'pruned' USING ERRCODE = 'IL011';
+    END IF;
     RETURN QUERY
         SELECT w.name, w.key,
                coalesce((SELECT sum(l.amount) FROM interlock.window_ledger l
@@ -441,6 +454,11 @@ CREATE INDEX IF NOT EXISTS window_ledger_by_key
 REVOKE ALL ON interlock.window_ledger FROM PUBLIC;
 """
 
+_PRUNED_WINDOW: Final = (
+    "a rate window reaches back past the history a checkpoint pruned: the vacuum was run "
+    "with windows shorter than this engine's. It cannot be measured until it no longer does"
+)
+
 _ENQUEUE_CALL: Final = (
     "interlock.enqueue(%s, %s, %s, %s, %s::text[], %s, %s, %s, %s, %s, %s, %s, %s, %s)"
 )
@@ -469,6 +487,8 @@ _OUTBOX_TABLES: Final = (
     "interlock.outbox_epochs",
     "interlock.outbox_legacy",
     "interlock.outbox_settlements",
+    "interlock.checkpoints",
+    "interlock.outbox_compacted",
 )
 
 _SETTLER_FUNCTIONS: Final = ("interlock.outbox_settle(uuid, text, text, text)",)
@@ -687,10 +707,10 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
 
 
 def installed_version(conn: psycopg.Connection[Any]) -> int:
-    """Which version installed the outbox in this database: 4 when its
-    delivery log records relays' attestations and rate windows keep their
-    history, 3 when the log records what calls created, 2 before; 0 when
-    there is no outbox."""
+    """Which version installed the outbox in this database: 5 when vacuums
+    compact it under checkpoints, 4 when its delivery log records relays'
+    attestations and rate windows keep their history, 3 when the log records
+    what calls created, 2 before; 0 when there is no outbox."""
     row = conn.execute(
         "SELECT pg_catalog.to_regclass('interlock.outbox_attempts') IS NOT NULL, "
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
@@ -699,11 +719,14 @@ def installed_version(conn: psycopg.Connection[Any]) -> int:
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
         "        WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
         "        AND attname = 'attestation' AND NOT attisdropped), "
-        "pg_catalog.to_regclass('interlock.window_ledger') IS NOT NULL"
+        "pg_catalog.to_regclass('interlock.window_ledger') IS NOT NULL, "
+        "pg_catalog.to_regclass('interlock.checkpoints') IS NOT NULL"
     ).fetchone()
     if row is None or not row[0]:
         return 0
-    return 4 if row[2] and row[3] else 3 if row[1] else 2
+    if row[2] and row[3]:
+        return 5 if row[4] else 4
+    return 3 if row[1] else 2
 
 
 def _milliseconds(span: timedelta) -> int:
@@ -1204,6 +1227,8 @@ class PostgresSubstrate:
                     ),
                 ).fetchall()
             except psycopg.Error as exc:
+                if exc.sqlstate == _PRUNED:
+                    raise SubstrateConfigurationError(_PRUNED_WINDOW) from exc
                 raise self._setup_error(exc) from exc
         held = {(str(w), str(k)): Decimal(str(total)) for w, k, total in rows}
         self._charges = tuple(charges)
@@ -1531,7 +1556,8 @@ class PostgresSubstrate:
                   JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                   JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
                   JOIN pg_catalog.pg_namespace pn ON pn.oid = p.pronamespace
-                 WHERE n.nspname = 'interlock' AND c.relname IN ('outbox', 'outbox_attempts')
+                 WHERE n.nspname = 'interlock'
+                   AND c.relname IN ('outbox', 'outbox_attempts', 'outbox_state', 'window_ledger')
                 """
             ).fetchall()
         }

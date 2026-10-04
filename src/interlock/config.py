@@ -104,6 +104,16 @@ Operators sign every action on the outbox (``docs/EPIC3_DESIGN.md`` §6)::
     [operators.keys]                  # public halves only: `interlock operator keygen`
     alice = "ed25519:5f0c..."
 
+A vacuum (``docs/EPIC5_DESIGN.md`` §1) prunes what no check will read again,
+under a checkpoint an operator signs and AgentGov anchors (``[operators]``
+needs its ``ledger``); window history goes only past the longest
+``[[windows]]`` span::
+
+    [vacuum]
+    retain_days = 30                  # a final message stays this long after its last row
+    margin_seconds = 3600             # window history stays this long past the longest span
+    archive = "archive"               # optional: pruned rows written here first, provable
+
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
 relay's in ``INTERLOCK_RELAY_DATABASE``. A sink has no endpoint or credential
@@ -143,6 +153,7 @@ __all__ = [
     "InterlockConfig",
     "OperatorsConfig",
     "RelayConfig",
+    "VacuumConfig",
     "load_config",
 ]
 
@@ -220,6 +231,22 @@ class OperatorsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class VacuumConfig:
+    """``[vacuum]``: what ``interlock vacuum`` keeps (``docs/EPIC5_DESIGN.md`` §1).
+
+    :ivar retain: How long a final message stays after its last log row.
+        Past it, a delivered request can no longer be compensated.
+    :ivar margin: How long window history stays past the longest span.
+    :ivar archive: A directory each checkpoint's pruned rows are written to
+        first, or ``None``.
+    """
+
+    retain: timedelta = timedelta(days=30)
+    margin: timedelta = timedelta(hours=1)
+    archive: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class InterlockConfig:
     substrate: str
     database: str
@@ -239,6 +266,8 @@ class InterlockConfig:
     outcome to one of them."""
     windows: tuple[RateWindow, ...] = ()
     """``[[windows]]``: the rate windows, as an engine takes them."""
+    vacuum: VacuumConfig = VacuumConfig()
+    """``[vacuum]``: what a vacuum keeps."""
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -309,6 +338,7 @@ def load_config(
     operators = _operators(raw.get("operators"), Path(path).parent)
     relays = _relays(raw.get("relays"))
     windows = _windows(raw.get("windows", []), tuple(tables), sinks)
+    vacuum = _vacuum(raw.get("vacuum"), Path(path).parent)
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -324,6 +354,27 @@ def load_config(
         operators=operators,
         relays=relays,
         windows=windows,
+        vacuum=vacuum,
+    )
+
+
+def _vacuum(raw: object, base: Path) -> VacuumConfig:
+    if raw is None:
+        return VacuumConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'vacuum' must be a table ([vacuum])")
+    unknown = sorted(set(raw) - {"retain_days", "margin_seconds", "archive"})
+    if unknown:
+        raise ConfigError(f"[vacuum]: unknown key(s) {', '.join(unknown)}")
+    retain = _integer(raw, "retain_days", 30)
+    margin = _integer(raw, "margin_seconds", 3600)
+    if retain < 0 or margin < 0:
+        raise ConfigError("[vacuum]: retain_days and margin_seconds are not negative")
+    archive = _string(raw, "archive", default="") or None
+    return VacuumConfig(
+        retain=timedelta(days=retain),
+        margin=timedelta(seconds=margin),
+        archive=None if archive is None else base / archive,
     )
 
 

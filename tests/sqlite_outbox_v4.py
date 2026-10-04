@@ -1,4 +1,12 @@
-"""The transactional outbox on SQLite (``docs/EPIC3_DESIGN.md`` §2).
+"""FROZEN: the outbox on SQLite as version 4 installed and relayed it.
+
+``src/interlock/sqlite_outbox.py`` at interlock main ``e3bb0ec`` (Epic 4,
+v0.4.0), verbatim below this note, for ``tests/test_upgrade_v5.py``: version 5
+is installed over a file version 4 installed and relayed. Never edit this file.
+
+The original docstring follows.
+
+The transactional outbox on SQLite (``docs/EPIC3_DESIGN.md`` §2).
 
 The same outbox as PostgreSQL's (``docs/OUTBOX_DESIGN.md``), in the database
 file itself: ``_interlock_sinks``, ``_interlock_outbox``,
@@ -34,7 +42,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -44,15 +52,6 @@ from urllib.parse import quote
 
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 
-from interlock.compaction import (
-    GENESIS,
-    CheckpointRow,
-    Tombstone,
-    WindowRow,
-    tombstone_root,
-    window_root,
-)
-from interlock.compaction import Checkpoint as CheckpointBody
 from interlock.deliveries import (
     _REGISTRY_COLUMNS,
     AuthorizedRow,
@@ -92,10 +91,6 @@ __all__ = [
 
 logger = logging.getLogger("interlock.sqlite_outbox")
 
-VERSION: Final = 5
-"""The outbox version this module installs: 5 compacts under checkpoints
-(``docs/EPIC5_DESIGN.md`` §1)."""
-
 SINKS: Final = "_interlock_sinks"
 OUTBOX: Final = "_interlock_outbox"
 STATE: Final = "_interlock_outbox_state"
@@ -103,27 +98,7 @@ LOG: Final = "_interlock_outbox_attempts"
 EPOCHS: Final = "_interlock_outbox_epochs"
 LEGACY: Final = "_interlock_outbox_legacy"
 SETTLEMENTS: Final = "_interlock_outbox_settlements"
-CHECKPOINTS: Final = "_interlock_checkpoints"
-COMPACTED: Final = "_interlock_outbox_compacted"
-OUTBOX_TABLES: Final = frozenset(
-    {SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS, CHECKPOINTS, COMPACTED}
-)
-
-WINDOWS_TABLE: Final = "_interlock_windows"
-"""What each committed plan added to each rate window (:mod:`interlock.windows`),
-written beside its commit marker, which it references: a row exists exactly
-when its stage committed. ``amount`` is a decimal numeral, ``at`` microseconds
-since the epoch. Created by the substrate and by the outbox's install alike,
-which guards it (version 5): pruned only under a checkpoint."""
-WINDOWS_DDL: Final = (
-    f"CREATE TABLE IF NOT EXISTS main.{WINDOWS_TABLE} ("
-    f"stage_id TEXT NOT NULL REFERENCES _interlock_commits (stage_id) "
-    f"DEFERRABLE INITIALLY DEFERRED, "
-    f"window_name TEXT NOT NULL, key TEXT NOT NULL, amount TEXT NOT NULL, "
-    f"at INTEGER NOT NULL, PRIMARY KEY (stage_id, window_name, key))",
-    f"CREATE INDEX IF NOT EXISTS main.{WINDOWS_TABLE}_by_key "
-    f"ON {WINDOWS_TABLE} (window_name, key, at)",
-)
+OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS})
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -140,43 +115,9 @@ _ATTESTATION_GLOB: Final = (
 """An attestation's shape, ``{alg, key_id, signature}`` as canonical JSON:
 the trigger checks it, verification checks the signature."""
 
-_COMPACTING: Final = (
-    f"SELECT 1 FROM {COMPACTED} AS t JOIN {CHECKPOINTS} AS c ON c.seq = t.checkpoint "
-    f"WHERE t.message_id = OLD.message_id AND c.open = 1"
-)
-"""Whether the row's message was tombstoned by a checkpoint still open: one the
-transaction deleting it wrote, and closes before it commits."""
-
-_SCHEMA_TEMPLATE: Final = (
+_SCHEMA: Final = (
     "CREATE TABLE IF NOT EXISTS main._interlock_commits "
     "(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)",
-    *WINDOWS_DDL,
-    # Version 5: checkpoints, and the tombstones of what they pruned.
-    f"""CREATE TABLE IF NOT EXISTS main.{CHECKPOINTS} (
-        seq             INTEGER PRIMARY KEY CHECK (seq > 0),
-        authority       TEXT NOT NULL CHECK (length(authority) = 64
-                                             AND authority NOT GLOB '*[^0-9a-f]*'),
-        body            TEXT NOT NULL,
-        digest          TEXT NOT NULL,
-        prev            TEXT NOT NULL,
-        windows_horizon INTEGER,
-        open            INTEGER NOT NULL DEFAULT 0 CHECK (open IN (0, 1)),
-        at              INTEGER NOT NULL
-    )""",
-    f"""CREATE TABLE IF NOT EXISTS main.{COMPACTED} (
-        message_id  TEXT PRIMARY KEY,
-        checkpoint  INTEGER NOT NULL REFERENCES {CHECKPOINTS} (seq),
-        stage_id    TEXT NOT NULL,
-        plan_id     TEXT NOT NULL,
-        state       TEXT NOT NULL CHECK (state IN ('delivered', 'cancelled')),
-        log_seq     INTEGER NOT NULL,
-        log_head    TEXT NOT NULL,
-        receipt_id  TEXT,
-        credit      TEXT,
-        cost        TEXT NOT NULL,
-        compensates TEXT
-    )""",
-    f"CREATE INDEX IF NOT EXISTS main.{COMPACTED}_by_checkpoint ON {COMPACTED} (checkpoint)",
     f"""CREATE TABLE IF NOT EXISTS main.{SINKS} (
         name              TEXT PRIMARY KEY,
         kind              TEXT NOT NULL DEFAULT 'http'
@@ -252,15 +193,11 @@ _SCHEMA_TEMPLATE: Final = (
     # The request the checkers adjudicated, and its delivery log, are never edited.
     f"CREATE TRIGGER IF NOT EXISTS _interlock_outbox_no_update BEFORE UPDATE ON {OUTBOX} "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: {OUTBOX} is append-only'); END",
-    # Version 5 (docs/EPIC5_DESIGN.md §1.5): a message a checkpoint still open
-    # tombstoned may be deleted, by the transaction that opened it; nothing else.
     f"CREATE TRIGGER IF NOT EXISTS _interlock_outbox_no_delete BEFORE DELETE ON {OUTBOX} "
-    f"WHEN NOT EXISTS ({{compacting}}) "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: {OUTBOX} is append-only'); END",
     f"CREATE TRIGGER IF NOT EXISTS _interlock_log_no_update BEFORE UPDATE ON {LOG} "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: {LOG} is append-only'); END",
     f"CREATE TRIGGER IF NOT EXISTS _interlock_log_no_delete BEFORE DELETE ON {LOG} "
-    f"WHEN NOT EXISTS ({{compacting}}) "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: {LOG} is append-only'); END",
     # Every row sits at its message's head, links to it, and hashes to what it
     # holds. interlock_event_hash exists only on Interlock's own connections.
@@ -316,44 +253,11 @@ _SCHEMA_TEMPLATE: Final = (
     f"CREATE TRIGGER IF NOT EXISTS _interlock_settlements_no_update BEFORE UPDATE "
     f"ON {SETTLEMENTS} BEGIN SELECT RAISE(ABORT, 'interlock: {SETTLEMENTS} is append-only'); END",
     f"CREATE TRIGGER IF NOT EXISTS _interlock_settlements_no_delete BEFORE DELETE "
-    f"ON {SETTLEMENTS} WHEN NOT EXISTS ({{compacting}}) "
-    f"BEGIN SELECT RAISE(ABORT, 'interlock: {SETTLEMENTS} is append-only'); END",
+    f"ON {SETTLEMENTS} BEGIN SELECT RAISE(ABORT, 'interlock: {SETTLEMENTS} is append-only'); END",
     f"CREATE TRIGGER IF NOT EXISTS _interlock_legacy_sealed BEFORE INSERT ON {LEGACY} "
     f"WHEN EXISTS (SELECT 1 FROM {EPOCHS} WHERE version = '4') "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: the legacy set was recorded when version 4 was "
     f"installed'); END",
-    # Version 5: a state row goes only with its message, compacted; the
-    # checkpoints and tombstones never change, but for a checkpoint closing;
-    # the rate windows' history is pruned only under an open checkpoint.
-    f"CREATE TRIGGER IF NOT EXISTS _interlock_state_no_delete BEFORE DELETE ON {STATE} "
-    f"WHEN NOT EXISTS ({{compacting}}) "
-    f"BEGIN SELECT RAISE(ABORT, 'interlock: a delivery state goes only with its message'); END",
-    f"""CREATE TRIGGER IF NOT EXISTS _interlock_checkpoints_no_update BEFORE UPDATE
-    ON {CHECKPOINTS}
-    WHEN NOT (OLD.open = 1 AND NEW.open = 0 AND NEW.seq IS OLD.seq
-              AND NEW.authority IS OLD.authority AND NEW.body IS OLD.body
-              AND NEW.digest IS OLD.digest AND NEW.prev IS OLD.prev
-              AND NEW.windows_horizon IS OLD.windows_horizon AND NEW.at IS OLD.at)
-    BEGIN SELECT RAISE(ABORT, 'interlock: {CHECKPOINTS} is append-only'); END""",
-    f"CREATE TRIGGER IF NOT EXISTS _interlock_checkpoints_no_delete BEFORE DELETE "
-    f"ON {CHECKPOINTS} BEGIN SELECT RAISE(ABORT, 'interlock: {CHECKPOINTS} is append-only'); "
-    f"END",
-    f"CREATE TRIGGER IF NOT EXISTS _interlock_compacted_no_update BEFORE UPDATE ON {COMPACTED} "
-    f"BEGIN SELECT RAISE(ABORT, 'interlock: {COMPACTED} is append-only'); END",
-    f"CREATE TRIGGER IF NOT EXISTS _interlock_compacted_no_delete BEFORE DELETE ON {COMPACTED} "
-    f"BEGIN SELECT RAISE(ABORT, 'interlock: {COMPACTED} is append-only'); END",
-    f"CREATE TRIGGER IF NOT EXISTS _interlock_windows_no_update BEFORE UPDATE "
-    f"ON {WINDOWS_TABLE} BEGIN SELECT RAISE(ABORT, 'interlock: {WINDOWS_TABLE} is the rate "
-    f"windows'' history'); END",
-    f"""CREATE TRIGGER IF NOT EXISTS _interlock_windows_no_delete BEFORE DELETE
-    ON {WINDOWS_TABLE}
-    WHEN NOT EXISTS (SELECT 1 FROM {CHECKPOINTS} AS c
-                      WHERE c.open = 1 AND c.windows_horizon IS NOT NULL
-                        AND OLD.at <= c.windows_horizon)
-    BEGIN SELECT RAISE(ABORT, 'interlock: {WINDOWS_TABLE} is the rate windows'' history'); END""",
-)
-_SCHEMA: Final = tuple(
-    statement.replace("{compacting}", _COMPACTING) for statement in _SCHEMA_TEMPLATE
 )
 
 LOG_TRIGGERS: Final = (
@@ -366,13 +270,7 @@ LOG_TRIGGERS: Final = (
     "_interlock_log_authority",
     "_interlock_log_attested",
 )
-_REDEFINED: Final = (
-    "_interlock_log_link",
-    "_interlock_log_attested",
-    "_interlock_outbox_no_delete",
-    "_interlock_log_no_delete",
-    "_interlock_settlements_no_delete",
-)
+_REDEFINED: Final = ("_interlock_log_link", "_interlock_log_attested")
 """Triggers whose definition a later version changed: dropped and created
 again at every install, so an upgraded file runs the current ones."""
 
@@ -444,18 +342,12 @@ def _event_hash_sql(
 
 
 def installed_version(conn: sqlite3.Connection) -> int:
-    """Which version installed the outbox in this file: 5 when vacuums compact
-    it under checkpoints, 4 when its delivery log records relays'
-    attestations, 3 before; 0 when there is none."""
+    """Which version installed the outbox in this file: 4 when its delivery log
+    records relays' attestations, 3 before; 0 when there is none."""
     if not outbox_installed(conn):
         return 0
     columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({LOG})").fetchall()}
-    if "attestation" not in columns:
-        return 3
-    compacting = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (CHECKPOINTS,)
-    ).fetchone()
-    return 5 if compacting is not None else 4
+    return 4 if "attestation" in columns else 3
 
 
 def outbox_installed(conn: sqlite3.Connection) -> bool:
@@ -766,11 +658,6 @@ OPERATOR: Final = frozenset({OUTBOX, STATE, LOG})
 """What an operator's connection may write: compensations are new requests."""
 SETTLER: Final = frozenset({SETTLEMENTS})
 """What settlement's connection may write: its record, and nothing else."""
-COMPACTOR: Final = frozenset(
-    {OUTBOX, STATE, LOG, SETTLEMENTS, CHECKPOINTS, COMPACTED, WINDOWS_TABLE}
-)
-"""What a vacuum's connection may write: checkpoints and tombstones, and the
-rows it prunes under them (an operator's, whose other actions it takes too)."""
 
 _OUTCOMES: Final = ("delivered", "retryable", "permanent", "unknown")
 
@@ -825,10 +712,10 @@ class SqliteOutboxStore:
                 raise SubstrateConfigurationError(
                     f"no outbox in {path}: run `interlock install` with [[sinks]] configured"
                 )
-            if version < VERSION:
+            if version < 4:
                 raise SubstrateConfigurationError(
                     f"the outbox in {path} was installed by version {version}: run "
-                    f"`interlock install` to upgrade it in place to version {VERSION}"
+                    f"`interlock install` to upgrade it in place to version 4"
                 )
             mode = conn.execute("PRAGMA journal_mode").fetchone()
             if mode is None or str(mode[0]).lower() != "wal":
@@ -1776,183 +1663,6 @@ class SqliteOutboxStore:
             ).fetchall()
         ]
 
-    # -- compaction (docs/EPIC5_DESIGN.md §1) -----------------------------------
-
-    def checkpoints(self) -> list[CheckpointRow]:
-        """Every checkpoint, in order."""
-        return [
-            CheckpointRow(
-                seq=int(r[0]),
-                authority=str(r[1]),
-                body=str(r[2]),
-                digest=str(r[3]),
-                prev=str(r[4]),
-                windows_horizon=None if r[5] is None else instant(int(r[5])),
-                open=bool(r[6]),
-            )
-            for r in self._conn.execute(
-                f"SELECT seq, authority, body, digest, prev, windows_horizon, open "
-                f"FROM {CHECKPOINTS} ORDER BY seq"
-            ).fetchall()
-        ]
-
-    def compacted(self) -> dict[uuid.UUID, Tombstone]:
-        """Every message a checkpoint pruned, by id."""
-        tombstones = (_tombstone(r) for r in self._conn.execute(_TOMBSTONES.format(where="1")))
-        return {t.message_id: t for t in tombstones}
-
-    def window_rows(self, horizon: datetime) -> list[WindowRow]:
-        """The rate windows' history at or before ``horizon``: what a vacuum
-        with that window horizon prunes."""
-        return _window_rows(self._conn, _microseconds(horizon))
-
-    def database_now(self) -> datetime:
-        """The clock the outbox's instants are on: this host's."""
-        return instant(now_us())
-
-    def compact(
-        self,
-        authority: str,
-        body: str,
-        heads: Sequence[Mapping[str, Any]],
-        *,
-        before_commit: Callable[[], None] | None = None,
-    ) -> dict[str, int]:
-        """A vacuum's act, as ``interlock.outbox_compact`` does it: record the
-        checkpoint ``body`` under ``authority``, tombstone the messages at the
-        ``heads`` that were verified, recompute what the checkpoint commits to
-        from what the file holds, and delete. All of it, or nothing.
-
-        :param before_commit: Called inside the transaction, everything done
-            but its commit: the crash tests stop the process there.
-        :raises CompactionRefusedError: If a message moved, the checkpoint does
-            not follow the last one, or the file holds other than what the
-            checkpoint commits to. Nothing is pruned.
-        """
-        from interlock.exceptions import CompactionRefusedError
-
-        checkpoint = CheckpointBody.parse(body)
-        targets = json.dumps([str(h["message"]) for h in heads])
-        with self._writing() as conn:
-            last = conn.execute(
-                f"SELECT seq, digest FROM {CHECKPOINTS} ORDER BY seq DESC LIMIT 1"
-            ).fetchone()
-            previous = GENESIS if last is None else str(last[1])
-            if checkpoint.seq != (0 if last is None else int(last[0])) + 1 or (
-                checkpoint.prev != previous
-            ):
-                raise CompactionRefusedError(
-                    f"checkpoint {checkpoint.seq} does not follow checkpoint "
-                    f"{0 if last is None else last[0]}"
-                )
-            horizon = (
-                None
-                if checkpoint.windows_horizon is None
-                else _microseconds(parse_instant(checkpoint.windows_horizon))
-            )
-            conn.execute(
-                f"INSERT INTO {CHECKPOINTS} "
-                f"(seq, authority, body, digest, prev, windows_horizon, open, at) "
-                f"VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
-                (
-                    checkpoint.seq,
-                    authority,
-                    body,
-                    hashlib.sha256(body.encode("utf-8")).hexdigest(),
-                    previous,
-                    horizon,
-                    now_us(),
-                ),
-            )
-            for head in heads:
-                row = conn.execute(
-                    f"SELECT state, log_seq, log_head, lease_owner FROM {STATE} "
-                    f"WHERE message_id = ?",
-                    (str(head["message"]),),
-                ).fetchone()
-                if row is None or int(row[1]) != int(head["seq"]) or row[2] != head["head"]:
-                    raise CompactionRefusedError(
-                        f"message {head['message']} moved after it was verified"
-                    )
-                settled = conn.execute(
-                    f"SELECT 1 FROM {SETTLEMENTS} WHERE message_id = ?", (str(head["message"]),)
-                ).fetchone()
-                if (
-                    row[0] not in ("delivered", "cancelled")
-                    or row[3] is not None
-                    or (row[0] == "delivered" and settled is None)
-                ):
-                    raise CompactionRefusedError(
-                        f"message {head['message']} is not final and settled"
-                    )
-            if conn.execute(
-                f"SELECT 1 FROM {LEGACY} WHERE message_id IN (SELECT value FROM json_each(?))",
-                (targets,),
-            ).fetchone():
-                raise CompactionRefusedError("the legacy set's messages are kept")
-            if conn.execute(
-                f"SELECT 1 FROM {OUTBOX} AS o WHERE o.stage_id IN ("
-                f"  SELECT t.stage_id FROM {OUTBOX} AS t "
-                f"   WHERE t.message_id IN (SELECT value FROM json_each(?1))) "
-                f"AND o.message_id NOT IN (SELECT value FROM json_each(?1))",
-                (targets,),
-            ).fetchone():
-                raise CompactionRefusedError("a stage is compacted whole or not at all")
-            conn.execute(
-                f"INSERT INTO {COMPACTED} (message_id, checkpoint, stage_id, plan_id, state, "
-                f"log_seq, log_head, receipt_id, credit, cost, compensates) "
-                f"SELECT o.message_id, ?, o.stage_id, o.plan_id, s.state, s.log_seq, s.log_head, "
-                f"x.receipt_id, x.credit, o.cost, o.compensates FROM {OUTBOX} AS o "
-                f"JOIN {STATE} AS s ON s.message_id = o.message_id "
-                f"LEFT JOIN {SETTLEMENTS} AS x ON x.message_id = o.message_id "
-                f"WHERE o.message_id IN (SELECT value FROM json_each(?))",
-                (checkpoint.seq, targets),
-            )
-            # What the checkpoint commits to, recomputed from what the file
-            # holds, and held to what was signed.
-            tombstones = [
-                _tombstone(r)
-                for r in conn.execute(
-                    _TOMBSTONES.format(where="checkpoint = ?"), (checkpoint.seq,)
-                ).fetchall()
-            ]
-            (log_rows,) = conn.execute(
-                f"SELECT count(*) FROM {LOG} WHERE message_id IN (SELECT value FROM json_each(?))",
-                (targets,),
-            ).fetchone()
-            if (tombstone_root(tombstones), len(tombstones), int(log_rows)) != (
-                checkpoint.root,
-                checkpoint.messages,
-                checkpoint.rows,
-            ):
-                raise CompactionRefusedError(
-                    "the messages are not the ones the checkpoint commits to"
-                )
-            pruned = [] if horizon is None else _window_rows(conn, horizon)
-            if (window_root(pruned), len(pruned)) != (
-                checkpoint.window_root,
-                checkpoint.window_rows,
-            ):
-                raise CompactionRefusedError(
-                    "the window history is not the one the checkpoint commits to"
-                )
-            for table in (SETTLEMENTS, LOG, STATE, OUTBOX):
-                conn.execute(
-                    f"DELETE FROM {table} WHERE message_id IN (SELECT value FROM json_each(?))",
-                    (targets,),
-                )
-            if horizon is not None:
-                conn.execute(f"DELETE FROM {WINDOWS_TABLE} WHERE at <= ?", (horizon,))
-            conn.execute(f"UPDATE {CHECKPOINTS} SET open = 0 WHERE seq = ?", (checkpoint.seq,))
-            if before_commit is not None:
-                before_commit()
-        return {
-            "checkpoint": checkpoint.seq,
-            "messages": len(tombstones),
-            "rows": int(log_rows),
-            "windows": len(pruned),
-        }
-
     def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
         """Each message's delivery-log head, as an operator sees it."""
         return {
@@ -1963,55 +1673,6 @@ class SqliteOutboxStore:
                 (json.dumps([str(m) for m in message_ids]),),
             ).fetchall()
         }
-
-
-_TOMBSTONES: Final = (
-    f"SELECT message_id, checkpoint, stage_id, plan_id, state, log_seq, log_head, receipt_id, "
-    f"credit, cost, compensates FROM {COMPACTED} WHERE {{where}} ORDER BY message_id"
-)
-
-
-def _tombstone(r: Sequence[Any]) -> Tombstone:
-    return Tombstone(
-        message_id=uuid.UUID(str(r[0])),
-        checkpoint=int(r[1]),
-        stage_id=uuid.UUID(str(r[2])),
-        plan_id=str(r[3]),
-        state=str(r[4]),
-        log_seq=int(r[5]),
-        log_head=str(r[6]),
-        receipt_id=None if r[7] is None else str(r[7]),
-        credit=None if r[8] is None else str(r[8]),
-        cost=str(r[9]),
-        compensates=None if r[10] is None else uuid.UUID(str(r[10])),
-    )
-
-
-def _window_rows(conn: sqlite3.Connection, horizon: int) -> list[WindowRow]:
-    if (
-        conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (WINDOWS_TABLE,)
-        ).fetchone()
-        is None
-    ):
-        return []
-    return [
-        WindowRow(
-            stage_id=uuid.UUID(str(r[0])),
-            window=str(r[1]),
-            key=str(r[2]),
-            amount=Decimal(str(r[3])),
-            at=instant(int(r[4])),
-        )
-        for r in conn.execute(
-            f"SELECT stage_id, window_name, key, amount, at FROM {WINDOWS_TABLE} WHERE at <= ?",
-            (horizon,),
-        ).fetchall()
-    ]
-
-
-def _microseconds(at: datetime) -> int:
-    return (at - _EPOCH) // timedelta(microseconds=1)
 
 
 def _operator(actor: str) -> str:

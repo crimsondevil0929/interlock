@@ -43,16 +43,20 @@ from interlock.exceptions import (
     StageConflictError,
     StageError,
     StageExpiredError,
+    SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
 from interlock.outbound import EnqueueOrder
 from interlock.sqlite_outbox import (
+    CHECKPOINTS,
     OUTBOX_TABLES,
+    WINDOWS_TABLE,
     enqueue,
     now_us,
     outbox_installed,
     stage_requests,
 )
+from interlock.sqlite_outbox import WINDOWS_DDL as _WINDOWS_DDL
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -93,21 +97,6 @@ substrate inside the stage's own transaction."""
 _MARKER_DDL = (
     f"CREATE TABLE IF NOT EXISTS main.{_MARKER_TABLE} "
     f"(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)"
-)
-
-WINDOWS_TABLE = "_interlock_windows"
-"""What each committed plan added to each rate window (:mod:`interlock.windows`),
-written beside its commit marker, which it references: a row exists exactly
-when its stage committed. ``amount`` is a decimal numeral, ``at`` microseconds
-since the epoch."""
-_WINDOWS_DDL = (
-    f"CREATE TABLE IF NOT EXISTS main.{WINDOWS_TABLE} ("
-    f"stage_id TEXT NOT NULL REFERENCES {_MARKER_TABLE} (stage_id) "
-    f"DEFERRABLE INITIALLY DEFERRED, "
-    f"window_name TEXT NOT NULL, key TEXT NOT NULL, amount TEXT NOT NULL, "
-    f"at INTEGER NOT NULL, PRIMARY KEY (stage_id, window_name, key))",
-    f"CREATE INDEX IF NOT EXISTS main.{WINDOWS_TABLE}_by_key "
-    f"ON {WINDOWS_TABLE} (window_name, key, at)",
 )
 
 FORBIDDEN_VERBS: frozenset[str] = frozenset(
@@ -785,6 +774,18 @@ class SqliteSubstrate:
         measures: list[WindowMeasure] = []
         try:
             with self._substrate_statements():
+                # A window reaching back before the latest checkpoint's window
+                # horizon would be read short: what it held there was pruned
+                # (docs/EPIC5_DESIGN.md §1.8). Fail closed.
+                pruned = _windows_watermark(conn)
+                if pruned is not None and any(
+                    now - _microseconds(c.span) < pruned for c in charges
+                ):
+                    raise SubstrateConfigurationError(
+                        "a rate window reaches back past the history a checkpoint pruned: the "
+                        "vacuum was run with windows shorter than this engine's. It cannot be "
+                        "measured until it no longer does"
+                    )
                 for charge in charges:
                     rows = conn.execute(
                         f"SELECT amount FROM main.{WINDOWS_TABLE} "
@@ -1206,6 +1207,19 @@ class SqliteSubstrate:
                 END;
                 """
             )
+
+
+def _windows_watermark(conn: sqlite3.Connection) -> int | None:
+    """The latest window horizon a checkpoint pruned history at, or ``None``."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (CHECKPOINTS,)
+        ).fetchone()
+        is None
+    ):
+        return None
+    row = conn.execute(f"SELECT max(windows_horizon) FROM main.{CHECKPOINTS}").fetchone()
+    return None if row is None or row[0] is None else int(row[0])
 
 
 def _microseconds(span: timedelta) -> int:

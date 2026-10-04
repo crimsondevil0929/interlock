@@ -1,4 +1,14 @@
-"""The transactional outbox's PostgreSQL objects (``docs/OUTBOX_DESIGN.md``).
+"""FROZEN: the outbox's PostgreSQL objects as version 4 installed them.
+
+``src/interlock/outbox_sql.py`` at interlock main ``e3bb0ec`` (Epic 4, v0.4.0),
+verbatim below this note, with version 4's stage functions, schema, grants
+and sink mirror from ``src/interlock/postgres.py`` after it, for
+``tests/test_upgrade_v5.py``: version 5 is installed over a database version 4
+installed. Never edit this file.
+
+The original docstring follows.
+
+The transactional outbox's PostgreSQL objects (``docs/OUTBOX_DESIGN.md``).
 
 Installed by :func:`interlock.postgres.install`, after the stage's own objects.
 Three kinds of function, by who may call them:
@@ -21,10 +31,11 @@ recomputes every link outside the database.
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Sequence
+from datetime import timedelta
+from typing import Any, Final
 
 __all__ = [
-    "COMPACT_FUNCTIONS",
     "OUTBOX_FUNCTIONS",
     "OUTBOX_GUARD",
     "OUTBOX_TABLES",
@@ -204,42 +215,6 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_settlements (
     settled_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
 );
 REVOKE ALL ON interlock.outbox_settlements FROM PUBLIC;
--- Version 5: compaction (docs/EPIC5_DESIGN.md §1). A checkpoint commits to
--- what a vacuum pruned, under the authority of an operator's signed intent;
--- its body is the canonical JSON the intent carried, kept byte for byte.
--- Its xid is the transaction that wrote it: the one transaction whose
--- deletions the guards admit.
-CREATE TABLE IF NOT EXISTS interlock.checkpoints (
-    seq             integer PRIMARY KEY CHECK (seq > 0),
-    authority       text NOT NULL CHECK (authority ~ '^[0-9a-f]{64}$'),
-    body            text NOT NULL,
-    digest          text NOT NULL,
-    prev            text NOT NULL,
-    windows_horizon timestamptz,
-    xid             xid8 NOT NULL DEFAULT pg_catalog.pg_current_xact_id(),
-    at              timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
-);
-REVOKE ALL ON interlock.checkpoints FROM PUBLIC;
-
--- One row per message a checkpoint pruned: the tip of its delivery log,
--- which commits to every row it had and, through its genesis, to the
--- request; and its settlement, for the receipt log and the ledger.
-CREATE TABLE IF NOT EXISTS interlock.outbox_compacted (
-    message_id  uuid PRIMARY KEY,
-    checkpoint  integer NOT NULL REFERENCES interlock.checkpoints (seq),
-    stage_id    uuid NOT NULL,
-    plan_id     text NOT NULL,
-    state       text NOT NULL CHECK (state IN ('delivered', 'cancelled')),
-    log_seq     integer NOT NULL,
-    log_head    text NOT NULL,
-    receipt_id  text,
-    credit      text,
-    cost        text NOT NULL,
-    compensates uuid
-);
-CREATE INDEX IF NOT EXISTS outbox_compacted_by_checkpoint
-    ON interlock.outbox_compacted (checkpoint);
-REVOKE ALL ON interlock.outbox_compacted FROM PUBLIC;
 DO $legacy$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
@@ -564,49 +539,6 @@ SET search_path = pg_catalog, pg_temp
 AS $fn$
 BEGIN
     RAISE EXCEPTION 'interlock: % is append-only; % refused', TG_TABLE_NAME, TG_OP
-        USING ERRCODE = 'IL002';
-END
-$fn$;
-
--- Append-only, with one exception (docs/EPIC5_DESIGN.md §1.5): a message a
--- checkpoint written in this very transaction tombstoned may be deleted.
--- The database cannot check the checkpoint's signature; it can make every
--- deletion stand beside a checkpoint naming an authority, which verification
--- holds to the signed operator log.
-CREATE OR REPLACE FUNCTION interlock.outbox_compactable()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $fn$
-BEGIN
-    IF TG_OP = 'DELETE' AND EXISTS (
-        SELECT 1 FROM interlock.outbox_compacted AS t
-          JOIN interlock.checkpoints AS c ON c.seq = t.checkpoint
-         WHERE t.message_id = OLD.message_id
-           AND c.xid = pg_catalog.pg_current_xact_id()) THEN
-        RETURN OLD;
-    END IF;
-    RAISE EXCEPTION 'interlock: % is append-only; % refused', TG_TABLE_NAME, TG_OP
-        USING ERRCODE = 'IL002';
-END
-$fn$;
-
--- The rate windows' history is append-only too, but for the rows a
--- checkpoint written in this transaction pruned: those at or before its
--- window horizon, which no window can read any more.
-CREATE OR REPLACE FUNCTION interlock.window_ledger_guard()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog, pg_temp
-AS $fn$
-BEGIN
-    IF TG_OP = 'DELETE' AND EXISTS (
-        SELECT 1 FROM interlock.checkpoints AS c
-         WHERE c.xid = pg_catalog.pg_current_xact_id()
-           AND c.windows_horizon IS NOT NULL AND OLD.at <= c.windows_horizon) THEN
-        RETURN OLD;
-    END IF;
-    RAISE EXCEPTION 'interlock: window_ledger is the rate windows'' history; % refused', TG_OP
         USING ERRCODE = 'IL002';
 END
 $fn$;
@@ -1405,164 +1337,12 @@ END
 $fn$;
 """
 
-COMPACT_FUNCTIONS: Final = r"""
--- A vacuum's act (docs/EPIC5_DESIGN.md §1.4), under the hash of the
--- operator's signed intent that carries p_body, the checkpoint: record it,
--- tombstone the messages it names at the heads that were verified and
--- signed for, recompute what the checkpoint commits to from what this
--- database holds, and delete. All of it, or nothing. Granted to no role.
-CREATE OR REPLACE FUNCTION interlock.outbox_compact(
-    p_authority text, p_body text, p_heads jsonb)
-RETURNS jsonb
-LANGUAGE plpgsql SECURITY DEFINER
-SET search_path = pg_catalog, pg_temp
-AS $fn$
-DECLARE
-    body jsonb := p_body::jsonb;
-    n integer := (body ->> 'seq')::integer;
-    last_seq integer;
-    last_digest text;
-    previous text;
-    horizon timestamptz := (body -> 'horizon' ->> 'windows')::timestamptz;
-    targets uuid[];
-    target record;
-    st record;
-    root text;
-    leaf text;
-    counted integer;
-    log_rows integer;
-    window_rows integer := 0;
-BEGIN
-    IF body ->> 'v' IS DISTINCT FROM 'interlock-checkpoint-v1' THEN
-        RAISE EXCEPTION 'interlock: not a checkpoint' USING ERRCODE = 'IL010';
-    END IF;
-    -- One vacuum at a time: the next checkpoint follows the last.
-    LOCK TABLE interlock.checkpoints IN EXCLUSIVE MODE;
-    SELECT c.seq, c.digest INTO last_seq, last_digest
-      FROM interlock.checkpoints AS c ORDER BY c.seq DESC LIMIT 1;
-    previous := coalesce(last_digest, pg_catalog.repeat('0', 64));
-    IF n IS DISTINCT FROM coalesce(last_seq, 0) + 1
-       OR body ->> 'prev' IS DISTINCT FROM previous THEN
-        RAISE EXCEPTION 'interlock: checkpoint % does not follow checkpoint %', n,
-            coalesce(last_seq, 0) USING ERRCODE = 'IL010';
-    END IF;
-    INSERT INTO interlock.checkpoints (seq, authority, body, digest, prev, windows_horizon)
-    VALUES (n, p_authority, p_body,
-            pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p_body, 'UTF8')), 'hex'),
-            previous, horizon);
-
-    -- The messages: final, settled, unleased, never legacy, at the heads
-    -- that were verified, each stage whole.
-    targets := ARRAY(SELECT (h ->> 'message')::uuid
-                       FROM pg_catalog.jsonb_array_elements(p_heads) AS h);
-    FOR target IN
-        SELECT (h ->> 'message')::uuid AS message, (h ->> 'seq')::integer AS seq,
-               h ->> 'head' AS head
-          FROM pg_catalog.jsonb_array_elements(p_heads) AS h
-    LOOP
-        SELECT s.state, s.log_seq, s.log_head, s.lease_owner INTO st
-          FROM interlock.outbox_state AS s WHERE s.message_id = target.message FOR UPDATE;
-        IF NOT FOUND OR st.log_seq IS DISTINCT FROM target.seq
-           OR st.log_head IS DISTINCT FROM target.head THEN
-            RAISE EXCEPTION 'interlock: message % moved after it was verified', target.message
-                USING ERRCODE = 'IL010';
-        END IF;
-        IF st.state NOT IN ('delivered', 'cancelled') OR st.lease_owner IS NOT NULL
-           OR (st.state = 'delivered' AND NOT EXISTS (
-                   SELECT 1 FROM interlock.outbox_settlements AS x
-                    WHERE x.message_id = target.message)) THEN
-            RAISE EXCEPTION 'interlock: message % is not final and settled', target.message
-                USING ERRCODE = 'IL010';
-        END IF;
-    END LOOP;
-    IF EXISTS (SELECT 1 FROM interlock.outbox_legacy AS l WHERE l.message_id = ANY (targets)) THEN
-        RAISE EXCEPTION 'interlock: the legacy set''s messages are kept' USING ERRCODE = 'IL010';
-    END IF;
-    IF EXISTS (
-        SELECT 1 FROM interlock.outbox AS o
-         WHERE o.stage_id IN (SELECT t.stage_id FROM interlock.outbox AS t
-                               WHERE t.message_id = ANY (targets))
-           AND NOT (o.message_id = ANY (targets))) THEN
-        RAISE EXCEPTION 'interlock: a stage is compacted whole or not at all'
-            USING ERRCODE = 'IL010';
-    END IF;
-
-    INSERT INTO interlock.outbox_compacted (
-        message_id, checkpoint, stage_id, plan_id, state, log_seq, log_head, receipt_id,
-        credit, cost, compensates)
-    SELECT o.message_id, n, o.stage_id, o.plan_id, s.state, s.log_seq, s.log_head,
-           x.receipt_id, x.credit, o.cost, o.compensates
-      FROM interlock.outbox AS o
-      JOIN interlock.outbox_state AS s USING (message_id)
-      LEFT JOIN interlock.outbox_settlements AS x USING (message_id)
-     WHERE o.message_id = ANY (targets);
-
-    -- What the checkpoint commits to, recomputed here and held to what was
-    -- signed: the tombstones' fold, and the window rows'.
-    root := interlock.outbox_digest('interlock-compacted-v1', '0');
-    counted := 0;
-    FOR leaf IN
-        SELECT interlock.outbox_digest(
-                   'interlock-tombstone-v1', t.message_id::text, t.stage_id::text, t.plan_id,
-                   t.state, t.log_seq::text, t.log_head, t.receipt_id, t.credit, t.cost,
-                   t.compensates::text)
-          FROM interlock.outbox_compacted AS t
-         WHERE t.checkpoint = n
-         ORDER BY t.message_id::text COLLATE "C"
-    LOOP
-        root := interlock.outbox_digest('interlock-compacted-v1', root, leaf);
-        counted := counted + 1;
-    END LOOP;
-    SELECT count(*) INTO log_rows FROM interlock.outbox_attempts AS a
-     WHERE a.message_id = ANY (targets);
-    IF root IS DISTINCT FROM body -> 'outbox' ->> 'root'
-       OR counted IS DISTINCT FROM (body -> 'outbox' ->> 'messages')::integer
-       OR log_rows IS DISTINCT FROM (body -> 'outbox' ->> 'rows')::integer THEN
-        RAISE EXCEPTION 'interlock: the messages are not the ones the checkpoint commits to'
-            USING ERRCODE = 'IL010';
-    END IF;
-    root := interlock.outbox_digest('interlock-windows-v1', '0');
-    IF horizon IS NOT NULL THEN
-        FOR leaf IN
-            SELECT interlock.outbox_digest(
-                       'interlock-window-row-v1', l.stage_id::text, l.window_name, l.key,
-                       pg_catalog.trim_scale(l.amount)::text, interlock.outbox_instant(l.at))
-              FROM interlock.window_ledger AS l
-             WHERE l.at <= horizon
-             ORDER BY l.window_name COLLATE "C", l.key COLLATE "C",
-                      l.stage_id::text COLLATE "C", l.at
-        LOOP
-            root := interlock.outbox_digest('interlock-windows-v1', root, leaf);
-            window_rows := window_rows + 1;
-        END LOOP;
-    END IF;
-    IF root IS DISTINCT FROM body -> 'windows' ->> 'root'
-       OR window_rows IS DISTINCT FROM (body -> 'windows' ->> 'rows')::integer THEN
-        RAISE EXCEPTION 'interlock: the window history is not the one the checkpoint commits to'
-            USING ERRCODE = 'IL010';
-    END IF;
-
-    DELETE FROM interlock.outbox_settlements WHERE message_id = ANY (targets);
-    DELETE FROM interlock.outbox_attempts WHERE message_id = ANY (targets);
-    DELETE FROM interlock.outbox_state WHERE message_id = ANY (targets);
-    DELETE FROM interlock.outbox WHERE message_id = ANY (targets);
-    IF horizon IS NOT NULL THEN
-        DELETE FROM interlock.window_ledger WHERE at <= horizon;
-    END IF;
-    RETURN pg_catalog.jsonb_build_object(
-        'checkpoint', n, 'messages', counted, 'rows', log_rows, 'windows', window_rows);
-END
-$fn$;
-"""
-
-OUTBOX_FUNCTIONS: Final = (
-    STAGE_OUTBOX_FUNCTIONS + RELAY_FUNCTIONS + SETTLE_FUNCTIONS + COMPACT_FUNCTIONS
-)
+OUTBOX_FUNCTIONS: Final = STAGE_OUTBOX_FUNCTIONS + RELAY_FUNCTIONS + SETTLE_FUNCTIONS
 
 OUTBOX_TRIGGERS: Final = r"""
 DROP TRIGGER IF EXISTS outbox_append_only ON interlock.outbox;
 CREATE TRIGGER outbox_append_only BEFORE UPDATE OR DELETE ON interlock.outbox
-    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_compactable();
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
 DROP TRIGGER IF EXISTS outbox_append_only_truncate ON interlock.outbox;
 CREATE TRIGGER outbox_append_only_truncate BEFORE TRUNCATE ON interlock.outbox
     FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
@@ -1570,7 +1350,7 @@ ALTER TABLE interlock.outbox ENABLE ALWAYS TRIGGER outbox_append_only,
     ENABLE ALWAYS TRIGGER outbox_append_only_truncate;
 DROP TRIGGER IF EXISTS attempts_append_only ON interlock.outbox_attempts;
 CREATE TRIGGER attempts_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_attempts
-    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_compactable();
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
 DROP TRIGGER IF EXISTS attempts_append_only_truncate ON interlock.outbox_attempts;
 CREATE TRIGGER attempts_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_attempts
     FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
@@ -1588,47 +1368,8 @@ CREATE TRIGGER legacy_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_l
     FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
 DROP TRIGGER IF EXISTS settlements_append_only ON interlock.outbox_settlements;
 CREATE TRIGGER settlements_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_settlements
-    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_compactable();
-DROP TRIGGER IF EXISTS settlements_append_only_truncate ON interlock.outbox_settlements;
-CREATE TRIGGER settlements_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_settlements
-    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
-ALTER TABLE interlock.outbox_settlements ENABLE ALWAYS TRIGGER settlements_append_only,
-    ENABLE ALWAYS TRIGGER settlements_append_only_truncate;
--- Version 5: delivery state may change, and a row goes only with its
--- message, compacted; the checkpoints and tombstones never change; the rate
--- windows' history is pruned only under a checkpoint.
-DROP TRIGGER IF EXISTS state_compacted_only ON interlock.outbox_state;
-CREATE TRIGGER state_compacted_only BEFORE DELETE ON interlock.outbox_state
-    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_compactable();
-DROP TRIGGER IF EXISTS state_no_truncate ON interlock.outbox_state;
-CREATE TRIGGER state_no_truncate BEFORE TRUNCATE ON interlock.outbox_state
-    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
-ALTER TABLE interlock.outbox_state ENABLE ALWAYS TRIGGER state_compacted_only,
-    ENABLE ALWAYS TRIGGER state_no_truncate;
-DROP TRIGGER IF EXISTS checkpoints_append_only ON interlock.checkpoints;
-CREATE TRIGGER checkpoints_append_only BEFORE UPDATE OR DELETE ON interlock.checkpoints
     FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
-DROP TRIGGER IF EXISTS checkpoints_append_only_truncate ON interlock.checkpoints;
-CREATE TRIGGER checkpoints_append_only_truncate BEFORE TRUNCATE ON interlock.checkpoints
-    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
-ALTER TABLE interlock.checkpoints ENABLE ALWAYS TRIGGER checkpoints_append_only,
-    ENABLE ALWAYS TRIGGER checkpoints_append_only_truncate;
-DROP TRIGGER IF EXISTS compacted_append_only ON interlock.outbox_compacted;
-CREATE TRIGGER compacted_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_compacted
-    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
-DROP TRIGGER IF EXISTS compacted_append_only_truncate ON interlock.outbox_compacted;
-CREATE TRIGGER compacted_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_compacted
-    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
-ALTER TABLE interlock.outbox_compacted ENABLE ALWAYS TRIGGER compacted_append_only,
-    ENABLE ALWAYS TRIGGER compacted_append_only_truncate;
-DROP TRIGGER IF EXISTS window_ledger_guard ON interlock.window_ledger;
-CREATE TRIGGER window_ledger_guard BEFORE UPDATE OR DELETE ON interlock.window_ledger
-    FOR EACH ROW EXECUTE FUNCTION interlock.window_ledger_guard();
-DROP TRIGGER IF EXISTS window_ledger_truncate ON interlock.window_ledger;
-CREATE TRIGGER window_ledger_truncate BEFORE TRUNCATE ON interlock.window_ledger
-    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
-ALTER TABLE interlock.window_ledger ENABLE ALWAYS TRIGGER window_ledger_guard,
-    ENABLE ALWAYS TRIGGER window_ledger_truncate;
+ALTER TABLE interlock.outbox_settlements ENABLE ALWAYS TRIGGER settlements_append_only;
 DROP TRIGGER IF EXISTS legacy_sealed ON interlock.outbox_legacy;
 CREATE TRIGGER legacy_sealed BEFORE INSERT ON interlock.outbox_legacy
     FOR EACH ROW EXECUTE FUNCTION interlock.outbox_legacy_sealed();
@@ -1638,14 +1379,377 @@ ALTER TABLE interlock.outbox_legacy ENABLE ALWAYS TRIGGER legacy_append_only,
 """
 
 OUTBOX_TRIGGER_NAMES: Final = (
-    ("outbox", "outbox_append_only", "interlock.outbox_compactable"),
+    ("outbox", "outbox_append_only", "interlock.outbox_append_only"),
     ("outbox", "outbox_append_only_truncate", "interlock.outbox_append_only"),
-    ("outbox_attempts", "attempts_append_only", "interlock.outbox_compactable"),
+    ("outbox_attempts", "attempts_append_only", "interlock.outbox_append_only"),
     ("outbox_attempts", "attempts_append_only_truncate", "interlock.outbox_append_only"),
     ("outbox_attempts", "outbox_log_link", "interlock.outbox_log_link"),
-    ("outbox_state", "state_compacted_only", "interlock.outbox_compactable"),
-    ("window_ledger", "window_ledger_guard", "interlock.window_ledger_guard"),
-    ("window_ledger", "window_ledger_truncate", "interlock.outbox_append_only"),
 )
-"""What keeps a committed request, its delivery log and the rate windows'
-history as written and linked, but for what a checkpoint prunes."""
+"""What keeps a committed request, and its delivery log, as written and linked."""
+
+
+# --------------------------------------------------------------------------
+# From src/interlock/postgres.py at e3bb0ec, verbatim.
+# --------------------------------------------------------------------------
+
+INSTALL_VERSION_V4: Final = "4"
+
+FUNCTIONS_V4: Final = r"""
+-- Version 1 took three arguments. A function is identified by its argument
+-- types, so the old one would survive CREATE OR REPLACE as an overload.
+DROP FUNCTION IF EXISTS interlock.begin_stage(uuid, text, jsonb);
+
+CREATE OR REPLACE FUNCTION interlock.begin_stage(
+    p_stage uuid, p_plan text, p_gates jsonb, p_enqueue_hash bytea DEFAULT NULL
+)
+RETURNS xid8
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    x xid8 := pg_catalog.pg_current_xact_id();
+BEGIN
+    IF pg_catalog.current_setting('transaction_isolation') <> 'repeatable read' THEN
+        RAISE EXCEPTION 'interlock: a stage runs in REPEATABLE READ, not %',
+            pg_catalog.current_setting('transaction_isolation')
+            USING ERRCODE = 'IL003';
+    END IF;
+    CREATE TEMP TABLE interlock_capture (
+        seq bigint GENERATED ALWAYS AS IDENTITY,
+        tbl text NOT NULL,
+        pk text NOT NULL,
+        before jsonb,
+        after jsonb
+    ) ON COMMIT DROP;
+    -- p_enqueue_hash is the sha256 of a token only the substrate holds; it
+    -- authorizes this stage's writes to the outbox (interlock.enqueue).
+    INSERT INTO interlock.stages (stage_id, plan_id, xid, gates, enqueue_hash)
+    VALUES (p_stage, p_plan, x, p_gates, p_enqueue_hash);
+    PERFORM pg_catalog.set_config('interlock.stage_id', p_stage::text, true);
+    RETURN x;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.capture()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    marker text := pg_catalog.current_setting('interlock.stage_id', true);
+    stage uuid;
+    gates jsonb;
+    gate jsonb;
+    old_row jsonb;
+    new_row jsonb;
+    keep text[];
+    col text;
+BEGIN
+    SELECT s.stage_id, s.gates INTO stage, gates
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL THEN
+        IF coalesce(marker, '') <> '' THEN
+            RAISE EXCEPTION
+                'interlock: interlock.stage_id is set, but this transaction opened no stage'
+                USING ERRCODE = 'IL002';
+        END IF;
+        -- Not mediated: nothing measured this write and nothing adjudicated
+        -- it. Logged for reconciliation, in the writer's own transaction, so
+        -- the entry exists exactly when the write does.
+        IF TG_LEVEL = 'STATEMENT' THEN
+            INSERT INTO interlock.unmediated (xid, tbl, pk, op)
+            VALUES (pg_catalog.pg_current_xact_id(), TG_TABLE_NAME, NULL, 'truncate');
+        ELSE
+            INSERT INTO interlock.unmediated (xid, tbl, pk, op)
+            VALUES (
+                pg_catalog.pg_current_xact_id(),
+                TG_TABLE_NAME,
+                coalesce(pg_catalog.to_jsonb(NEW), pg_catalog.to_jsonb(OLD)) ->> TG_ARGV[0],
+                pg_catalog.lower(TG_OP)
+            );
+        END IF;
+        RETURN NULL;
+    END IF;
+    IF marker IS DISTINCT FROM stage::text THEN
+        RAISE EXCEPTION 'interlock: interlock.stage_id was changed inside stage %', stage
+            USING ERRCODE = 'IL002';
+    END IF;
+    IF TG_LEVEL = 'STATEMENT' THEN
+        RAISE EXCEPTION 'interlock: TRUNCATE on % inside a stage', TG_TABLE_NAME
+            USING ERRCODE = 'IL001',
+                  DETAIL = pg_catalog.json_build_object(
+                      'table', TG_TABLE_NAME, 'operation', 'truncate')::text;
+    END IF;
+    IF TG_OP <> 'INSERT' THEN old_row := pg_catalog.to_jsonb(OLD); END IF;
+    IF TG_OP <> 'DELETE' THEN new_row := pg_catalog.to_jsonb(NEW); END IF;
+
+    gate := gates -> TG_TABLE_NAME;
+    IF gate IS NOT NULL THEN
+        IF TG_OP = 'DELETE' AND (gate ->> 'delete')::boolean THEN
+            RAISE EXCEPTION 'interlock: DELETE on % is gated by the cascade check', TG_TABLE_NAME
+                USING ERRCODE = 'IL001',
+                      DETAIL = pg_catalog.json_build_object(
+                          'table', TG_TABLE_NAME, 'operation', 'delete')::text;
+        END IF;
+        IF TG_OP = 'UPDATE' THEN
+            IF (gate ->> 'update_any')::boolean AND old_row IS DISTINCT FROM new_row THEN
+                RAISE EXCEPTION 'interlock: UPDATE on % is gated by the cascade check',
+                    TG_TABLE_NAME
+                    USING ERRCODE = 'IL001',
+                          DETAIL = pg_catalog.json_build_object(
+                              'table', TG_TABLE_NAME, 'operation', 'update')::text;
+            END IF;
+            FOR col IN SELECT pg_catalog.jsonb_array_elements_text(gate -> 'update_columns') LOOP
+                IF (old_row -> col) IS DISTINCT FROM (new_row -> col) THEN
+                    RAISE EXCEPTION 'interlock: UPDATE of %.% is gated by the cascade check',
+                        TG_TABLE_NAME, col
+                        USING ERRCODE = 'IL001',
+                              DETAIL = pg_catalog.json_build_object(
+                                  'table', TG_TABLE_NAME, 'operation', 'update',
+                                  'column', col)::text;
+                END IF;
+            END LOOP;
+        END IF;
+    END IF;
+
+    keep := TG_ARGV[1:TG_NARGS - 1];
+    INSERT INTO pg_temp.interlock_capture (tbl, pk, before, after)
+    VALUES (
+        TG_TABLE_NAME,
+        coalesce(new_row, old_row) ->> TG_ARGV[0],
+        (SELECT pg_catalog.jsonb_object_agg(e.key, e.value)
+           FROM pg_catalog.jsonb_each(old_row) AS e WHERE e.key = ANY (keep)),
+        (SELECT pg_catalog.jsonb_object_agg(e.key, e.value)
+           FROM pg_catalog.jsonb_each(new_row) AS e WHERE e.key = ANY (keep))
+    );
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.stage_capture(p_limit bigint)
+RETURNS TABLE (out_tbl text, out_pk text, out_before text, out_after text)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    RETURN QUERY
+        SELECT c.tbl, c.pk, c.before::text, c.after::text
+          FROM pg_temp.interlock_capture AS c
+         ORDER BY c.tbl COLLATE "C", c.pk COLLATE "C", c.seq
+         LIMIT p_limit;
+END
+$fn$;
+
+-- Rate windows (docs/EPIC4_DESIGN.md §3). A stage locks each window key it
+-- adds to, in one order, until it ends; reads what the keys hold from outside
+-- itself; and writes what it adds with its token, beside its stages row.
+CREATE OR REPLACE FUNCTION interlock.window_lock(p_locks bigint[])
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    lock_id bigint;
+BEGIN
+    FOR lock_id IN SELECT DISTINCT l FROM pg_catalog.unnest(p_locks) AS l ORDER BY 1 LOOP
+        PERFORM pg_catalog.pg_advisory_xact_lock(lock_id);
+    END LOOP;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.window_totals(
+    p_windows text[], p_keys text[], p_spans_us bigint[]
+)
+RETURNS TABLE (out_window text, out_key text, out_total numeric)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    now_at timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    -- Outside every stage, in READ COMMITTED: a stage's snapshot would miss
+    -- what committed after it began, and an agent's statement, which runs
+    -- only inside a stage, may not read what other plans added.
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed'
+       OR coalesce(pg_catalog.current_setting('interlock.stage_id', true), '') <> ''
+       OR EXISTS (SELECT 1 FROM interlock.stages s
+                   WHERE s.xid = pg_catalog.pg_current_xact_id_if_assigned()) THEN
+        RAISE EXCEPTION 'interlock: the rate windows'' history is read outside every stage'
+            USING ERRCODE = 'IL009';
+    END IF;
+    RETURN QUERY
+        SELECT w.name, w.key,
+               coalesce((SELECT sum(l.amount) FROM interlock.window_ledger l
+                          WHERE l.window_name = w.name AND l.key = w.key
+                            AND l.at > now_at - w.span * interval '1 microsecond'), 0)
+          FROM ROWS FROM (pg_catalog.unnest(p_windows), pg_catalog.unnest(p_keys),
+                          pg_catalog.unnest(p_spans_us)) AS w(name, key, span);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.window_add(
+    p_token bytea, p_windows text[], p_keys text[], p_amounts numeric[]
+)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    stage uuid;
+    expected bytea;
+BEGIN
+    SELECT s.stage_id, s.enqueue_hash INTO stage, expected
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL OR expected IS NULL
+       OR pg_catalog.sha256(p_token) IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'interlock: this transaction''s stage did not add to a rate window'
+            USING ERRCODE = 'IL002';
+    END IF;
+    INSERT INTO interlock.window_ledger (stage_id, window_name, key, amount)
+    SELECT stage, w.name, w.key, w.amount
+      FROM ROWS FROM (pg_catalog.unnest(p_windows), pg_catalog.unnest(p_keys),
+                      pg_catalog.unnest(p_amounts)) AS w(name, key, amount);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.resolve(p_stage uuid, p_xid xid8)
+RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    IF EXISTS (SELECT 1 FROM interlock.stages s WHERE s.stage_id = p_stage) THEN
+        RETURN 'marker';
+    END IF;
+    IF p_xid IS NULL THEN
+        RETURN 'unknown';
+    END IF;
+    RETURN coalesce(pg_catalog.pg_xact_status(p_xid), 'forgotten');
+END
+$fn$;
+"""
+
+
+SCHEMA_V4: Final = """
+CREATE SCHEMA IF NOT EXISTS interlock;
+REVOKE ALL ON SCHEMA interlock FROM PUBLIC;
+
+CREATE TABLE IF NOT EXISTS interlock.stages (
+    stage_id uuid PRIMARY KEY,
+    plan_id text NOT NULL,
+    xid xid8 NOT NULL UNIQUE,
+    gates jsonb NOT NULL DEFAULT '{}'::jsonb,
+    stage_role name NOT NULL DEFAULT session_user,
+    opened_at timestamptz NOT NULL DEFAULT now()
+);
+REVOKE ALL ON interlock.stages FROM PUBLIC;
+
+CREATE TABLE IF NOT EXISTS interlock.unmediated (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    xid xid8 NOT NULL,
+    tbl text NOT NULL,
+    pk text,
+    op text NOT NULL,
+    at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    db_user name NOT NULL DEFAULT session_user,
+    application text DEFAULT current_setting('application_name', true)
+);
+REVOKE ALL ON interlock.unmediated FROM PUBLIC;
+
+CREATE TABLE IF NOT EXISTS interlock.installation (
+    tbl text PRIMARY KEY,
+    primary_key text NOT NULL,
+    columns text[] NOT NULL,
+    tenant_column text,
+    version text NOT NULL,
+    installed_at timestamptz NOT NULL DEFAULT now()
+);
+REVOKE ALL ON interlock.installation FROM PUBLIC;
+
+-- Version 2: the transactional outbox (docs/OUTBOX_DESIGN.md); its own
+-- objects are in interlock.outbox_sql.
+ALTER TABLE interlock.stages ADD COLUMN IF NOT EXISTS enqueue_hash bytea;
+
+-- Version 4: what each committed plan added to each rate window
+-- (docs/EPIC4_DESIGN.md §3), written in its stage, so a row exists exactly
+-- when its stages row does. No role writes it but through
+-- interlock.window_add, and none but an auditor reads it.
+CREATE TABLE IF NOT EXISTS interlock.window_ledger (
+    stage_id uuid NOT NULL REFERENCES interlock.stages (stage_id),
+    window_name text NOT NULL,
+    key text NOT NULL,
+    amount numeric NOT NULL CHECK (amount > 0),
+    at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (stage_id, window_name, key)
+);
+CREATE INDEX IF NOT EXISTS window_ledger_by_key
+    ON interlock.window_ledger (window_name, key, at);
+REVOKE ALL ON interlock.window_ledger FROM PUBLIC;
+"""
+
+
+OUTBOX_TABLES_V4: Final = (
+    "interlock.sinks",
+    "interlock.outbox",
+    "interlock.outbox_state",
+    "interlock.outbox_attempts",
+    "interlock.outbox_epochs",
+    "interlock.outbox_legacy",
+    "interlock.outbox_settlements",
+)
+
+
+SETTLER_FUNCTIONS_V4: Final = ("interlock.outbox_settle(uuid, text, text, text)",)
+
+
+RELAY_FUNCTIONS_V4: Final = (
+    "interlock.relay_claim(text, double precision, integer, text[])",
+    "interlock.relay_sending(uuid, text, bigint, text)",
+    "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text, "
+    "text)",
+    "interlock.relay_hold(uuid, text, bigint, text)",
+    "interlock.relay_defer(uuid, text, bigint, text, bigint)",
+    "interlock.relay_refuse(uuid, text, bigint, text)",
+)
+"""What a relay may call: every change it makes goes through one of these."""
+
+
+def install_sinks_v4(conn: Any, sinks: Sequence[Any]) -> None:
+    """Mirror the registry into ``interlock.sinks``: what ``enqueue`` checks."""
+    for sink in sinks:
+        conn.execute(
+            "INSERT INTO interlock.sinks (name, kind, operations, cost_per_call, idempotency, "
+            "max_payload_bytes, not_after_seconds, max_attempts, backoff_base_ms, "
+            "backoff_cap_ms, unknown_outcome, config_hash, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true) "
+            "ON CONFLICT (name) DO UPDATE SET kind = EXCLUDED.kind, "
+            "operations = EXCLUDED.operations, cost_per_call = EXCLUDED.cost_per_call, "
+            "idempotency = EXCLUDED.idempotency, "
+            "max_payload_bytes = EXCLUDED.max_payload_bytes, "
+            "not_after_seconds = EXCLUDED.not_after_seconds, "
+            "max_attempts = EXCLUDED.max_attempts, "
+            "backoff_base_ms = EXCLUDED.backoff_base_ms, "
+            "backoff_cap_ms = EXCLUDED.backoff_cap_ms, "
+            "unknown_outcome = EXCLUDED.unknown_outcome, "
+            "config_hash = EXCLUDED.config_hash, enabled = true",
+            (
+                sink.name,
+                sink.kind,
+                [op.name for op in sink.operations],
+                str(sink.cost_per_call),
+                sink.idempotency,
+                sink.max_payload_bytes,
+                int(sink.not_after.total_seconds()),
+                sink.max_attempts,
+                int(sink.backoff_base / timedelta(milliseconds=1)),
+                int(sink.backoff_cap / timedelta(milliseconds=1)),
+                sink.unknown_outcome,
+                sink.config_hash(),
+            ),
+        )
+    conn.execute(
+        "UPDATE interlock.sinks SET enabled = false WHERE NOT (name = ANY (%s))",
+        ([sink.name for sink in sinks],),
+    )

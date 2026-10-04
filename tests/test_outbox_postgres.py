@@ -264,13 +264,17 @@ def downgrade_to_version_1(env: Pg) -> None:
     column, and the three-argument ``begin_stage``."""
     with psycopg.connect(env.admin, autocommit=True) as conn:
         conn.execute(
-            "DROP TABLE interlock.outbox_settlements, interlock.outbox_legacy, "
+            "DROP TABLE interlock.outbox_compacted, interlock.checkpoints, "
+            "interlock.outbox_settlements, interlock.outbox_legacy, "
             "interlock.outbox_epochs, interlock.outbox_attempts, interlock.outbox_state, "
             "interlock.outbox, interlock.sinks"
         )
         conn.execute(f"DROP FUNCTION interlock.enqueue{ENQUEUE.removeprefix('interlock.enqueue')}")
         conn.execute("DROP FUNCTION interlock.stage_outbox(bigint)")
-        conn.execute("DROP FUNCTION interlock.outbox_append_only()")
+        # And the guards version 5 put on the rate windows' history.
+        conn.execute("DROP FUNCTION interlock.window_ledger_guard() CASCADE")
+        conn.execute("DROP FUNCTION interlock.outbox_compactable() CASCADE")
+        conn.execute("DROP FUNCTION interlock.outbox_append_only() CASCADE")
         conn.execute("DROP FUNCTION interlock.begin_stage(uuid, text, jsonb, bytea)")
         conn.execute("ALTER TABLE interlock.stages DROP COLUMN enqueue_hash")
         conn.execute(

@@ -31,6 +31,7 @@ from typing import Any
 
 import psycopg
 from agentgov import BudgetManager
+from agentgov.exceptions import DuplicateScopeError
 from agentgov.receipts.signing import Ed25519Signer
 from psycopg.conninfo import make_conninfo
 
@@ -67,6 +68,7 @@ from interlock.postgres import install
 from interlock.records import Keyring, read_records
 from interlock.relay import DELIVERED, Breaker, Delivery, DeliveryResult, LedgerBreaker, Relay
 from interlock.sqlite_outbox import (
+    COMPACTOR,
     OPERATOR,
     SETTLER,
     SqliteOutboxStore,
@@ -75,6 +77,7 @@ from interlock.sqlite_outbox import (
     now_us,
 )
 from interlock.types import EffectId, EffectPlan, OutboundRequest
+from interlock.vacuum import Vacuum
 from tests.conftest import (
     OBSERVED,
     PASSWORD,
@@ -374,6 +377,50 @@ class Outbox:
         records = read_records(self.operator_log) if self.operator_log.exists() else ()
         return verify_operators(self.operator(), records, self.keyring())
 
+    # -- the vacuum (docs/EPIC5_DESIGN.md §1) --------------------------------
+
+    def compactor(self) -> Any:
+        """What a vacuum acts through: the installer on PostgreSQL, a store
+        that may prune on SQLite."""
+        raise NotImplementedError
+
+    @contextmanager
+    def vacuum(
+        self,
+        actor: str = "ops",
+        *,
+        ledger: BudgetManager | None = None,
+        anchored: bool = True,
+        **settings: Any,
+    ) -> Iterator[Vacuum]:
+        """A vacuum, as one ``interlock vacuum`` command runs it: its operator
+        log anchored into the ledger (unless ``anchored`` is false), every
+        operator's and relay's key, retention 0 unless ``settings`` says."""
+        governor = ledger if ledger is not None else self.governor
+        try:
+            governor.open_root("operators", "1")
+        except DuplicateScopeError:
+            pass
+        log = OperatorLog(
+            self.operator_log,
+            self.operator_key(actor),
+            self.keyring(),
+            ledger=governor if anchored else None,
+            scope="operators",
+        )
+        settings.setdefault("retain", timedelta(0))
+        try:
+            yield Vacuum(
+                log,
+                self.compactor(),
+                operators=self.keyring(),
+                relays=RELAYS,
+                ledger=governor,
+                **settings,
+            )
+        finally:
+            log.close()
+
     def relay_target(self) -> dict[str, str]:
         """Where a relay in another process finds the outbox: the store's
         kind, and its connection string or file."""
@@ -620,6 +667,9 @@ class PostgresOutbox(Outbox):
     def operations(self) -> OutboxOperations:
         return deliveries.operations(self.operator())
 
+    def compactor(self) -> Any:
+        return deliveries.operations(self.operator())
+
     def forge(
         self,
         message: uuid.UUID,
@@ -739,6 +789,7 @@ class SqliteOutbox(Outbox):
         super().__init__(ledger_path, governor)
         self.path = path
         self._operator: SqliteOutboxStore | None = None
+        self._compactor: SqliteOutboxStore | None = None
 
     def substrate(self, kind: type[Any] | None = None) -> Any:
         return (kind or SqliteSubstrate)(self.path, tables=specs(*OBSERVED))
@@ -803,6 +854,11 @@ class SqliteOutbox(Outbox):
 
     def operations(self) -> OutboxOperations:
         return self.operator()
+
+    def compactor(self) -> SqliteOutboxStore:
+        if self._compactor is None:
+            self._compactor = SqliteOutboxStore(self.path, writes=COMPACTOR)
+        return self._compactor
 
     def forge(
         self,
@@ -895,6 +951,8 @@ class SqliteOutbox(Outbox):
     def close(self) -> None:
         if self._operator is not None:
             self._operator.close()
+        if self._compactor is not None:
+            self._compactor.close()
         super().close()
 
 

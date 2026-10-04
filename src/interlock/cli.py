@@ -13,6 +13,10 @@
                                  ``release``, ``cancel``, ``requeue``,
                                  ``compensate``, ``resolve``: an operator's
                                  actions, each signed with their key
+``interlock vacuum``             prune what no check will read again, under a
+                                 checkpoint the operator signs and AgentGov
+                                 anchors first (``--dry-run``: say what;
+                                 ``--verify-archive FILE``: prove an archive)
 ``interlock keygen``             a new relay or operator key, and its public
                                  half for ``[relays.keys]`` or
                                  ``[operators.keys]`` (``interlock operator
@@ -26,7 +30,9 @@ Exit codes, for scripts and CI:
       ``reconcile-effects``, every write is accounted for
 1     ``reconcile-effects`` found an unrecorded write; ``outbox verify``
       found a delivery log, an attestation or an operator record that
-      does not verify; an ``outbox`` action found nothing to act on
+      does not verify; an ``outbox`` action found nothing to act on; a
+      ``vacuum`` refused (what it would prune does not verify), or an
+      archive does not prove out
 2     usage, or the configuration file is wrong; a relay without a key
       registered in ``[relays.keys]``
 3     the database is not set up (not installed, grants)
@@ -108,6 +114,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             return _relay(config, args, stream)
         if args.command == "outbox":
             return _outbox(config, args, stream)
+        if args.command == "vacuum":
+            return _vacuum(config, args, stream)
         return _check(config, stream)
     except ChainIntegrityError as exc:
         print(f"interlock: {exc}", file=sys.stderr)
@@ -198,6 +206,23 @@ def _parser() -> argparse.ArgumentParser:
                 required=name == "cancel",
                 help="recorded in the signed intent and the delivery log",
             )
+    vacuum = commands.add_parser(
+        "vacuum",
+        help="prune settled history under a signed, anchored checkpoint",
+        description="Verify the outbox, then prune what no check will read again: stages "
+        "delivered and settled, or cancelled, past [vacuum] retain_days; window history past "
+        "the longest [[windows]] span. Under one checkpoint, signed with your operator key "
+        "and anchored into [operators]' ledger before anything is deleted.",
+    )
+    _common(vacuum, _DATABASE_HELP)
+    vacuum.add_argument("--key", help=f"your operator key file (default: ${OPERATOR_KEY_ENV})")
+    vacuum.add_argument("--reason", help="recorded in the signed intent")
+    vacuum.add_argument("--dry-run", action="store_true", help="say what would go; sign nothing")
+    vacuum.add_argument(
+        "--verify-archive",
+        metavar="FILE",
+        help="prove an archive a vacuum wrote against its checkpoint, and do nothing else",
+    )
     operator = commands.add_parser("operator", help="operator keys", description="Operator keys.")
     keys = operator.add_subparsers(dest="action", required=True)
     keygen = keys.add_parser(
@@ -683,6 +708,16 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
             file=out,
         )
     if settings is not None:
+        from interlock.deliveries import reader
+
+        checkpoints = reader(source).checkpoints()
+        if checkpoints:
+            pruned = len(reader(source).compacted())
+            print(
+                f"{len(checkpoints)} checkpoint(s) verify against their signed intents; "
+                f"{pruned} message(s) pruned under them, every tombstone in its fold",
+                file=out,
+            )
         print(
             "every operator action is signed, and the operator log verifies"
             + (
@@ -807,6 +842,130 @@ def _act(operator: Any, config: InterlockConfig, args: argparse.Namespace) -> An
         reason=args.reason,
         registry=config.sink_registry(),
     )
+
+
+def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    from interlock.vacuum import Vacuum
+
+    relays = config.relay_keyring()
+    settings = config.operators
+    if args.verify_archive:
+        return _verify_archive(config, Path(args.verify_archive), out)
+    if settings is None or settings.ledger is None:
+        print(
+            "interlock: a vacuum's checkpoint is anchored into AgentGov before anything is "
+            "pruned: configure [operators] with its ledger",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    if relays is None:
+        print(
+            "interlock: a vacuum prunes only what verifies, relays' attestations included: "
+            "register their keys in [relays.keys]",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    try:
+        signer = _signer(config, args.key)
+    except _RefusedError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    from interlock.operators import OperatorLog
+
+    governor = _ledger(settings.ledger)
+    source, close = _compactor(config)
+    try:
+        try:
+            log = OperatorLog(
+                settings.log, signer, settings.keyring(), ledger=governor, scope=settings.scope
+            )
+        except ValueError as exc:
+            print(f"interlock: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            report = Vacuum(
+                log,
+                source,
+                operators=settings.keyring(),
+                relays=relays,
+                ledger=governor,
+                windows=config.windows,
+                retain=config.vacuum.retain,
+                margin=config.vacuum.margin,
+                archive=config.vacuum.archive,
+            ).run(reason=args.reason, dry_run=args.dry_run)
+        finally:
+            log.close()
+    finally:
+        close()
+        governor.close()
+    for problem in report.problems:
+        print(problem, file=out)
+    for stage, why in report.kept:
+        print(f"kept stage {stage}: {why}", file=out)
+    checkpoint = report.checkpoint
+    if report.outcome in ("applied", "dry-run") and checkpoint is not None:
+        verb = "pruned" if report.outcome == "applied" else "would prune"
+        print(
+            f"checkpoint {checkpoint.seq} ({checkpoint.digest[:16]}): {verb} "
+            f"{report.messages} message(s), {report.log_rows} log row(s), "
+            f"{report.window_rows} window row(s)"
+            + (f"; archived to {report.archive}" if report.archive else ""),
+            file=out,
+        )
+        return EXIT_OK
+    if report.outcome == "nothing":
+        print("nothing to prune", file=out)
+        return EXIT_OK
+    print(f"{report.outcome}: nothing pruned", file=out)
+    return EXIT_FINDINGS
+
+
+def _compactor(config: InterlockConfig) -> tuple[Any, Callable[[], None]]:
+    """The outbox as a vacuum acts on it, and how to close it."""
+    if config.substrate != "postgres":
+        from interlock.sqlite_outbox import COMPACTOR, SqliteOutboxStore
+
+        store = SqliteOutboxStore(config.database, writes=COMPACTOR)
+        return store, store.close
+    import psycopg
+
+    from interlock.deliveries import operations
+
+    try:
+        conn = psycopg.connect(config.database, autocommit=True)
+    except psycopg.Error as exc:
+        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
+    return operations(conn), conn.close
+
+
+def _verify_archive(config: InterlockConfig, path: Path, out: TextIO) -> int:
+    from interlock.compaction import Checkpoint
+    from interlock.vacuum import ARCHIVE_VERSION, verify_archive
+
+    try:
+        header = json.loads(path.read_text(encoding="utf-8").split("\n", 1)[0])
+        if header.get("v") != ARCHIVE_VERSION:
+            raise ValueError("not an archive")
+        seq = int(header["checkpoint"]["seq"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"interlock: {path} is not a vacuum's archive: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    source, close = _compactor(config)
+    try:
+        rows = [row for row in source.checkpoints() if row.seq == seq]
+    finally:
+        close()
+    if not rows:
+        print(f"the database holds no checkpoint {seq}", file=out)
+        return EXIT_FINDINGS
+    problems = verify_archive(path, Checkpoint.parse(rows[0].body), relays=config.relay_keyring())
+    for problem in problems:
+        print(problem, file=out)
+    if problems:
+        return EXIT_FINDINGS
+    print(f"{path.name} proves checkpoint {seq}'s pruned history", file=out)
+    return EXIT_OK
 
 
 def _check(config: InterlockConfig, out: TextIO) -> int:

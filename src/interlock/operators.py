@@ -329,6 +329,9 @@ class Operator:
         without an outcome, from what the database holds."""
         resolved = []
         for intent in self._log.unresolved():
+            if intent.body.get("action") == "compact":
+                resolved.append(self._resolve_compaction(intent))
+                continue
             rows = self._outbox.authorized(intent.record_hash)
             if rows:
                 record = self._log.append(
@@ -351,6 +354,30 @@ class Operator:
                 )
             resolved.append(record)
         return resolved
+
+    def _resolve_compaction(self, intent: SignedRecord) -> SignedRecord:
+        """A vacuum killed between its phases: its checkpoint is in the
+        database when its transaction committed, and nowhere when not."""
+        found = [c for c in self._outbox.checkpoints() if c.authority == intent.record_hash]
+        if found:
+            return self._log.append(
+                APPLIED,
+                {
+                    "intent": _ref(intent),
+                    "rows": [],
+                    "skipped": [],
+                    "checkpoint": {"seq": found[0].seq, "digest": found[0].digest},
+                    "resolved": "the process that signed it stopped before recording this",
+                },
+            )
+        return self._log.append(
+            ABANDONED,
+            {
+                "intent": _ref(intent),
+                "why": "no checkpoint carries its authority: the process that signed it "
+                "stopped before its transaction committed, and nothing was pruned",
+            },
+        )
 
     def installed(self, legacy: LegacySet | None = None) -> SignedRecord:
         """Vouch for the sink registry as the database mirrors it now, and for
@@ -734,7 +761,14 @@ def verify_operators(
       version 3), or an authority no signed intent holds, or one whose
       intent is another action, does not name the message, or named another
       head, or was recorded refused or abandoned;
-    - an applied record naming a row the delivery log does not hold.
+    - an applied record naming a row the delivery log does not hold, unless a
+      checkpoint pruned it (its message's tombstone reaches that row);
+    - a checkpoint no signed ``compact`` intent carries, or not the one it
+      carries, or recorded otherwise than applied; an applied ``compact``
+      intent whose checkpoint the database no longer holds; a chain of
+      checkpoints with a gap or a fork; one left open; tombstones that no
+      longer fold to their checkpoint's root; a pruned message live again
+      (``docs/EPIC5_DESIGN.md`` §1.6).
 
     :param source: The outbox: a PostgreSQL connection or a store.
     :param records: The operator log's records, as read from its file.
@@ -866,11 +900,20 @@ def verify_operators(
             }
             if (str(event.message_id), event.seq, event.event_hash) not in listed:
                 problems.append(f"{where} is not among the rows its applied record names")
+    compacted = source_reader.compacted()
     for digest, outcome in outcomes.items():
         if outcome.kind != APPLIED.value:
             continue
         for row in outcome.body.get("rows", []):
-            found = by_row.get((uuid.UUID(str(row.get("message"))), row.get("seq")))
+            listed_message = uuid.UUID(str(row.get("message")))
+            found = by_row.get((listed_message, row.get("seq")))
+            tombstone = compacted.get(listed_message)
+            if (
+                found is None
+                and tombstone is not None
+                and int(row.get("seq") or 0) <= tombstone.log_seq
+            ):
+                continue  # pruned under a checkpoint, which commits to it
             if found is None or found.event_hash != row.get("hash") or found.authority != digest:
                 problems.append(
                     f"operator record {outcome.seq} names row {row.get('seq')} of message "
@@ -884,7 +927,91 @@ def verify_operators(
         )
     if recorded is not None:
         problems += recorded.vanished(events)
+    problems += _checkpoint_problems(
+        source_reader.checkpoints(), compacted, messages, intents, outcomes
+    )
     return OperatorReport(tuple(problems), len(trusted), actions, legacy)
+
+
+def _checkpoint_problems(
+    rows: Sequence[Any],
+    compacted: Mapping[uuid.UUID, Any],
+    messages: Sequence[Any],
+    intents: Mapping[str, SignedRecord],
+    outcomes: Mapping[str, SignedRecord],
+) -> list[str]:
+    """Every checkpoint held to the signed intent that carries it, the chain
+    of checkpoints to itself, and the tombstones to their checkpoints."""
+    import hashlib
+
+    from agentgov.exceptions import MalformedReceiptError
+    from agentgov.receipts.canonical import canonical_bytes
+
+    from interlock.compaction import GENESIS, tombstone_root
+
+    problems: list[str] = []
+    previous = GENESIS
+    by_checkpoint: dict[int, list[Any]] = {}
+    for tombstone in compacted.values():
+        by_checkpoint.setdefault(tombstone.checkpoint, []).append(tombstone)
+    held = {row.authority for row in rows}
+    for index, row in enumerate(sorted(rows, key=lambda r: r.seq), start=1):
+        where = f"checkpoint {row.seq}"
+        if row.seq != index or row.prev != previous:
+            problems.append(f"{where} does not follow checkpoint {index - 1}: the chain was cut")
+        if hashlib.sha256(row.body.encode("utf-8")).hexdigest() != row.digest:
+            problems.append(f"{where}'s digest is not its body's: it was rewritten")
+        previous = row.digest
+        if row.open:
+            problems.append(f"{where} was left open: written around Interlock")
+        intent = intents.get(row.authority)
+        if intent is None or intent.body.get("action") != "compact":
+            problems.append(
+                f"{where} names authority {row.authority[:16]}, which no signed compact intent "
+                f"holds: written around Interlock"
+            )
+        else:
+            try:
+                signed = canonical_bytes(intent.body.get("checkpoint")).decode("utf-8")
+            except MalformedReceiptError:  # a body that is no checkpoint at all
+                signed = None
+            if signed != row.body:
+                problems.append(
+                    f"{where} is not the checkpoint operator record {intent.seq} signed"
+                )
+            outcome = outcomes.get(row.authority)
+            if outcome is not None and outcome.kind != APPLIED.value:
+                problems.append(f"{where}'s intent was recorded {outcome.kind}")
+        try:
+            body = row.checkpoint()
+        except (ValueError, KeyError, TypeError):
+            problems.append(f"{where} is not a checkpoint")
+            continue
+        tombstones = by_checkpoint.get(row.seq, [])
+        if (tombstone_root(tombstones), len(tombstones)) != (body.root, body.messages):
+            problems.append(
+                f"{where}'s tombstones no longer fold to its signed root: they were edited "
+                f"around Interlock"
+            )
+    for digest, outcome in outcomes.items():
+        intent = intents.get(digest)
+        if (
+            outcome.kind == APPLIED.value
+            and intent is not None
+            and intent.body.get("action") == "compact"
+            and digest not in held
+        ):
+            problems.append(
+                f"operator record {outcome.seq} applied a checkpoint the database no longer "
+                f"holds: it was deleted around Interlock"
+            )
+    for message in messages:
+        if message.message_id in compacted:
+            problems.append(
+                f"message {message.message_id} was pruned by checkpoint "
+                f"{compacted[message.message_id].checkpoint}, and the outbox holds it again"
+            )
+    return problems
 
 
 def legacy_vouch(records: Sequence[SignedRecord], keyring: Keyring) -> LegacyVouch | None:

@@ -45,6 +45,7 @@ import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -61,7 +62,13 @@ from agentgov.receipts import (
 
 from interlock.attestations import attestation_of
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
-from interlock.deliveries import LogEvent, LoggedMessage, settlements, verify_delivery_log
+from interlock.deliveries import (
+    LogEvent,
+    LoggedMessage,
+    Settled,
+    settlements,
+    verify_delivery_log,
+)
 from interlock.records import Keyring, SignedRecord, read_records
 from interlock.types import EffectId, outbound_key
 
@@ -80,6 +87,8 @@ CREDIT_MEMO: Final = "interlock-credit:"
 message id: how a run finds the credit a crashed one posted."""
 
 _RECEIPT: Final = re.compile(r"; receipt ([0-9a-f-]{36})")
+_PRUNED_AT: Final = datetime(1970, 1, 1, tzinfo=UTC)
+"""A pruned settlement's time, which its tombstone does not keep."""
 _COMMITTED: Final = frozenset({OutcomeStatus.COMMITTED, OutcomeStatus.RECOVERED_COMMITTED})
 
 
@@ -627,11 +636,36 @@ def verify_settlements(
     or one naming a compensation credited twice, or for another amount than
     its original cost; and a settlement naming a credit the ledger does not
     hold.
+
+    A message a checkpoint pruned (``docs/EPIC5_DESIGN.md`` §1.6) is held by
+    its tombstone, which keeps its settlement's receipt and credit, its price
+    and what it compensates.
     """
     source = settlements(outbox)
-    rows = source.settlements()
+    rows = dict(source.settlements())
     messages, _ = source.snapshot(None)
     by_id = {m.message_id: m for m in messages}
+    pruned = source.compacted()
+    for message_id, tombstone in pruned.items():
+        if tombstone.state == "delivered" and message_id not in rows:
+            rows[message_id] = Settled(
+                message_id, tombstone.receipt_id, tombstone.credit, "", _PRUNED_AT
+            )
+
+    def compensates(message_id: uuid.UUID) -> uuid.UUID | None:
+        live = by_id.get(message_id)
+        if live is not None:
+            return live.compensates
+        tombstone = pruned.get(message_id)
+        return None if tombstone is None else tombstone.compensates
+
+    def cost(message_id: uuid.UUID) -> Decimal | None:
+        live = by_id.get(message_id)
+        if live is not None:
+            return live.cost
+        tombstone = pruned.get(message_id)
+        return None if tombstone is None else Decimal(tombstone.cost)
+
     problems: list[str] = []
     deliveries = {d.receipt_id: d for d in log.deliveries()}
     named: set[str] = set()
@@ -679,19 +713,15 @@ def verify_settlements(
                 credits.setdefault(compensation, []).append(entry)
         for compensation, entries in sorted(credits.items()):
             settled = rows.get(compensation)
-            message = by_id.get(compensation)
             if len(entries) > 1:
                 problems.append(f"compensation {compensation} was credited {len(entries)} times")
             if settled is None or settled.credit not in {e.entry_hash for e in entries}:
                 problems.append(
                     f"a credit for compensation {compensation} is named by no settlement"
                 )
-            original = (
-                by_id.get(message.compensates)
-                if message is not None and message.compensates
-                else None
-            )
-            if original is None or any(e.amount != original.cost for e in entries):
+            original = compensates(compensation)
+            price = None if original is None else cost(original)
+            if price is None or any(e.amount != price for e in entries):
                 problems.append(
                     f"the credit for compensation {compensation} is not its original's cost"
                 )

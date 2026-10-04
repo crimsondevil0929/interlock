@@ -523,3 +523,70 @@ Where the implementation settled what the design left open, or refined it.
   `enum` and `const` compared with Python's equality, under which `true` is `1`; they now
   compare as JSON does. And a field named like a credential is folded through NFKC before
   it is compared, so `ＡＰＩ_ＫＥＹ` is `api_key`.
+
+### Step 3: compaction and the vacuum
+
+- **The action.** A compaction is an operator action named `compact` (`interlock.vacuum.Vacuum`).
+  Its intent carries the checkpoint body under `checkpoint`, with no per-message targets: the
+  tombstones' fold commits to them. `Operator.resolve()` records a dead vacuum's intent
+  applied when a checkpoint row carries its hash, and abandoned when none does.
+- **Anchored before the act.** The operator log anchors every record it writes. The vacuum
+  then looks for the intent's `ANCHOR` entry in the ledger. Without it the intent is
+  recorded abandoned, and nothing is deleted. `interlock vacuum` refuses to start without
+  `[operators] ledger`, or without `[relays.keys]` (an outcome is pruned only once its
+  attestation verifies).
+- **Verified first.** The survey runs `verify_delivery_log`, `verify_attestations` (under the
+  legacy vouch) and `verify_operators`, which now holds every earlier checkpoint too. A
+  finding about one message keeps that message's stage. Any other finding (the operator
+  log, an earlier checkpoint, the legacy set) refuses the whole vacuum.
+- **The act on each store.** On PostgreSQL, `interlock.outbox_compact` recomputes both folds
+  in PL/pgSQL: amounts through `trim_scale`, instants through `outbox_instant`. Its
+  `IL010` refusals become `CompactionRefusedError`. On SQLite the same steps run in Python
+  inside one `BEGIN IMMEDIATE`. Both refuse:
+  - a checkpoint out of order;
+  - a log head that moved;
+  - a message not final and settled, or still leased;
+  - a message of the legacy set;
+  - half a stage;
+  - folds other than the signed ones.
+- **The guards.** The trigger names stay what they were, so tests and tools that lift a
+  guard by name still find it:
+  - On PostgreSQL, `outbox_append_only` and `attempts_append_only` now run
+    `interlock.outbox_compactable()`. New triggers: `state_compacted_only` on
+    `outbox_state`; `window_ledger_guard` and `window_ledger_truncate` on the window
+    history; append-only guards on the checkpoints and the tombstones. Settlements gained
+    the `TRUNCATE` guard they lacked.
+  - On SQLite, the delete triggers became conditional, and are dropped and created again at
+    every install, so an upgraded file runs version 5's.
+  - Stages check the new guards, as they checked the old ones.
+- **The watermark** is the latest checkpoint's window horizon. On PostgreSQL,
+  `window_totals` raises `IL011`; on SQLite, `measure_windows` checks it. Both surface as
+  a `SubstrateConfigurationError`, a configuration problem rather than an unavailable
+  database. A horizon is recorded only when window rows were actually pruned.
+- **Version 5.** PostgreSQL's `INSTALL_VERSION` and SQLite's `VERSION` are 5, and a store or a
+  stage refuses an older database plainly. The SQLite window table's definition moved to
+  `interlock.sqlite_outbox`, so the outbox's install creates it, and its guard, too. The
+  read-only roles (auditors, relays, settlers) may read the checkpoints and tombstones;
+  no role may write them.
+- **The archive** is written whole and moved into place before the intent, so its digest can
+  enter the checkpoint. A file already there for the same sequence is one a run that died
+  before its act left, and is replaced. `interlock vacuum --verify-archive FILE` checks it
+  against the database's checkpoint of that sequence:
+  - every chain recomputed;
+  - every attestation verified;
+  - the folds recomputed;
+  - the file's digest matched.
+- **`outbox verify`** says how many checkpoints verify against their signed intents, and how
+  many messages were pruned under them.
+- **Proofs.**
+  - `tests/test_vacuum.py`, on both stores: what goes and what stays; nothing unverified
+    pruned; stages whole; the database's own refusals; the watermark; the guards; forgeries
+    named; the archive; the command line.
+  - `tests/test_vacuum_crash.py`: SIGKILL after the intent, after the anchor check, inside
+    the database's transaction, after its commit, and after the outcome, on both stores.
+  - `tests/test_upgrade_v5.py`: version 5 over version 4's frozen code
+    (`tests/outbox_v4.py`, `tests/sqlite_outbox_v4.py`), with a relay of version 4 left
+    running across the install on both stores.
+- **Not kept.** A pruned settlement's time: its tombstone keeps the receipt and the credit,
+  never when they were recorded.
+

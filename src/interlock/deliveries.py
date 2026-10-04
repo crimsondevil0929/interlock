@@ -19,7 +19,7 @@ import hashlib
 import json
 import uuid
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,6 +32,8 @@ from interlock.exceptions import OutboundRequestError
 
 if TYPE_CHECKING:
     import psycopg
+
+    from interlock.compaction import CheckpointRow, Tombstone, WindowRow
 
 __all__ = [
     "ACTION_EVENTS",
@@ -349,6 +351,23 @@ class OutboxReader(Protocol):
         """Every delivered request settled so far, by message."""
         ...
 
+    def checkpoints(self) -> list[CheckpointRow]:
+        """Every compaction's checkpoint, in order (``docs/EPIC5_DESIGN.md``
+        §1); none before version 5."""
+        ...
+
+    def compacted(self) -> dict[uuid.UUID, Tombstone]:
+        """Every message a checkpoint pruned, by id; none before version 5."""
+        ...
+
+    def window_rows(self, horizon: datetime) -> list[WindowRow]:
+        """The rate windows' history at or before ``horizon``."""
+        ...
+
+    def database_now(self) -> datetime:
+        """The clock the store's instants are on."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class Settled:
@@ -576,6 +595,19 @@ class OutboxOperations(OutboxReader, Protocol):
         idempotency_key: str,
     ) -> bool: ...
 
+    def compact(
+        self,
+        authority: str,
+        body: str,
+        heads: Sequence[Mapping[str, Any]],
+        *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> dict[str, int]:
+        """A vacuum's act, under ``authority``: the checkpoint ``body``, the
+        tombstones of the messages at ``heads``, and the deletions, all or
+        nothing (``docs/EPIC5_DESIGN.md`` §1.4)."""
+        ...
+
 
 class PostgresReader:
     """An :class:`OutboxReader` over a PostgreSQL connection."""
@@ -674,6 +706,69 @@ class PostgresReader:
                 "FROM interlock.outbox_settlements"
             )
         }
+
+    def _exists(self, table: str) -> bool:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass(%s) IS NOT NULL", (table,)
+        ).fetchone()
+        return bool(row and row[0])
+
+    def checkpoints(self) -> list[CheckpointRow]:
+        from interlock.compaction import CheckpointRow
+
+        if not self._exists("interlock.checkpoints"):
+            return []
+        return [
+            CheckpointRow(int(r[0]), str(r[1]), str(r[2]), str(r[3]), str(r[4]), r[5])
+            for r in self._conn.execute(
+                "SELECT seq, authority, body, digest, prev, windows_horizon "
+                "FROM interlock.checkpoints ORDER BY seq"
+            )
+        ]
+
+    def compacted(self) -> dict[uuid.UUID, Tombstone]:
+        from interlock.compaction import Tombstone
+
+        if not self._exists("interlock.outbox_compacted"):
+            return {}
+        return {
+            r[0]: Tombstone(
+                message_id=r[0],
+                checkpoint=int(r[1]),
+                stage_id=r[2],
+                plan_id=str(r[3]),
+                state=str(r[4]),
+                log_seq=int(r[5]),
+                log_head=str(r[6]),
+                receipt_id=_text(r[7]),
+                credit=_text(r[8]),
+                cost=str(r[9]),
+                compensates=r[10],
+            )
+            for r in self._conn.execute(
+                "SELECT message_id, checkpoint, stage_id, plan_id, state, log_seq, log_head, "
+                "receipt_id, credit, cost, compensates FROM interlock.outbox_compacted"
+            )
+        }
+
+    def window_rows(self, horizon: datetime) -> list[WindowRow]:
+        from interlock.compaction import WindowRow
+
+        if not self._exists("interlock.window_ledger"):
+            return []
+        return [
+            WindowRow(stage_id=r[0], window=str(r[1]), key=str(r[2]), amount=r[3], at=r[4])
+            for r in self._conn.execute(
+                "SELECT stage_id, window_name, key, amount, at FROM interlock.window_ledger "
+                "WHERE at <= %s",
+                (horizon,),
+            )
+        ]
+
+    def database_now(self) -> datetime:
+        row = self._conn.execute("SELECT pg_catalog.clock_timestamp()").fetchone()
+        assert row is not None
+        return row[0]  # type: ignore[no-any-return]
 
     def legacy(self) -> LegacySet | None:
         row = self._conn.execute(
@@ -1129,6 +1224,35 @@ class PostgresOperations(PostgresReader):
             payload=payload,
             idempotency_key=idempotency_key,
         )
+
+    def compact(
+        self,
+        authority: str,
+        body: str,
+        heads: Sequence[Mapping[str, Any]],
+        *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> dict[str, int]:
+        import psycopg
+
+        from interlock.exceptions import CompactionRefusedError
+
+        with self._conn.transaction():
+            try:
+                row = self._conn.execute(
+                    "SELECT interlock.outbox_compact(%s, %s, %s::jsonb)",
+                    (authority, body, json.dumps(list(heads))),
+                ).fetchone()
+            except psycopg.Error as exc:
+                if exc.sqlstate == "IL010":
+                    raise CompactionRefusedError(
+                        str(exc.diag.message_primary or exc).removeprefix("interlock: ")
+                    ) from exc
+                raise
+            if before_commit is not None:
+                before_commit()
+        assert row is not None
+        return {str(k): int(v) for k, v in dict(row[0]).items()}
 
 
 class PostgresSettlements(PostgresReader):

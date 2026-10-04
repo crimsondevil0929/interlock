@@ -277,7 +277,7 @@ def test_outbound_count_refuses_no_limit_and_a_negative_one() -> None:
     with pytest.raises(ValueError, match="non-negative"):
         OutboundCount(-1)
     with pytest.raises(ValueError, match="non-negative"):
-        OutboundCount(per_sink={"mail": True})  # type: ignore[dict-item]
+        OutboundCount(per_sink={"mail": True})
 
 
 # --------------------------------------------------------------------------
