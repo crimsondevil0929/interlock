@@ -52,6 +52,7 @@ from interlock.deliveries import (
     LogEvent,
     LoggedMessage,
     MessageView,
+    Settled,
     _registry_row,
     event_hash,
     genesis_hash,
@@ -88,7 +89,8 @@ STATE: Final = "_interlock_outbox_state"
 LOG: Final = "_interlock_outbox_attempts"
 EPOCHS: Final = "_interlock_outbox_epochs"
 LEGACY: Final = "_interlock_outbox_legacy"
-OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY})
+SETTLEMENTS: Final = "_interlock_outbox_settlements"
+OUTBOX_TABLES: Final = frozenset({SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS})
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -235,6 +237,15 @@ _SCHEMA: Final = (
     f"BEGIN SELECT RAISE(ABORT, 'interlock: {LEGACY} is append-only'); END",
     f"CREATE TRIGGER IF NOT EXISTS _interlock_legacy_no_delete BEFORE DELETE ON {LEGACY} "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: {LEGACY} is append-only'); END",
+    # What settlement did with each delivered request (interlock.settlement):
+    # one row per message, never changed.
+    f"CREATE TABLE IF NOT EXISTS main.{SETTLEMENTS} ("
+    f"message_id TEXT PRIMARY KEY REFERENCES {OUTBOX} (message_id), receipt_id TEXT, "
+    f"credit TEXT, note TEXT NOT NULL, settled_at INTEGER NOT NULL)",
+    f"CREATE TRIGGER IF NOT EXISTS _interlock_settlements_no_update BEFORE UPDATE "
+    f"ON {SETTLEMENTS} BEGIN SELECT RAISE(ABORT, 'interlock: {SETTLEMENTS} is append-only'); END",
+    f"CREATE TRIGGER IF NOT EXISTS _interlock_settlements_no_delete BEFORE DELETE "
+    f"ON {SETTLEMENTS} BEGIN SELECT RAISE(ABORT, 'interlock: {SETTLEMENTS} is append-only'); END",
     f"CREATE TRIGGER IF NOT EXISTS _interlock_legacy_sealed BEFORE INSERT ON {LEGACY} "
     f"WHEN EXISTS (SELECT 1 FROM {EPOCHS} WHERE version = '4') "
     f"BEGIN SELECT RAISE(ABORT, 'interlock: the legacy set was recorded when version 4 was "
@@ -637,6 +648,8 @@ RELAY: Final = frozenset({STATE, LOG})
 """What a relay's connection may write."""
 OPERATOR: Final = frozenset({OUTBOX, STATE, LOG})
 """What an operator's connection may write: compensations are new requests."""
+SETTLER: Final = frozenset({SETTLEMENTS})
+"""What settlement's connection may write: its record, and nothing else."""
 
 _OUTCOMES: Final = ("delivered", "retryable", "permanent", "unknown")
 
@@ -651,7 +664,8 @@ class SqliteOutboxStore:
 
     :param path: The database file, with the outbox installed.
     :param writes: What this connection may write: :data:`RELAY` for a relay,
-        :data:`OPERATOR` for an operator's actions.
+        :data:`OPERATOR` for an operator's actions, :data:`SETTLER` for
+        settlement.
     :param busy_seconds: How long a write waits for the lock. Longer than a
         stage may live (``max_stage_seconds``): a stage holds the lock for its
         whole life.
@@ -1445,11 +1459,14 @@ class SqliteOutboxStore:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
+                cost=Decimal(str(m[13])),
+                compensates=None if m[14] is None else uuid.UUID(str(m[14])),
             )
             for m in self._conn.execute(
                 f"SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
                 f"o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, "
-                f"s.log_seq, s.log_head FROM {OUTBOX} AS o JOIN {STATE} AS s "
+                f"s.log_seq, s.log_head, o.cost, o.compensates FROM {OUTBOX} AS o "
+                f"JOIN {STATE} AS s "
                 f"ON s.message_id = o.message_id "
                 f"WHERE ?1 IS NULL OR o.message_id IN (SELECT value FROM json_each(?1)) "
                 f"ORDER BY o.enqueued_at, o.message_id",
@@ -1542,6 +1559,46 @@ class SqliteOutboxStore:
 
     def legacy(self) -> LegacySet | None:
         return _legacy(self._conn)
+
+    def settlements(self) -> dict[uuid.UUID, Settled]:
+        return {
+            uuid.UUID(str(r[0])): Settled(
+                uuid.UUID(str(r[0])),
+                None if r[1] is None else str(r[1]),
+                None if r[2] is None else str(r[2]),
+                str(r[3]),
+                instant(int(r[4])),
+            )
+            for r in self._conn.execute(
+                f"SELECT message_id, receipt_id, credit, note, settled_at FROM {SETTLEMENTS}"
+            )
+        }
+
+    def settle(
+        self, message_id: uuid.UUID, *, receipt_id: str | None, credit: str | None, note: str
+    ) -> bool:
+        """Record a delivered request's settlement, once, as
+        ``interlock.outbox_settle`` does. ``False`` when it was settled already.
+
+        :raises InterlockError: If the message is not delivered.
+        """
+        from interlock.exceptions import InterlockError
+
+        with self._writing() as conn:
+            row = conn.execute(
+                f"SELECT state FROM {STATE} WHERE message_id = ?", (str(message_id),)
+            ).fetchone()
+            if row is None or row[0] != "delivered":
+                raise InterlockError(
+                    f"message {message_id} is {row[0] if row else 'not in the outbox'}: only "
+                    f"a delivered request is settled"
+                )
+            cursor = conn.execute(
+                f"INSERT OR IGNORE INTO {SETTLEMENTS} "
+                f"(message_id, receipt_id, credit, note, settled_at) VALUES (?, ?, ?, ?, ?)",
+                (str(message_id), receipt_id, credit, note, now_us()),
+            )
+            return cursor.rowcount == 1
 
     def authorized(self, authority: str) -> list[AuthorizedRow]:
         return [

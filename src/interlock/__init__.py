@@ -127,6 +127,7 @@ from interlock.relay import (
 )
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
+from interlock.settlement import SettlementReport, Settler, verify_settlements
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.types import (
     Compensation,
@@ -234,6 +235,8 @@ __all__ = [
     "RowSum",
     "Rung",
     "ScopeHaltedError",
+    "SettlementReport",
+    "Settler",
     "Severity",
     "ShadowSubstrate",
     "SignedRecord",
@@ -269,4 +272,5 @@ __all__ = [
     "retry_delay",
     "verify_delivery_log",
     "verify_records",
+    "verify_settlements",
 ]

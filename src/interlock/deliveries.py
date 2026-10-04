@@ -249,7 +249,8 @@ before an upgrade."""
 _MESSAGES: Final = (
     "SELECT o.message_id, o.stage_id, o.plan_id, o.scope_id, o.effect_id, o.sink, "
     "o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, s.log_seq, "
-    "s.log_head FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
+    "s.log_head, o.cost, {compensates} "
+    "FROM interlock.outbox o JOIN interlock.outbox_state s USING (message_id) "
     "WHERE %(ids)s::uuid[] IS NULL OR o.message_id = ANY (%(ids)s::uuid[]) "
     "ORDER BY o.enqueued_at, o.message_id"
 )
@@ -293,6 +294,11 @@ class LoggedMessage:
     attempts: int
     log_seq: int
     log_head: str
+    cost: Decimal = Decimal(0)
+    """What the request cost, as the sink registry priced it when its plan
+    committed: what the plan was charged for it."""
+    compensates: uuid.UUID | None = None
+    """The request this one compensates, when it is a compensation."""
 
     def genesis(self) -> str:
         return genesis_hash(
@@ -338,6 +344,23 @@ class OutboxReader(Protocol):
         """The legacy set version 4 recorded as it was installed, or ``None``
         before version 4."""
         ...
+
+    def settlements(self) -> dict[uuid.UUID, Settled]:
+        """Every delivered request settled so far, by message."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class Settled:
+    """A delivered request, settled (:mod:`interlock.settlement`): its
+    delivery receipt and its credit, or why there is none."""
+
+    message_id: uuid.UUID
+    receipt_id: str | None
+    credit: str | None
+    """The ledger entry that credited the agent, by hash."""
+    note: str
+    settled_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,6 +435,17 @@ class LegacyVouch:
             f"the legacy set ({len(recorded)} row(s)) is not the one operator record "
             f"{self.record} vouched for ({self.rows} row(s)): it was edited around Interlock"
         )
+
+
+class OutboxSettlements(OutboxReader, Protocol):
+    """What :class:`~interlock.settlement.Settler` reads and writes."""
+
+    def settle(
+        self, message_id: uuid.UUID, *, receipt_id: str | None, credit: str | None, note: str
+    ) -> bool:
+        """Record a delivered request's settlement, once. ``False`` when it
+        was settled already."""
+        ...
 
 
 def registry_digest(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -594,11 +628,20 @@ class PostgresReader:
                 attempts=int(m[10]),
                 log_seq=int(m[11]),
                 log_head=str(m[12]),
+                cost=Decimal(str(m[13])),
+                compensates=m[14],
             )
-            for m in self._conn.execute(_MESSAGES, params).fetchall()
+            for m in self._conn.execute(self._messages(), params).fetchall()
         ]
         events = [_event(row) for row in self._conn.execute(self._events(), params)]
         return found, events
+
+    def _messages(self) -> str:
+        from interlock.postgres import installed_version
+
+        # Compensations arrived with version 3.
+        compensates = "o.compensates" if installed_version(self._conn) >= 3 else "NULL::uuid"
+        return _MESSAGES.format(compensates=compensates)
 
     def epoch(self, version: str = "3") -> datetime | None:
         row = self._conn.execute(
@@ -617,6 +660,20 @@ class PostgresReader:
                 "unknown_outcome, config_hash, enabled FROM interlock.sinks ORDER BY name"
             )
         ]
+
+    def settlements(self) -> dict[uuid.UUID, Settled]:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.outbox_settlements') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return {}
+        return {
+            r[0]: Settled(r[0], r[1], r[2], str(r[3]), r[4])
+            for r in self._conn.execute(
+                "SELECT message_id, receipt_id, credit, note, settled_at "
+                "FROM interlock.outbox_settlements"
+            )
+        }
 
     def legacy(self) -> LegacySet | None:
         row = self._conn.execute(
@@ -1072,6 +1129,29 @@ class PostgresOperations(PostgresReader):
             payload=payload,
             idempotency_key=idempotency_key,
         )
+
+
+class PostgresSettlements(PostgresReader):
+    """:class:`OutboxSettlements` over a PostgreSQL connection as a settler role."""
+
+    __slots__ = ()
+
+    def settle(
+        self, message_id: uuid.UUID, *, receipt_id: str | None, credit: str | None, note: str
+    ) -> bool:
+        row = self._conn.execute(
+            "SELECT interlock.outbox_settle(%s, %s, %s, %s)",
+            (message_id, receipt_id, credit, note),
+        ).fetchone()
+        return bool(row and row[0])
+
+
+def settlements(source: object) -> OutboxSettlements:
+    """``source`` as :class:`OutboxSettlements`: a SQLite store opened with
+    ``writes=SETTLER`` already is; a PostgreSQL connection is wrapped."""
+    if hasattr(source, "settle"):
+        return source  # type: ignore[return-value]
+    return PostgresSettlements(source)  # type: ignore[arg-type]
 
 
 def operations(source: object) -> OutboxOperations:

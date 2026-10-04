@@ -68,6 +68,7 @@ from interlock.records import Keyring, read_records
 from interlock.relay import DELIVERED, Breaker, Delivery, DeliveryResult, LedgerBreaker, Relay
 from interlock.sqlite_outbox import (
     OPERATOR,
+    SETTLER,
     SqliteOutboxStore,
     install_sqlite_outbox,
     instant_text,
@@ -373,6 +374,16 @@ class Outbox:
         kind, and its connection string or file."""
         raise NotImplementedError
 
+    def settler(self) -> Any:
+        """The outbox as settlement reads and writes it: a connection as the
+        settler role, or a store that writes settlements only. The caller
+        closes it."""
+        raise NotImplementedError
+
+    def settler_target(self) -> dict[str, str]:
+        """Where settlement in another process finds the outbox."""
+        raise NotImplementedError
+
     def lease_left(self, message: uuid.UUID) -> float:
         """Seconds left on the message's lease, by the database's clock; 0
         when it is not leased."""
@@ -524,12 +535,21 @@ class PostgresOutbox(Outbox):
     backend = "postgres"
 
     def __init__(
-        self, pg: Pg, relay_dsn: str, relay_role: str, ledger_path: str, governor: BudgetManager
+        self,
+        pg: Pg,
+        relay_dsn: str,
+        relay_role: str,
+        ledger_path: str,
+        governor: BudgetManager,
+        settler_dsn: str = "",
+        settler_role: str = "",
     ) -> None:
         super().__init__(ledger_path, governor)
         self.pg = pg
         self.relay_dsn = relay_dsn
         self.relay_role = relay_role
+        self.settler_dsn = settler_dsn
+        self.settler_role = settler_role
         self._admin: psycopg.Connection[Any] | None = None
 
     def substrate(self, kind: type[Any] | None = None) -> Any:
@@ -633,6 +653,12 @@ class PostgresOutbox(Outbox):
     def relay_target(self) -> dict[str, str]:
         return {"store": "postgres", "dsn": self.relay_dsn, "key": RELAY_SEED.hex()}
 
+    def settler(self) -> Any:
+        return psycopg.connect(self.settler_dsn, autocommit=True)
+
+    def settler_target(self) -> dict[str, str]:
+        return {"store": "postgres", "dsn": self.settler_dsn}
+
     def operator_target(self) -> dict[str, str]:
         return {"store": "postgres", "dsn": self.pg.admin}
 
@@ -673,6 +699,7 @@ class PostgresOutbox(Outbox):
             stage_roles=[self.pg.role],
             sinks=sinks,
             relay_roles=[self.relay_role],
+            settler_roles=[self.settler_role] if self.settler_role else [],
         )
 
     def fetch(self, sql: str, *params: object) -> list[tuple[Any, ...]]:
@@ -804,6 +831,12 @@ class SqliteOutbox(Outbox):
     def relay_target(self) -> dict[str, str]:
         return {"store": "sqlite", "dsn": self.path, "key": RELAY_SEED.hex()}
 
+    def settler(self) -> Any:
+        return SqliteOutboxStore(self.path, writes=SETTLER)
+
+    def settler_target(self) -> dict[str, str]:
+        return {"store": "sqlite", "dsn": self.path}
+
     def operator_target(self) -> dict[str, str]:
         return {"store": "sqlite", "dsn": self.path}
 
@@ -853,7 +886,9 @@ def _ledger(tmp_path: Path) -> tuple[str, BudgetManager]:
 
 def build_outbox(pg: Pg, tmp_path: Path) -> Iterator[PostgresOutbox]:
     role = f"il_relay_{uuid.uuid4().hex[:8]}"
+    settler = f"il_settle_{uuid.uuid4().hex[:8]}"
     create_role(pg.cluster, role)
+    create_role(pg.cluster, settler)
     try:
         with psycopg.connect(pg.admin, autocommit=True) as conn:
             install(
@@ -862,6 +897,7 @@ def build_outbox(pg: Pg, tmp_path: Path) -> Iterator[PostgresOutbox]:
                 stage_roles=[pg.role],
                 sinks=RELAY_SINKS,
                 relay_roles=[role],
+                settler_roles=[settler],
             )
         ledger, governor = _ledger(tmp_path)
         env = PostgresOutbox(
@@ -870,12 +906,15 @@ def build_outbox(pg: Pg, tmp_path: Path) -> Iterator[PostgresOutbox]:
             relay_role=role,
             ledger_path=ledger,
             governor=governor,
+            settler_dsn=make_conninfo(pg.admin, user=settler, password=PASSWORD),
+            settler_role=settler,
         )
         try:
             yield env
         finally:
             env.close()
     finally:
+        drop_role(pg.cluster, pg.admin, settler)
         drop_role(pg.cluster, pg.admin, role)
 
 

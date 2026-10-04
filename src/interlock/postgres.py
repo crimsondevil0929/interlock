@@ -468,7 +468,10 @@ _OUTBOX_TABLES: Final = (
     "interlock.outbox_attempts",
     "interlock.outbox_epochs",
     "interlock.outbox_legacy",
+    "interlock.outbox_settlements",
 )
+
+_SETTLER_FUNCTIONS: Final = ("interlock.outbox_settle(uuid, text, text, text)",)
 
 _RELAY_FUNCTIONS: Final = (
     "interlock.relay_claim(text, double precision, integer, text[])",
@@ -491,6 +494,7 @@ def install(
     audit_roles: Iterable[str] = (),
     sinks: Iterable[SinkSpec] = (),
     relay_roles: Iterable[str] = (),
+    settler_roles: Iterable[str] = (),
 ) -> LegacySet:
     """Install Interlock's schema, functions and triggers. Idempotent.
 
@@ -515,6 +519,10 @@ def install(
         outbox tables, and change delivery state only through the relay
         functions, which check its lease and append to the delivery log. It
         may not change a request, or write anything else.
+    :param settler_roles: Roles settlement runs as
+        (:class:`~interlock.settlement.Settler`). Each may read the outbox
+        tables and record a delivered request's settlement, through
+        ``interlock.outbox_settle``, and nothing else.
     :raises ValueError: On a schema or role name that is not a plain
         identifier.
 
@@ -544,7 +552,8 @@ def install(
     roles = list(stage_roles)
     auditors = list(audit_roles)
     relays = list(relay_roles)
-    for role in (*roles, *auditors, *relays):
+    settlers = list(settler_roles)
+    for role in (*roles, *auditors, *relays, *settlers):
         _identifier(role)
     wanted = {spec.name.lower(): spec for spec in tables}
     registry = list(sinks)
@@ -626,6 +635,13 @@ def install(
             conn.execute(f"REVOKE ALL ON {', '.join(_OUTBOX_TABLES)} FROM {role}")
             conn.execute(f"GRANT SELECT ON {', '.join(_OUTBOX_TABLES)} TO {role}")
             for signature in _RELAY_FUNCTIONS:
+                conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
+        for role in settlers:
+            conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
+            # Reads only, but for its one function.
+            conn.execute(f"REVOKE ALL ON {', '.join(_OUTBOX_TABLES)} FROM {role}")
+            conn.execute(f"GRANT SELECT ON {', '.join(_OUTBOX_TABLES)} TO {role}")
+            for signature in _SETTLER_FUNCTIONS:
                 conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
         legacy = PostgresReader(conn).legacy()
     return legacy or LegacySet({})

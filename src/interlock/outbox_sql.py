@@ -191,6 +191,18 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_legacy (
     PRIMARY KEY (message_id, seq)
 );
 REVOKE ALL ON interlock.outbox_legacy FROM PUBLIC;
+
+-- What settlement did with each delivered request (docs/EPIC4_DESIGN.md §4):
+-- its delivery receipt and its credit, or why there is none. One row per
+-- message, written by interlock.outbox_settle alone, never changed.
+CREATE TABLE IF NOT EXISTS interlock.outbox_settlements (
+    message_id uuid PRIMARY KEY REFERENCES interlock.outbox (message_id),
+    receipt_id text,
+    credit     text,
+    note       text NOT NULL,
+    settled_at timestamptz NOT NULL DEFAULT pg_catalog.clock_timestamp()
+);
+REVOKE ALL ON interlock.outbox_settlements FROM PUBLIC;
 DO $legacy$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
@@ -1284,7 +1296,36 @@ END
 $fn$;
 """
 
-OUTBOX_FUNCTIONS: Final = STAGE_OUTBOX_FUNCTIONS + RELAY_FUNCTIONS
+SETTLE_FUNCTIONS: Final = r"""
+-- A settler records each delivered request's settlement once: the delivery
+-- receipt the receipt log issued and the credit the ledger posted, or why
+-- there is none (interlock.settlement). Only a delivered request is settled.
+CREATE OR REPLACE FUNCTION interlock.outbox_settle(
+    p_message uuid, p_receipt text, p_credit text, p_note text)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    st text;
+BEGIN
+    SELECT s.state INTO st FROM interlock.outbox_state AS s WHERE s.message_id = p_message;
+    IF st IS NULL THEN
+        RAISE EXCEPTION 'interlock: no message %', p_message USING ERRCODE = 'IL002';
+    END IF;
+    IF st <> 'delivered' THEN
+        RAISE EXCEPTION 'interlock: message % is %: only a delivered request is settled',
+            p_message, st USING ERRCODE = 'IL002';
+    END IF;
+    INSERT INTO interlock.outbox_settlements (message_id, receipt_id, credit, note)
+    VALUES (p_message, p_receipt, p_credit, coalesce(p_note, ''))
+    ON CONFLICT (message_id) DO NOTHING;
+    RETURN FOUND;
+END
+$fn$;
+"""
+
+OUTBOX_FUNCTIONS: Final = STAGE_OUTBOX_FUNCTIONS + RELAY_FUNCTIONS + SETTLE_FUNCTIONS
 
 OUTBOX_TRIGGERS: Final = r"""
 DROP TRIGGER IF EXISTS outbox_append_only ON interlock.outbox;
@@ -1313,6 +1354,10 @@ CREATE TRIGGER legacy_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_le
 DROP TRIGGER IF EXISTS legacy_append_only_truncate ON interlock.outbox_legacy;
 CREATE TRIGGER legacy_append_only_truncate BEFORE TRUNCATE ON interlock.outbox_legacy
     FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS settlements_append_only ON interlock.outbox_settlements;
+CREATE TRIGGER settlements_append_only BEFORE UPDATE OR DELETE ON interlock.outbox_settlements
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
+ALTER TABLE interlock.outbox_settlements ENABLE ALWAYS TRIGGER settlements_append_only;
 DROP TRIGGER IF EXISTS legacy_sealed ON interlock.outbox_legacy;
 CREATE TRIGGER legacy_sealed BEFORE INSERT ON interlock.outbox_legacy
     FOR EACH ROW EXECUTE FUNCTION interlock.outbox_legacy_sealed();

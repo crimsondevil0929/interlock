@@ -8,6 +8,7 @@ TOML, so the standard library reads it::
     stage_roles = ["interlock_agent"] # PostgreSQL install only
     audit_roles = ["interlock_audit"] # PostgreSQL install only
     relay_roles = ["interlock_relay"] # PostgreSQL install only
+    settler_roles = ["interlock_settle"]  # PostgreSQL install only; interlock.settlement
     acknowledge_cascades = []
 
     [[tables]]
@@ -229,6 +230,7 @@ class InterlockConfig:
     acknowledge_cascades: tuple[str, ...] = ()
     sinks: tuple[SinkSpec, ...] = ()
     relay_roles: tuple[str, ...] = ()
+    settler_roles: tuple[str, ...] = ()
     relay: RelayConfig | None = None
     operators: OperatorsConfig | None = None
     relays: Mapping[str, str] | None = None
@@ -297,10 +299,11 @@ def load_config(
             raise ConfigError(f"tables[{index}]: {exc}") from exc
     sinks = _sinks(raw.get("sinks", []), Path(path).parent)
     relay_roles = tuple(_strings(raw, "relay_roles", required=False))
-    if relay_roles and substrate != "postgres":
+    settler_roles = tuple(_strings(raw, "settler_roles", required=False))
+    if (relay_roles or settler_roles) and substrate != "postgres":
         raise ConfigError(
-            "relay_roles are PostgreSQL roles; a SQLite relay is bounded by the file's "
-            "permissions instead"
+            f"{'relay_roles' if relay_roles else 'settler_roles'} are PostgreSQL roles; on "
+            f"SQLite the file's permissions bound who writes it instead"
         )
     relay = _relay(raw.get("relay"), sinks, Path(path).parent)
     operators = _operators(raw.get("operators"), Path(path).parent)
@@ -316,6 +319,7 @@ def load_config(
         acknowledge_cascades=tuple(_strings(raw, "acknowledge_cascades", required=False)),
         sinks=sinks,
         relay_roles=relay_roles,
+        settler_roles=settler_roles,
         relay=relay,
         operators=operators,
         relays=relays,

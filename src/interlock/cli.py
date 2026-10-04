@@ -324,6 +324,7 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
                 audit_roles=config.audit_roles,
                 sinks=config.sinks,
                 relay_roles=config.relay_roles,
+                settler_roles=config.settler_roles,
             )
             report = analyze_cascades(
                 read_postgres_foreign_keys(conn, config.schema),
@@ -344,6 +345,8 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
         print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
     for role in config.relay_roles:
         print(f"granted to relay role: {role}", file=out)
+    for role in config.settler_roles:
+        print(f"granted to settler role: {role}", file=out)
     _print_report(report, out)
     return EXIT_OK, legacy
 

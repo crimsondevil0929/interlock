@@ -1,6 +1,7 @@
 # Epic 4: delivery receipts, rate windows, ledger-integrated compensations
 
-**Status: design, approved; built step by step on `feat/epic4-zero-trust`.** Builds on
+**Status: built**, step by step on `feat/epic4-zero-trust`; §7 records where the build
+settled what the design left open. Builds on
 [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md) (Epic 2) and [`EPIC3_DESIGN.md`](EPIC3_DESIGN.md),
 and closes the outbox specification's last open items: delivery receipts (§9 there) and
 rate windows (§5.3 there), with the ledger policy for compensations. Decided before any
@@ -299,3 +300,39 @@ Where the implementation settled what the design left open, or refined it.
   after.
 - A fresh install records an empty set, so on a database that never ran an older version,
   every outcome must be attested and every operator row signed.
+
+### Step 5: settlement
+
+- **`Settler`**, in `interlock.settlement`, runs in the process that holds the receipt log
+  and the ledger (the engine's: the receipt log admits one writer, a SQLite ledger one
+  governor). It reads the outbox as a settler role (`install(settler_roles=...)`, which
+  may read the outbox and call `interlock.outbox_settle`, nothing else) or a SQLite store
+  opened with `writes=SETTLER`.
+- **The delivery receipt** binds to the action receipt the plan that committed the request
+  was issued, found through the escrow chain (its `COMMITTED` record names the receipt) and
+  read from the log. A compensation binds to its original's plan: the plan carried and the
+  checkers judged the compensation; an operator's signed intent only set it off. A plan
+  with no action receipt (receipts off, or a commit recovered after a crash, which issues
+  none) is settled without one, and the settlement says so.
+- **The credit** is AgentGov `refund()` to the original's scope of the original's
+  `cost_per_call`, the amount its plan was charged for it, under a memo naming the
+  compensation and the charge it reverses. The charge is the plan's reverse-anchor spend,
+  whose memo names its commit record; the credits for one plan never exceed it. The
+  authority is checked in full: the original's `compensated` row carries the hash of a
+  signed intent, under a registered operator key, of action `compensate`, naming this
+  compensation's message, sink, operation, payload hash and idempotency key, and recorded
+  applied with that row.
+- **Decided, or deferred.** A credit is refused for good, and the request settled without
+  one and saying why, when there is no ledger, the original cost nothing, the plan was
+  never charged, or the authority does not hold. It is deferred, the request left
+  unsettled and reported, while the decision may still change: the intent behind the
+  compensation has no outcome yet (the next operator command resolves it), or no operator
+  log is configured. A delivery no registered relay attested is never settled.
+- **Exactly once.** Each step looks for what a crashed run left of it: the log's delivery
+  receipt for the message, the ledger's credit for the compensation; the settlement row
+  is written once, for a delivered request only, never changed. Killed after the receipt,
+  after the credit, or after the row, on either store, the next run settles every message
+  once: `tests/test_settlement_crash.py`.
+- `verify_settlements` holds the three to each other: every settlement's receipt in the
+  log, for its message, attested and bound; every delivery receipt named by a settlement;
+  every credit named by one, once, of its original's cost.
