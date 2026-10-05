@@ -236,6 +236,8 @@ def test_a_finding_no_one_messages_stops_the_vacuum(bench: Bench) -> None:
     bench.settler().settle()
     with outbox.vacuum() as vacuum:
         report = vacuum.run()
+        # Not even surveyed as prunable: the evidence it would rest on is gone.
+        assert vacuum.survey().tombstones == ()
     assert report.outcome == "refused"
     assert any("checkpoint 1's tombstones no longer fold" in p for p in report.problems)
     assert len(outbox.compactor().checkpoints()) == 1
@@ -339,6 +341,14 @@ def test_the_database_refuses_what_is_not_final_settled_and_whole(bench: Bench) 
         compactor.compact("a" * 64, _body(outbox).canonical(), [heads[first]])
     with pytest.raises(CompactionRefusedError, match="not the ones the checkpoint commits to"):
         compactor.compact("a" * 64, _body(outbox).canonical(), [heads[first], heads[second]])
+    # The counts right, the root not: the fold itself is held, not only its size.
+    rows = len(outbox.log(first)) + len(outbox.log(second))
+    with pytest.raises(CompactionRefusedError, match="not the ones the checkpoint commits to"):
+        compactor.compact(
+            "a" * 64,
+            _body(outbox, messages=2, rows=rows, root="0" * 64).canonical(),
+            [heads[first], heads[second]],
+        )
     assert pending in {m.message_id for m in messages}
     assert compactor.checkpoints() == [] and outbox.requests() == 3
 
@@ -495,6 +505,51 @@ def test_forgeries_around_the_guards_are_named(bench: Bench) -> None:
     problems = outbox.verify_operators().problems
     assert any("checkpoint 1's digest is not its body's" in p for p in problems)
     assert any("not the checkpoint operator record" in p for p in problems)
+
+
+def test_a_checkpoint_of_another_transaction_admits_no_delete(bench: Bench) -> None:
+    """The guards admit a delete beside a checkpoint the deleting transaction
+    itself wrote: on PostgreSQL, by its transaction id; on SQLite, by the open
+    flag the act clears before it commits. A checkpoint written before, by the
+    owner, tombstone and all, admits none."""
+    outbox = bench.outbox
+    _, other, _, _ = office(bench)
+    ((message,), _) = outbox.compactor().snapshot([other])
+    if isinstance(outbox, PostgresOutbox):
+        checkpoint = (
+            "INSERT INTO interlock.checkpoints (seq, authority, body, digest, prev) "
+            "VALUES (1, %s, '{}', %s, %s)",
+            ("c" * 64, "d" * 64, "0" * 64),
+        )
+    else:
+        checkpoint = (
+            "INSERT INTO interlock.checkpoints (seq, authority, body, digest, prev, open, at) "
+            "VALUES (1, %s, '{}', %s, %s, 0, 0)",
+            ("c" * 64, "d" * 64, "0" * 64),
+        )
+    owner(
+        outbox,
+        checkpoint,
+        (
+            f"INSERT INTO {table(outbox, 'outbox_compacted')} (message_id, checkpoint, "
+            f"stage_id, plan_id, state, log_seq, log_head, cost) "
+            f"VALUES (%s, 1, %s, %s, 'delivered', %s, %s, '0')",
+            (
+                key(outbox, other),
+                key(outbox, message.stage_id),
+                message.plan_id,
+                message.log_seq,
+                message.log_head,
+            ),
+        ),
+    )
+    for name in ("outbox_attempts", "outbox_settlements", "outbox_state", "outbox"):
+        with pytest.raises(Exception, match=r"append-only|goes only with"):
+            owner(
+                outbox,
+                (f"DELETE FROM {table(outbox, name)} WHERE message_id = %s", (key(outbox, other),)),
+            )
+    assert outbox.state(other) == "delivered"
 
 
 def test_a_deleted_checkpoint_is_named(bench: Bench) -> None:

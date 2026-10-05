@@ -1,7 +1,7 @@
 # Epic 5: the zero-trust inbox, cryptographic compaction, the last checkers
 
-**Status: building**, step by step on `feat/epic5-inbox-compaction`; §8 will
-record where the build settled what the design leaves open. Builds on
+**Status: built**, on `feat/epic5-inbox-compaction`; §8 records where the build settled
+what the design left open. Builds on
 [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md) (Epic 2), [`EPIC3_DESIGN.md`](EPIC3_DESIGN.md) and
 [`EPIC4_DESIGN.md`](EPIC4_DESIGN.md). Three parts:
 
@@ -589,4 +589,172 @@ Where the implementation settled what the design left open, or refined it.
     running across the install on both stores.
 - **Not kept.** A pruned settlement's time: its tombstone keeps the receipt and the credit,
   never when they were recorded.
+
+### Step 4: the inbox
+
+- **Modules.** `interlock.inbox` holds the vendors' schemes, the projection, the log's hash and
+  the attestations, the receiver (`Inbox`), verification (`verify_inbox`, `verify_fact`) and
+  the HTTP server (`serve`). `interlock.inbox_sql` holds both stores' schema and functions,
+  and `interlock.inbox_store` the stores: `PostgresInboxStore`, an inbox role's connection,
+  and on SQLite the same steps under `BEGIN IMMEDIATE`, through a store opened with the
+  `INBOX` write set (`inbox_sources`, `inbox_events`, `inbox_facts`; never the outbox, never
+  consumption).
+- **The log's hash and the event's attestation cover more than §2.3 listed.** Both cover
+  the event's part (its place in a SendGrid batch), its references, its projected fields
+  and the names of its withheld fields, so what the agent is shown is chained and signed,
+  not only the body's hash. The attestation is canonical JSON with a version (`v`,
+  `ILOK1-inbound-event`) and the signer's `alg` and `key_id`.
+- **A fact's attestation signs the event's attestation in.** Without it, a database owner
+  could pair one event's genuinely attested content with another event's genuinely attested
+  binding by rewriting an event row: each signature would verify, and the pairing would be a
+  forgery. With it, a fact verifies only with the very event it was made for.
+- **One fact per event.** `UNIQUE (source, event_seq)`: an event names one object, and its
+  first matching reference binds it. A later reference is tried when an earlier one names
+  nothing delivered (a refund event naming an unknown refund but a delivered payment
+  intent). An event naming what two messages' deliveries created is bound to neither, and
+  stays unmatched.
+- **What the database checks, and what it cannot.** `inbox_record` recomputes the body's
+  hash over the text as sent, refuses a disabled or unknown source, and answers a retry
+  with the row already there. `inbox_match` holds a binding to an event at its hash and to a
+  `delivered` row at its position and hash, carrying the reference, of the message's own
+  scope, plan and tenant. Neither can check a signature: an event or a fact needs an
+  attestation of the right shape (`IL008`), and verification checks it. Their refusals are
+  `IL012`.
+- **Matching checks the relay's attestation and the plan's key in Python**, as settlement
+  does: `attestation_of(message, row)` under `[relays.keys]`, and the message's
+  idempotency key against `outbound_key(plan_id, effect_id)`. A ghost delivery the owner
+  wrote, linked and hashed, binds nothing.
+- **The receiver's answers.** `404` an unknown source; `413` a body over the bound (`411`
+  without a `Content-Length` over HTTP); `415` anything but `application/json`; `401` a
+  signature that does not verify or a timestamp outside the tolerance; `400` a missing or
+  malformed header, or a body not in the vendor's shape after a valid signature; `503` a
+  source whose secret the environment lacks, or a verified webhook the store could not
+  record (the vendor retries it, and nothing is recorded twice). Only a `2xx` says
+  recorded.
+- **A SendGrid key is checked when configured**: base64 DER, an ECDSA P-256 public key.
+  `cryptography` is imported only for SendGrid and for signing, which the inbox's host has
+  (the `sign` extra); an engine's host verifying facts needs neither.
+- **The engine.** `EscrowEngine(inbox=keyring)`: `engine.facts(scope)` returns the pending
+  facts that verify, and logs the rest as the forgeries they are. A plan consuming facts
+  is refused at admission unless every one is pending for its scope and verifies; the stage
+  consumes them before any effect (`consume_facts`), the diff reads them back
+  (`EffectDiff.facts`, part of its hash), and the engine verifies them again as measured:
+  the facts read back must be exactly the plan's, its scope's, and attested. A repair
+  consumes before its savepoint, so every trial is judged with the facts, and commits
+  nothing.
+- **Consumption on each store.** PostgreSQL: `interlock.inbox_consume(token, facts, scope)`
+  with the stage's token, which no agent statement holds; a second stage racing for the
+  same fact waits on the first's key, then fails (`StageConflictError`, or
+  `InboundFactError` once the first committed). SQLite: the stage's own transaction, the
+  rows bound to its commit marker by a deferred foreign key, which the stage's write lock
+  serializes.
+- **No statement of a plan reads the inbox.** PostgreSQL: no grant on its tables, and
+  `inbox_pending` refuses inside a stage (`IL009`, now named for both the windows and the
+  inbox). SQLite: the authorizer refuses reads of the inbox's four tables, as it refuses
+  window history.
+- **Receipts** commit to each consumed fact as a row of `interlock.inbox`, keyed by the
+  fact's id, holding its source, kind, event hash and message: the event, not its body.
+- **`FactAgreement`** grew what using it showed it needed. `kind` may name several event
+  types. `exempt` lists values a row may hold with no fact, such as an initial `pending`; a
+  rule exempting nothing holds every write. A fact and a row that each name a tenant must
+  name the same one. An insert writes the column; an update writes it only when it changes
+  it; a delete writes nothing; an empty value is held like any other, unless exempt.
+- **Configuration and commands.** `[inbox]` (`key`, `database`, `listen`, `max_body_bytes`,
+  `match_window_seconds`, `match_every_seconds`), `[[inbox.sources]]` (an `http` source's
+  `fields` as `{ name, path, type }` tables), `[inbox.keys]`, and `inbox_roles` on
+  PostgreSQL. `interlock install` mirrors the sources and grants the roles;
+  `interlock keygen --role inbox`; `interlock inbox serve | match | list | verify`. The
+  inbox starts only with a key registered in `[inbox.keys]`, `[relays.keys]` to verify
+  deliveries under, and every source's secret in its environment.
+- **Verification sees every fact**, its event's row or not: a fact whose event was deleted is
+  named, not skipped.
+
+### Step 4, continued: the inbox in the vacuum
+
+- **The cut.** A checkpoint's `inbox` is `{"sources": [cut...], "facts": n, "root": <fold>}`,
+  empty when nothing of the inbox goes. Each cut is `{source, from, prev, through, head,
+  events, facts, consumed}`: the prefix is events `from + 1` to `through`. `prev` and
+  `head` are the hashes it linked from and ends at, so an archive proves it standalone.
+  §1.3's inbox horizon was left out: the cut is exact.
+- **Eligibility, as §1.2 says.** A source's longest prefix of events received before
+  `now - retain`, each bound by nothing or by a fact some stage consumed. A pending fact
+  stops the prefix, and so does a recent event. An event left unmatched past the retention
+  goes unmatched; keep the inbox's match window shorter than the retention.
+- **Verified first, under `[inbox.keys]`.** A vacuum given the inbox's keys
+  (`Vacuum(inbox=...)`, which `interlock vacuum` passes from the configuration) runs
+  `verify_inbox` first. A source that does not verify is kept whole and reported; a
+  finding that is no one source's (a consumed row for no fact) prunes nothing at all.
+  Without the keys the inbox stays.
+- **The facts' fold.** `leaf = digest("interlock-inbox-fact-v1", fact_id, source,
+  event_seq, event_hash, message_id, delivery_seq, delivery_hash, remote_ref, scope, plan,
+  tenant, attestation, consuming stage)`, folded in fact-id order under
+  `"interlock-inbox-facts-v1"`, the same in PL/pgSQL and in Python.
+- **The act** cuts each prefix in the checkpoint's own transaction. It holds each cut to the
+  log as it was verified (the count, the first event's link to `prev`, the head at
+  `through`), refuses a pending fact, recomputes the fold, and deletes the consumption, the
+  facts, then the events. `interlock.inbox_compactable()` on PostgreSQL, and conditional
+  `BEFORE DELETE` triggers on SQLite, admit those deletes beside an open checkpoint naming
+  the cut, and nothing else.
+- **After.** Each source's log starts at the latest cut's `(through, head)`. A prefix
+  deleted around Interlock leaves the log starting nowhere it links from, and a pruned event
+  restored sits before the start: both are named. The archive holds every pruned event as
+  the vendor sent it (body and signature headers) and every pruned fact with its consuming
+  stage; `verify_archive(..., inbox=keys)` proves the chain, the bodies, the attestations
+  and the fold.
+
+### Step 5: the matrices
+
+- **No forged webhook is accepted.** `tests/test_inbox_vendors.py` refuses, for each scheme,
+  every forgery a sender without the secret can make: another secret or key, a body, a
+  timestamp or a webhook id changed after signing, another body's signature, a truncated
+  one, upper-case hex, a timestamp past the tolerance either way, the headers missing or
+  malformed, only another scheme's signature. `tests/test_inbox.py` sends forgeries through
+  the receiver on both stores, and each is answered and records nothing.
+- **The inbox's crash matrix** (`tests/test_inbox_crash.py`, `tests/inbox_child.py`). An
+  inbox in a process of its own is SIGKILLed after verifying, inside the event's
+  transaction, after it commits, inside the fact's transaction, and after that commits;
+  and a SendGrid batch between its events. After each, what is recorded is exactly what
+  committed and verifies as left, and the vendor's retry records what is missing and
+  nothing twice. A forged webhook never reaches the first point.
+- **Consumption is atomic.** An engine is killed with the fact consumed in its stage, with
+  the effect applied too, and after its commit: the fact is consumed exactly when the
+  plan's effects committed, and a later plan naming it is admitted, or refused,
+  accordingly. Two stages racing for one fact: one consumes it.
+- **A vacuum cutting the inbox** is killed inside its transaction and after its commit:
+  the cut is whole or absent, the next operator command resolves the intent, and a second
+  vacuum finishes the job once.
+- **Forged facts are refused**, on both stores: a fact written around the inbox, a genuine
+  attestation copied onto another fact, a fact moved to another scope, a fact carrying
+  another event's attested content, a fact read back other than the inbox attested.
+
+### Step 6: the mutation pass
+
+Each mechanism of this epic was removed in turn, and a test failed for each: 63 of 63. The
+mutations cover:
+
+- the five outbound checkers' rules and strict numbers;
+- compaction's own refusals on both stores (a moved log, folds other than the signed
+  ones), its guards (a delete only beside a checkpoint of the deleting transaction on
+  PostgreSQL, an open one on SQLite), the watermark, the anchor, the survey, and the
+  checkpoint held to its signed intent;
+- every vendor scheme's comparison and the tolerance; the projection's types;
+- matching's three conditions, and the fact's binding of its event's attestation;
+- the inbox's database functions and triggers on both stores, and verification of the
+  chain, the attestations and orphaned facts;
+- consumption: admission, verification as measured, the scope, the token, the
+  consumption key, no reads by a plan's statements, and the receipt's rows;
+- `FactAgreement`'s value, tenant, key and kind;
+- the inbox in the vacuum: the prefix's two stops, the source kept, the cut, the pending
+  fact and the fold held on both stores, the guards, and the archive's proof.
+
+Four survivors of the first pass were real gaps, and each now has a test:
+
+- a subdomain admitted without `subdomains=True`;
+- a tombstones' fold with the right counts and the wrong root;
+- a checkpoint written in another transaction admitting a delete;
+- the survey collecting tombstones while a global finding stands.
+
+One survivor was the runner's own: a mutation the same size as the one before it,
+written within the same second, ran on that one's cached bytecode. The runner now drops a
+module's bytecode around each mutation.
 

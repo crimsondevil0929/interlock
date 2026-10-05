@@ -426,6 +426,12 @@ def test_subdomains_exact_addresses_and_tenant_domains() -> None:
     assert check(wide, plan_of(mail("a@globex.test", tenant="globex"))) == ()
     assert check(wide, plan_of(mail("a@globex.test", tenant="acme"))) != ()
     assert check(wide, plan_of(mail("a@globex.test", tenant=None))) != ()
+    # A suffix is a subdomain only at a dot.
+    assert check(wide, plan_of(mail("a@evilacme.test"))) != ()
+    # Without subdomains, only the domain itself.
+    narrow = RecipientAllowlist("mail", "send", fields="to", domains=["acme.test"])
+    assert check(narrow, plan_of(mail("a@acme.test"))) == ()
+    assert check(narrow, plan_of(mail("a@mail.acme.test"))) != ()
 
 
 def test_an_internationalized_domain_is_allowed_in_its_ascii_form() -> None:

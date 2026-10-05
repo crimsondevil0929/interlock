@@ -9,6 +9,56 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 5: the zero-trust inbox, cryptographic compaction, the last checkers; `docs/EPIC5_DESIGN.md`)
+
+- **The vacuum** (`interlock.vacuum.Vacuum`, `interlock vacuum`; schema version 5). Prunes
+  what no check will read again: stages whose every message is delivered and settled, or
+  cancelled, past `[vacuum] retain_days`; rate-window history past the longest
+  `[[windows]]` span plus a margin; and each inbound source's prefix of events past the
+  retention whose facts were all consumed. Everything is verified first (delivery logs,
+  relay attestations, operator records, earlier checkpoints, the inbox under
+  `[inbox.keys]`), and what does not verify is kept and reported. A *checkpoint* commits
+  to what goes: tombstones (each message's log head, settlement and price), folds over
+  the tombstones, the window rows and the inbox's facts, each source's cut, and the
+  AgentGov ledger's head. It is signed in an operator intent, anchored into AgentGov, and
+  only then is the act run: one database transaction recording the checkpoint,
+  recomputing every fold from what the database holds, and deleting. The guards admit no
+  other delete. Checkpoints chain by `seq` and `prev`; `verify_operators` holds each to
+  its signed intent; verifiers account for pruned history by its tombstones and cuts; a
+  window reaching back past pruned history fails closed. `--archive` writes the pruned
+  rows first and `--verify-archive FILE` proves them against the checkpoint.
+- **The zero-trust inbox** (`interlock.inbox`, `interlock inbox serve | match | list |
+  verify`, `interlock keygen --role inbox`). Verifies each vendor's webhook signature
+  (Stripe's `Stripe-Signature`, Standard Webhooks, SendGrid's ECDSA Signed Event Webhook)
+  within a timestamp tolerance, with secrets only in the inbox's environment; records each
+  event once in its source's hash-linked log, attested with the inbox's Ed25519 key; binds
+  it to the delivered request whose relay-attested `remote_ref` it names (never to two
+  messages' deliveries, never to a delivery no registered relay attested); and attests the
+  binding as a fact. A fact's fields are a typed projection (ids, codes, integers,
+  decimals, currencies, booleans, instants): no vendor free text reaches the agent.
+  `EscrowEngine(inbox=keys)`, `engine.facts(scope)`, `PlanBuilder.consume(fact)`: a plan
+  consumes its scope's attested facts in its stage's own transaction, exactly once and
+  exactly when it commits; the diff carries them (`EffectDiff.facts`), verified again as
+  measured; receipts commit to them. `[inbox]`, `[[inbox.sources]]`, `[inbox.keys]`,
+  `inbox_roles`. Crash-proven: `tests/test_inbox_crash.py`.
+- **`FactAgreement`**: a write of a guarded column must hold what a consumed fact of the
+  named kind says, keyed to the row when configured; exempt values need no fact.
+- **The last outbound checkers** (`interlock.outbound_checks`): `SinkAllowlist`,
+  `OutboundCount`, `PayloadAmountCap` (per request, tenant or plan; per currency),
+  `RecipientAllowlist` (email domains and addresses, https hosts, per tenant), and
+  `OutboundTenantIsolation`. Each tells the agent the rule, never a cap or a value.
+- `interlock.types.values_at` reaches list items and object values through `*`.
+
+### Changed (Epic 5)
+
+- **Breaking:** schema version 5. Run `interlock install`; versions 2 to 4 upgrade in place.
+  No relay function changed, so running relays carry on.
+- Payload numbers are strict everywhere: ASCII digits only, no exponents, no leading `+`,
+  no underscores. The schema subset's `enum` and `const` compare as JSON does, so `true` is
+  not `1`; a field named like a credential is folded through NFKC before it is compared.
+- `IL009` names both the rate windows' history and the inbox: neither is a stage's to read.
+  A window past pruned history raises `IL011`, surfaced as `SubstrateConfigurationError`.
+
 ### Added (Epic 4: delivery receipts, rate windows, ledger-integrated compensations; `docs/EPIC4_DESIGN.md`)
 
 - **Relays sign every outcome** (schema version 4). Each `delivered`, `retryable`,
