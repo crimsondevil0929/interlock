@@ -50,6 +50,7 @@ from interlock.operators import OperatorRefusedError
 from interlock.relay import DELIVERED, RETRYABLE, DeliveryResult, NoBreaker, Relay
 from interlock.sqlite_outbox import (
     OPERATOR,
+    VERSION,
     SqliteOutboxStore,
     install_sqlite_outbox,
     installed_version,
@@ -538,7 +539,7 @@ def test_version_4_over_version_3_on_sqlite(tmp_path: Path) -> None:
     install_sqlite_outbox(path, RELAY_SINKS)
     install_sqlite_outbox(path, RELAY_SINKS)
     with closing(sqlite3.connect(path)) as conn:
-        assert installed_version(conn) == 4
+        assert installed_version(conn) == VERSION
     assert _log_rows(path) == before
     operator = SqliteOutboxStore(path, writes=OPERATOR)
     try:

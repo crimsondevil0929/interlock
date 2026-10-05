@@ -611,7 +611,8 @@ def test_the_command_line_on_a_sqlite_file(tmp_path: Path) -> None:
         # With [operators], installing changes the registry an operator signs for.
         assert cli("install", "--config", str(path))[0] == 2
         code, out = cli("install", "--config", str(path), "--key", str(tmp_path / "ops.key"))
-        assert code == 0 and "the outbox, and WAL mode" in out and "registered sink: mail" in out
+        assert code == 0 and "the outbox, the inbox, and WAL mode" in out
+        assert "registered sink: mail" in out
         assert "signed by ops: the sink registry" in out
         registry = SinkRegistry(
             [SinkSpec("mail", (OperationSpec("send"),), cost_per_call=Decimal("0.002"))]

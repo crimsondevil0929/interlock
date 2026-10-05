@@ -39,20 +39,31 @@ from interlock.cascade import (
 )
 from interlock.exceptions import (
     ForbiddenStatementError,
+    InboundFactError,
     OutboundRequestError,
     StageConflictError,
     StageError,
     StageExpiredError,
+    SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
+from interlock.inbox_sql import (
+    SQLITE_CONSUMED,
+    SQLITE_FACTS,
+    SQLITE_INBOX_TABLES,
+)
+from interlock.inbox_store import sqlite_facts, sqlite_has
 from interlock.outbound import EnqueueOrder
 from interlock.sqlite_outbox import (
+    CHECKPOINTS,
     OUTBOX_TABLES,
+    WINDOWS_TABLE,
     enqueue,
     now_us,
     outbox_installed,
     stage_requests,
 )
+from interlock.sqlite_outbox import WINDOWS_DDL as _WINDOWS_DDL
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -60,6 +71,7 @@ from interlock.types import (
     EffectKind,
     EffectOutcome,
     EffectPlan,
+    InboundFact,
     RowDelta,
     StageHandle,
     SubstrateCapabilities,
@@ -93,21 +105,6 @@ substrate inside the stage's own transaction."""
 _MARKER_DDL = (
     f"CREATE TABLE IF NOT EXISTS main.{_MARKER_TABLE} "
     f"(stage_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, committed_at TEXT NOT NULL)"
-)
-
-WINDOWS_TABLE = "_interlock_windows"
-"""What each committed plan added to each rate window (:mod:`interlock.windows`),
-written beside its commit marker, which it references: a row exists exactly
-when its stage committed. ``amount`` is a decimal numeral, ``at`` microseconds
-since the epoch."""
-_WINDOWS_DDL = (
-    f"CREATE TABLE IF NOT EXISTS main.{WINDOWS_TABLE} ("
-    f"stage_id TEXT NOT NULL REFERENCES {_MARKER_TABLE} (stage_id) "
-    f"DEFERRABLE INITIALLY DEFERRED, "
-    f"window_name TEXT NOT NULL, key TEXT NOT NULL, amount TEXT NOT NULL, "
-    f"at INTEGER NOT NULL, PRIMARY KEY (stage_id, window_name, key))",
-    f"CREATE INDEX IF NOT EXISTS main.{WINDOWS_TABLE}_by_key "
-    f"ON {WINDOWS_TABLE} (window_name, key, at)",
 )
 
 FORBIDDEN_VERBS: frozenset[str] = frozenset(
@@ -362,6 +359,7 @@ class SqliteSubstrate:
         "_conn",
         "_denied",
         "_enforce",
+        "_facts",
         "_folded",
         "_handle",
         "_internal",
@@ -425,6 +423,7 @@ class SqliteSubstrate:
         self._scope: str | None = None
         self._outbox = False
         self._charges: tuple[WindowCharge, ...] = ()
+        self._facts: tuple[uuid.UUID, ...] = ()
 
     @property
     def substrate_id(self) -> str:
@@ -587,6 +586,7 @@ class SqliteSubstrate:
         self._order = EnqueueOrder()
         self._scope = plan.scope_id
         self._charges = ()
+        self._facts = ()
         return handle
 
     def reject_reason(self, effect: Effect) -> str | None:
@@ -728,6 +728,15 @@ class SqliteSubstrate:
             requests = (
                 stage_requests(conn, handle.stage_id, self._max_rows + 1) if self._outbox else []
             )
+            consumed = (
+                sqlite_facts(
+                    conn,
+                    f"f.fact_id IN (SELECT fact_id FROM {SQLITE_CONSUMED} WHERE stage_id = ?)",
+                    str(handle.stage_id),
+                )
+                if self._facts
+                else []
+            )
 
         truncated = len(rows) > self._max_rows or len(requests) > self._max_rows
         deltas: list[RowDelta] = []
@@ -759,7 +768,76 @@ class SqliteSubstrate:
             deltas=tuple(deltas),
             truncated=truncated,
             outbound=tuple(requests[: self._max_rows]),
+            facts=tuple(consumed),
         )
+
+    # -- inbound facts (docs/EPIC5_DESIGN.md §2) --------------------------------
+
+    def pending_facts(self, scope_id: str) -> tuple[InboundFact, ...]:
+        """The facts pending for ``scope_id``, read outside any stage, on a
+        connection of their own that reads and writes nothing else."""
+        try:
+            conn = sqlite3.connect(
+                f"file:{self._path}?mode=rw", uri=True, timeout=self._stage_seconds
+            )
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(f"cannot open {self._path}: {exc}") from exc
+        try:
+            if not outbox_installed(conn) or not sqlite_has(conn, SQLITE_FACTS):
+                raise SubstrateConfigurationError(
+                    f"{self._path} has no inbox: run `interlock install` with this version"
+                )
+            return tuple(
+                sqlite_facts(
+                    conn,
+                    f"f.scope_id = ? AND NOT EXISTS (SELECT 1 FROM {SQLITE_CONSUMED} AS c "
+                    f"WHERE c.fact_id = f.fact_id)",
+                    scope_id,
+                )
+            )
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(
+                f"cannot read the inbox from {self._path}: {exc}"
+            ) from exc
+        finally:
+            conn.close()
+
+    def consume_facts(
+        self, handle: StageHandle, fact_ids: Sequence[uuid.UUID], scope_id: str
+    ) -> None:
+        """Consume the plan's facts in its stage: each its scope's, and not
+        consumed already. The rows commit with the stage's marker, or not at
+        all.
+
+        :raises InboundFactError: If a fact is unknown, another scope's, or
+            consumed already.
+        :raises StageError: If commit markers are off: consumption is bound to
+            them.
+        """
+        conn = self._require(handle)
+        self._assert_live(handle)
+        if not self._markers:
+            raise StageError(
+                "facts are consumed beside the commit marker; this substrate has "
+                "commit_markers=False"
+            )
+        try:
+            with self._substrate_statements():
+                for fact_id in fact_ids:
+                    row = conn.execute(
+                        f"SELECT scope_id FROM {SQLITE_FACTS} WHERE fact_id = ?", (str(fact_id),)
+                    ).fetchone()
+                    if row is None or row[0] != scope_id:
+                        raise InboundFactError(f"no fact {fact_id} for scope {scope_id!r}")
+                    conn.execute(
+                        f"INSERT INTO {SQLITE_CONSUMED} (fact_id, stage_id, at) VALUES (?, ?, ?)",
+                        (str(fact_id), str(handle.stage_id), now_us()),
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise InboundFactError(f"a fact the plan consumes was consumed already: {exc}") from exc
+        except sqlite3.Error as exc:
+            raise StageError(f"could not consume the plan's facts: {exc}") from exc
+        self._facts = tuple(fact_ids)
 
     def measure_windows(
         self, handle: StageHandle, charges: Sequence[WindowCharge]
@@ -785,6 +863,18 @@ class SqliteSubstrate:
         measures: list[WindowMeasure] = []
         try:
             with self._substrate_statements():
+                # A window reaching back before the latest checkpoint's window
+                # horizon would be read short: what it held there was pruned
+                # (docs/EPIC5_DESIGN.md §1.8). Fail closed.
+                pruned = _windows_watermark(conn)
+                if pruned is not None and any(
+                    now - _microseconds(c.span) < pruned for c in charges
+                ):
+                    raise SubstrateConfigurationError(
+                        "a rate window reaches back past the history a checkpoint pruned: the "
+                        "vacuum was run with windows shorter than this engine's. It cannot be "
+                        "measured until it no longer does"
+                    )
                 for charge in charges:
                     rows = conn.execute(
                         f"SELECT amount FROM main.{WINDOWS_TABLE} "
@@ -1024,11 +1114,15 @@ class SqliteSubstrate:
         - A cascade-gated delete or key update (see :mod:`interlock.cascade`),
           and a foreign-key action SQLite compiles into an unobserved table.
 
-        Reads are left alone, but for one table. A statement may legitimately
-        join or subquery a table it does not write, and denying reads would
-        break correct plans without bounding any effect. The exception is the
-        rate windows' history, which records what every plan, of every agent
-        and tenant, added to each window: no statement of a plan reads it.
+        Reads are left alone, but for the tables that hold everyone's
+        activity. A statement may legitimately join or subquery a table it
+        does not write, and denying reads would break correct plans without
+        bounding any effect. The exceptions are the rate windows' history,
+        which records what every plan, of every agent and tenant, added to
+        each window, and the inbox, which holds every scope's facts and the
+        vendors' raw bodies: no statement of a plan reads either. A plan
+        reads its scope's facts the one way the engine gives it, typed and
+        attested (``EscrowEngine.facts``).
 
         :returns: ``SQLITE_OK`` or ``SQLITE_DENY``.
         """
@@ -1053,6 +1147,12 @@ class SqliteSubstrate:
             return self._deny(
                 f"statement reads {arg1!r}, the rate windows' history, which holds other "
                 f"plans' activity",
+                "protected",
+            )
+        if action == sqlite3.SQLITE_READ and (arg1 or "").lower() in SQLITE_INBOX_TABLES:
+            # Nor the inbox: every scope's facts, and the vendors' raw bodies.
+            return self._deny(
+                f"statement reads {arg1!r}, the inbox, which holds every scope's facts",
                 "protected",
             )
         if action not in _WRITE_ACTIONS:
@@ -1206,6 +1306,19 @@ class SqliteSubstrate:
                 END;
                 """
             )
+
+
+def _windows_watermark(conn: sqlite3.Connection) -> int | None:
+    """The latest window horizon a checkpoint pruned history at, or ``None``."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (CHECKPOINTS,)
+        ).fetchone()
+        is None
+    ):
+        return None
+    row = conn.execute(f"SELECT max(windows_horizon) FROM main.{CHECKPOINTS}").fetchone()
+    return None if row is None or row[0] is None else int(row[0])
 
 
 def _microseconds(span: timedelta) -> int:

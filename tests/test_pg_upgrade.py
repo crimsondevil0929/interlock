@@ -1,5 +1,6 @@
 """The current version installed over versions 2 and 3, in place
-(``docs/EPIC3_DESIGN.md`` §3, ``docs/EPIC4_DESIGN.md`` §2).
+(``docs/EPIC3_DESIGN.md`` §3, ``docs/EPIC4_DESIGN.md`` §2), through version 4's
+changes and every one since (``docs/EPIC5_DESIGN.md`` §4).
 
 The database starts as an older version left it: installed from that
 version's own SQL (``tests/outbox_v2.py``, ``tests/outbox_v3.py``, frozen),
@@ -62,6 +63,7 @@ from tests import outbox_v3 as v3  # noqa: E402
 from tests.conftest import OBSERVED, PASSWORD, create_role, drop_role  # noqa: E402
 from tests.outbox_env import (  # noqa: E402
     INSTALLERS,
+    NO_INBOX,
     REGISTRY,
     RELAY_SINKS,
     RELAYS,
@@ -72,6 +74,14 @@ from tests.outbox_env import (  # noqa: E402
     vouch,
 )
 from tests.schemas import specs  # noqa: E402
+
+CURRENT = int(installer.INSTALL_VERSION)
+"""The version installed over the old ones: 4 when these tests were written,
+the outbox's current one now."""
+
+OLD_GUARDS: dict[int, Any] = {2: v2.OUTBOX_TRIGGER_NAMES, 3: v3.OUTBOX_TRIGGER_NAMES}
+"""The guards each old version installed, which a stage staged against it
+before the upgrade checks instead of the current version's."""
 
 VERSION_2: dict[str, Any] = {
     "OUTBOX_GUARD": v2.OUTBOX_GUARD,
@@ -87,6 +97,7 @@ VERSION_2: dict[str, Any] = {
         "interlock.outbox_attempts",
     ),
     "INSTALL_VERSION": "2",
+    **NO_INBOX,
 }
 
 VERSION_3: dict[str, Any] = {
@@ -98,6 +109,7 @@ VERSION_3: dict[str, Any] = {
     "_install_sinks": v3.install_sinks_v3,
     "_OUTBOX_TABLES": v3.OUTBOX_TABLES_V3,
     "INSTALL_VERSION": "3",
+    **NO_INBOX,
 }
 
 
@@ -270,7 +282,8 @@ def _old_traffic(
         PostgresOutboxStore(upgrade.relay)
 
     with monkeypatch.context() as patch:
-        patch.setattr(installer, "installed_version", lambda conn: 4)
+        patch.setattr(installer, "installed_version", lambda conn: CURRENT)
+        patch.setattr(installer, "OUTBOX_TRIGGER_NAMES", OLD_GUARDS[version])
         engine = upgrade.engine()
         for n in range(3):
             assert engine.execute(PlanBuilder(SCOPE).enqueue(**_mail(n)).build()).committed
@@ -315,8 +328,8 @@ def _upgraded(upgrade: Upgrade, traffic: Traffic, *, operator_rows: int = 0) -> 
     upgrade.install()
     with psycopg.connect(upgrade.admin, autocommit=True) as conn:
         version = conn.execute("SELECT DISTINCT version FROM interlock.installation").fetchall()
-        assert version == [("4",)]
-        assert installer.installed_version(conn) == 4
+        assert version == [(installer.INSTALL_VERSION,)]
+        assert installer.installed_version(conn) == CURRENT
         kinds = dict(conn.execute("SELECT name, kind FROM interlock.sinks").fetchall())
         assert set(kinds.values()) == {"http"}
         assert upgrade.log_rows() == traffic.rows
@@ -369,7 +382,8 @@ def test_version_4_over_version_2_keeps_every_log_and_carries_on(
     # And an operator's action under version 2, which had no operator log:
     # a cancel no one signed.
     with monkeypatch.context() as patch:
-        patch.setattr(installer, "installed_version", lambda conn: 4)
+        patch.setattr(installer, "installed_version", lambda conn: CURRENT)
+        patch.setattr(installer, "OUTBOX_TRIGGER_NAMES", OLD_GUARDS[2])
         plan = PlanBuilder(SCOPE).enqueue(**_mail(9)).build()
         assert upgrade.engine().execute(plan).committed
     with psycopg.connect(upgrade.admin, autocommit=True) as conn:

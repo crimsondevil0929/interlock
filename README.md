@@ -263,6 +263,12 @@ blocking violation: fail closed.
 | `TruncationGuard` | a diff that hit the row cap |
 | `StatedFootprint` | the agent's claim against the measurement |
 | `CrossEffectAgreement` | an outbound request against the rows it rides with ([outbox](#outbound-requests-the-transactional-outbox)) |
+| `SinkAllowlist` | the sinks and operations a plan may call |
+| `OutboundCount` | the requests one plan may enqueue, in all or per sink |
+| `PayloadAmountCap` | a payload amount, per request, per tenant or per plan, per currency |
+| `RecipientAllowlist` | where a request may send: email domains and addresses, https hosts, per tenant |
+| `OutboundTenantIsolation` | the tenants one plan's requests may span |
+| `FactAgreement` | a write against the inbound fact it must follow ([inbox](#inbound-facts-the-zero-trust-inbox)) |
 
 `TenantDrawdownGuard` exists because `ColumnValueGuard` sums the column across
 the whole diff, and a sum is the wrong denominator on a multi-tenant
@@ -1326,6 +1332,123 @@ report = settler.settle()  # as often as you like
   receipt, the credit, or the settlement row, the next run settles every request once: no
   receipt twice, no orphaned receipt, no second credit.
 
+### Inbound facts: the zero-trust inbox
+
+Vendors answer later. Stripe sends `charge.refund.updated` days after the refund; SendGrid
+reports a bounce an hour after the send. An agent has to react, and a webhook is exactly
+where a prompt injection would ride in: a forged request, or a genuine one whose
+description field says "refund everything". The inbox turns a webhook into a fact the
+agent may act on, and nothing else (`docs/EPIC5_DESIGN.md` §2):
+
+```toml
+inbox_roles = ["interlock_inbox"]     # PostgreSQL: the inbox's own role
+
+[inbox]
+key = "inbox.key"                     # interlock keygen --role inbox
+database = "postgresql://interlock_inbox@db/app"
+listen = "127.0.0.1:8787"             # plain HTTP: put TLS in front of it
+
+[[inbox.sources]]                     # POST /inbox/stripe
+name = "stripe"
+kind = "stripe"                       # or "sendgrid", or "http" (Standard Webhooks)
+secret_env = "STRIPE_WEBHOOK_SECRET"  # the secret lives in the inbox's environment only
+
+[inbox.keys]                          # what engines verify facts under
+main = "ed25519:7d2e..."
+```
+
+```bash
+interlock keygen --role inbox --out ~/.interlock/inbox.key --name main   # prints [inbox.keys]
+STRIPE_WEBHOOK_SECRET=whsec_... interlock inbox serve --config interlock.toml
+interlock inbox verify --config interlock.toml
+```
+
+- **Verified, or not recorded.** The vendor's signature (Stripe's HMAC, Standard Webhooks'
+  HMAC, SendGrid's ECDSA) is checked over the raw bytes, within a timestamp tolerance, before
+  the body is parsed. A forged, replayed or stale webhook is answered `401` and writes
+  nothing; a retry of a genuine one records nothing twice.
+- **Bound to what Interlock sent.** An event names what it is about (a refund's id). It is
+  bound to the delivered request whose relay-attested `remote_ref` is that id: never to a
+  delivery no registered relay attested, never to two messages' deliveries at once. The
+  binding gives the fact its scope and plan.
+- **Attested, and chained.** Each source's events form a hash-linked log, and the inbox
+  signs every event and every fact with its own Ed25519 key. A fact written, copied or
+  moved around the inbox does not verify, and `interlock inbox verify` names it.
+- **Typed.** A fact carries a projection: ids, codes, integers, decimals, currencies,
+  booleans, instants. No type admits free text, so a vendor's description, metadata or
+  error message never reaches the agent. A value that does not fit is withheld, by name.
+
+An engine consumes facts, never webhooks:
+
+<!-- readme-test: skip reason="needs an inbox's facts" -->
+```python
+from interlock import EscrowEngine, FactAgreement, PlanBuilder
+
+engine = EscrowEngine(
+    substrate,
+    checkers=[
+        # A refund is marked failed only on the vendor's word that it failed.
+        FactAgreement(
+            "charge.refund.updated",
+            field="status",
+            table="refunds",
+            column="status",
+            exempt=["pending"],
+        ),
+    ],
+    inbox=config.inbox_keyring(),
+)
+(fact,) = engine.facts("support-agent")  # pending, attested, this scope's
+plan = (
+    PlanBuilder("support-agent")
+    .consume(fact)
+    .update(
+        table="refunds",
+        statement="UPDATE refunds SET status = %(status)s WHERE id = 9000",
+        parameters={"status": fact.fields["status"]},
+    )
+    .build()
+)
+engine.execute(plan)
+```
+
+A fact is consumed in the plan's own stage, exactly when it commits, once: a second plan
+naming it is refused, and a refused plan consumes nothing. The stage reads the fact back
+for the diff, where it is verified again, and the receipt commits to it. No statement of a
+plan can read the inbox. `FactAgreement` makes the reaction answer to the fact: a plan that
+writes a status no consumed fact says is refused, and the agent is told the rule, never the
+values.
+
+### Compaction: the vacuum
+
+The outbox, window history and the inbox only grow. `interlock vacuum` prunes what no check
+will read again, and keeps it provable (`docs/EPIC5_DESIGN.md` §1):
+
+```toml
+[vacuum]
+retain_days = 30                      # a delivered request can be compensated this long
+margin_seconds = 3600                 # window history stays this long past the longest span
+archive = "archive"                   # optional: the pruned rows, written first, provable
+```
+
+```bash
+interlock vacuum --config interlock.toml --key ~/.interlock/alice.key --dry-run
+interlock vacuum --config interlock.toml --key ~/.interlock/alice.key --reason monthly
+interlock vacuum --config interlock.toml --verify-archive archive/checkpoint-1.jsonl
+```
+
+It verifies everything first: delivery logs, relay attestations, operator records, earlier
+checkpoints, and the inbox under `[inbox.keys]`. What does not verify is kept and named.
+What may go: stages whose every request is delivered and settled, or cancelled, past the
+retention; window history past the longest span; each inbound source's prefix of events
+past the retention whose facts were all consumed. A *checkpoint* commits to all of it
+(each pruned message's log head and settlement, folds over everything pruned, where each
+inbound log was cut) and is signed in an operator intent and anchored into AgentGov before
+a row is deleted. One database transaction then records it, recomputes every fold from
+what the database holds, and deletes; the database refuses any other delete. Afterwards
+every verifier passes, accounting for pruned history by its tombstones and cuts, and a
+window that would reach back past pruned history fails closed.
+
 ## Unrecorded writes
 
 The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
@@ -1424,7 +1547,8 @@ against the shipped code, not inferred.
 - **Chain durability is opt-in.** With no `chain_path` the chain lives in memory and
   dies with the process. With one, the intent is write-ahead and a crashed commit is
   resolved exactly on restart; see [Lifecycle](#lifecycle). The `_interlock_commits`
-  table gains one row per committed stage and is not pruned.
+  table gains one row per committed stage and is not pruned, not even by the
+  [vacuum](#compaction-the-vacuum): recovery and `reconcile-effects` read it.
 - **The chain is keyless.** Anyone who can write the chain file can recompute a SHA-256
   chain from start to finish and it will verify. A reverse anchor in a governed AgentGov
   is one copy of the head outside the file. With [receipts](#receipts) on, each
@@ -1448,8 +1572,10 @@ against the shipped code, not inferred.
   external effects is deliberately weaker, and stated as such: the **request** is measured,
   adjudicated and made durable exactly when the rest of the plan is; its **delivery** is
   at-least-once, recorded, and bounded; what the external system then does is not measured
-  at all. See [Outbound requests](#outbound-requests-the-transactional-outbox). SQLite has
-  no outbox and refuses an outbound request.
+  at all. What it reports back arrives as an [inbound fact](#inbound-facts-the-zero-trust-inbox):
+  the vendor's signed word, bound to the request, never a measurement. See
+  [Outbound requests](#outbound-requests-the-transactional-outbox). On SQLite the outbox is
+  installed by `interlock install`, as on PostgreSQL.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
 

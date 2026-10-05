@@ -125,6 +125,7 @@ def subplan(plan: EffectPlan, kept: frozenset[EffectId]) -> EffectPlan:
         effects=tuple(e for e in plan.effects if e.effect_id in kept),
         intent=plan.intent,
         repair_of=plan.repair_of,
+        facts=plan.facts,
     )
 
 

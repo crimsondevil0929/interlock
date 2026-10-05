@@ -92,7 +92,7 @@ def pg_back_office(pg_database: str) -> str:
     return pg_database
 
 
-PASSWORD = "agent"  # noqa: S105 - a throwaway role in a throwaway database
+PASSWORD = "agent"  # a throwaway role in a throwaway database
 
 OBSERVED = ("orders", "order_items", "refunds", "shipments", "stock_reservations", "accounts")
 

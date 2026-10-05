@@ -37,6 +37,7 @@ from interlock.exceptions import PlanError
 __all__ = [
     "AUDIT_VERSION",
     "GENESIS_HASH",
+    "INBOX_TARGET",
     "MAX_NOT_AFTER",
     "OUTBOX_TARGET",
     "CommitReceipt",
@@ -47,6 +48,7 @@ __all__ = [
     "EffectKind",
     "EffectOutcome",
     "EffectPlan",
+    "InboundFact",
     "InvariantViolation",
     "OutboundDelta",
     "OutboundRequest",
@@ -166,6 +168,10 @@ class Compensation:
 OUTBOX_TARGET: Final = "interlock.outbox"
 """The target of every ``ENQUEUE`` effect: the table its request is written
 to, inside the stage. The request's own destination is its ``sink``."""
+
+INBOX_TARGET: Final = "interlock.inbox"
+"""Where a receipt names the inbound facts a plan consumed: each a row its
+stage wrote, committed with the rest."""
 
 MAX_NOT_AFTER: Final = timedelta(days=7)
 """The longest a committed request may wait to be delivered. A request older
@@ -424,6 +430,10 @@ class EffectPlan:
     """The refused plan this one repairs, when it is a proposal from
     :meth:`~interlock.engine.EscrowEngine.repair`. The engine admits such a
     plan only as proposed: same content, same link."""
+    facts: tuple[uuid.UUID, ...] = ()
+    """The inbound facts this plan consumes (``docs/EPIC5_DESIGN.md`` §2.6):
+    each one its scope's, pending, attested; consumed exactly when the plan
+    commits."""
 
     def topological_order(self) -> tuple[Effect, ...]:
         """Effects in a deterministic execution order.
@@ -480,6 +490,9 @@ class EffectPlan:
         # its hash.
         if self.repair_of is not None:
             fields.append(["repair_of", self.repair_of])
+        # Likewise the facts it consumes.
+        if self.facts:
+            fields.append(["facts", sorted(str(f) for f in self.facts)])
         return canonical_hash(fields)
 
 
@@ -568,6 +581,46 @@ class WindowMeasure:
 
 
 @dataclass(frozen=True, slots=True)
+class InboundFact:
+    """An inbound event, bound to the delivered request it names: what a plan
+    may consume (``docs/EPIC5_DESIGN.md`` §2).
+
+    Everything the inbox process attested, the event's statement and the
+    fact's, so either is rebuilt from this alone and checked under
+    ``[inbox.keys]`` (:func:`interlock.inbox.verify_fact`).
+
+    :ivar kind: The event's type, as the vendor named it (``charge.refunded``).
+    :ivar fields: The event's projection: named values, each of a closed set
+        of types, never free text (``docs/EPIC5_DESIGN.md`` §2.5).
+    :ivar withheld: The projected fields whose value did not fit its type: by
+        name, never their value.
+    """
+
+    fact_id: uuid.UUID
+    source: str
+    event_seq: int
+    event_hash: str
+    message_id: uuid.UUID
+    delivery_seq: int
+    delivery_hash: str
+    remote_ref: str
+    scope_id: str
+    plan_id: str
+    tenant_id: str | None
+    attestation: str
+    event_id: str
+    kind: str
+    vendor_at: datetime | None
+    received_at: datetime
+    body_hash: str
+    part: int
+    refs: tuple[str, ...]
+    fields: Mapping[str, Any]
+    withheld: tuple[str, ...]
+    event_attestation: str
+
+
+@dataclass(frozen=True, slots=True)
 class EffectDiff:
     """The delta a stage would commit, as measured by the substrate.
 
@@ -580,6 +633,8 @@ class EffectDiff:
     :ivar windows: The rate windows the plan adds to, each measured with its
         history (:class:`WindowMeasure`). Part of the measurement, so the
         diff's hash covers it and a verdict replays from the diff alone.
+    :ivar facts: The inbound facts the stage consumed, read back from the
+        database (:class:`InboundFact`).
     """
 
     plan_id: PlanId
@@ -590,6 +645,7 @@ class EffectDiff:
     truncated: bool = False
     outbound: tuple[OutboundDelta, ...] = ()
     windows: tuple[WindowMeasure, ...] = ()
+    facts: tuple[InboundFact, ...] = ()
 
     def window(self, name: str, key: str) -> WindowMeasure | None:
         """The measure of window ``name`` for ``key``, if the stage took one."""
@@ -726,12 +782,33 @@ class EffectDiff:
                     ],
                 ]
             )
+        # And the facts the plan consumed, as the stage read them back.
+        if self.facts:
+            fields.append(
+                [
+                    "facts",
+                    [
+                        [
+                            str(f.fact_id),
+                            f.source,
+                            f.event_hash,
+                            f.kind,
+                            str(f.message_id),
+                            f.remote_ref,
+                            canonical_bytes(dict(f.fields)).decode("utf-8"),
+                            list(f.withheld),
+                        ]
+                        for f in sorted(self.facts, key=lambda f: str(f.fact_id))
+                    ],
+                ]
+            )
         return canonical_hash(fields)
 
 
-_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+_NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?", re.ASCII)
 """A decimal numeral as money travels in a payload: ``"50.00"``, ``"-3"``. No
-exponent, no leading zeros, so ``"007"`` stays an identifier."""
+exponent, no leading zeros, so ``"007"`` stays an identifier. ASCII digits
+only: ``re``'s ``[0-9]`` is ASCII already, and the flag says so."""
 
 
 def field_path(field: str) -> tuple[str, ...]:
@@ -753,9 +830,32 @@ def value_at(payload: object, path: tuple[str, ...]) -> tuple[bool, object]:
     return True, current
 
 
+def values_at(payload: object, path: tuple[str, ...]) -> list[tuple[str, object]]:
+    """Every value at ``path`` in a payload, with where it was found: a ``*``
+    part stands for every item of a list, or every value of an object, there.
+    Empty when there is none: a path through a missing field finds nothing."""
+    found: list[tuple[str, object]] = [("$", payload)]
+    for part in path:
+        following: list[tuple[str, object]] = []
+        for where, current in found:
+            if part == "*":
+                if isinstance(current, Mapping):
+                    following += [(f"{where}.{k}", v) for k, v in current.items()]
+                elif isinstance(current, tuple | list):
+                    following += [(f"{where}[{i}]", v) for i, v in enumerate(current)]
+            elif isinstance(current, Mapping) and part in current:
+                following.append((f"{where}.{part}", current[part]))
+            elif isinstance(current, tuple | list) and part.isdigit() and int(part) < len(current):
+                following.append((f"{where}[{part}]", current[int(part)]))
+        found = following
+    return found
+
+
 def exact_number(value: object) -> Decimal | None:
     """A number, exactly: an integer, a ``Decimal``, or a decimal numeral. A
-    float, a boolean or anything else is none."""
+    float, a boolean or anything else is none: so is a string Python's own
+    ``Decimal`` would read (``"1_000"``, ``" 5"``, ``"1e3"``, ``"+5"``,
+    ``"١٢٣"``) but a sink might read otherwise."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int | Decimal):

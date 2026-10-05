@@ -17,9 +17,11 @@ __all__ = [
     "AnchorError",
     "ChainInUseError",
     "ChainIntegrityError",
+    "CompactionRefusedError",
     "CyclicPlanError",
     "ExtensionError",
     "ForbiddenStatementError",
+    "InboundFactError",
     "InterlockError",
     "LedgerUnverifiedError",
     "OutboundRequestError",
@@ -302,3 +304,18 @@ class ToolRevokedError(RecoveryError):
     def __init__(self, tool: str) -> None:
         self.tool = tool
         super().__init__(f"tool {tool!r} was revoked for the rest of this task")
+
+
+class CompactionRefusedError(InterlockError):
+    """The database refused a vacuum's act (``docs/EPIC5_DESIGN.md`` §1.4):
+    a message's delivery log moved after it was verified, a checkpoint does
+    not follow the last one, or what the database holds is not what the
+    signed checkpoint commits to. Nothing was pruned."""
+
+
+class InboundFactError(PlanError):
+    """A plan consumes an inbound fact it may not (``docs/EPIC5_DESIGN.md``
+    §2.6): one unknown, consumed already, of another scope, or whose
+    attestation does not verify under ``[inbox.keys]``; or an engine that
+    verifies no facts. ``str(exc)`` is the operator's; the agent is told the
+    kind of refusal only."""

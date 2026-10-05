@@ -42,6 +42,7 @@ from interlock.types import (
     EffectId,
     EffectKind,
     EffectPlan,
+    InboundFact,
     OutboundRequest,
     PlanId,
 )
@@ -77,7 +78,15 @@ class PlanBuilder:
     :param created_at: Override the clock. Must be timezone-aware.
     """
 
-    __slots__ = ("_created_at", "_effects", "_intent", "_plan_id", "_scope_id", "_trajectory_id")
+    __slots__ = (
+        "_created_at",
+        "_effects",
+        "_facts",
+        "_intent",
+        "_plan_id",
+        "_scope_id",
+        "_trajectory_id",
+    )
 
     def __init__(
         self,
@@ -99,6 +108,7 @@ class PlanBuilder:
         self._plan_id = plan_id
         self._created_at = created_at
         self._effects: list[Effect] = []
+        self._facts: list[uuid.UUID] = []
 
     # -- adding effects --------------------------------------------------
 
@@ -237,6 +247,21 @@ class PlanBuilder:
             return tuple(after)
         return (self._effects[-1].effect_id,) if self._effects else ()
 
+    def consume(self, fact: InboundFact | uuid.UUID) -> PlanBuilder:
+        """Consume an inbound fact (``docs/EPIC5_DESIGN.md`` §2.6): an event a
+        vendor sent about a request this scope's plan delivered, verified and
+        attested by the inbox. The plan's hash covers it; the engine admits it
+        only as its scope's, pending, and attested under ``[inbox.keys]``;
+        and it is consumed exactly when the plan commits, once.
+
+        :param fact: A fact from :meth:`~interlock.engine.EscrowEngine.facts`,
+            or its id.
+        """
+        fact_id = fact.fact_id if isinstance(fact, InboundFact) else fact
+        if fact_id not in self._facts:
+            self._facts.append(fact_id)
+        return self
+
     # -- inspection ------------------------------------------------------
 
     @property
@@ -268,6 +293,7 @@ class PlanBuilder:
             created_at=self._created_at or datetime.now(UTC),
             effects=tuple(self._effects),
             intent=self._intent,
+            facts=tuple(self._facts),
         )
         try:
             plan.topological_order()

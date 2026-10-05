@@ -64,6 +64,7 @@ from interlock.exceptions import (
     CommitUnsettledError,
     CyclicPlanError,
     ForbiddenStatementError,
+    InboundFactError,
     InterlockError,
     OutboundRequestError,
     PlanError,
@@ -76,6 +77,7 @@ from interlock.exceptions import (
 from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedback_for_error
 from interlock.invariants import InvariantChecker
 from interlock.outbound import SinkRegistry
+from interlock.records import Keyring
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
 from interlock.substrate import ShadowSubstrate, _verb_reason
 from interlock.types import (
@@ -85,6 +87,7 @@ from interlock.types import (
     EffectKind,
     EffectOutcome,
     EffectPlan,
+    InboundFact,
     PlanId,
     StageHandle,
     StageState,
@@ -210,6 +213,10 @@ class EscrowEngine:
         refused if it would take one past its limit. A
         :class:`~interlock.windows.RateWindowCheck` is added to ``checkers``
         for each. See :mod:`interlock.windows`.
+    :param inbox: The inbox processes' public keys (``[inbox.keys]``): a
+        plan may consume an inbound fact only when both its attestations
+        verify under one of them (``docs/EPIC5_DESIGN.md`` §2). Without it, a
+        plan that consumes a fact is refused.
     :raises ValueError: If ``settle_cost`` is negative, ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`, two windows share a
         name, or the substrate keeps no window history.
@@ -221,6 +228,7 @@ class EscrowEngine:
         "_checkers",
         "_claims",
         "_claims_lock",
+        "_inbox",
         "_inflight",
         "_receipts",
         "_reserving",
@@ -241,9 +249,11 @@ class EscrowEngine:
         receipts: ReceiptIssuer | None = None,
         sinks: SinkRegistry | None = None,
         windows: Sequence[RateWindow] = (),
+        inbox: Keyring | None = None,
     ) -> None:
         self._substrate = substrate
         self._sinks = sinks
+        self._inbox = inbox
         self._receipts = receipts
         self._windows = tuple(windows)
         names = [w.name for w in self._windows]
@@ -289,6 +299,81 @@ class EscrowEngine:
     @property
     def receipts(self) -> ReceiptIssuer | None:
         return self._receipts
+
+    # -- inbound facts (docs/EPIC5_DESIGN.md §2) ------------------------------
+
+    def facts(self, scope_id: str) -> tuple[InboundFact, ...]:
+        """The inbound facts pending for ``scope_id``: what vendors sent about
+        requests the scope's plans delivered, each bound to its delivery and
+        attested by an inbox. Only the facts whose attestations verify under
+        ``[inbox.keys]``; any other is left out, and logged, as the forgery
+        it is. A plan consumes one with :meth:`PlanBuilder.consume`.
+
+        :raises InboundFactError: If this engine has no inbox keys.
+        """
+        from interlock.inbox import verify_fact
+
+        if self._inbox is None:
+            raise InboundFactError(
+                "this engine verifies no inbound facts: build it with inbox=[inbox.keys]"
+            )
+        read = getattr(self._substrate, "pending_facts", None)
+        if not callable(read):
+            return ()
+        verified: list[InboundFact] = []
+        for fact in read(scope_id):
+            problem = verify_fact(fact, self._inbox)
+            if problem is None:
+                verified.append(fact)
+            else:
+                logger.warning("fact %s left out: %s", fact.fact_id, problem)
+        return tuple(verified)
+
+    def _admit_facts(self, plan: EffectPlan) -> None:
+        """Refuse a plan consuming a fact that is not its scope's, pending and
+        attested now. Its stage checks again, as it consumes them."""
+        if not plan.facts:
+            return
+        if len(set(plan.facts)) != len(plan.facts):
+            raise InboundFactError(f"plan {plan.plan_id} names a fact more than once")
+        if not callable(getattr(self._substrate, "consume_facts", None)):
+            raise InboundFactError(
+                f"substrate {self._substrate.substrate_id!r} keeps no inbox to consume a fact from"
+            )
+        pending = {f.fact_id for f in self.facts(plan.scope_id)}
+        missing = [str(f) for f in plan.facts if f not in pending]
+        if missing:
+            raise InboundFactError(
+                f"plan {plan.plan_id} consumes fact(s) {', '.join(missing)}, not pending for "
+                f"scope {plan.scope_id!r} or not attested under [inbox.keys]"
+            )
+
+    def _consume(self, handle: StageHandle, plan: EffectPlan) -> None:
+        """Consume the plan's facts in its stage, before any effect."""
+        if plan.facts:
+            consume = getattr(self._substrate, "consume_facts")  # noqa: B009
+            consume(handle, plan.facts, plan.scope_id)
+
+    def _measured_facts(self, plan: EffectPlan, diff: EffectDiff) -> None:
+        """The facts the stage read back are exactly the plan's, its scope's,
+        and attested: verified as measured, not as admitted."""
+        from interlock.inbox import verify_fact
+
+        if not plan.facts and not diff.facts:
+            return
+        assert self._inbox is not None  # admission refused facts without keys
+        if {f.fact_id for f in diff.facts} != set(plan.facts):
+            raise InboundFactError(
+                f"plan {plan.plan_id}: the facts its stage consumed are not the ones it names"
+            )
+        for fact in diff.facts:
+            problem = verify_fact(fact, self._inbox)
+            if problem is None and fact.scope_id != plan.scope_id:
+                problem = f"it is scope {fact.scope_id!r}'s"
+            if problem is not None:
+                raise InboundFactError(
+                    f"plan {plan.plan_id}: fact {fact.fact_id}, as its stage read it: {problem}"
+                )
 
     # -- admission ----------------------------------------------------------
 
@@ -379,6 +464,15 @@ class EscrowEngine:
         if self._anchor is not None:
             self._anchor.assert_scope_known(plan.scope_id)
 
+        # Every fact the plan consumes is its scope's, pending, and attested.
+        if plan.facts:
+            if self._inbox is None:
+                raise InboundFactError(
+                    f"plan {plan.plan_id} consumes inbound facts, and this engine verifies "
+                    f"none: build it with inbox=[inbox.keys]"
+                )
+            self._admit_facts(plan)
+
     # -- the main path ------------------------------------------------------
 
     def execute(self, plan: EffectPlan, *, settle_cost: Decimal | str | None = None) -> StageResult:
@@ -464,11 +558,13 @@ class EscrowEngine:
                 stage=handle.stage_id,
                 note=_coverage_note(self._substrate),
             )
+            self._consume(handle, plan)
             for effect in plan.topological_order():
                 outcomes.append(self._substrate.apply(handle, effect))
             state = StageState.STAGED
 
             diff = self._windowed(handle, plan, self._substrate.diff(handle))
+            self._measured_facts(plan, diff)
             self._record(
                 RecordType.DIFF_COMPUTED,
                 plan,
@@ -703,6 +799,12 @@ class EscrowEngine:
             raise CyclicPlanError(str(exc)) from exc
         if self._anchor is not None:
             self._anchor.assert_scope_known(plan.scope_id)
+        if plan.facts:
+            if self._inbox is None:
+                raise InboundFactError(
+                    f"plan {plan.plan_id} consumes inbound facts, and this engine verifies none"
+                )
+            self._admit_facts(plan)
 
         inadmissible: dict[EffectId, InterlockError] = {}
         for effect in plan.effects:
@@ -736,6 +838,9 @@ class EscrowEngine:
             )
             savepoint = getattr(self._substrate, "savepoint")  # noqa: B009
             rollback_to = getattr(self._substrate, "rollback_to")  # noqa: B009
+            # Consumed once, before the savepoint every trial returns to: each
+            # trial is judged with the plan's facts. The search never commits.
+            self._consume(handle, plan)
             savepoint(handle, _SAVEPOINT)
 
             def evaluate(kept: frozenset[EffectId]) -> Trial:
@@ -787,6 +892,7 @@ class EscrowEngine:
                     effects=tuple(e for e in plan.effects if e.effect_id in kept),
                     intent=plan.intent,
                     repair_of=plan.plan_id,
+                    facts=plan.facts,
                 )
                 how = "exhaustive" if result.exhaustive else f"stopped: {result.stopped}"
                 self._record(
