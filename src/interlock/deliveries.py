@@ -617,6 +617,11 @@ class PostgresReader:
     def __init__(self, conn: psycopg.Connection[Any]) -> None:
         self._conn = conn
 
+    @property
+    def connection(self) -> psycopg.Connection[Any]:
+        """The connection read through."""
+        return self._conn
+
     @contextmanager
     def _one_snapshot(self) -> Iterator[None]:
         """Read messages and logs as of one instant: a relay committing between

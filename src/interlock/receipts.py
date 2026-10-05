@@ -70,7 +70,14 @@ from interlock.anchor import AnchorPoint
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowRecord
 from interlock.invariants import BlastRadius, InvariantChecker
-from interlock.types import OUTBOX_TARGET, EffectDiff, EffectPlan, Verdict, canonical_hash
+from interlock.types import (
+    INBOX_TARGET,
+    OUTBOX_TARGET,
+    EffectDiff,
+    EffectPlan,
+    Verdict,
+    canonical_hash,
+)
 
 __all__ = ["ReceiptIssuer", "checker_records", "receipt_rows", "schema_hash"]
 
@@ -138,7 +145,9 @@ class ReceiptIssuer:
         :raises agentgov.exceptions.ReceiptError: If the log refuses it.
         """
         rows = receipt_rows(diff)
-        outbox = {OUTBOX_TARGET} if diff.outbound else set()
+        outbox = ({OUTBOX_TARGET} if diff.outbound else set()) | (
+            {INBOX_TARGET} if diff.facts else set()
+        )
         commitment = commit_rows(rows, secret=self._row_secret)
         report = getattr(substrate, "cascade_report", None)
         observed = sorted(getattr(substrate, "observed_tables", frozenset()))
@@ -169,12 +178,14 @@ class ReceiptIssuer:
                 row_root=commitment.root,
                 row_count=len(rows),
                 summary=EffectSummary(
-                    inserted=diff.rows_inserted + len(diff.outbound),
+                    inserted=diff.rows_inserted + len(diff.outbound) + len(diff.facts),
                     updated=diff.rows_updated,
                     deleted=diff.rows_deleted,
                     tables=tuple(diff.tables_touched | outbox),
                     tenants=tuple(
-                        diff.tenant_ids | {o.tenant_id for o in diff.outbound if o.tenant_id}
+                        diff.tenant_ids
+                        | {o.tenant_id for o in diff.outbound if o.tenant_id}
+                        | {f.tenant_id for f in diff.facts if f.tenant_id}
                     ),
                 ),
                 truncated=diff.truncated,
@@ -240,10 +251,12 @@ def receipt_rows(diff: EffectDiff) -> list[RowChange]:
     """The rows a receipt's ``row_root`` commits to, in commitment order.
 
     Every measured row, then each outbound request as the row the stage
-    inserted into the outbox, committed with the rest. A request's payload is
-    represented by its hash: the commitment proves which request was staged
-    without the receipt carrying its body. Disclosing a receipt's rows means
-    committing exactly this list with the issuer's row secret.
+    inserted into the outbox, committed with the rest, then each inbound fact
+    the stage consumed. A request's payload is represented by its hash, and a
+    fact by its event's: the commitment proves which request was staged and
+    which event the plan acted on, without the receipt carrying either body.
+    Disclosing a receipt's rows means committing exactly this list with the
+    issuer's row secret.
     """
     rows = [
         RowChange.from_values(
@@ -265,6 +278,21 @@ def receipt_rows(diff: EffectDiff) -> list[RowChange]:
             tenant=o.tenant_id,
         )
         for o in diff.outbound
+    ]
+    rows += [
+        RowChange.from_values(
+            INBOX_TARGET,
+            str(f.fact_id),
+            before=None,
+            after={
+                "source": f.source,
+                "kind": f.kind,
+                "event_hash": f.event_hash,
+                "message_id": str(f.message_id),
+            },
+            tenant=f.tenant_id,
+        )
+        for f in diff.facts
     ]
     return rows
 

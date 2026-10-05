@@ -72,11 +72,20 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
+from interlock.inbox_sql import (
+    SQLITE_CONSUMED,
+    SQLITE_EVENTS,
+    SQLITE_FACTS,
+    SQLITE_INBOX_SCHEMA,
+    SQLITE_INBOX_TABLES,
+    SQLITE_SOURCES,
+)
 from interlock.outbound import bind, placeholders, typed_sink
 from interlock.outbox_store import Checkpoint, milliseconds
-from interlock.types import OutboundDelta, _frozen
+from interlock.types import InboundFact, OutboundDelta, _frozen
 
 if TYPE_CHECKING:
+    from interlock.inbox import DeliveredRef, InboundEvent, InboundSource
     from interlock.outbound import SinkSpec
     from interlock.relay import DeliveryResult, Lease
     from interlock.types import Effect
@@ -107,6 +116,7 @@ CHECKPOINTS: Final = "_interlock_checkpoints"
 COMPACTED: Final = "_interlock_outbox_compacted"
 OUTBOX_TABLES: Final = frozenset(
     {SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS, CHECKPOINTS, COMPACTED}
+    | SQLITE_INBOX_TABLES
 )
 
 WINDOWS_TABLE: Final = "_interlock_windows"
@@ -351,6 +361,8 @@ _SCHEMA_TEMPLATE: Final = (
                       WHERE c.open = 1 AND c.windows_horizon IS NOT NULL
                         AND OLD.at <= c.windows_horizon)
     BEGIN SELECT RAISE(ABORT, 'interlock: {WINDOWS_TABLE} is the rate windows'' history'); END""",
+    # Version 5: the inbox (docs/EPIC5_DESIGN.md §2).
+    *SQLITE_INBOX_SCHEMA,
 )
 _SCHEMA: Final = tuple(
     statement.replace("{compacting}", _COMPACTING) for statement in _SCHEMA_TEMPLATE
@@ -405,8 +417,12 @@ def _us(span: timedelta) -> int:
 
 
 def register(conn: sqlite3.Connection) -> None:
-    """Register what the delivery log's triggers need on ``conn``."""
+    """Register what the delivery log's and the inbox log's triggers need on
+    ``conn``."""
+    from interlock.inbox_store import register as register_inbox
+
     conn.create_function("interlock_event_hash", 14, _event_hash_sql, deterministic=True)
+    register_inbox(conn)
 
 
 def _event_hash_sql(
@@ -466,7 +482,9 @@ def outbox_installed(conn: sqlite3.Connection) -> bool:
     return bool(row and row[0] == 4)
 
 
-def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> LegacySet:
+def install_sqlite_outbox(
+    path: str | Path, sinks: Iterable[SinkSpec] = (), sources: Iterable[InboundSource] = ()
+) -> LegacySet:
     """Install the outbox in a SQLite file, and mirror the sink registry. Idempotent.
 
     Switches the file to WAL first, so a relay's and an operator's reads never
@@ -555,6 +573,7 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> L
                 f"WHERE name NOT IN (SELECT value FROM json_each(?))",
                 (json.dumps([s.name for s in listed]),),
             )
+            _install_sources(conn, list(sources))
             legacy = _legacy(conn)
             assert legacy is not None
             conn.execute("COMMIT")
@@ -565,6 +584,25 @@ def install_sqlite_outbox(path: str | Path, sinks: Iterable[SinkSpec] = ()) -> L
     finally:
         conn.close()
     return legacy
+
+
+def _install_sources(conn: sqlite3.Connection, sources: Sequence[InboundSource]) -> None:
+    """Mirror the inbound sources: what the inbox records events of. A source
+    installed before and not listed now is disabled, not deleted: its log stays."""
+    from interlock.inbox import inbox_genesis
+
+    for source in sources:
+        conn.execute(
+            f"INSERT INTO {SQLITE_SOURCES} (name, kind, config_hash, enabled, log_seq, log_head) "
+            f"VALUES (?, ?, ?, 1, 0, ?) ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, "
+            f"config_hash = excluded.config_hash, enabled = 1",
+            (source.name, source.kind, source.config_hash(), inbox_genesis(source.name)),
+        )
+    conn.execute(
+        f"UPDATE {SQLITE_SOURCES} SET enabled = 0 "
+        f"WHERE name NOT IN (SELECT value FROM json_each(?))",
+        (json.dumps([s.name for s in sources]),),
+    )
 
 
 def _legacy(conn: sqlite3.Connection) -> LegacySet | None:
@@ -766,11 +804,25 @@ OPERATOR: Final = frozenset({OUTBOX, STATE, LOG})
 """What an operator's connection may write: compensations are new requests."""
 SETTLER: Final = frozenset({SETTLEMENTS})
 """What settlement's connection may write: its record, and nothing else."""
+INBOX: Final = frozenset({SQLITE_SOURCES, SQLITE_EVENTS, SQLITE_FACTS})
+"""What the inbox process's connection may write: its log and its facts."""
 COMPACTOR: Final = frozenset(
-    {OUTBOX, STATE, LOG, SETTLEMENTS, CHECKPOINTS, COMPACTED, WINDOWS_TABLE}
+    {
+        OUTBOX,
+        STATE,
+        LOG,
+        SETTLEMENTS,
+        CHECKPOINTS,
+        COMPACTED,
+        WINDOWS_TABLE,
+        SQLITE_EVENTS,
+        SQLITE_FACTS,
+        SQLITE_CONSUMED,
+    }
 )
 """What a vacuum's connection may write: checkpoints and tombstones, and the
-rows it prunes under them (an operator's, whose other actions it takes too)."""
+rows it prunes under them, the inbox's prefixes included (an operator's,
+whose other actions it takes too)."""
 
 _OUTCOMES: Final = ("delivered", "retryable", "permanent", "unknown")
 
@@ -1936,6 +1988,7 @@ class SqliteOutboxStore:
                 raise CompactionRefusedError(
                     "the window history is not the one the checkpoint commits to"
                 )
+            events, facts = _inbox_cuts(conn, checkpoint)
             for table in (SETTLEMENTS, LOG, STATE, OUTBOX):
                 conn.execute(
                     f"DELETE FROM {table} WHERE message_id IN (SELECT value FROM json_each(?))",
@@ -1943,6 +1996,20 @@ class SqliteOutboxStore:
                 )
             if horizon is not None:
                 conn.execute(f"DELETE FROM {WINDOWS_TABLE} WHERE at <= ?", (horizon,))
+            for cut in checkpoint.inbox_cuts():
+                conn.execute(
+                    f"DELETE FROM {SQLITE_CONSUMED} WHERE fact_id IN (SELECT fact_id FROM "
+                    f"{SQLITE_FACTS} WHERE source = ? AND event_seq <= ?)",
+                    (cut.source, cut.through),
+                )
+                conn.execute(
+                    f"DELETE FROM {SQLITE_FACTS} WHERE source = ? AND event_seq <= ?",
+                    (cut.source, cut.through),
+                )
+                conn.execute(
+                    f"DELETE FROM {SQLITE_EVENTS} WHERE source = ? AND seq <= ?",
+                    (cut.source, cut.through),
+                )
             conn.execute(f"UPDATE {CHECKPOINTS} SET open = 0 WHERE seq = ?", (checkpoint.seq,))
             if before_commit is not None:
                 before_commit()
@@ -1951,7 +2018,74 @@ class SqliteOutboxStore:
             "messages": len(tombstones),
             "rows": int(log_rows),
             "windows": len(pruned),
+            "inbox_events": events,
+            "inbox_facts": facts,
         }
+
+    # -- the inbox (docs/EPIC5_DESIGN.md §2) ------------------------------------
+
+    def record_event(self, **event: Any) -> tuple[int, bool]:
+        """Append a verified event to its source's log, once."""
+        from interlock.inbox_store import sqlite_record_event
+
+        with self._writing() as conn:
+            recorded = sqlite_record_event(conn, **event)
+            self.checkpoint("record-uncommitted", None)
+            return recorded
+
+    def event(self, source: str, seq: int) -> InboundEvent:
+        from interlock.inbox_store import sqlite_event
+
+        return sqlite_event(self._conn, source, seq)
+
+    def record_fact(self, fact: InboundFact) -> bool:
+        """Bind an event to the delivery it names, once."""
+        from interlock.inbox_store import sqlite_record_fact
+
+        with self._writing() as conn:
+            fresh = sqlite_record_fact(conn, fact, now_us())
+            self.checkpoint("match-uncommitted", None)
+            return fresh
+
+    def delivered_with(self, ref: str) -> list[DeliveredRef]:
+        from interlock.inbox_store import sqlite_delivered_with
+
+        return sqlite_delivered_with(self._conn, ref)
+
+    def unmatched(self, since: datetime) -> list[InboundEvent]:
+        from interlock.inbox_store import sqlite_unmatched
+
+        return sqlite_unmatched(self._conn, since)
+
+    def inbound_events(self) -> list[InboundEvent]:
+        from interlock.inbox_store import sqlite_events
+
+        return sqlite_events(self._conn)
+
+    def inbound_heads(self) -> dict[str, tuple[int, str]]:
+        from interlock.inbox_store import sqlite_heads
+
+        return sqlite_heads(self._conn)
+
+    def inbound_starts(self) -> dict[str, tuple[int, str]]:
+        from interlock.inbox_store import sqlite_starts
+
+        return sqlite_starts(self._conn, self.checkpoints())
+
+    def inbound_facts(self) -> list[InboundFact]:
+        from interlock.inbox_store import sqlite_facts
+
+        return sqlite_facts(self._conn, orphans=True)
+
+    def inbound_consumed(self) -> dict[uuid.UUID, uuid.UUID]:
+        from interlock.inbox_store import sqlite_consumed
+
+        return sqlite_consumed(self._conn)
+
+    def inbound_raw(self, source: str, through: int) -> dict[int, tuple[str, str]]:
+        from interlock.inbox_store import sqlite_raw
+
+        return sqlite_raw(self._conn, source, through)
 
     def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
         """Each message's delivery-log head, as an operator sees it."""
@@ -1985,6 +2119,71 @@ def _tombstone(r: Sequence[Any]) -> Tombstone:
         cost=str(r[9]),
         compensates=None if r[10] is None else uuid.UUID(str(r[10])),
     )
+
+
+def _inbox_cuts(conn: sqlite3.Connection, checkpoint: CheckpointBody) -> tuple[int, int]:
+    """Within a compaction's transaction: hold each inbound source's cut to the
+    log as it was verified, every fact in it consumed, and the facts to the
+    fold the checkpoint carries, as ``interlock.outbox_compact`` does. The
+    events and facts it prunes.
+
+    :raises CompactionRefusedError: If a cut does not hold.
+    """
+    from interlock.compaction import inbox_root
+    from interlock.exceptions import CompactionRefusedError
+    from interlock.inbox_store import sqlite_facts
+
+    cuts = checkpoint.inbox_cuts()
+    if not cuts:
+        return 0, 0
+    events = 0
+    pairs: list[tuple[InboundFact, uuid.UUID | None]] = []
+    for cut in cuts:
+        first, counted = conn.execute(
+            f"SELECT min(seq), count(*) FROM {SQLITE_EVENTS} WHERE source = ? AND seq <= ?",
+            (cut.source, cut.through),
+        ).fetchone()
+        linked = conn.execute(
+            f"SELECT 1 FROM {SQLITE_EVENTS} WHERE source = ? AND seq = ? AND prev_hash = ?",
+            (cut.source, cut.start + 1, cut.prev),
+        ).fetchone()
+        headed = conn.execute(
+            f"SELECT 1 FROM {SQLITE_EVENTS} WHERE source = ? AND seq = ? AND event_hash = ?",
+            (cut.source, cut.through, cut.head),
+        ).fetchone()
+        if (
+            int(counted) != cut.events
+            or cut.through - cut.start != cut.events
+            or first != cut.start + 1
+            or linked is None
+            or headed is None
+        ):
+            raise CompactionRefusedError(f"inbound source {cut.source} moved after it was verified")
+        found = sqlite_facts(conn, "f.source = ? AND f.event_seq <= ?", cut.source, cut.through)
+        consumed = {
+            uuid.UUID(str(r[0])): uuid.UUID(str(r[1]))
+            for r in conn.execute(
+                f"SELECT c.fact_id, c.stage_id FROM {SQLITE_CONSUMED} AS c "
+                f"JOIN {SQLITE_FACTS} AS f ON f.fact_id = c.fact_id "
+                f"WHERE f.source = ? AND f.event_seq <= ?",
+                (cut.source, cut.through),
+            ).fetchall()
+        }
+        if any(f.fact_id not in consumed for f in found):
+            raise CompactionRefusedError(f"a fact of inbound source {cut.source} is still pending")
+        if (len(found), len(found)) != (cut.facts, cut.consumed):
+            raise CompactionRefusedError(
+                f"the facts of inbound source {cut.source} are not the ones the checkpoint "
+                f"commits to"
+            )
+        pairs += [(f, consumed[f.fact_id]) for f in found]
+        events += cut.events
+    if (inbox_root(pairs), len(pairs)) != (
+        checkpoint.inbox.get("root"),
+        checkpoint.inbox.get("facts"),
+    ):
+        raise CompactionRefusedError("the facts are not the ones the checkpoint commits to")
+    return events, len(pairs)
 
 
 def _window_rows(conn: sqlite3.Connection, horizon: int) -> list[WindowRow]:

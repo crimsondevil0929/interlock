@@ -50,7 +50,16 @@ from interlock.windows import Plans, RateWindow
 from tests import outbox_v4 as v4
 from tests import sqlite_outbox_v4 as lite4
 from tests.conftest import OBSERVED, PASSWORD, build_sqlite_back_office, create_role, drop_role
-from tests.outbox_env import REGISTRY, RELAY_SINKS, RELAYS, SCOPE, Scripted, mail, relay_signer
+from tests.outbox_env import (
+    NO_INBOX,
+    REGISTRY,
+    RELAY_SINKS,
+    RELAYS,
+    SCOPE,
+    Scripted,
+    mail,
+    relay_signer,
+)
 from tests.schemas import specs
 
 WINDOW = RateWindow("plans_per_scope", timedelta(milliseconds=50), 1000, Plans(), "scope")
@@ -67,6 +76,7 @@ VERSION_4: dict[str, Any] = {
     "_install_sinks": v4.install_sinks_v4,
     "_OUTBOX_TABLES": v4.OUTBOX_TABLES_V4,
     "INSTALL_VERSION": v4.INSTALL_VERSION_V4,
+    **NO_INBOX,
 }
 
 

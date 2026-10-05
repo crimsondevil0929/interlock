@@ -17,10 +17,16 @@
                                  checkpoint the operator signs and AgentGov
                                  anchors first (``--dry-run``: say what;
                                  ``--verify-archive FILE``: prove an archive)
-``interlock keygen``             a new relay or operator key, and its public
-                                 half for ``[relays.keys]`` or
-                                 ``[operators.keys]`` (``interlock operator
-                                 keygen``: an operator's)
+``interlock inbox ACTION``       ``serve``: receive vendors' webhooks, verify
+                                 their signatures, bind each to the delivery
+                                 it names, attest it; ``match``: bind what
+                                 arrived before its delivery was recorded;
+                                 ``list`` the events and facts; ``verify``
+                                 every inbound log, fact and consumption
+``interlock keygen``             a new relay, operator or inbox key, and its
+                                 public half for ``[relays.keys]``,
+                                 ``[operators.keys]`` or ``[inbox.keys]``
+                                 (``interlock operator keygen``: an operator's)
 
 Every command reads a TOML configuration file (see :mod:`interlock.config`).
 Exit codes, for scripts and CI:
@@ -32,9 +38,10 @@ Exit codes, for scripts and CI:
       found a delivery log, an attestation or an operator record that
       does not verify; an ``outbox`` action found nothing to act on; a
       ``vacuum`` refused (what it would prune does not verify), or an
-      archive does not prove out
-2     usage, or the configuration file is wrong; a relay without a key
-      registered in ``[relays.keys]``
+      archive does not prove out; ``inbox verify`` found an event, a
+      fact or a consumption that does not verify
+2     usage, or the configuration file is wrong; a relay or an inbox
+      without a key registered in ``[relays.keys]`` or ``[inbox.keys]``
 3     the database is not set up (not installed, grants)
 4     the database cannot be reached
 5     an escrow chain failed verification, so it proves nothing
@@ -57,7 +64,14 @@ from typing import Any, Final, TextIO
 
 from interlock.cascade import CascadeReport, analyze_cascades, read_postgres_foreign_keys
 from interlock.chain import EscrowChain, EscrowRecord
-from interlock.config import ConfigError, Endpoint, InterlockConfig, RelayConfig, load_config
+from interlock.config import (
+    INBOX_DATABASE_ENV,
+    ConfigError,
+    Endpoint,
+    InterlockConfig,
+    RelayConfig,
+    load_config,
+)
 from interlock.deliveries import (
     message_log,
     messages,
@@ -95,7 +109,10 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     args = parser.parse_args(argv)
     if args.command in ("operator", "keygen"):
         return _keygen(args, stream)
-    relaying = args.command == "relay"
+    # A relay and an inbox connect as their own roles, not the file's.
+    relaying = args.command == "relay" or (
+        args.command == "inbox" and args.action in ("serve", "match")
+    )
     try:
         config = load_config(
             args.config,
@@ -110,6 +127,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             return _install(config, args, stream)
         if args.command == "reconcile-effects":
             return _reconcile(config, args.chain, args.after, stream)
+        if args.command == "inbox":
+            return _inbox(config, args, stream)
         if relaying:
             return _relay(config, args, stream)
         if args.command == "outbox":
@@ -140,6 +159,9 @@ OPERATOR_KEY_ENV = "INTERLOCK_OPERATOR_KEY"
 RELAY_KEY_ENV = "INTERLOCK_RELAY_KEY"
 """The path to a relay's key file, when ``--key`` is not given; it overrides
 ``[relay] key``."""
+INBOX_KEY_ENV = "INTERLOCK_INBOX_KEY"
+"""The path to the inbox's key file, when ``--key`` is not given; it
+overrides ``[inbox] key``."""
 SIGNED: Final = frozenset({"release", "cancel", "requeue", "compensate", "resolve"})
 """The outbox actions an operator signs."""
 
@@ -223,6 +245,32 @@ def _parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="prove an archive a vacuum wrote against its checkpoint, and do nothing else",
     )
+    inbox = commands.add_parser(
+        "inbox",
+        help="receive vendors' webhooks as facts plans may consume",
+        description="Receive vendors' webhooks, verify their signatures, bind each to the "
+        "delivered request it names, and attest it as a fact (docs/EPIC5_DESIGN.md §2).",
+    )
+    steps = inbox.add_subparsers(dest="action", required=True)
+    for name, text in (
+        ("serve", "serve POST /inbox/<source> until stopped (SIGTERM or Ctrl-C)"),
+        ("match", "bind the events that matched nothing yet, once"),
+        ("list", "list each source's events, and the facts bound to them"),
+        ("verify", "verify every inbound log, fact and consumption; exit 1 on a problem"),
+    ):
+        step = steps.add_parser(name, help=text, description=text)
+        if name in ("serve", "match"):
+            _common(step, f"overrides [inbox]'s database, as does {INBOX_DATABASE_ENV}")
+            step.add_argument(
+                "--key", help=f"overrides [inbox]'s key, the inbox's own, as does {INBOX_KEY_ENV}"
+            )
+        else:
+            _common(step, _DATABASE_HELP)
+        if name == "serve":
+            step.add_argument("--listen", help="overrides [inbox]'s listen, HOST:PORT")
+        if name == "list":
+            step.add_argument("--source", help="only this source's events")
+            step.add_argument("--limit", type=int, default=100)
     operator = commands.add_parser("operator", help="operator keys", description="Operator keys.")
     keys = operator.add_subparsers(dest="action", required=True)
     keygen = keys.add_parser(
@@ -236,14 +284,15 @@ def _parser() -> argparse.ArgumentParser:
     keygen.set_defaults(role="operator")
     keygen = commands.add_parser(
         "keygen",
-        help="write a new Ed25519 key for a relay or an operator; print its public half",
+        help="write a new Ed25519 key for a relay, an operator or an inbox; print its public half",
         description="Write a new Ed25519 key (readable by you only), and print the line that "
         "registers its public half: in [relays.keys] for a relay, which signs every outcome "
-        "it records; in [operators.keys] for an operator, who signs every action.",
+        "it records; in [operators.keys] for an operator, who signs every action; in "
+        "[inbox.keys] for an inbox, which attests every event and fact.",
     )
-    keygen.add_argument("--role", required=True, choices=("relay", "operator"))
+    keygen.add_argument("--role", required=True, choices=("relay", "operator", "inbox"))
     keygen.add_argument("--out", required=True, help="where to write the key: never overwritten")
-    keygen.add_argument("--name", required=True, help="the relay's or the operator's name")
+    keygen.add_argument("--name", required=True, help="the relay's, operator's or inbox's name")
     for name, text in (
         ("install", "install Interlock's schema and triggers (run as the tables' owner)"),
         ("check", "verify the setup and print what the cascade check refuses"),
@@ -329,12 +378,14 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         install_sqlite_journal(config.database, config.tables)
-        legacy = install_sqlite_outbox(config.database, config.sinks)
+        legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
         print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
-        print("installed: the outbox, and WAL mode", file=out)
+        print("installed: the outbox, the inbox, and WAL mode", file=out)
         for sink in config.sinks:
             operations = ", ".join(op.name for op in sink.operations)
             print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
+        for source in config.inbox.sources:
+            print(f"registered inbound source: {source.name} ({source.kind})", file=out)
         _print_report(_sqlite(config).check_cascades(), out)
         return EXIT_OK, legacy
     import psycopg
@@ -350,6 +401,8 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
                 sinks=config.sinks,
                 relay_roles=config.relay_roles,
                 settler_roles=config.settler_roles,
+                sources=config.inbox.sources,
+                inbox_roles=config.inbox_roles,
             )
             report = analyze_cascades(
                 read_postgres_foreign_keys(conn, config.schema),
@@ -372,6 +425,10 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
         print(f"granted to relay role: {role}", file=out)
     for role in config.settler_roles:
         print(f"granted to settler role: {role}", file=out)
+    for source in config.inbox.sources:
+        print(f"registered inbound source: {source.name} ({source.kind})", file=out)
+    for role in config.inbox_roles:
+        print(f"granted to inbox role: {role}", file=out)
     _print_report(report, out)
     return EXIT_OK, legacy
 
@@ -584,7 +641,10 @@ def _keygen(args: argparse.Namespace, out: TextIO) -> int:
         print(f"interlock: {args.out} exists; a key is never overwritten", file=sys.stderr)
         return EXIT_USAGE
     print(f"wrote {args.out} (keep it to yourself). Register its public half:", file=out)
-    print("[relays.keys]" if args.role == "relay" else "[operators.keys]", file=out)
+    print(
+        {"relay": "[relays.keys]", "inbox": "[inbox.keys]"}.get(args.role, "[operators.keys]"),
+        file=out,
+    )
     print(f'{args.name} = "{signer.public_key().spec()}"', file=out)
     return EXIT_OK
 
@@ -893,6 +953,7 @@ def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
                 retain=config.vacuum.retain,
                 margin=config.vacuum.margin,
                 archive=config.vacuum.archive,
+                inbox=config.inbox_keyring(),
             ).run(reason=args.reason, dry_run=args.dry_run)
         finally:
             log.close()
@@ -903,13 +964,15 @@ def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         print(problem, file=out)
     for stage, why in report.kept:
         print(f"kept stage {stage}: {why}", file=out)
+    for source, why in report.inbox_kept:
+        print(f"kept inbound source {source}: {why}", file=out)
     checkpoint = report.checkpoint
     if report.outcome in ("applied", "dry-run") and checkpoint is not None:
         verb = "pruned" if report.outcome == "applied" else "would prune"
         print(
             f"checkpoint {checkpoint.seq} ({checkpoint.digest[:16]}): {verb} "
             f"{report.messages} message(s), {report.log_rows} log row(s), "
-            f"{report.window_rows} window row(s)"
+            f"{report.window_rows} window row(s), {report.inbox_events} inbound event(s)"
             + (f"; archived to {report.archive}" if report.archive else ""),
             file=out,
         )
@@ -959,12 +1022,244 @@ def _verify_archive(config: InterlockConfig, path: Path, out: TextIO) -> int:
     if not rows:
         print(f"the database holds no checkpoint {seq}", file=out)
         return EXIT_FINDINGS
-    problems = verify_archive(path, Checkpoint.parse(rows[0].body), relays=config.relay_keyring())
+    problems = verify_archive(
+        path,
+        Checkpoint.parse(rows[0].body),
+        relays=config.relay_keyring(),
+        inbox=config.inbox_keyring(),
+    )
     for problem in problems:
         print(problem, file=out)
     if problems:
         return EXIT_FINDINGS
     print(f"{path.name} proves checkpoint {seq}'s pruned history", file=out)
+    return EXIT_OK
+
+
+def _inbox(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    try:
+        return _inbox_command(config, args, out)
+    except _database_errors() as exc:
+        if getattr(exc, "sqlstate", None) == "42501":
+            raise SubstrateConfigurationError(
+                f"the inbox's role lacks a privilege it needs: {exc}. Install with the role in "
+                f"inbox_roles"
+            ) from exc
+        raise SubstrateUnavailableError(f"inbox {args.action} failed: {exc}") from exc
+
+
+def _database_errors() -> tuple[type[Exception], ...]:
+    import sqlite3
+
+    try:
+        import psycopg
+    except ImportError:  # pragma: no cover - the postgres extra is not installed
+        return (sqlite3.Error,)
+    return (sqlite3.Error, psycopg.Error)
+
+
+def _inbox_command(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    settings = config.inbox
+    keys = settings.keyring()
+    if keys is None:
+        print(
+            "interlock: the inbox attests every event and fact, and verifying needs its "
+            "public key: register it in [inbox.keys] (a new one: interlock keygen --role inbox)",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    if args.action in ("list", "verify"):
+        source, close = _inbox_reader(config)
+        try:
+            if args.action == "list":
+                return _inbox_list(source, args, out)
+            return _inbox_verify(config, source, keys, out)
+        finally:
+            close()
+    relays = config.relay_keyring()
+    if relays is None:
+        print(
+            "interlock: an inbox binds an event only to a delivery a registered relay "
+            "attested: register the relays' keys in [relays.keys]",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    if not settings.sources:
+        print("interlock: [[inbox.sources]] configures no source to receive", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        signer = _inbox_signer(config, args.key or os.environ.get(INBOX_KEY_ENV) or settings.key)
+    except _RefusedError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    from interlock.inbox import Inbox
+
+    store, close = _inbox_store(config, args.database)
+    try:
+        inbox = Inbox(
+            store,
+            settings.sources,
+            signer=signer,
+            relays=relays,
+            secrets=os.environ.get,
+            max_body=settings.max_body,
+            match_window=settings.match_window,
+        )
+        if args.action == "match":
+            print(f"bound {inbox.match_pending()} event(s) to their deliveries", file=out)
+            return EXIT_OK
+        missing = sorted(
+            f"{s.secret_env} (source {s.name})"
+            for s in settings.sources
+            if s.secret_env and s.secret_env not in os.environ
+        )
+        if missing:
+            raise SubstrateConfigurationError(
+                f"a webhook's signing secret comes from the inbox's environment, and these are "
+                f"not set: {', '.join(missing)}"
+            )
+        return _inbox_serve(inbox, args.listen or settings.listen, settings.match_every, out)
+    finally:
+        close()
+
+
+def _inbox_serve(inbox: Any, listen: str, every: Any, out: TextIO) -> int:
+    from interlock.inbox import serve
+
+    host, _, port = listen.rpartition(":")
+    if not host or not port.isdigit():
+        print(f"interlock: listen is HOST:PORT, not {listen!r}", file=sys.stderr)
+        return EXIT_USAGE
+    stop = threading.Event()
+    _stop_on_signals(stop)
+
+    def ready(bound: int) -> None:
+        print(f"receiving webhooks on {host}:{bound}; stop with SIGTERM or Ctrl-C", file=out)
+
+    serve(inbox, host, int(port), stop=stop, ready=ready, match_every=every)
+    return EXIT_OK
+
+
+def _inbox_signer(config: InterlockConfig, path: str | Path | None) -> Any:
+    """The inbox's key, registered in ``[inbox.keys]``; or why the inbox may
+    not start. A fact no registered key verifies is consumed by no engine, so
+    the inbox does not make one."""
+    from agentgov.exceptions import SignerUnavailableError
+
+    from interlock.operators import load_key
+
+    if not path:
+        raise _RefusedError(
+            f"an inbox attests every event and fact: give it its key with [inbox] key, "
+            f"--key PATH or {INBOX_KEY_ENV} (a new one: interlock keygen --role inbox)"
+        )
+    try:
+        signer = load_key(path)
+    except (OSError, ValueError, SignerUnavailableError) as exc:
+        raise _RefusedError(f"cannot read the inbox key: {exc}") from exc
+    keyring = config.inbox_keyring()
+    if keyring is None or signer.key_id not in keyring:
+        raise _RefusedError(
+            f"the inbox's key {signer.key_id} is not registered, so nothing it attests would "
+            f"verify: register it in [inbox.keys] under the inbox's name, as "
+            f'"{signer.public_key().spec()}"'
+        )
+    return signer
+
+
+def _inbox_store(config: InterlockConfig, database: str | None) -> tuple[Any, Callable[[], None]]:
+    """Where the inbox records, as its own role, and how to close it."""
+    sqlite = config.substrate != "postgres"
+    dsn = (
+        database
+        or config.inbox.database
+        or os.environ.get(INBOX_DATABASE_ENV)
+        or (config.database if sqlite else "")
+    )
+    if not dsn:
+        raise SubstrateConfigurationError(
+            f"no database for the inbox: set [inbox] database, pass --database, or set "
+            f"{INBOX_DATABASE_ENV}"
+        )
+    if sqlite:
+        from interlock.sqlite_outbox import INBOX, SqliteOutboxStore
+
+        store = SqliteOutboxStore(dsn, writes=INBOX)
+        return store, store.close
+    import psycopg
+
+    from interlock.inbox_store import PostgresInboxStore
+
+    try:
+        conn = psycopg.connect(dsn, autocommit=True)
+    except psycopg.Error as exc:
+        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
+    return PostgresInboxStore(conn), conn.close
+
+
+def _inbox_reader(config: InterlockConfig) -> tuple[Any, Callable[[], None]]:
+    """The inbox as the installer or an auditor reads it, and how to close it."""
+    if config.substrate != "postgres":
+        from interlock.sqlite_outbox import SqliteOutboxStore
+
+        store = SqliteOutboxStore(config.database, writes=frozenset())
+        return store, store.close
+    import psycopg
+
+    from interlock.inbox_store import PostgresInboxStore
+
+    try:
+        conn = psycopg.connect(config.database, autocommit=True)
+    except psycopg.Error as exc:
+        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
+    return PostgresInboxStore(conn), conn.close
+
+
+def _inbox_list(source: Any, args: argparse.Namespace, out: TextIO) -> int:
+    facts = {(f.source, f.event_seq): f for f in source.inbound_facts()}
+    consumed = source.inbound_consumed()
+    shown = 0
+    for event in source.inbound_events():
+        if args.source and event.source != args.source:
+            continue
+        if shown >= args.limit:
+            break
+        shown += 1
+        fact = facts.get((event.source, event.seq))
+        if fact is None:
+            bound = "  unmatched"
+        else:
+            stage = consumed.get(fact.fact_id)
+            bound = (
+                f"  fact {fact.fact_id} -> message {fact.message_id} (scope {fact.scope_id})"
+                + (f", consumed by stage {stage}" if stage else ", pending")
+            )
+        print(
+            f"{event.source} {event.seq:>4} {event.received_at.isoformat()} {event.kind}  "
+            f"event {event.event_id}" + (f"#{event.part}" if event.part else "") + bound,
+            file=out,
+        )
+    return EXIT_OK
+
+
+def _inbox_verify(config: InterlockConfig, source: Any, keys: Any, out: TextIO) -> int:
+    from interlock.inbox import verify_inbox
+
+    relays = config.relay_keyring()
+    report = verify_inbox(source, keys, relays=relays)
+    for problem in report.problems:
+        print(problem, file=out)
+    if report.problems:
+        return EXIT_FINDINGS
+    print(
+        f"every inbound log verifies: {report.events} event(s), each attested by a registered "
+        f"inbox; {report.facts} fact(s) bound to the deliveries they name"
+        + ("" if relays is None else ", each attested by a registered relay")
+        + f"; {report.consumed} consumed",
+        file=out,
+    )
+    if relays is None:
+        print("relays' attestations not checked: register their keys in [relays.keys]", file=out)
     return EXIT_OK
 
 

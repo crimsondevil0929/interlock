@@ -33,6 +33,7 @@ from interlock.types import (
     EffectDiff,
     EffectKind,
     EffectPlan,
+    InboundFact,
     InvariantViolation,
     OutboundDelta,
     RowDelta,
@@ -48,6 +49,7 @@ __all__ = [
     "BlastRadius",
     "ColumnValueGuard",
     "CrossEffectAgreement",
+    "FactAgreement",
     "InvariantChecker",
     "NoDelete",
     "NoSchemaChange",
@@ -829,6 +831,146 @@ def _scalar(value: object) -> tuple[str, str] | None:
     return None
 
 
+class FactAgreement:
+    """Refuse a plan that writes what no consumed inbound fact says.
+
+    An agent's reaction must answer to the event behind it
+    (``docs/EPIC5_DESIGN.md`` §2.7). Every row the plan writes to
+    ``table.column`` must hold the value ``field`` has in a fact of ``kind``
+    the plan consumed: a plan that marks a refund ``failed`` without the
+    vendor's attested ``failed`` event is refused. A prompt-injected agent can
+    neither claim an event it never received nor rewrite what one said, since
+    the facts are read back from the database, attested, never from the plan.
+    A pure function of ``(plan, diff)``, like every checker.
+
+    :param kind: The facts that may justify a write: events of this type
+        (``"charge.refund.updated"``), or of any of these types.
+    :param field: The fact's projected field the row must agree with.
+    :param table: The rows held to it: this table's...
+    :param column: ...writes of this column. An insert writes it, and so does
+        an update that changes it; a delete writes nothing.
+    :param key: Pairs facts with rows, as ``(fact_field, key_column)``: a row
+        is held only to the facts whose ``fact_field`` equals its
+        ``key_column``, so the refund a fact names is the refund written.
+        Without it, any consumed fact of ``kind`` saying the value will do.
+    :param exempt: Values a row may be written with and no fact: an initial
+        state, say ``"pending"``. Exempt nothing, and every write needs a fact.
+
+    A fact and a row that each name a tenant must name the same one. Values
+    compare exactly, numbers as ``Decimal``; anything else as itself. The agent
+    is told the rule, never the values.
+
+    :raises ValueError: On an empty name, kind or key.
+    """
+
+    __slots__ = ("_column", "_exempt", "_field", "_key", "_kinds", "_table")
+
+    def __init__(
+        self,
+        kind: str | Sequence[str],
+        *,
+        field: str,
+        table: str,
+        column: str,
+        key: tuple[str, str] | None = None,
+        exempt: Sequence[object] = (),
+    ) -> None:
+        kinds = (kind,) if isinstance(kind, str) else tuple(kind)
+        if not kinds or not all(isinstance(k, str) and k.strip() for k in kinds):
+            raise ValueError("FactAgreement needs the kind of fact a write answers to")
+        for label, value in (("field", field), ("table", table), ("column", column)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"FactAgreement needs a {label}")
+        if key is not None and (
+            len(key) != 2 or not all(isinstance(k, str) and k.strip() for k in key)
+        ):
+            raise ValueError("key is a (fact_field, column) pair")
+        self._kinds = tuple(sorted(set(kinds)))
+        self._field = field
+        self._table = table
+        self._column = column
+        self._key = key
+        self._exempt = frozenset(None if v is None else _scalar(v) for v in exempt)
+
+    @property
+    def name(self) -> str:
+        return f"fact_agreement:{'|'.join(self._kinds)}.{self._field}={self._table}.{self._column}"
+
+    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        table = self._table.lower()
+        facts = [f for f in diff.facts if f.kind in self._kinds]
+        problems: list[tuple[str, str]] = []
+        for row in diff.deltas:
+            if row.table.lower() != table or row.after is None:
+                continue
+            if self._column not in row.after:
+                continue
+            value = row.after[self._column]
+            written = None if value is None else _scalar(value)
+            if row.before is not None and self._column in row.before:
+                prior = row.before[self._column]
+                if (None if prior is None else _scalar(prior)) == written:
+                    continue
+            if written in self._exempt:
+                continue
+            problem = self._unjustified(row, written, facts)
+            if problem is not None:
+                problems.append((problem, row.primary_key))
+        return tuple(
+            InvariantViolation(
+                invariant=self.name,
+                severity=Severity.BLOCKING,
+                message=message,
+                evidence={
+                    "kind": "|".join(self._kinds),
+                    "field": self._field,
+                    "rows": f"{self._table}.{self._column}",
+                    "row": key,
+                },
+            )
+            for message, key in problems
+        )
+
+    def _unjustified(
+        self, row: RowDelta, written: tuple[str, str] | None, facts: list[InboundFact]
+    ) -> str | None:
+        """Why no fact justifies the row's write, or ``None`` when one does.
+        Values are not echoed: what a vendor said is data."""
+        kinds = " or ".join(self._kinds)
+        if written is None:
+            # Empty, or not a value at all: no projected field is either.
+            return f"the plan writes {self._table}.{self._column} with a value no fact can hold"
+        if self._key is not None:
+            fact_field, key_column = self._key
+            assert row.after is not None
+            paired = _scalar(row.after.get(key_column))
+            if paired is None:
+                return f"a {self._table} row has no {key_column} to pair it with a {kinds} fact"
+            facts = [f for f in facts if _scalar(f.fields.get(fact_field)) == paired]
+        if row.tenant_id is not None:
+            facts = [f for f in facts if f.tenant_id in (None, row.tenant_id)]
+        if not facts:
+            return (
+                f"the plan writes {self._table}.{self._column} without consuming a {kinds} "
+                f"fact about that row"
+            )
+        if any(_scalar(f.fields.get(self._field)) == written for f in facts):
+            return None
+        return (
+            f"the plan writes {self._table}.{self._column} other than the {self._field} its "
+            f"{kinds} fact says"
+        )
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # The rule, never the values: what the vendor said, and what the row
+        # held, are data.
+        return FeedbackHint(
+            kind=Guidance.FACT_AGREEMENT, tables=(self._table,), columns=(self._column,)
+        )
+
+
 def default_checkers(
     *,
     row_limit: int,
@@ -861,6 +1003,7 @@ def _percent(fraction: Decimal) -> int:
 BUILT_IN_CHECKERS: frozenset[type] = frozenset(
     {
         CrossEffectAgreement,
+        FactAgreement,
         SinkAllowlist,
         OutboundCount,
         PayloadAmountCap,

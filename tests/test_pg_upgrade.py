@@ -63,6 +63,7 @@ from tests import outbox_v3 as v3  # noqa: E402
 from tests.conftest import OBSERVED, PASSWORD, create_role, drop_role  # noqa: E402
 from tests.outbox_env import (  # noqa: E402
     INSTALLERS,
+    NO_INBOX,
     REGISTRY,
     RELAY_SINKS,
     RELAYS,
@@ -96,6 +97,7 @@ VERSION_2: dict[str, Any] = {
         "interlock.outbox_attempts",
     ),
     "INSTALL_VERSION": "2",
+    **NO_INBOX,
 }
 
 VERSION_3: dict[str, Any] = {
@@ -107,6 +109,7 @@ VERSION_3: dict[str, Any] = {
     "_install_sinks": v3.install_sinks_v3,
     "_OUTBOX_TABLES": v3.OUTBOX_TABLES_V3,
     "INSTALL_VERSION": "3",
+    **NO_INBOX,
 }
 
 

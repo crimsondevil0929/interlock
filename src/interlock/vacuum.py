@@ -5,11 +5,13 @@ in two phases like every other (``docs/EPIC3_DESIGN.md`` §6):
 
 1. **Survey.** Verify everything from the database and the keys alone: every
    delivery log, every relay's attestation, every operator row, the operator
-   log, every earlier checkpoint. Anything that does not verify is evidence of
-   tampering: nothing is pruned while it stands. Then collect what may go:
-   stages whose every message is delivered and settled, or cancelled, older
-   than the retention, in no row of the legacy set; and rate-window history
-   older than the longest window's span plus a margin.
+   log, every earlier checkpoint, and, given the inbox's keys, every inbound
+   log and fact. Anything that does not verify is evidence of tampering:
+   nothing is pruned while it stands. Then collect what may go: stages whose
+   every message is delivered and settled, or cancelled, older than the
+   retention, in no row of the legacy set; rate-window history older than the
+   longest window's span plus a margin; and each inbound source's longest
+   prefix of events older than the retention whose facts were all consumed.
 2. **Archive** (optional). Write what will go to a file, whose SHA-256 the
    checkpoint carries: :func:`verify_archive` proves it against the checkpoint.
 3. **Intent.** Sign an ``operator.intent``, action ``compact``, carrying the
@@ -37,8 +39,8 @@ import os
 import re
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -50,9 +52,11 @@ from interlock.compaction import (
     GENESIS,
     Checkpoint,
     CheckpointRow,
+    InboxCut,
     Tombstone,
     WindowRow,
     heads_argument,
+    inbox_root,
     instant_text,
     tombstone_root,
     window_root,
@@ -67,10 +71,12 @@ from interlock.deliveries import (
 )
 from interlock.exceptions import CompactionRefusedError
 from interlock.records import Keyring, anchor_memo
+from interlock.types import InboundFact
 
 if TYPE_CHECKING:
     from agentgov import BudgetManager
 
+    from interlock.inbox import InboundEvent
     from interlock.operators import OperatorLog
     from interlock.windows import RateWindow
 
@@ -85,6 +91,8 @@ __all__ = [
 
 ARCHIVE_VERSION: Final = "interlock-archive-v1"
 _MESSAGE: Final = re.compile(r"\Amessage ([0-9a-f-]{36})\b")
+_SOURCE: Final = re.compile(r"\Ainbound source ([a-z][a-z0-9_-]*)\b")
+_FACT: Final = re.compile(r"\Afact ([0-9a-f-]{36})\b")
 _FINAL: Final = frozenset({"delivered", "cancelled"})
 
 
@@ -102,6 +110,9 @@ class Survey:
         pruned: the evidence a vacuum would rely on does not hold.
     :ivar kept: Each stage with a message that did not verify, and why: it is
         kept, whatever its age.
+    :ivar inbox_cuts: Each inbound source's prefix that may go.
+    :ivar inbox_kept: Each source whose log or facts did not verify, and why:
+        it is kept whole.
     """
 
     now: datetime
@@ -115,10 +126,14 @@ class Survey:
     settlements: Mapping[uuid.UUID, Any]
     problems: tuple[str, ...] = ()
     kept: tuple[tuple[uuid.UUID, str], ...] = ()
+    inbox_cuts: tuple[InboxCut, ...] = ()
+    inbox_events: Mapping[str, tuple[InboundEvent, ...]] = field(default_factory=dict)
+    inbox_facts: tuple[tuple[InboundFact, uuid.UUID | None], ...] = ()
+    inbox_kept: tuple[tuple[str, str], ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.tombstones and not self.window_rows
+        return not self.tombstones and not self.window_rows and not self.inbox_cuts
 
 
 def survey(
@@ -130,6 +145,7 @@ def survey(
     windows: Sequence[RateWindow] = (),
     retain: timedelta = timedelta(days=30),
     margin: timedelta = timedelta(hours=1),
+    inbox: Keyring | None = None,
 ) -> Survey:
     """Verify the outbox, then collect what a vacuum may prune.
 
@@ -139,7 +155,11 @@ def survey(
         its attestation verifies.
     :param windows: The rate windows engines measure. Window history goes
         only past the longest one's span plus ``margin``; with none, it stays.
-    :param retain: How long after its last log row a final message stays.
+    :param retain: How long after its last log row a final message stays,
+        and an inbound event after it was received.
+    :param inbox: The inbox's public keys (``[inbox.keys]``): inbound logs
+        are verified, and their prefixes pruned, only under them. Without,
+        the inbox stays.
     """
     from interlock.attestations import verify_attestations
     from interlock.operators import legacy_vouch, verify_operators
@@ -201,6 +221,13 @@ def survey(
         horizon = now - max(w.span for w in windows) - margin
         pruned = outbox.window_rows(horizon)
         windows_horizon = horizon if pruned else None
+    prefixes = _Prefixes()
+    if inbox is not None and not problems:
+        prefixes = _inbox_prefixes(outbox, inbox, relays, now - retain)
+        if prefixes.problems:
+            problems += prefixes.problems
+            tombstones, log_rows, kept, pruned, windows_horizon = [], 0, [], [], None
+            prefixes = _Prefixes(kept=prefixes.kept)
     chosen = {t.message_id for t in tombstones}
     return Survey(
         now=now,
@@ -214,7 +241,85 @@ def survey(
         settlements={m: settled[m] for m in chosen if m in settled},
         problems=tuple(problems),
         kept=tuple(kept),
+        inbox_cuts=tuple(prefixes.cuts),
+        inbox_events=dict(prefixes.events),
+        inbox_facts=tuple(prefixes.facts),
+        inbox_kept=tuple(prefixes.kept),
     )
+
+
+@dataclass
+class _Prefixes:
+    """What of the inbox a vacuum may prune, and what it keeps."""
+
+    cuts: list[InboxCut] = field(default_factory=list)
+    events: dict[str, tuple[InboundEvent, ...]] = field(default_factory=dict)
+    facts: list[tuple[InboundFact, uuid.UUID | None]] = field(default_factory=list)
+    kept: list[tuple[str, str]] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+
+def _inbox_prefixes(
+    outbox: OutboxOperations, keys: Keyring, relays: Keyring, horizon: datetime
+) -> _Prefixes:
+    """Each inbound source's longest prefix that may go: events received
+    before ``horizon``, each bound to nothing or by a fact some stage
+    consumed. Verified first, as :func:`~interlock.inbox.verify_inbox` does:
+    a source whose log or facts do not verify is kept whole; a problem that
+    is no one source's prunes nothing at all."""
+    from interlock.inbox import verify_inbox
+    from interlock.inbox_store import inbox_reader
+
+    found = _Prefixes()
+    reader = inbox_reader(outbox)
+    heads = reader.inbound_heads()
+    if not heads:
+        return found
+    facts = reader.inbound_facts()
+    source_of = {str(f.fact_id): f.source for f in facts}
+    for problem in verify_inbox(reader, keys, relays=relays).problems:
+        named = _SOURCE.match(problem)
+        fact = _FACT.match(problem)
+        if named is not None:
+            source = named.group(1)
+        elif fact is not None and fact.group(1) in source_of:
+            source = source_of[fact.group(1)]
+        else:
+            found.problems.append(problem)
+            continue
+        if source not in {name for name, _ in found.kept}:
+            found.kept.append((source, problem))
+    if found.problems:
+        return found
+    starts = reader.inbound_starts()
+    logs: dict[str, list[InboundEvent]] = {}
+    for event in reader.inbound_events():
+        logs.setdefault(event.source, []).append(event)
+    bound = {(f.source, f.event_seq): f for f in facts}
+    consumed = reader.inbound_consumed()
+    withheld = {name for name, _ in found.kept}
+    for name in sorted(heads):
+        if name in withheld:
+            continue
+        start, prev = starts[name]
+        log = sorted(logs.get(name, []), key=lambda e: e.seq)
+        through, head = start, prev
+        taken: list[tuple[InboundFact, uuid.UUID | None]] = []
+        count = 0
+        for event in log:
+            fact = bound.get((name, event.seq))
+            if event.received_at >= horizon or (fact is not None and fact.fact_id not in consumed):
+                break
+            through, head, count = event.seq, event.event_hash, count + 1
+            if fact is not None:
+                taken.append((fact, consumed[fact.fact_id]))
+        if count:
+            found.cuts.append(
+                InboxCut(name, start, prev, through, head, count, len(taken), len(taken))
+            )
+            found.events[name] = tuple(log[:count])
+            found.facts += taken
+    return found
 
 
 def _kept(
@@ -310,11 +415,55 @@ def _window_line(row: WindowRow) -> dict[str, Any]:
     }
 
 
-def write_archive(path: Path, header: Checkpoint, found: Survey) -> str:
+def _inbox_event_line(event: InboundEvent, raw: tuple[str, str] | None) -> dict[str, Any]:
+    return {
+        "kind": "inbox-event",
+        "source": event.source,
+        "seq": event.seq,
+        "event_id": event.event_id,
+        "type": event.kind,
+        "vendor_at": None if event.vendor_at is None else instant_text(event.vendor_at),
+        "received_at": instant_text(event.received_at),
+        "body_hash": event.body_hash,
+        "part": event.part,
+        "refs": list(event.refs),
+        "fields": dict(event.fields),
+        "withheld": list(event.withheld),
+        "attestation": event.attestation,
+        "prev_hash": event.prev_hash,
+        "event_hash": event.event_hash,
+        "body": None if raw is None else raw[0],
+        "signature": None if raw is None else raw[1],
+    }
+
+
+def _inbox_fact_line(fact: InboundFact, consumed_by: uuid.UUID | None) -> dict[str, Any]:
+    return {
+        "kind": "inbox-fact",
+        "fact_id": str(fact.fact_id),
+        "source": fact.source,
+        "event_seq": fact.event_seq,
+        "event_hash": fact.event_hash,
+        "message_id": str(fact.message_id),
+        "delivery_seq": fact.delivery_seq,
+        "delivery_hash": fact.delivery_hash,
+        "remote_ref": fact.remote_ref,
+        "scope_id": fact.scope_id,
+        "plan_id": fact.plan_id,
+        "tenant_id": fact.tenant_id,
+        "attestation": fact.attestation,
+        "consumed_by": None if consumed_by is None else str(consumed_by),
+    }
+
+
+def write_archive(
+    path: Path, header: Checkpoint, found: Survey, source: object | None = None
+) -> str:
     """Write what ``found`` prunes to ``path``, one canonical JSON document a
     line: the checkpoint (its ``archive`` unset), then every message with its
-    log and settlement, then every window row. Returns the file's SHA-256,
-    which the checkpoint then carries.
+    log and settlement, then every window row, then every inbound event, as
+    the vendor sent it (read from ``source``), and every fact. Returns the
+    file's SHA-256, which the checkpoint then carries.
 
     Written whole, then moved into place. A file already there for the same
     checkpoint is one a run that died before its act left: no checkpoint in
@@ -331,6 +480,20 @@ def write_archive(path: Path, header: Checkpoint, found: Survey) -> str:
             )
         )
     lines += [_window_line(row) for row in sorted(found.window_rows, key=WindowRow.order)]
+    if found.inbox_cuts:
+        from interlock.inbox_store import inbox_reader
+
+        reader = inbox_reader(source)
+        for cut in found.inbox_cuts:
+            raw = reader.inbound_raw(cut.source, cut.through)
+            lines += [
+                _inbox_event_line(event, raw.get(event.seq))
+                for event in found.inbox_events.get(cut.source, ())
+            ]
+        lines += [
+            _inbox_fact_line(fact, stage)
+            for fact, stage in sorted(found.inbox_facts, key=lambda pair: str(pair[0].fact_id))
+        ]
     data = b"".join(canonical_bytes(line) + b"\n" for line in lines)
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".partial")
@@ -343,15 +506,22 @@ def write_archive(path: Path, header: Checkpoint, found: Survey) -> str:
 
 
 def verify_archive(
-    path: Path, checkpoint: Checkpoint, *, relays: Keyring | None = None
+    path: Path,
+    checkpoint: Checkpoint,
+    *,
+    relays: Keyring | None = None,
+    inbox: Keyring | None = None,
 ) -> list[str]:
     """Prove the history an archive holds against the checkpoint that pruned it.
 
     Every archived message's log recomputes from its genesis to the head its
     tombstone carries; every outcome's relay attestation verifies (with
     ``relays``); the tombstones fold to the checkpoint's root, the window rows
-    to its window root; and the file is the one whose digest the checkpoint
-    carries.
+    to its window root; every inbound source's archived events link from
+    where the cut started to the head it names, each body hashing to what
+    its event says, each event and fact attested by a registered inbox (with
+    ``inbox``); the facts fold to the checkpoint's root; and the file is the
+    one whose digest the checkpoint carries.
 
     :returns: Every problem found; empty when the archive proves out.
     """
@@ -373,7 +543,15 @@ def verify_archive(
         problems.append(f"{path.name} archives checkpoint {header.seq}, not {checkpoint.seq}")
     tombstones: list[Tombstone] = []
     rows: list[WindowRow] = []
+    inbound: dict[str, list[dict[str, Any]]] = {}
+    facts: list[dict[str, Any]] = []
     for line in lines[1:]:
+        if line.get("kind") == "inbox-event":
+            inbound.setdefault(str(line["source"]), []).append(line)
+            continue
+        if line.get("kind") == "inbox-fact":
+            facts.append(line)
+            continue
         if line.get("kind") == "window":
             rows.append(
                 WindowRow(
@@ -469,6 +647,113 @@ def verify_archive(
         problems.append(
             f"the archived window rows do not fold to checkpoint {checkpoint.seq}'s root"
         )
+    problems += _verify_inbox_archive(checkpoint, inbound, facts, inbox)
+    return problems
+
+
+def _archived_event(line: Mapping[str, Any]) -> InboundEvent:
+    from interlock.inbox import InboundEvent, frozen_fields
+
+    return InboundEvent(
+        source=str(line["source"]),
+        seq=int(line["seq"]),
+        event_id=str(line["event_id"]),
+        kind=str(line["type"]),
+        vendor_at=None if line["vendor_at"] is None else parse_instant(line["vendor_at"]),
+        received_at=parse_instant(line["received_at"]),
+        body_hash=str(line["body_hash"]),
+        part=int(line["part"]),
+        refs=tuple(line["refs"]),
+        fields=frozen_fields(json.dumps(line["fields"])),
+        withheld=tuple(line["withheld"]),
+        attestation=str(line["attestation"]),
+        prev_hash=str(line["prev_hash"]),
+        event_hash=str(line["event_hash"]),
+    )
+
+
+def _verify_inbox_archive(
+    checkpoint: Checkpoint,
+    inbound: Mapping[str, list[dict[str, Any]]],
+    facts: Sequence[Mapping[str, Any]],
+    keys: Keyring | None,
+) -> list[str]:
+    """The inbound prefixes an archive holds, against the cuts and the fact
+    root its checkpoint carries."""
+    from interlock.inbox import verify_event, verify_fact
+
+    problems: list[str] = []
+    archived: dict[tuple[str, int], InboundEvent] = {}
+    cuts = {cut.source: cut for cut in checkpoint.inbox_cuts()}
+    for name in sorted(set(inbound) - set(cuts)):
+        problems.append(f"the archive holds events of source {name}, which no cut names")
+    for name, cut in sorted(cuts.items()):
+        expected, count = cut.prev, 0
+        for index, line in enumerate(
+            sorted(inbound.get(name, []), key=lambda raw: int(raw["seq"])), start=cut.start + 1
+        ):
+            event = _archived_event(line)
+            where = f"source {name}: archived event {event.seq}"
+            if event.seq != index or event.prev_hash != expected:
+                problems.append(f"{where} does not link to the event before it")
+                break
+            if event.recomputed() != event.event_hash:
+                problems.append(f"{where} does not hash to what it records")
+                break
+            body = line.get("body")
+            if body is not None and hashlib.sha256(body.encode()).hexdigest() != event.body_hash:
+                problems.append(f"{where}: its body is not the one it was received with")
+            if keys is not None:
+                found = verify_event(event, keys)
+                if found is not None:
+                    problems.append(f"{where}: {found}")
+            archived[name, event.seq] = event
+            expected, count = event.event_hash, count + 1
+        if (count, cut.start + count, expected) != (cut.events, cut.through, cut.head):
+            problems.append(
+                f"the archived events of source {name} do not end at the head checkpoint "
+                f"{checkpoint.seq} cut it at"
+            )
+    pairs: list[tuple[InboundFact, uuid.UUID | None]] = []
+    for raw in facts:
+        bound = archived.get((str(raw["source"]), int(raw["event_seq"])))
+        fact = InboundFact(
+            fact_id=uuid.UUID(str(raw["fact_id"])),
+            source=str(raw["source"]),
+            event_seq=int(raw["event_seq"]),
+            event_hash=str(raw["event_hash"]),
+            message_id=uuid.UUID(str(raw["message_id"])),
+            delivery_seq=int(raw["delivery_seq"]),
+            delivery_hash=str(raw["delivery_hash"]),
+            remote_ref=str(raw["remote_ref"]),
+            scope_id=str(raw["scope_id"]),
+            plan_id=str(raw["plan_id"]),
+            tenant_id=None if raw["tenant_id"] is None else str(raw["tenant_id"]),
+            attestation=str(raw["attestation"]),
+            event_id="" if bound is None else bound.event_id,
+            kind="" if bound is None else bound.kind,
+            vendor_at=None if bound is None else bound.vendor_at,
+            received_at=datetime.fromtimestamp(0, UTC) if bound is None else bound.received_at,
+            body_hash="" if bound is None else bound.body_hash,
+            part=0 if bound is None else bound.part,
+            refs=() if bound is None else bound.refs,
+            fields={} if bound is None else bound.fields,
+            withheld=() if bound is None else bound.withheld,
+            event_attestation="" if bound is None else bound.attestation,
+        )
+        if bound is None or bound.event_hash != fact.event_hash:
+            problems.append(f"archived fact {fact.fact_id} names an event the archive lacks")
+        elif keys is not None:
+            found = verify_fact(fact, keys)
+            if found is not None:
+                problems.append(f"archived fact {fact.fact_id}: {found}")
+        consumed = raw.get("consumed_by")
+        pairs.append((fact, None if consumed is None else uuid.UUID(str(consumed))))
+    inbox = checkpoint.inbox
+    if inbox and (inbox_root(pairs), len(pairs)) != (inbox.get("root"), inbox.get("facts")):
+        problems.append(f"the archived facts do not fold to checkpoint {checkpoint.seq}'s root")
+    if not inbox and pairs:
+        problems.append(f"the archive holds facts checkpoint {checkpoint.seq} never pruned")
     return problems
 
 
@@ -497,6 +782,9 @@ class VacuumReport:
     problems: tuple[str, ...] = ()
     kept: tuple[tuple[uuid.UUID, str], ...] = ()
     archive: Path | None = None
+    inbox_events: int = 0
+    """Inbound events pruned, every source's prefix together."""
+    inbox_kept: tuple[tuple[str, str], ...] = ()
 
 
 class Vacuum:
@@ -515,6 +803,8 @@ class Vacuum:
     :param retain: How long a final message stays after its last log row.
     :param margin: How long window history stays past the longest span.
     :param archive: A directory to write each checkpoint's pruned rows to.
+    :param inbox: The inbox's public keys (``[inbox.keys]``): with them,
+        inbound logs are verified and their prefixes pruned too.
     :param checkpoint: Called at ``surveyed``, ``intent``, ``anchored``,
         ``transaction`` (inside the database's transaction, before its commit),
         ``acted`` and ``recorded``: the crash tests stop the process there.
@@ -524,6 +814,7 @@ class Vacuum:
     __slots__ = (
         "_archive",
         "_checkpoint",
+        "_inbox",
         "_ledger",
         "_log",
         "_margin",
@@ -546,6 +837,7 @@ class Vacuum:
         retain: timedelta = timedelta(days=30),
         margin: timedelta = timedelta(hours=1),
         archive: str | Path | None = None,
+        inbox: Keyring | None = None,
         checkpoint: Callable[[str], None] | None = None,
     ) -> None:
         if retain < timedelta(0) or margin < timedelta(0):
@@ -559,6 +851,7 @@ class Vacuum:
         self._retain = retain
         self._margin = margin
         self._archive = None if archive is None else Path(archive)
+        self._inbox = inbox
         self._checkpoint = checkpoint or (lambda point: None)
 
     def survey(self) -> Survey:
@@ -571,6 +864,7 @@ class Vacuum:
             windows=self._windows,
             retain=self._retain,
             margin=self._margin,
+            inbox=self._inbox,
         )
 
     def run(self, *, reason: str | None = None, dry_run: bool = False) -> VacuumReport:
@@ -581,10 +875,14 @@ class Vacuum:
         found = self.survey()
         self._checkpoint("surveyed")
         counts = (len(found.tombstones), found.log_rows, len(found.window_rows))
+        events = sum(cut.events for cut in found.inbox_cuts)
+        held = found.inbox_kept
         if found.problems:
-            return VacuumReport("refused", None, 0, 0, 0, found.problems, found.kept)
+            return VacuumReport(
+                "refused", None, 0, 0, 0, found.problems, found.kept, inbox_kept=held
+            )
         if found.empty:
-            return VacuumReport("nothing", None, 0, 0, 0, (), found.kept)
+            return VacuumReport("nothing", None, 0, 0, 0, (), found.kept, inbox_kept=held)
         last = _last(self._outbox.checkpoints())
         draft = Checkpoint(
             seq=1 if last is None else last.seq + 1,
@@ -599,13 +897,22 @@ class Vacuum:
             window_rows=len(found.window_rows),
             window_root=window_root(found.window_rows),
             agentgov=self._head(),
+            inbox={}
+            if not found.inbox_cuts
+            else {
+                "sources": [cut.body() for cut in found.inbox_cuts],
+                "facts": len(found.inbox_facts),
+                "root": inbox_root(found.inbox_facts),
+            },
         )
         if dry_run:
-            return VacuumReport("dry-run", draft, *counts, (), found.kept)
+            return VacuumReport(
+                "dry-run", draft, *counts, (), found.kept, inbox_events=events, inbox_kept=held
+            )
         written = None
         if self._archive is not None:
             written = self._archive / f"checkpoint-{draft.seq}.jsonl"
-            digest = write_archive(written, draft, found)
+            digest = write_archive(written, draft, found, self._outbox)
             draft = Checkpoint(**{**_fields(draft), "archive": digest})
         intent = self._log.append(
             INTENT,
@@ -620,7 +927,9 @@ class Vacuum:
                     "why": "the checkpoint could not be anchored into AgentGov: nothing pruned",
                 },
             )
-            return VacuumReport("abandoned", draft, 0, 0, 0, (), found.kept, written)
+            return VacuumReport(
+                "abandoned", draft, 0, 0, 0, (), found.kept, written, inbox_kept=held
+            )
         self._checkpoint("anchored")
         try:
             done = self._outbox.compact(
@@ -633,7 +942,9 @@ class Vacuum:
             self._log.append(
                 REFUSED, {"intent": _ref(intent), "rows": [], "skipped": [], "why": str(exc)}
             )
-            return VacuumReport("rejected", draft, 0, 0, 0, (str(exc),), found.kept, written)
+            return VacuumReport(
+                "rejected", draft, 0, 0, 0, (str(exc),), found.kept, written, inbox_kept=held
+            )
         self._checkpoint("acted")
         self._log.append(
             APPLIED,
@@ -646,7 +957,7 @@ class Vacuum:
             },
         )
         self._checkpoint("recorded")
-        return VacuumReport("applied", draft, *counts, (), found.kept, written)
+        return VacuumReport("applied", draft, *counts, (), found.kept, written, events, held)
 
     def _head(self) -> tuple[int, str]:
         ledger = self._ledger.ledger

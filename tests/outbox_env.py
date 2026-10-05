@@ -43,6 +43,7 @@ from interlock import (
     SqliteSubstrate,
     deliveries,
 )
+from interlock import postgres as installer
 from interlock.adapters import HttpAdapter
 from interlock.attestations import AttestationReport, verify_attestations
 from interlock.deliveries import (
@@ -106,6 +107,23 @@ RELAYS = Keyring({"relay": relay_signer().public_key()})
 INSTALLER = Ed25519Signer(bytes.fromhex("1e" * 32))
 """The operator who signs installs in the tests."""
 INSTALLERS = Keyring({"installer": INSTALLER.public_key()})
+
+
+NO_INBOX: dict[str, Any] = {
+    "INBOX_TABLES": "SELECT 1",
+    "INBOX_FUNCTIONS": "SELECT 1",
+    "INBOX_TRIGGERS": "SELECT 1",
+    "_INBOX_TABLES": (),
+    "_INBOX_FUNCTIONS": (),
+    "_install_sources": lambda conn, sources: None,
+    "_STAGE_FUNCTIONS": tuple(
+        f
+        for f in installer._STAGE_FUNCTIONS
+        if not f.startswith(("interlock.inbox_", "interlock.stage_facts"))
+    ),
+}
+"""What an install by a version before the inbox (5) leaves out, patched over
+the current installer with that version's own SQL (``tests/outbox_v2.py``...)."""
 
 
 def vouch(source: object, log: Path) -> LegacyVouch:

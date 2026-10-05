@@ -114,11 +114,42 @@ needs its ``ledger``); window history goes only past the longest
     margin_seconds = 3600             # window history stays this long past the longest span
     archive = "archive"               # optional: pruned rows written here first, provable
 
+The inbox (``docs/EPIC5_DESIGN.md`` §2) receives vendors' webhooks in a
+process of its own, verifies each one's signature, binds it to the delivered
+request it names, and attests the fact; an engine consumes only facts that
+verify under ``[inbox.keys]``, as ``EscrowEngine(inbox=config.inbox_keyring())``::
+
+    inbox_roles = ["interlock_inbox"] # PostgreSQL install only
+
+    [inbox]                           # interlock inbox serve; see interlock.inbox
+    key = "inbox.key"                 # its Ed25519 key (interlock keygen --role inbox)
+    database = "postgresql://interlock_inbox@db/app"  # an inbox role
+    listen = "127.0.0.1:8787"         # plain HTTP: put TLS in front of it
+    max_body_bytes = 262144
+    match_window_seconds = 3600       # an event that matched nothing is tried again this long
+    match_every_seconds = 5
+
+    [[inbox.sources]]                 # served at POST /inbox/<name>
+    name = "stripe"
+    kind = "stripe"                   # or "sendgrid", or "http" (Standard Webhooks)
+    secret_env = "STRIPE_WEBHOOK_SECRET"  # the variable holding the signing secret
+    tolerance_seconds = 300
+    # verification_key = "MFkw..."    # sendgrid: the account's public verification key
+    # type_field = "type"             # http: where the event names its type
+    # references = ["data.id"]        # http: where it names what it is about
+    # fields = [{ name = "status", path = "data.status", type = "code" }]  # http
+
+    [inbox.keys]                      # public halves only: what facts verify under
+    main = "ed25519:7d2e..."
+
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
-relay's in ``INTERLOCK_RELAY_DATABASE``. A sink has no endpoint or credential
-in ``[[sinks]]``: those belong to the relay, and its credentials only to its
+relay's in ``INTERLOCK_RELAY_DATABASE``, the inbox's in
+``INTERLOCK_INBOX_DATABASE``. A sink has no endpoint or credential in
+``[[sinks]]``: those belong to the relay, and its credentials only to its
 environment: ``header_env`` names the variable holding each header's value.
+A webhook's signing secret, likewise, lives only in the inbox's environment:
+``secret_env`` names the variable.
 """
 
 from __future__ import annotations
@@ -133,6 +164,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
 from interlock.outbound import (
     HTTP,
     KINDS,
@@ -148,8 +180,10 @@ from interlock.windows import Measure, Plans, RateWindow, Requests, RequestSum, 
 
 __all__ = [
     "DATABASE_ENV",
+    "INBOX_DATABASE_ENV",
     "RELAY_DATABASE_ENV",
     "Endpoint",
+    "InboxConfig",
     "InterlockConfig",
     "OperatorsConfig",
     "RelayConfig",
@@ -159,6 +193,7 @@ __all__ = [
 
 DATABASE_ENV = "INTERLOCK_DATABASE"
 RELAY_DATABASE_ENV = "INTERLOCK_RELAY_DATABASE"
+INBOX_DATABASE_ENV = "INTERLOCK_INBOX_DATABASE"
 
 
 class ConfigError(ValueError):
@@ -247,6 +282,33 @@ class VacuumConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class InboxConfig:
+    """``[inbox]``: how ``interlock inbox`` runs, and what facts verify under
+    (``docs/EPIC5_DESIGN.md`` §2).
+
+    :ivar sources: ``[[inbox.sources]]``: each vendor sending webhooks.
+    :ivar keys: ``[inbox.keys]``: each inbox's name and Ed25519 public key.
+        An engine consumes a fact only when its attestations verify under one.
+    :ivar database: The inbox role's connection, or ``""`` for the
+        configuration's own (SQLite) or ``INTERLOCK_INBOX_DATABASE``.
+    :ivar key: The inbox's own key file (``interlock keygen --role inbox``),
+        or ``INTERLOCK_INBOX_KEY``.
+    """
+
+    sources: tuple[InboundSource, ...] = ()
+    keys: Mapping[str, str] | None = None
+    database: str = ""
+    key: Path | None = None
+    listen: str = "127.0.0.1:8787"
+    max_body: int = MAX_BODY
+    match_window: timedelta = timedelta(hours=1)
+    match_every: timedelta = timedelta(seconds=5)
+
+    def keyring(self) -> Keyring | None:
+        return None if self.keys is None else Keyring(self.keys)
+
+
+@dataclass(frozen=True, slots=True)
 class InterlockConfig:
     substrate: str
     database: str
@@ -268,9 +330,16 @@ class InterlockConfig:
     """``[[windows]]``: the rate windows, as an engine takes them."""
     vacuum: VacuumConfig = VacuumConfig()
     """``[vacuum]``: what a vacuum keeps."""
+    inbox: InboxConfig = InboxConfig()
+    """``[inbox]``: the inbox, and the keys its facts verify under."""
+    inbox_roles: tuple[str, ...] = ()
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
+
+    def inbox_keyring(self) -> Keyring | None:
+        """``[inbox.keys]``, as an engine takes them: ``EscrowEngine(inbox=...)``."""
+        return self.inbox.keyring()
 
     def with_database(self, database: str | None) -> InterlockConfig:
         if not database:
@@ -329,16 +398,23 @@ def load_config(
     sinks = _sinks(raw.get("sinks", []), Path(path).parent)
     relay_roles = tuple(_strings(raw, "relay_roles", required=False))
     settler_roles = tuple(_strings(raw, "settler_roles", required=False))
-    if (relay_roles or settler_roles) and substrate != "postgres":
-        raise ConfigError(
-            f"{'relay_roles' if relay_roles else 'settler_roles'} are PostgreSQL roles; on "
-            f"SQLite the file's permissions bound who writes it instead"
-        )
+    inbox_roles = tuple(_strings(raw, "inbox_roles", required=False))
+    for label, roles in (
+        ("relay_roles", relay_roles),
+        ("settler_roles", settler_roles),
+        ("inbox_roles", inbox_roles),
+    ):
+        if roles and substrate != "postgres":
+            raise ConfigError(
+                f"{label} are PostgreSQL roles; on SQLite the file's permissions bound who "
+                f"writes it instead"
+            )
     relay = _relay(raw.get("relay"), sinks, Path(path).parent)
     operators = _operators(raw.get("operators"), Path(path).parent)
     relays = _relays(raw.get("relays"))
     windows = _windows(raw.get("windows", []), tuple(tables), sinks)
     vacuum = _vacuum(raw.get("vacuum"), Path(path).parent)
+    inbox = _inbox(raw.get("inbox"), Path(path).parent)
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -355,6 +431,8 @@ def load_config(
         relays=relays,
         windows=windows,
         vacuum=vacuum,
+        inbox=inbox,
+        inbox_roles=inbox_roles,
     )
 
 
@@ -376,6 +454,121 @@ def _vacuum(raw: object, base: Path) -> VacuumConfig:
         margin=timedelta(seconds=margin),
         archive=None if archive is None else base / archive,
     )
+
+
+_INBOX_KEYS = frozenset(
+    {
+        "key",
+        "database",
+        "listen",
+        "max_body_bytes",
+        "match_window_seconds",
+        "match_every_seconds",
+        "sources",
+        "keys",
+    }
+)
+_SOURCE_KEYS = frozenset(
+    {
+        "name",
+        "kind",
+        "secret_env",
+        "verification_key",
+        "tolerance_seconds",
+        "type_field",
+        "references",
+        "fields",
+    }
+)
+
+
+def _inbox(raw: object, base: Path) -> InboxConfig:
+    if raw is None:
+        return InboxConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'inbox' must be a table ([inbox])")
+    unknown = sorted(set(raw) - _INBOX_KEYS)
+    if unknown:
+        raise ConfigError(f"[inbox]: unknown key(s) {', '.join(unknown)}")
+    entries = raw.get("sources", [])
+    if not isinstance(entries, list):
+        raise ConfigError("inbox.sources must be an array of tables ([[inbox.sources]])")
+    sources = tuple(_source(entry, index) for index, entry in enumerate(entries))
+    names = [s.name for s in sources]
+    twice = sorted({n for n in names if names.count(n) > 1})
+    if twice:
+        raise ConfigError(f"[[inbox.sources]]: {', '.join(twice)} configured twice")
+    keys = None
+    if "keys" in raw:
+        keys = _table_of_strings(raw, "keys")
+        try:
+            Keyring(keys)
+        except ValueError as exc:
+            raise ConfigError(f"[inbox.keys]: {exc}") from exc
+    key = _string(raw, "key", default="")
+    max_body = _integer(raw, "max_body_bytes", MAX_BODY)
+    window = _integer(raw, "match_window_seconds", 3600)
+    every = _seconds(raw, "match_every_seconds", 5.0)
+    if max_body <= 0 or window < 0 or every <= 0:
+        raise ConfigError(
+            "[inbox]: max_body_bytes and match_every_seconds are positive, "
+            "match_window_seconds is not negative"
+        )
+    listen = _string(raw, "listen", default="127.0.0.1:8787")
+    host, _, port = listen.rpartition(":")
+    if not host or not port.isdigit() or not 0 <= int(port) <= 65535:
+        raise ConfigError(f"[inbox]: listen is HOST:PORT, not {listen!r}")
+    return InboxConfig(
+        sources=sources,
+        keys=keys,
+        database=_string(raw, "database", default=""),
+        key=base / key if key else None,
+        listen=listen,
+        max_body=max_body,
+        match_window=timedelta(seconds=window),
+        match_every=timedelta(seconds=every),
+    )
+
+
+def _source(entry: object, index: int) -> InboundSource:
+    where = f"inbox.sources[{index}]"
+    if not isinstance(entry, dict):
+        raise ConfigError(f"{where} is not a table")
+    unknown = sorted(set(entry) - _SOURCE_KEYS)
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+    fields: list[FieldSpec] = []
+    raw_fields = entry.get("fields", [])
+    if not isinstance(raw_fields, list):
+        raise ConfigError(f"{where}: fields is an array of {{ name, path, type }} tables")
+    for number, spec in enumerate(raw_fields):
+        if not isinstance(spec, dict) or set(spec) != {"name", "path", "type"}:
+            raise ConfigError(
+                f"{where}: fields[{number}] is a {{ name, path, type }} table, type one of "
+                f"{', '.join(TYPES)}"
+            )
+        try:
+            fields.append(
+                FieldSpec(_string(spec, "name"), _string(spec, "path"), _string(spec, "type"))
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    tolerance = _integer(entry, "tolerance_seconds", 300)
+    if tolerance <= 0:
+        raise ConfigError(f"{where}: tolerance_seconds is positive")
+    try:
+        return InboundSource(
+            name=_string(entry, "name"),
+            kind=_string(entry, "kind", default=HTTP),
+            secret_env=_string(entry, "secret_env", default=""),
+            verification_key=_string(entry, "verification_key", default=""),
+            tolerance=timedelta(seconds=tolerance),
+            type_field=_string(entry, "type_field", default="type"),
+            references=tuple(_strings(entry, "references", required=False)),
+            fields=tuple(fields),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"{where}: {exc}") from exc
 
 
 _MEASURES = ("requests", "request_sum", "row_sum", "plans")

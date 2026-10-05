@@ -3,7 +3,8 @@
 ``python -m tests.vacuum_child scenario.json`` opens the operator log with the
 operator's key file, anchored into the AgentGov ledger, and the outbox as a
 vacuum acts on it (PostgreSQL as the installer, or the SQLite file with the
-compactor's write set), and runs one vacuum. At the scenario's point it prints
+compactor's write set), and runs one vacuum: with the scenario's ``inbox``
+keys, the inbound logs' prefixes too. At the scenario's point it prints
 one line and SIGKILLs itself:
 
 ================  ==========================================================
@@ -73,6 +74,7 @@ def run(scenario: dict[str, Any]) -> NoReturn:
         relays=RELAYS,
         ledger=governor,
         retain=timedelta(0),
+        inbox=Keyring(scenario["inbox"]) if scenario.get("inbox") else None,
         checkpoint=checkpoint,
     )
     say("started", pid=os.getpid())

@@ -1432,6 +1432,11 @@ DECLARE
     counted integer;
     log_rows integer;
     window_rows integer := 0;
+    cuts jsonb := coalesce(body -> 'inbox' -> 'sources', '[]'::jsonb);
+    cut record;
+    first_seq integer;
+    inbox_events integer := 0;
+    inbox_facts integer := 0;
 BEGIN
     IF body ->> 'v' IS DISTINCT FROM 'interlock-checkpoint-v1' THEN
         RAISE EXCEPTION 'interlock: not a checkpoint' USING ERRCODE = 'IL010';
@@ -1542,6 +1547,70 @@ BEGIN
             USING ERRCODE = 'IL010';
     END IF;
 
+    -- The inbound sources' prefixes: each cut where the signed body says, the
+    -- log there as it was verified, every fact in it consumed.
+    FOR cut IN
+        SELECT c ->> 'source' AS source, (c ->> 'from')::integer AS start, c ->> 'prev' AS prev,
+               (c ->> 'through')::integer AS through, c ->> 'head' AS head,
+               (c ->> 'events')::integer AS events, (c ->> 'facts')::integer AS facts,
+               (c ->> 'consumed')::integer AS consumed
+          FROM pg_catalog.jsonb_array_elements(cuts) AS c
+    LOOP
+        PERFORM 1 FROM interlock.inbox_sources AS s WHERE s.name = cut.source FOR UPDATE;
+        SELECT min(e.seq), count(*) INTO first_seq, counted
+          FROM interlock.inbox_events AS e
+         WHERE e.source = cut.source AND e.seq <= cut.through;
+        IF NOT FOUND OR counted IS DISTINCT FROM cut.events
+           OR cut.through - cut.start IS DISTINCT FROM cut.events
+           OR first_seq IS DISTINCT FROM cut.start + 1
+           OR NOT EXISTS (SELECT 1 FROM interlock.inbox_events AS e
+                           WHERE e.source = cut.source AND e.seq = cut.start + 1
+                             AND e.prev_hash = cut.prev)
+           OR NOT EXISTS (SELECT 1 FROM interlock.inbox_events AS e
+                           WHERE e.source = cut.source AND e.seq = cut.through
+                             AND e.event_hash = cut.head) THEN
+            RAISE EXCEPTION 'interlock: inbound source % moved after it was verified', cut.source
+                USING ERRCODE = 'IL010';
+        END IF;
+        IF EXISTS (SELECT 1 FROM interlock.inbox_facts AS f
+                    WHERE f.source = cut.source AND f.event_seq <= cut.through
+                      AND NOT EXISTS (SELECT 1 FROM interlock.inbox_consumed AS k
+                                       WHERE k.fact_id = f.fact_id)) THEN
+            RAISE EXCEPTION 'interlock: a fact of inbound source % is still pending', cut.source
+                USING ERRCODE = 'IL010';
+        END IF;
+        SELECT count(*) INTO counted FROM interlock.inbox_facts AS f
+         WHERE f.source = cut.source AND f.event_seq <= cut.through;
+        IF counted IS DISTINCT FROM cut.facts OR counted IS DISTINCT FROM cut.consumed THEN
+            RAISE EXCEPTION 'interlock: the facts of inbound source % are not the ones the '
+                'checkpoint commits to', cut.source USING ERRCODE = 'IL010';
+        END IF;
+        inbox_events := inbox_events + cut.events;
+    END LOOP;
+    IF pg_catalog.jsonb_array_length(cuts) > 0 THEN
+        root := interlock.outbox_digest('interlock-inbox-facts-v1', '0');
+        FOR leaf IN
+            SELECT interlock.outbox_digest(
+                       'interlock-inbox-fact-v1', f.fact_id::text, f.source, f.event_seq::text,
+                       f.event_hash, f.message_id::text, f.delivery_seq::text, f.delivery_hash,
+                       f.remote_ref, f.scope_id, f.plan_id, f.tenant_id, f.attestation,
+                       k.stage_id::text)
+              FROM interlock.inbox_facts AS f
+              JOIN pg_catalog.jsonb_array_elements(cuts) AS c
+                ON c ->> 'source' = f.source AND f.event_seq <= (c ->> 'through')::integer
+              LEFT JOIN interlock.inbox_consumed AS k ON k.fact_id = f.fact_id
+             ORDER BY f.fact_id::text COLLATE "C"
+        LOOP
+            root := interlock.outbox_digest('interlock-inbox-facts-v1', root, leaf);
+            inbox_facts := inbox_facts + 1;
+        END LOOP;
+        IF root IS DISTINCT FROM body -> 'inbox' ->> 'root'
+           OR inbox_facts IS DISTINCT FROM (body -> 'inbox' ->> 'facts')::integer THEN
+            RAISE EXCEPTION 'interlock: the facts are not the ones the checkpoint commits to'
+                USING ERRCODE = 'IL010';
+        END IF;
+    END IF;
+
     DELETE FROM interlock.outbox_settlements WHERE message_id = ANY (targets);
     DELETE FROM interlock.outbox_attempts WHERE message_id = ANY (targets);
     DELETE FROM interlock.outbox_state WHERE message_id = ANY (targets);
@@ -1549,8 +1618,20 @@ BEGIN
     IF horizon IS NOT NULL THEN
         DELETE FROM interlock.window_ledger WHERE at <= horizon;
     END IF;
+    IF pg_catalog.jsonb_array_length(cuts) > 0 THEN
+        DELETE FROM interlock.inbox_consumed AS k
+         USING interlock.inbox_facts AS f, pg_catalog.jsonb_array_elements(cuts) AS c
+         WHERE k.fact_id = f.fact_id AND c ->> 'source' = f.source
+           AND f.event_seq <= (c ->> 'through')::integer;
+        DELETE FROM interlock.inbox_facts AS f USING pg_catalog.jsonb_array_elements(cuts) AS c
+         WHERE c ->> 'source' = f.source AND f.event_seq <= (c ->> 'through')::integer;
+        DELETE FROM interlock.inbox_events AS e USING pg_catalog.jsonb_array_elements(cuts) AS c
+         WHERE c ->> 'source' = e.source AND e.seq <= (c ->> 'through')::integer;
+    END IF;
+    SELECT count(*) INTO counted FROM interlock.outbox_compacted AS t WHERE t.checkpoint = n;
     RETURN pg_catalog.jsonb_build_object(
-        'checkpoint', n, 'messages', counted, 'rows', log_rows, 'windows', window_rows);
+        'checkpoint', n, 'messages', counted, 'rows', log_rows, 'windows', window_rows,
+        'inbox_events', inbox_events, 'inbox_facts', inbox_facts);
 END
 $fn$;
 """

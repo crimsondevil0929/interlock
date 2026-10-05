@@ -47,6 +47,7 @@ from typing import Any, Final
 from interlock.exceptions import (
     CyclicPlanError,
     ForbiddenStatementError,
+    InboundFactError,
     InterlockError,
     OutboundRequestError,
     PlanError,
@@ -135,6 +136,10 @@ class Guidance(StrEnum):
     OUTBOUND_AMOUNT = "outbound_amount"
     OUTBOUND_RECIPIENT = "outbound_recipient"
     OUTBOUND_TENANT = "outbound_tenant"
+    # Raised by admission, or a checker over the facts a plan consumes
+    # (docs/EPIC5_DESIGN.md §2).
+    INBOUND_FACT = "inbound_fact"
+    FACT_AGREEMENT = "fact_agreement"
 
 
 _LABELS: Final[Mapping[Guidance, str]] = {
@@ -167,6 +172,8 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.OUTBOUND_AMOUNT: "payload_amount_cap",
     Guidance.OUTBOUND_RECIPIENT: "recipient_allowlist",
     Guidance.OUTBOUND_TENANT: "outbound_tenant_isolation",
+    Guidance.INBOUND_FACT: "inbound_fact",
+    Guidance.FACT_AGREEMENT: "fact_agreement",
 }
 """The public name of each kind. Derived from the kind, never from a checker's
 own ``name``, which can embed configuration (``column_value_guard:orders.total``)
@@ -427,6 +434,14 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"request goes only to a tenant the plan's rows involve, and its payload names that "
         f"tenant where it names one."
     ),
+    Guidance.INBOUND_FACT: lambda c: (
+        "a fact the plan consumes is not pending for its scope, or does not verify. Read the "
+        "pending facts again before planning on one."
+    ),
+    Guidance.FACT_AGREEMENT: lambda c: (
+        f"the plan writes {_column(c)} without consuming the inbound fact it must follow, or "
+        f"other than that fact says. Consume the fact, and write what it says."
+    ),
 }
 
 
@@ -639,7 +654,9 @@ def feedback_for_error(plan: EffectPlan, error: BaseException) -> AgentFeedback:
     blocking = True
     retryable = False
     hint: FeedbackHint
-    if isinstance(error, ForbiddenStatementError):
+    if isinstance(error, InboundFactError):
+        hint = FeedbackHint(kind=Guidance.INBOUND_FACT)
+    elif isinstance(error, ForbiddenStatementError):
         kind = _REASON_GUIDANCE.get(error.reason, Guidance.STATEMENT_KIND)
         tables = (error.table,) if error.table else ()
         hint = FeedbackHint(kind=kind, tables=tables)

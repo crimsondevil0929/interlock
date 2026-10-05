@@ -65,6 +65,7 @@ from interlock.deliveries import LegacySet, PostgresReader
 from interlock.exceptions import (
     CommitUnsettledError,
     ForbiddenStatementError,
+    InboundFactError,
     InterlockError,
     OutboundRequestError,
     StageConflictError,
@@ -73,6 +74,8 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
+from interlock.inbox_sql import INBOX_FUNCTIONS, INBOX_TABLES, INBOX_TRIGGERS
+from interlock.inbox_store import fact_row
 from interlock.outbound import EnqueueOrder, SinkSpec
 from interlock.outbox_sql import (
     OUTBOX_FUNCTIONS,
@@ -90,6 +93,7 @@ from interlock.types import (
     EffectKind,
     EffectOutcome,
     EffectPlan,
+    InboundFact,
     OutboundDelta,
     RowDelta,
     StageHandle,
@@ -102,6 +106,8 @@ from interlock.windows import WindowCharge, window_lock
 
 if TYPE_CHECKING:
     import psycopg
+
+    from interlock.inbox import InboundSource
 
 __all__ = [
     "INSTALL_VERSION",
@@ -138,11 +144,15 @@ _OUTBOUND: Final = "IL004"
 """The outbox refused a request: an unregistered or disabled sink, an operation
 it does not install, a payload over its bound or not matching its hash."""
 _WINDOWS: Final = "IL009"
-"""``interlock.window_totals`` was called inside a stage: the rate windows'
-history is never a stage's to read."""
+"""``interlock.window_totals`` or ``interlock.inbox_pending`` was called inside
+a stage: the rate windows' history and the inbox are never a stage's to read."""
 _PRUNED: Final = "IL011"
 """A rate window reaches back past the history a checkpoint pruned
 (``docs/EPIC5_DESIGN.md`` §1.8): it cannot be measured honestly."""
+_INBOUND: Final = "IL012"
+"""The inbox refused: no such fact for the plan's scope, an event that does
+not extend its log, a binding to nothing delivered (``docs/EPIC5_DESIGN.md``
+§2)."""
 _UNIQUE: Final = "23505"
 _CANCELLED: Final = "57014"
 _PRIVILEGE: Final = "42501"
@@ -477,6 +487,9 @@ _STAGE_FUNCTIONS: Final = (
     "interlock.window_lock(bigint[])",
     "interlock.window_totals(text[], text[], bigint[])",
     "interlock.window_add(bytea, text[], text[], numeric[])",
+    "interlock.inbox_pending(text)",
+    "interlock.inbox_consume(bytea, uuid[], text)",
+    "interlock.stage_facts(bigint)",
 )
 
 _OUTBOX_TABLES: Final = (
@@ -492,6 +505,22 @@ _OUTBOX_TABLES: Final = (
 )
 
 _SETTLER_FUNCTIONS: Final = ("interlock.outbox_settle(uuid, text, text, text)",)
+
+_INBOX_TABLES: Final = (
+    "interlock.inbox_sources",
+    "interlock.inbox_events",
+    "interlock.inbox_facts",
+    "interlock.inbox_consumed",
+)
+
+_INBOX_FUNCTIONS: Final = (
+    "interlock.inbox_record(text, text, text, timestamptz, timestamptz, text, text, text, "
+    "integer, text, text, text, text)",
+    "interlock.inbox_match(uuid, text, integer, text, uuid, integer, text, text, text, text, "
+    "text, text)",
+)
+"""What an inbox process may call: every event and fact it records goes
+through one of these."""
 
 _RELAY_FUNCTIONS: Final = (
     "interlock.relay_claim(text, double precision, integer, text[])",
@@ -515,6 +544,8 @@ def install(
     sinks: Iterable[SinkSpec] = (),
     relay_roles: Iterable[str] = (),
     settler_roles: Iterable[str] = (),
+    sources: Iterable[InboundSource] = (),
+    inbox_roles: Iterable[str] = (),
 ) -> LegacySet:
     """Install Interlock's schema, functions and triggers. Idempotent.
 
@@ -543,6 +574,14 @@ def install(
         (:class:`~interlock.settlement.Settler`). Each may read the outbox
         tables and record a delivered request's settlement, through
         ``interlock.outbox_settle``, and nothing else.
+    :param sources: The inbound sources webhooks arrive from
+        (``docs/EPIC5_DESIGN.md`` §2), mirrored into ``interlock.inbox_sources``
+        without their secrets. One installed before and no longer listed is
+        disabled, not deleted: its log stays.
+    :param inbox_roles: Roles the inbox process runs as. Each may read the
+        outbox and the inbox, and record events and facts through
+        ``interlock.inbox_record`` and ``interlock.inbox_match``, and nothing
+        else.
     :raises ValueError: On a schema or role name that is not a plain
         identifier.
 
@@ -573,7 +612,8 @@ def install(
     auditors = list(audit_roles)
     relays = list(relay_roles)
     settlers = list(settler_roles)
-    for role in (*roles, *auditors, *relays, *settlers):
+    inboxes = list(inbox_roles)
+    for role in (*roles, *auditors, *relays, *settlers, *inboxes):
         _identifier(role)
     wanted = {spec.name.lower(): spec for spec in tables}
     registry = list(sinks)
@@ -581,9 +621,12 @@ def install(
         conn.execute(OUTBOX_GUARD)
         conn.execute(_SCHEMA)
         conn.execute(OUTBOX_TABLES)
+        conn.execute(INBOX_TABLES)
         conn.execute(_FUNCTIONS)
         conn.execute(OUTBOX_FUNCTIONS)
+        conn.execute(INBOX_FUNCTIONS)
         conn.execute(OUTBOX_TRIGGERS)
+        conn.execute(INBOX_TRIGGERS)
         # Every function defaults to EXECUTE for PUBLIC. Revoked from all:
         # anyone who could call begin_stage could open a stage, so their
         # writes would be captured into their own session instead of treated
@@ -591,6 +634,7 @@ def install(
         # request delivered. Roles get back exactly what their part needs.
         conn.execute("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA interlock FROM PUBLIC")
         _install_sinks(conn, registry)
+        _install_sources(conn, list(sources))
         previous = [
             str(row[0]) for row in conn.execute("SELECT tbl FROM interlock.installation").fetchall()
         ]
@@ -646,7 +690,7 @@ def install(
             conn.execute(
                 "GRANT SELECT ON interlock.stages, interlock.unmediated, "
                 f"interlock.installation, interlock.window_ledger, "
-                f"{', '.join(_OUTBOX_TABLES)} TO {role}"
+                f"{', '.join((*_OUTBOX_TABLES, *_INBOX_TABLES))} TO {role}"
             )
         for role in relays:
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
@@ -662,6 +706,15 @@ def install(
             conn.execute(f"REVOKE ALL ON {', '.join(_OUTBOX_TABLES)} FROM {role}")
             conn.execute(f"GRANT SELECT ON {', '.join(_OUTBOX_TABLES)} TO {role}")
             for signature in _SETTLER_FUNCTIONS:
+                conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
+        for role in inboxes:
+            conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
+            # Reads the outbox to match, the inbox to verify; writes only
+            # through its two functions, which link and check.
+            readable = ", ".join((*_OUTBOX_TABLES, *_INBOX_TABLES))
+            conn.execute(f"REVOKE ALL ON {readable} FROM {role}")
+            conn.execute(f"GRANT SELECT ON {readable} TO {role}")
+            for signature in _INBOX_FUNCTIONS:
                 conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
         legacy = PostgresReader(conn).legacy()
     return legacy or LegacySet({})
@@ -703,6 +756,23 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
     conn.execute(
         "UPDATE interlock.sinks SET enabled = false WHERE NOT (name = ANY (%s))",
         ([sink.name for sink in sinks],),
+    )
+
+
+def _install_sources(conn: psycopg.Connection[Any], sources: Sequence[InboundSource]) -> None:
+    """Mirror the inbound sources into ``interlock.inbox_sources``: no secret."""
+    from interlock.inbox import inbox_genesis
+
+    for source in sources:
+        conn.execute(
+            "INSERT INTO interlock.inbox_sources (name, kind, config_hash, enabled, log_seq, "
+            "log_head) VALUES (%s, %s, %s, true, 0, %s) ON CONFLICT (name) DO UPDATE SET "
+            "kind = EXCLUDED.kind, config_hash = EXCLUDED.config_hash, enabled = true",
+            (source.name, source.kind, source.config_hash(), inbox_genesis(source.name)),
+        )
+    conn.execute(
+        "UPDATE interlock.inbox_sources SET enabled = false WHERE NOT (name = ANY (%s))",
+        ([source.name for source in sources],),
     )
 
 
@@ -765,6 +835,7 @@ class PostgresSubstrate:
         "_conn",
         "_dsn",
         "_enforce",
+        "_facts",
         "_folded",
         "_handle",
         "_lock_seconds",
@@ -872,6 +943,7 @@ class PostgresSubstrate:
         self._scope: str | None = None
         self._order = EnqueueOrder()
         self._charges: tuple[WindowCharge, ...] = ()
+        self._facts: tuple[uuid.UUID, ...] = ()
 
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
@@ -1125,6 +1197,14 @@ class PostgresSubstrate:
             ).fetchall()
         except psycopg.Error as exc:
             raise StageError(f"could not read the stage's outbox: {exc}") from exc
+        consumed: list[Any] = []
+        if self._facts:
+            try:
+                consumed = conn.execute(
+                    "SELECT * FROM interlock.stage_facts(%s)", (self._max_rows + 1,)
+                ).fetchall()
+            except psycopg.Error as exc:
+                raise StageError(f"could not read the facts the stage consumed: {exc}") from exc
         truncated = len(rows) > self._max_rows or len(requests) > self._max_rows
         outbound = tuple(
             OutboundDelta(
@@ -1180,7 +1260,66 @@ class PostgresSubstrate:
             deltas=tuple(deltas),
             truncated=truncated,
             outbound=outbound,
+            facts=tuple(fact_row(r) for r in consumed),
         )
+
+    # -- inbound facts (docs/EPIC5_DESIGN.md §2) --------------------------------
+
+    def pending_facts(self, scope_id: str) -> tuple[InboundFact, ...]:
+        """The facts pending for ``scope_id``, read on a connection of their
+        own, outside every stage: ``interlock.inbox_pending`` refuses inside
+        one, so no statement of a plan reads them.
+
+        :raises SubstrateConfigurationError: If the inbox is not installed.
+        """
+        import psycopg
+
+        with self._reader() as side:
+            try:
+                rows = side.execute(
+                    "SELECT * FROM interlock.inbox_pending(%s)", (scope_id,)
+                ).fetchall()
+            except psycopg.Error as exc:
+                raise self._setup_error(exc) from exc
+        return tuple(fact_row(r) for r in rows)
+
+    def consume_facts(
+        self, handle: StageHandle, fact_ids: Sequence[uuid.UUID], scope_id: str
+    ) -> None:
+        """Consume the plan's facts in its stage, with its token
+        (``interlock.inbox_consume``): each its scope's, and not consumed
+        already. The rows commit with the stage, or not at all.
+
+        :raises InboundFactError: If a fact is unknown, another scope's, or
+            consumed already.
+        :raises StageConflictError: If another open stage is consuming one.
+        """
+        import psycopg
+
+        conn = self._require(handle)
+        self._assert_live(handle)
+        if self._token is None:
+            raise StageError("facts are consumed inside a stage")
+        try:
+            conn.execute(self._timeouts())
+            conn.execute(
+                "SELECT interlock.inbox_consume(%s, %s::uuid[], %s)",
+                (self._token, list(fact_ids), scope_id),
+                prepare=True,
+            )
+        except psycopg.Error as exc:
+            if exc.sqlstate == _INBOUND:
+                raise InboundFactError(f"the stage could not consume a fact: {exc}") from exc
+            if exc.sqlstate == _UNIQUE:
+                raise InboundFactError(
+                    f"a fact the plan consumes was consumed already: {exc}"
+                ) from exc
+            if exc.sqlstate in _CONFLICTS:
+                raise StageConflictError(
+                    f"another stage is consuming a fact this plan consumes: {exc}"
+                ) from exc
+            raise StageError(f"could not consume the plan's facts: {exc}") from exc
+        self._facts = tuple(fact_ids)
 
     def measure_windows(
         self, handle: StageHandle, charges: Sequence[WindowCharge]
@@ -1712,8 +1851,8 @@ class PostgresSubstrate:
             )
         if sqlstate == _WINDOWS:
             return ForbiddenStatementError(
-                f"{who} refused: {exc}. What other plans added to a rate window is not "
-                f"a stage's to read",
+                f"{who} refused: {exc}. What other plans added to a rate window, and the "
+                f"inbox, are read outside every stage, never by a plan's statement",
                 reason="protected",
             )
         if sqlstate == _PRIVILEGE:

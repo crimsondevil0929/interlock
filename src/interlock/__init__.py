@@ -58,9 +58,11 @@ from interlock.exceptions import (
     ChainIntegrityError,
     ChainInUseError,
     CommitUnsettledError,
+    CompactionRefusedError,
     CyclicPlanError,
     ExtensionError,
     ForbiddenStatementError,
+    InboundFactError,
     InterlockError,
     LedgerUnverifiedError,
     OutboundRequestError,
@@ -87,10 +89,12 @@ from interlock.extension import (
     Spend,
 )
 from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEvidence, Refusal
+from interlock.inbox import InboundSource, Inbox, verify_fact, verify_inbox
 from interlock.invariants import (
     BlastRadius,
     ColumnValueGuard,
     CrossEffectAgreement,
+    FactAgreement,
     InvariantChecker,
     NoDelete,
     NoSchemaChange,
@@ -143,6 +147,7 @@ from interlock.types import (
     EffectId,
     EffectKind,
     EffectPlan,
+    InboundFact,
     InvariantViolation,
     OutboundRequest,
     PlanId,
@@ -152,6 +157,7 @@ from interlock.types import (
     Verdict,
     WindowMeasure,
 )
+from interlock.vacuum import Vacuum, VacuumReport, verify_archive
 from interlock.windows import (
     Plans,
     RateWindow,
@@ -176,6 +182,7 @@ __all__ = [
     "Channel",
     "ColumnValueGuard",
     "CommitUnsettledError",
+    "CompactionRefusedError",
     "Compensation",
     "ConstraintFeedback",
     "CrossEffectAgreement",
@@ -197,8 +204,13 @@ __all__ = [
     "ExtensionError",
     "ExtensionGrant",
     "ExtensionRequest",
+    "FactAgreement",
     "ForbiddenStatementError",
     "HttpAdapter",
+    "InboundFact",
+    "InboundFactError",
+    "InboundSource",
+    "Inbox",
     "InterlockError",
     "InvariantChecker",
     "InvariantViolation",
@@ -274,6 +286,8 @@ __all__ = [
     "TripKind",
     "TruncationGuard",
     "UncompensatableEffectError",
+    "Vacuum",
+    "VacuumReport",
     "Verdict",
     "WindowMeasure",
     "__version__",
@@ -282,7 +296,10 @@ __all__ = [
     "new_effect_id",
     "new_plan_id",
     "retry_delay",
+    "verify_archive",
     "verify_delivery_log",
+    "verify_fact",
+    "verify_inbox",
     "verify_records",
     "verify_settlements",
 ]
