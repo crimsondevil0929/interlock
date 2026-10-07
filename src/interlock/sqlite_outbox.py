@@ -1613,7 +1613,28 @@ class SqliteOutboxStore:
 
     # -- reading ---------------------------------------------------------------
 
+    @contextmanager
+    def consistent(self) -> Iterator[None]:
+        """Every read inside sees one state of the database: a read
+        transaction, or the one already open (:func:`interlock.deliveries.consistent`)."""
+        conn = self._conn
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN")
+        try:
+            yield
+        finally:
+            if conn.in_transaction:
+                conn.execute("COMMIT")  # it read; there is nothing to keep or undo
+
     def snapshot(
+        self, message_ids: Sequence[uuid.UUID] | None
+    ) -> tuple[list[LoggedMessage], list[LogEvent]]:
+        with self.consistent():
+            return self._snapshot(message_ids)
+
+    def _snapshot(
         self, message_ids: Sequence[uuid.UUID] | None
     ) -> tuple[list[LoggedMessage], list[LogEvent]]:
         ids = None if message_ids is None else json.dumps([str(m) for m in message_ids])

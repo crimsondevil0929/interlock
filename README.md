@@ -49,7 +49,7 @@ from another (would a *real* model produce it?) -- but it means demo.py cannot a
 second question, and an adversarial audit of this project found that a real, current
 Claude model declines the exact injected instruction shown above, across several
 realistic framings of the same prompt injection. For the first question answered against
-a real model instead of a scripted stand-in, see [`scripts/live_stress_test.py`](scripts/live_stress_test.py):
+a real model instead of a scripted stand-in, see [`scripts/live_gauntlet.py`](scripts/live_gauntlet.py):
 eight scenarios, a real `anthropic.Anthropic` client, real governed spend, and verdicts the
 script itself says are not reproducible, because what the model chooses to do is not.
 

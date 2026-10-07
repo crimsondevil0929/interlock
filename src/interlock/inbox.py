@@ -1048,11 +1048,21 @@ def verify_inbox(source: object, keys: Keyring, *, relays: Keyring | None = None
     (forged, or copied from another), a fact naming an event or a delivery the
     database does not hold as named, and a delivery its relay never attested
     (with ``relays``). A pruned message's fact is held to its tombstone.
+    Everything is read as of one state of the database
+    (:func:`~interlock.deliveries.consistent`): what the inbox records
+    meanwhile is not mistaken for a fact without its event.
     """
-    from interlock.attestations import attestation_of
+    from interlock.deliveries import consistent
     from interlock.inbox_store import inbox_reader
 
     reader = inbox_reader(source)
+    with consistent(reader):
+        return _verify_inbox(reader, keys, relays)
+
+
+def _verify_inbox(reader: Any, keys: Keyring, relays: Keyring | None) -> InboxReport:
+    from interlock.attestations import attestation_of
+
     problems: list[str] = []
     events = reader.inbound_events()
     by_source: dict[str, list[InboundEvent]] = {}

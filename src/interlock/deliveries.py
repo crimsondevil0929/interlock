@@ -49,6 +49,7 @@ __all__ = [
     "PostgresReader",
     "cancel",
     "compensate",
+    "consistent",
     "event_hash",
     "frame",
     "genesis_hash",
@@ -626,13 +627,7 @@ class PostgresReader:
     def _one_snapshot(self) -> Iterator[None]:
         """Read messages and logs as of one instant: a relay committing between
         the two reads would otherwise show a log ahead of its head."""
-        from psycopg.pq import TransactionStatus
-
-        if self._conn.info.transaction_status != TransactionStatus.IDLE:
-            yield  # the caller's transaction, and its snapshot
-            return
-        with self._conn.transaction():
-            self._conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        with _postgres_snapshot(self._conn):
             yield
 
     def _events(self) -> str:
@@ -898,6 +893,42 @@ class PostgresReader:
                 "SELECT state, count(*) FROM interlock.outbox_state GROUP BY state ORDER BY state"
             )
         }
+
+
+@contextmanager
+def consistent(source: object) -> Iterator[None]:
+    """Every read of ``source`` inside sees one state of the database, whatever
+    commits meanwhile: on PostgreSQL, a ``REPEATABLE READ`` read-only
+    transaction; on SQLite, a read transaction. Inside a transaction already
+    open on the connection, that one, and its snapshot.
+
+    A check that reads several tables of a live database needs one: a relay,
+    an inbox or a settler committing between two of its reads shows each read
+    a different database, and the check finds what is not there, such as a
+    fact whose event it read too early to see.
+
+    :param source: A PostgreSQL connection, a reader over one, or a store.
+    """
+    hold = getattr(source, "consistent", None)
+    if callable(hold):
+        with hold():
+            yield
+        return
+    conn = source.connection if isinstance(source, PostgresReader) else source
+    with _postgres_snapshot(conn):  # type: ignore[arg-type]
+        yield
+
+
+@contextmanager
+def _postgres_snapshot(conn: psycopg.Connection[Any]) -> Iterator[None]:
+    from psycopg.pq import TransactionStatus
+
+    if conn.info.transaction_status != TransactionStatus.IDLE:
+        yield  # the caller's transaction, and its snapshot
+        return
+    with conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        yield
 
 
 def reader(source: object) -> OutboxReader:

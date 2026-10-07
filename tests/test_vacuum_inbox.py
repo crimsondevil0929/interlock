@@ -422,3 +422,70 @@ def test_a_cut_round_trips_through_its_checkpoint() -> None:
     )
     assert Checkpoint.parse(body.canonical()).inbox_cuts() == (cut,)
     assert Checkpoint.parse(body.canonical()) == body
+
+
+# --------------------------------------------------------------------------
+# one state of the database, whatever the inbox records meanwhile
+# --------------------------------------------------------------------------
+
+
+def test_a_verifier_reads_one_state_of_the_database_while_the_inbox_records(
+    site: InboxSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``verify_inbox`` reads events, heads, facts and deliveries in turn. An
+    event and its fact the inbox records between two of those reads are after
+    all of them: never a fact whose event was read too early to see, nor a
+    head past the log read."""
+    site.deliver("re_1", "re_2")
+    inbox = site.inbox()
+    webhook = stripe_webhook(refund_event("re_1", event_id="evt_1"))
+    assert site.receive(inbox, "stripe", webhook).status == 200
+    reader = site.reader()
+    kind: Any = type(reader)
+    read = kind.inbound_events
+
+    def racing(self: Any) -> Any:
+        events = read(self)
+        if self is reader:
+            late = stripe_webhook(refund_event("re_2", event_id="evt_2"))
+            assert site.receive(inbox, "stripe", late).status == 200
+        return events
+
+    monkeypatch.setattr(kind, "inbound_events", racing)
+    report = verify_inbox(reader, INBOX_KEYS, relays=RELAYS)
+    monkeypatch.undo()
+    assert (report.problems, report.events, report.facts) == ((), 1, 1)
+    after = _report(site)
+    assert (after.problems, after.events, after.facts) == ((), 2, 2)
+
+
+def test_a_vacuum_reads_one_state_of_the_database_while_the_inbox_records(
+    site: InboxSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vacuum's survey reads the outbox, the inbox and the operator log in
+    turn while the daemon's relays, inbox and settler go on. What the inbox
+    records meanwhile is the next vacuum's: this one prunes the prefix it
+    verified, and is not refused for a fact it read without its event."""
+    from interlock.inbox_store import PostgresInboxStore
+    from interlock.sqlite_outbox import SqliteOutboxStore
+
+    _history(site)
+    kind: Any = PostgresInboxStore if isinstance(site.outbox, PostgresOutbox) else SqliteOutboxStore
+    read = kind.inbound_events
+    inbox = site.inbox()
+    recorded: list[int] = []
+
+    def racing(self: Any) -> Any:
+        events = read(self)
+        if not recorded:
+            late = stripe_webhook(refund_event("re_2", event_id="evt_late"))
+            recorded.append(site.receive(inbox, "stripe", late).status)
+        return events
+
+    monkeypatch.setattr(kind, "inbound_events", racing)
+    report = _vacuum(site)
+    monkeypatch.undo()
+    assert recorded == [200]
+    # The prefix it verified: stripe's events 1 to 3, and hooks' first.
+    assert (report.outcome, report.problems, report.inbox_events) == ("applied", (), 4)
+    assert _report(site).problems == ()

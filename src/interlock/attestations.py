@@ -35,7 +35,15 @@ from agentgov.receipts import Attestation, AttestedOutcome, DeliveredRequest
 from agentgov.receipts.canonical import loads_strict
 from agentgov.receipts.schema import Signature, _Fields
 
-from interlock.deliveries import OUTCOMES, LegacyVouch, LogEvent, LoggedMessage, reader
+from interlock.deliveries import (
+    OUTCOMES,
+    LegacyVouch,
+    LogEvent,
+    LoggedMessage,
+    OutboxReader,
+    consistent,
+    reader,
+)
 from interlock.records import Keyring
 
 __all__ = ["AttestationReport", "attestation_of", "verify_attestations"]
@@ -102,6 +110,13 @@ def verify_attestations(
         (:func:`interlock.operators.legacy_vouch`).
     """
     source_reader = reader(source)
+    with consistent(source_reader):
+        return _verify_attestations(source_reader, relays, legacy)
+
+
+def _verify_attestations(
+    source_reader: OutboxReader, relays: Keyring, legacy: LegacyVouch | None
+) -> AttestationReport:
     recorded = source_reader.legacy()
     if recorded is None:
         return AttestationReport(

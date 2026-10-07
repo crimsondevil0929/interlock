@@ -1056,10 +1056,11 @@ class InterlockSupervisor:
                 logger.exception("closing a shared resource failed")
 
     async def _drained(self) -> None:
-        """Until every queued plan has been taken by a worker. The ones taken
-        are answered as they finish."""
+        """Until every queued plan has been taken by a worker, or no worker is
+        left to take one (the loop is being torn down). The ones taken are
+        answered as they finish."""
         assert self._queue is not None
-        while not self._queue.empty():
+        while not self._queue.empty() and not all(w.done() for w in self._workers):
             await asyncio.sleep(0.01)
 
     def _cancel_queued(self) -> None:

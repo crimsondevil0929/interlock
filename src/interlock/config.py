@@ -168,6 +168,7 @@ vacuum, each part connecting as its own role::
 
     [vacuum]                          # with the keys above
     every_seconds = 3600              # the daemon's vacuums; 0 or unset: none
+    # retain_seconds = 600            # in place of retain_days: retention in seconds
     database = "postgresql://owner@db/app"  # the installer
     key = "vacuum.key"                # an operator key in [operators.keys]
 
@@ -590,21 +591,36 @@ def _vacuum(raw: object, base: Path) -> VacuumConfig:
         return VacuumConfig()
     if not isinstance(raw, dict):
         raise ConfigError("'vacuum' must be a table ([vacuum])")
-    known = {"retain_days", "margin_seconds", "archive", "every_seconds", "database", "key"}
+    known = {
+        "retain_days",
+        "retain_seconds",
+        "margin_seconds",
+        "archive",
+        "every_seconds",
+        "database",
+        "key",
+    }
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ConfigError(f"[vacuum]: unknown key(s) {', '.join(unknown)}")
-    retain = _integer(raw, "retain_days", 30)
+    if "retain_days" in raw and "retain_seconds" in raw:
+        raise ConfigError("[vacuum]: retain_days or retain_seconds, not both")
+    retain = (
+        timedelta(seconds=_integer(raw, "retain_seconds", 0))
+        if "retain_seconds" in raw
+        else timedelta(days=_integer(raw, "retain_days", 30))
+    )
     margin = _integer(raw, "margin_seconds", 3600)
     every = _integer(raw, "every_seconds", 0)
-    if retain < 0 or margin < 0 or every < 0:
+    if retain < timedelta(0) or margin < 0 or every < 0:
         raise ConfigError(
-            "[vacuum]: retain_days, margin_seconds and every_seconds are not negative"
+            "[vacuum]: retain_days, retain_seconds, margin_seconds and every_seconds are not "
+            "negative"
         )
     archive = _string(raw, "archive", default="") or None
     key = _string(raw, "key", default="")
     return VacuumConfig(
-        retain=timedelta(days=retain),
+        retain=retain,
         margin=timedelta(seconds=margin),
         archive=None if archive is None else base / archive,
         every=timedelta(seconds=every) if every else None,
@@ -949,7 +965,7 @@ def _operators(raw: object, base: Path) -> OperatorsConfig | None:
         config.keyring()
     except ValueError as exc:
         raise ConfigError(f"[operators]: {exc}") from exc
-    if config.ledger is not None and not config.ledger.startswith(("postgres://", "postgresql://")):
+    if config.ledger is not None and not is_dsn(config.ledger):
         config = replace(config, ledger=str(base / config.ledger))
     return config
 

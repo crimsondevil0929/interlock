@@ -53,6 +53,7 @@ from interlock.deliveries import (
     LegacySet,
     LegacyVouch,
     OutboxOperations,
+    consistent,
     reader,
     registry_digest,
 )
@@ -223,6 +224,17 @@ class OperatorLog:
     def anchor_pending(self) -> int:
         """Anchor every record the ledger does not hold yet. Returns how many."""
         if self._ledger is None:
+            return 0
+        # As of now: a view of a shared ledger lacks what other governors
+        # anchored since its last read, and would anchor those records again.
+        try:
+            self._ledger.refresh()
+        except Exception as exc:  # anchored the next time the ledger can be read
+            logger.warning(
+                "the ledger could not be read (%s: %s); records wait to be anchored",
+                type(exc).__name__,
+                exc,
+            )
             return 0
         anchored = {
             entry.memo
@@ -774,6 +786,16 @@ def verify_operators(
     :param records: The operator log's records, as read from its file.
     :param ledger: The ledger's entries, when the log is anchored into one.
     """
+    with consistent(source):
+        return _verify_operators(source, records, keyring, ledger)
+
+
+def _verify_operators(
+    source: object,
+    records: Sequence[SignedRecord],
+    keyring: Keyring,
+    ledger: Iterable[LedgerEntry] | None,
+) -> OperatorReport:
     problems: list[str] = []
     trusted = _verified_prefix(records, keyring, problems)
     if ledger is not None and trusted:
