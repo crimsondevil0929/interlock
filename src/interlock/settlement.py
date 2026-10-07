@@ -116,7 +116,9 @@ class Settler:
     :param receipts: The engine's receipt issuer. Its log holds the plans'
         action receipts; delivery receipts are issued into it.
     :param chain: The engine's escrow chain, or its file: which receipt each
-        committed plan was issued, and which records its charge names.
+        committed plan was issued, and which records its charge names. Several
+        engines' (the daemon's workers, each writing a chain of its own), as a
+        sequence of chains or files.
     :param relays: The relays' public keys (``[relays.keys]``).
     :param ledger: The AgentGov ledger the engine charges plans to. Without
         it, nothing is credited.
@@ -149,7 +151,7 @@ class Settler:
         outbox: object,
         *,
         receipts: ReceiptIssuer,
-        chain: EscrowChain | str | Path,
+        chain: EscrowChain | str | Path | Sequence[EscrowChain | str | Path],
         relays: Keyring,
         ledger: BudgetManager | None = None,
         operator_log: str | Path | None = None,
@@ -400,9 +402,14 @@ class Settler:
     # -- reading what the engine wrote --------------------------------------------
 
     def _chain_records(self) -> tuple[EscrowRecord, ...]:
-        if isinstance(self._chain, EscrowChain):
-            return self._chain.records()
-        return EscrowChain.load(self._chain).records()
+        chains = [self._chain] if isinstance(self._chain, EscrowChain | str | Path) else self._chain
+        records: list[EscrowRecord] = []
+        for chain in chains:
+            if isinstance(chain, EscrowChain):
+                records += chain.records()
+            else:
+                records += EscrowChain.load(chain).records()
+        return tuple(records)
 
     def _operator_records(self) -> _Operators | None:
         if self._operator_log is None or self._operators is None:

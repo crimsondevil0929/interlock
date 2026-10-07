@@ -59,6 +59,7 @@ __all__ = [
     "InboundSource",
     "Inbox",
     "InboxReport",
+    "InboxServer",
     "Rejected",
     "Response",
     "event_hash",
@@ -1138,6 +1139,101 @@ def verify_inbox(source: object, keys: Keyring, *, relays: Keyring | None = None
 # --------------------------------------------------------------------------
 
 
+class InboxServer:
+    """The inbox's HTTP endpoint: ``POST /inbox/<source>`` for vendors, and
+    ``GET /healthz`` when given a ``health`` to report. Plain HTTP: put TLS in
+    front of it.
+
+    A request is answered on a thread of its own. :meth:`stop` stops
+    accepting and waits for the requests in flight to be answered: each read
+    is bounded by ``timeout`` seconds, so a slow client cannot hold a stop.
+
+    :param health: Called for ``GET /healthz``; answers with the status and
+        a JSON body. Without it the route does not exist.
+    """
+
+    def __init__(
+        self,
+        inbox: Inbox,
+        host: str,
+        port: int,
+        *,
+        health: Callable[[], tuple[int, Mapping[str, Any]]] | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        receiver = inbox
+        bound = timeout
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = "interlock-inbox"
+            timeout = bound
+
+            def do_POST(self) -> None:
+                parts = self.path.split("?", 1)[0].strip("/").split("/")
+                if len(parts) != 2 or parts[0] != "inbox":
+                    self._answer(Response(404, {"error": "no such route"}))
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    self._answer(Response(411, {"error": "a Content-Length is needed"}))
+                    return
+                if length < 0 or length > receiver._max_body:
+                    self._answer(Response(413, {"error": "the body is too large"}))
+                    return
+                body = self.rfile.read(length)
+                self._answer(receiver.receive(parts[1], dict(self.headers.items()), body))
+
+            def do_GET(self) -> None:
+                if health is None or self.path.split("?", 1)[0].rstrip("/") != "/healthz":
+                    self._answer(Response(404, {"error": "no such route"}))
+                    return
+                status, report = health()
+                self._answer(Response(status, report))
+
+            def _answer(self, response: Response) -> None:
+                payload = json.dumps(dict(response.body), default=str).encode("utf-8")
+                self.send_response(response.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                logger.info("%s %s", self.address_string(), format % args)
+
+        self._server = ThreadingHTTPServer((host, port), Handler)
+        # Answered before a stop returns: threads joined on close, each
+        # bounded by the handler's timeout.
+        self._server.daemon_threads = False
+        self._server.block_on_close = True
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        """The port bound: the one asked for, or the one chosen for port 0."""
+        return int(self._server.server_address[1])
+
+    def start(self) -> int:
+        """Accept requests on a thread of its own. Returns :attr:`port`."""
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            name=f"interlock-inbox-{self.port}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self.port
+
+    def stop(self) -> None:
+        """Stop accepting, and answer what is in flight. Idempotent."""
+        if self._thread is not None:
+            self._server.shutdown()
+            self._thread.join()
+            self._thread = None
+        self._server.server_close()
+
+
 def serve(
     inbox: Inbox,
     host: str,
@@ -1152,43 +1248,10 @@ def serve(
 
     :param ready: Called with the port bound (useful with port 0).
     """
-
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "interlock-inbox"
-
-        def do_POST(self) -> None:
-            parts = self.path.split("?", 1)[0].strip("/").split("/")
-            if len(parts) != 2 or parts[0] != "inbox":
-                self._answer(Response(404, {"error": "no such route"}))
-                return
-            try:
-                length = int(self.headers.get("Content-Length", ""))
-            except ValueError:
-                self._answer(Response(411, {"error": "a Content-Length is needed"}))
-                return
-            if length < 0 or length > inbox._max_body:
-                self._answer(Response(413, {"error": "the body is too large"}))
-                return
-            body = self.rfile.read(length)
-            self._answer(inbox.receive(parts[1], dict(self.headers.items()), body))
-
-        def _answer(self, response: Response) -> None:
-            payload = json.dumps(dict(response.body)).encode("utf-8")
-            self.send_response(response.status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, format: str, *args: Any) -> None:
-            logger.info("%s %s", self.address_string(), format % args)
-
-    server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
+    server = InboxServer(inbox, host, port)
+    bound = server.start()
     if ready is not None:
-        ready(server.server_address[1])
-    worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
-    worker.start()
+        ready(bound)
     try:
         while not stop.wait(match_every.total_seconds()):
             try:
@@ -1196,9 +1259,7 @@ def serve(
             except Exception:  # pragma: no cover - logged, retried next round
                 logger.exception("inbox: matching what is pending failed")
     finally:
-        server.shutdown()
-        worker.join()
-        server.server_close()
+        server.stop()
 
 
 def frozen_fields(raw: str) -> Mapping[str, Any]:

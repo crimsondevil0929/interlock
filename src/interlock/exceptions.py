@@ -35,6 +35,7 @@ __all__ = [
     "StageExpiredError",
     "SubstrateConfigurationError",
     "SubstrateUnavailableError",
+    "SupervisorStoppedError",
     "ToolRevokedError",
     "UncompensatableEffectError",
 ]
@@ -319,3 +320,9 @@ class InboundFactError(PlanError):
     attestation does not verify under ``[inbox.keys]``; or an engine that
     verifies no facts. ``str(exc)`` is the operator's; the agent is told the
     kind of refusal only."""
+
+
+class SupervisorStoppedError(InterlockError):
+    """The supervisor is not accepting plans (``docs/EPIC6_DESIGN.md`` §2.5):
+    not started, shutting down, or run without engines. A plan refused with it
+    was never staged."""

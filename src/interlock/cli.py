@@ -23,6 +23,10 @@
                                  arrived before its delivery was recorded;
                                  ``list`` the events and facts; ``verify``
                                  every inbound log, fact and consumption
+``interlock daemon``             every part in one process until stopped: the
+                                 relays, the inbox, the settler, the vacuum,
+                                 and (``--app module:callable``) the
+                                 application's engines and agents
 ``interlock keygen``             a new relay, operator or inbox key, and its
                                  public half for ``[relays.keys]``,
                                  ``[operators.keys]`` or ``[inbox.keys]``
@@ -57,7 +61,7 @@ import signal
 import sys
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, TextIO
@@ -67,9 +71,7 @@ from interlock.chain import EscrowChain, EscrowRecord
 from interlock.config import (
     INBOX_DATABASE_ENV,
     ConfigError,
-    Endpoint,
     InterlockConfig,
-    RelayConfig,
     load_config,
 )
 from interlock.deliveries import (
@@ -92,6 +94,14 @@ from interlock.reconcile import (
     reconcile_sqlite,
 )
 from interlock.substrate import SqliteSubstrate
+from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV
+from interlock.wiring import RefusedError as _RefusedError
+from interlock.wiring import compactor as _compactor
+from interlock.wiring import inbox_signer as _inbox_signer
+from interlock.wiring import inbox_store as _inbox_store
+from interlock.wiring import open_ledger as _ledger
+from interlock.wiring import relay_adapters as _adapters
+from interlock.wiring import relay_signer as _relay_signer
 
 __all__ = ["main", "main_entry"]
 
@@ -109,7 +119,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     args = parser.parse_args(argv)
     if args.command in ("operator", "keygen"):
         return _keygen(args, stream)
-    # A relay and an inbox connect as their own roles, not the file's.
+    # A relay and an inbox connect as their own roles, not the file's; so
+    # may every part of the daemon.
     relaying = args.command == "relay" or (
         args.command == "inbox" and args.action in ("serve", "match")
     )
@@ -117,7 +128,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
         config = load_config(
             args.config,
             database=None if relaying else args.database,
-            require_database=not relaying,
+            require_database=not relaying and args.command != "daemon",
         )
     except ConfigError as exc:
         print(f"interlock: {exc}", file=sys.stderr)
@@ -129,6 +140,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             return _reconcile(config, args.chain, args.after, stream)
         if args.command == "inbox":
             return _inbox(config, args, stream)
+        if args.command == "daemon":
+            return _daemon(config, args, stream)
         if relaying:
             return _relay(config, args, stream)
         if args.command == "outbox":
@@ -156,12 +169,6 @@ _DATABASE_HELP = "overrides the file's database (DSN or SQLite path), as does IN
 
 OPERATOR_KEY_ENV = "INTERLOCK_OPERATOR_KEY"
 """The path to an operator's key file, when ``--key`` is not given."""
-RELAY_KEY_ENV = "INTERLOCK_RELAY_KEY"
-"""The path to a relay's key file, when ``--key`` is not given; it overrides
-``[relay] key``."""
-INBOX_KEY_ENV = "INTERLOCK_INBOX_KEY"
-"""The path to the inbox's key file, when ``--key`` is not given; it
-overrides ``[inbox] key``."""
 SIGNED: Final = frozenset({"release", "cancel", "requeue", "compensate", "resolve"})
 """The outbox actions an operator signs."""
 
@@ -271,6 +278,22 @@ def _parser() -> argparse.ArgumentParser:
         if name == "list":
             step.add_argument("--source", help="only this source's events")
             step.add_argument("--limit", type=int, default=100)
+    daemon = commands.add_parser(
+        "daemon",
+        help="run every part of Interlock in one process",
+        description="Run the relays, the inbox, the settler and the vacuum, and with --app the "
+        "application's engines and agents, in one process until SIGTERM or Ctrl-C "
+        "(docs/EPIC6_DESIGN.md). Each part connects as its own role.",
+    )
+    _common(daemon, _DATABASE_HELP)
+    daemon.add_argument(
+        "--app",
+        metavar="MODULE:CALLABLE",
+        help="a callable taking the configuration and returning an interlock.daemon.Application",
+    )
+    daemon.add_argument("--listen", help="overrides [inbox]'s listen, HOST:PORT")
+    daemon.add_argument("--relay-key", help=f"overrides [relay]'s key, as does {RELAY_KEY_ENV}")
+    daemon.add_argument("--inbox-key", help=f"overrides [inbox]'s key, as does {INBOX_KEY_ENV}")
     operator = commands.add_parser("operator", help="operator keys", description="Operator keys.")
     keys = operator.add_subparsers(dest="action", required=True)
     keygen = keys.add_parser(
@@ -512,104 +535,8 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
             breaker.close()
 
 
-def _relay_signer(config: InterlockConfig, path: str | Path | None) -> Any:
-    """The relay's key, registered in ``[relays.keys]``; or why the relay
-    may not start. An attestation no registered key verifies proves nothing,
-    so a relay does not make one."""
-    from agentgov.exceptions import SignerUnavailableError
-
-    from interlock.operators import load_key
-
-    if not path:
-        raise _RefusedError(
-            f"a relay signs every outcome it records: give it its key with [relay] key, "
-            f"--key PATH or {RELAY_KEY_ENV} (a new one: interlock keygen --role relay)"
-        )
-    try:
-        signer = load_key(path)
-    except (OSError, ValueError, SignerUnavailableError) as exc:
-        raise _RefusedError(f"cannot read the relay key: {exc}") from exc
-    keyring = config.relay_keyring()
-    if keyring is None or signer.key_id not in keyring:
-        raise _RefusedError(
-            f"the relay's key {signer.key_id} is not registered, so nothing it signs would "
-            f"verify: register it in [relays.keys] under the relay's name, as "
-            f'"{signer.public_key().spec()}"'
-        )
-    return signer
-
-
 def _kind(sink: Any) -> str:
     return "" if sink.kind == "http" else f"{sink.kind}: "
-
-
-def _adapters(settings: RelayConfig) -> dict[str, Any]:
-    missing = sorted(
-        [
-            f"{variable} (sink {endpoint.sink}, header {header})"
-            for endpoint in settings.endpoints
-            for header, variable in endpoint.header_env.items()
-            if variable not in os.environ
-        ]
-        + [
-            f"{endpoint.secret_env} (sink {endpoint.sink}, its API key)"
-            for endpoint in settings.endpoints
-            if endpoint.secret_env and endpoint.secret_env not in os.environ
-        ]
-    )
-    if missing:
-        raise SubstrateConfigurationError(
-            f"the relay's credentials come from its environment, and these are not set: "
-            f"{', '.join(missing)}"
-        )
-    return {endpoint.sink: _adapter(endpoint) for endpoint in settings.endpoints}
-
-
-def _adapter(endpoint: Endpoint) -> Any:
-    """The adapter for one endpoint: the generic one, or its vendor's."""
-    if endpoint.kind == "stripe":
-        from interlock.stripe import API, STRIPE_VERSION, StripeAdapter
-
-        return StripeAdapter(
-            _variable(endpoint.secret_env),
-            base_url=endpoint.url or API,
-            version=endpoint.stripe_version or STRIPE_VERSION,
-        )
-    if endpoint.kind == "sendgrid":
-        from interlock.sendgrid import API as SENDGRID_API
-        from interlock.sendgrid import SendGridAdapter
-
-        return SendGridAdapter(
-            _variable(endpoint.secret_env),
-            base_url=endpoint.url or SENDGRID_API,
-            sandbox=endpoint.sandbox,
-        )
-    from interlock.adapters import HttpAdapter
-
-    return HttpAdapter(
-        endpoint.url, routes=endpoint.routes, headers=_environment(endpoint.header_env)
-    )
-
-
-def _variable(name: str) -> Callable[[], str]:
-    """A secret read from the environment on every call, so a rotated key
-    takes effect without a restart."""
-
-    def value() -> str:
-        return os.environ[name]
-
-    return value
-
-
-def _environment(names: Mapping[str, str]) -> Callable[[], dict[str, str]]:
-    """Header values read from the environment on every call, so a rotated
-    credential takes effect without a restart."""
-    fixed = dict(names)
-
-    def headers() -> dict[str, str]:
-        return {header: os.environ[variable] for header, variable in fixed.items()}
-
-    return headers
 
 
 def _stop_on_signals(stop: threading.Event) -> None:
@@ -793,18 +720,6 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
     return EXIT_OK
 
 
-def _ledger(ledger: str, *, read_only: bool = False) -> Any:
-    from agentgov import BudgetManager
-
-    if ledger.startswith(("postgres://", "postgresql://")):
-        return BudgetManager.open_postgres(ledger, read_only=read_only)
-    return BudgetManager.open_sqlite(ledger, read_only=read_only)
-
-
-class _RefusedError(Exception):
-    """An operator command refused before it began: usage, not the outbox."""
-
-
 def _signer(config: InterlockConfig, key: str | None) -> Any:
     """The operator's key, or why there is none."""
     from interlock.operators import load_key
@@ -984,24 +899,6 @@ def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
     return EXIT_FINDINGS
 
 
-def _compactor(config: InterlockConfig) -> tuple[Any, Callable[[], None]]:
-    """The outbox as a vacuum acts on it, and how to close it."""
-    if config.substrate != "postgres":
-        from interlock.sqlite_outbox import COMPACTOR, SqliteOutboxStore
-
-        store = SqliteOutboxStore(config.database, writes=COMPACTOR)
-        return store, store.close
-    import psycopg
-
-    from interlock.deliveries import operations
-
-    try:
-        conn = psycopg.connect(config.database, autocommit=True)
-    except psycopg.Error as exc:
-        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
-    return operations(conn), conn.close
-
-
 def _verify_archive(config: InterlockConfig, path: Path, out: TextIO) -> int:
     from interlock.compaction import Checkpoint
     from interlock.vacuum import ARCHIVE_VERSION, verify_archive
@@ -1140,63 +1037,6 @@ def _inbox_serve(inbox: Any, listen: str, every: Any, out: TextIO) -> int:
     return EXIT_OK
 
 
-def _inbox_signer(config: InterlockConfig, path: str | Path | None) -> Any:
-    """The inbox's key, registered in ``[inbox.keys]``; or why the inbox may
-    not start. A fact no registered key verifies is consumed by no engine, so
-    the inbox does not make one."""
-    from agentgov.exceptions import SignerUnavailableError
-
-    from interlock.operators import load_key
-
-    if not path:
-        raise _RefusedError(
-            f"an inbox attests every event and fact: give it its key with [inbox] key, "
-            f"--key PATH or {INBOX_KEY_ENV} (a new one: interlock keygen --role inbox)"
-        )
-    try:
-        signer = load_key(path)
-    except (OSError, ValueError, SignerUnavailableError) as exc:
-        raise _RefusedError(f"cannot read the inbox key: {exc}") from exc
-    keyring = config.inbox_keyring()
-    if keyring is None or signer.key_id not in keyring:
-        raise _RefusedError(
-            f"the inbox's key {signer.key_id} is not registered, so nothing it attests would "
-            f"verify: register it in [inbox.keys] under the inbox's name, as "
-            f'"{signer.public_key().spec()}"'
-        )
-    return signer
-
-
-def _inbox_store(config: InterlockConfig, database: str | None) -> tuple[Any, Callable[[], None]]:
-    """Where the inbox records, as its own role, and how to close it."""
-    sqlite = config.substrate != "postgres"
-    dsn = (
-        database
-        or config.inbox.database
-        or os.environ.get(INBOX_DATABASE_ENV)
-        or (config.database if sqlite else "")
-    )
-    if not dsn:
-        raise SubstrateConfigurationError(
-            f"no database for the inbox: set [inbox] database, pass --database, or set "
-            f"{INBOX_DATABASE_ENV}"
-        )
-    if sqlite:
-        from interlock.sqlite_outbox import INBOX, SqliteOutboxStore
-
-        store = SqliteOutboxStore(dsn, writes=INBOX)
-        return store, store.close
-    import psycopg
-
-    from interlock.inbox_store import PostgresInboxStore
-
-    try:
-        conn = psycopg.connect(dsn, autocommit=True)
-    except psycopg.Error as exc:
-        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
-    return PostgresInboxStore(conn), conn.close
-
-
 def _inbox_reader(config: InterlockConfig) -> tuple[Any, Callable[[], None]]:
     """The inbox as the installer or an auditor reads it, and how to close it."""
     if config.substrate != "postgres":
@@ -1260,6 +1100,46 @@ def _inbox_verify(config: InterlockConfig, source: Any, keys: Any, out: TextIO) 
     )
     if relays is None:
         print("relays' attestations not checked: register their keys in [relays.keys]", file=out)
+    return EXIT_OK
+
+
+def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    import asyncio
+
+    from interlock.daemon import build_supervisor, load_application
+
+    application = load_application(args.app, config) if args.app else None
+    supervisor = build_supervisor(
+        config,
+        application,
+        listen=args.listen,
+        relay_key=args.relay_key,
+        inbox_key=args.inbox_key,
+    )
+
+    async def run() -> None:
+        running = asyncio.create_task(supervisor.run(handle_signals=True))
+        ready = asyncio.create_task(supervisor.ready())
+        await asyncio.wait({running, ready}, return_when=asyncio.FIRST_COMPLETED)
+        if ready.done() and not running.done():
+            parts = ", ".join(sorted(supervisor.status()))
+            print(f"interlock daemon running: {parts}; stop with SIGTERM or Ctrl-C", file=out)
+            port = supervisor.inbox_port
+            if port is not None:
+                print(f"receiving webhooks on port {port}", file=out)
+            out.flush()
+        else:
+            ready.cancel()
+        await running
+
+    asyncio.run(run())
+    for name, status in sorted(supervisor.status().items()):
+        counters = ", ".join(f"{k} {v}" for k, v in sorted(status.counters.items()) if v)
+        print(
+            f"{name}: {status.state}, {status.steps} step(s), {status.failures} failure(s)"
+            + (f"; {counters}" if counters else ""),
+            file=out,
+        )
     return EXIT_OK
 
 
