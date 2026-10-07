@@ -24,14 +24,21 @@ engine is. That order is load-bearing and was, until this module, folklore.
 
 Attach a governor with ``governed=manager`` and the same runtime writes
 bidirectional anchors. Nothing else changes.
+
+The runtime is configured whole (``docs/EPIC6_DESIGN.md`` §1): any substrate
+(``substrate=PostgresSubstrate(...)`` in place of the SQLite path), rate
+windows, the inbox's keys for inbound facts, and any anchor, the
+claim-and-settle one included. :meth:`EscrowRuntime.from_config` builds all of
+it from ``interlock.toml``; checkers stay in code, as policy is reviewed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
+from typing import TYPE_CHECKING
 
 from interlock.anchor import LedgerAnchor
 from interlock.builder import PlanBuilder
@@ -41,9 +48,14 @@ from interlock.engine import EscrowEngine, StageResult
 from interlock.invariants import InvariantChecker, default_checkers
 from interlock.outbound import SinkRegistry
 from interlock.receipts import ReceiptIssuer
+from interlock.records import Keyring
 from interlock.repair import Repair
-from interlock.substrate import SqliteSubstrate, TableSpec
-from interlock.types import EffectKind, EffectPlan
+from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
+from interlock.types import EffectKind, EffectPlan, InboundFact
+from interlock.windows import RateWindow
+
+if TYPE_CHECKING:
+    from interlock.config import InterlockConfig
 
 __all__ = ["EscrowRuntime"]
 
@@ -52,6 +64,9 @@ class EscrowRuntime:
     """A configured escrow: substrate, chain, anchor and engine in one object.
 
     :param db_path: The SQLite database to stage against.
+    :param substrate: Any substrate, already built, in place of ``db_path``:
+        a :class:`~interlock.postgres.PostgresSubstrate`, say. Its own options
+        configure it, so ``tables`` and the SQLite options are not given.
     :param tables: Tables to observe. Writes outside this set are denied by
         the substrate's authorizer unless ``enforce_table_access=False``.
     :param scope_id: Default AgentGov scope for plans this runtime builds.
@@ -82,6 +97,17 @@ class EscrowRuntime:
     :param sinks: The sinks outbound requests may name. The file needs the
         outbox, which ``interlock install`` puts in it (or
         :func:`interlock.sqlite_outbox.install_sqlite_outbox`).
+    :param windows: Rate windows every plan is measured against (see
+        :mod:`interlock.windows`).
+    :param inbox: The inbox's public keys (``[inbox.keys]``): plans may
+        consume the inbound facts that verify under them (:meth:`facts`).
+    :param anchor: An anchor already built, in place of ``governed`` and
+        ``audit_path``: the claim-and-settle one
+        (``LedgerAnchor(governed=..., same_transaction=True)``), say. The
+        caller keeps it, and closes it.
+    :raises ValueError: On both ``db_path`` and ``substrate``, or neither; on
+        ``tables`` or SQLite options beside ``substrate``; or on ``anchor``
+        beside ``governed`` or ``audit_path``.
 
     Construction runs the cascade check against the database (see
     :attr:`cascade_report`), so the database must exist: an operation whose
@@ -92,6 +118,7 @@ class EscrowRuntime:
     __slots__ = (
         "_anchor",
         "_chain",
+        "_closers",
         "_engine",
         "_recovered",
         "_scope_id",
@@ -101,14 +128,16 @@ class EscrowRuntime:
 
     def __init__(
         self,
-        db_path: str | Path,
+        db_path: str | Path | None = None,
         *,
-        tables: Sequence[TableSpec],
+        tables: Sequence[TableSpec] = (),
         scope_id: str,
+        substrate: ShadowSubstrate | None = None,
         checkers: Sequence[InvariantChecker] | None = None,
         chain_path: str | Path | None = None,
         governed: object | None = None,
         audit_path: str | Path | None = None,
+        anchor: LedgerAnchor | None = None,
         settle_cost: Decimal | str = "0",
         max_stage_seconds: float = 10.0,
         max_diff_rows: int = 50_000,
@@ -116,27 +145,51 @@ class EscrowRuntime:
         acknowledge_cascades: Sequence[str] = (),
         receipts: ReceiptIssuer | None = None,
         sinks: SinkRegistry | None = None,
+        windows: Sequence[RateWindow] = (),
+        inbox: Keyring | None = None,
     ) -> None:
+        if (db_path is None) == (substrate is None):
+            raise ValueError("an EscrowRuntime stages on a SQLite db_path or a substrate: one")
+        if substrate is not None and (
+            tables
+            or max_stage_seconds != 10.0
+            or max_diff_rows != 50_000
+            or not enforce_table_access
+            or acknowledge_cascades
+        ):
+            raise ValueError(
+                "tables and the SQLite options configure the substrate a db_path names; a "
+                "substrate passed in is configured already"
+            )
+        if anchor is not None and (governed is not None or audit_path is not None):
+            raise ValueError("pass an anchor, or governed/audit_path to build one: not both")
         self._scope_id = scope_id
         self._settle_cost = Decimal(str(settle_cost))
-        self._substrate = SqliteSubstrate(
-            str(db_path),
-            tables=tables,
-            max_stage_seconds=max_stage_seconds,
-            max_diff_rows=max_diff_rows,
-            enforce_table_access=enforce_table_access,
-            acknowledge_cascades=acknowledge_cascades,
-        )
+        self._closers: list[Callable[[], None]] = []
+        if substrate is None:
+            substrate = SqliteSubstrate(
+                str(db_path),
+                tables=tables,
+                max_stage_seconds=max_stage_seconds,
+                max_diff_rows=max_diff_rows,
+                enforce_table_access=enforce_table_access,
+                acknowledge_cascades=acknowledge_cascades,
+            )
+        self._substrate = substrate
         # The cascade check at setup: a misconfigured boundary is reported
         # when the runtime starts, not when the first delete is refused.
-        self._substrate.check_cascades()
-        self._anchor: LedgerAnchor | None = None
+        check = getattr(substrate, "check_cascades", None)
+        if callable(check):
+            check()
+        self._anchor: LedgerAnchor | None = anchor
         if governed is not None or audit_path is not None:
             self._anchor = LedgerAnchor(audit_path, governed=governed)  # type: ignore[arg-type]
+            self._closers.append(self._anchor.close)
         if checkers is None:
+            observed = getattr(substrate, "table_specs", ()) or ()
             checkers = default_checkers(
-                row_limit=max_diff_rows,
-                allowed_tables=[t.name for t in tables],
+                row_limit=substrate.capabilities.max_diff_rows,
+                allowed_tables=[t.name for t in observed],
             )
         try:
             self._chain = EscrowChain(chain_path) if chain_path is not None else EscrowChain()
@@ -149,15 +202,73 @@ class EscrowRuntime:
                     settle_cost=self._settle_cost,
                     receipts=receipts,
                     sinks=sinks,
+                    windows=windows,
+                    inbox=inbox,
                 )
                 self._recovered = self._engine.recover() if chain_path is not None else ()
             except BaseException:
                 self._chain.close()
                 raise
         except BaseException:
-            if self._anchor is not None:
-                self._anchor.close()
+            self._close_owned()
             raise
+
+    @classmethod
+    def from_config(
+        cls,
+        config: InterlockConfig,
+        *,
+        scope_id: str,
+        checkers: Sequence[InvariantChecker] | None = None,
+        database: str | None = None,
+        chain_path: str | Path | None = None,
+    ) -> EscrowRuntime:
+        """The runtime ``interlock.toml`` describes: its substrate, connected
+        as the stage role (``[engine] database``, else ``database``); its
+        tables, sinks, rate windows and inbox keys; and, from ``[engine]`` and
+        ``[receipts]``, its ledger, anchor, settle cost, chain file and receipt
+        log. What it opens it closes, in :meth:`close`.
+
+        :param checkers: The policy the engine adjudicates with; the
+            placeholder ``default_checkers`` when ``None``.
+        :param database: Overrides the stage role's connection.
+        :param chain_path: Overrides ``[engine] chain``.
+        """
+        from interlock.wiring import open_anchor, open_governor, open_receipts, open_substrate
+
+        closers: list[Callable[[], None]] = []
+        try:
+            substrate = open_substrate(config, database=database)
+            governor = open_governor(config)
+            if governor is not None:
+                closers.append(governor.close)
+            anchor = open_anchor(config, governor)
+            receipts = open_receipts(config)
+            if receipts is not None:
+                closers.append(receipts.log.close)
+            runtime = cls(
+                substrate=substrate,
+                scope_id=scope_id,
+                checkers=checkers,
+                chain_path=chain_path if chain_path is not None else config.engine.chain_for(0, 1),
+                anchor=anchor,
+                settle_cost=config.engine.settle_cost,
+                receipts=receipts,
+                sinks=config.sink_registry() if config.sinks else None,
+                windows=config.windows,
+                inbox=config.inbox_keyring(),
+            )
+        except BaseException:
+            for close in reversed(closers):
+                close()
+            raise
+        runtime._closers.extend(closers)
+        return runtime
+
+    def _close_owned(self) -> None:
+        closers, self._closers = self._closers, []
+        for close in reversed(closers):
+            close()
 
     # -- accessors -------------------------------------------------------
 
@@ -175,14 +286,15 @@ class EscrowRuntime:
         return self._anchor
 
     @property
-    def substrate(self) -> SqliteSubstrate:
+    def substrate(self) -> ShadowSubstrate:
         return self._substrate
 
     @property
     def cascade_report(self) -> CascadeReport | None:
         """The foreign-key reach out of ``tables``: what is gated, what is
         acknowledged. Refreshed whenever a stage sees a schema change."""
-        return self._substrate.cascade_report
+        report = getattr(self._substrate, "cascade_report", None)
+        return report if isinstance(report, CascadeReport) else None
 
     @property
     def recovered(self) -> tuple[EscrowRecord, ...]:
@@ -192,6 +304,16 @@ class EscrowRuntime:
     def plan(self, *, intent: str = "", trajectory_id: str | None = None) -> PlanBuilder:
         """A builder pre-bound to this runtime's scope."""
         return PlanBuilder(self._scope_id, trajectory_id=trajectory_id, intent=intent)
+
+    def facts(self, scope_id: str | None = None) -> tuple[InboundFact, ...]:
+        """The inbound facts pending for ``scope_id`` (this runtime's scope by
+        default) that verify under the inbox's keys: what a plan may
+        :meth:`~interlock.builder.PlanBuilder.consume`. See
+        :meth:`EscrowEngine.facts`.
+
+        :raises InboundFactError: If the runtime has no inbox keys.
+        """
+        return self._engine.facts(scope_id or self._scope_id)
 
     # -- the write path --------------------------------------------------
 
@@ -232,7 +354,7 @@ class EscrowRuntime:
             the statement uses a positional placeholder.
         """
         if table is None:
-            observed = sorted(self._substrate.observed_tables)
+            observed = sorted(getattr(self._substrate, "observed_tables", ()))
             if len(observed) != 1:
                 from interlock.exceptions import PlanError
 
@@ -269,14 +391,15 @@ class EscrowRuntime:
             self._anchor.verify()
 
     def close(self) -> None:
-        """Release the chain file and the anchor's read-only ledger handle.
+        """Release the chain file, and what this runtime opened: the anchor's
+        read-only ledger handle, and what :meth:`from_config` opened (the
+        governor, the receipt log). An anchor passed in is the caller's.
 
         The substrate holds no connection between stages, so there is nothing
         else to release. Idempotent.
         """
         self._chain.close()
-        if self._anchor is not None:
-            self._anchor.close()
+        self._close_owned()
 
     def __enter__(self) -> EscrowRuntime:
         return self

@@ -142,6 +142,40 @@ verify under ``[inbox.keys]``, as ``EscrowEngine(inbox=config.inbox_keyring())``
     [inbox.keys]                      # public halves only: what facts verify under
     main = "ed25519:7d2e..."
 
+The daemon (``interlock daemon``; ``docs/EPIC6_DESIGN.md`` §2) runs the engines
+that execute agents' plans beside the relays, the inbox, the settler and the
+vacuum, each part connecting as its own role::
+
+    [engine]                          # the engines executing agents' plans
+    workers = 4                       # plans staged at once: one engine each
+    database = "postgresql://interlock_agent@db/app"  # the stage role
+    chain = "escrow.chain"            # worker n writes escrow-<n>.chain
+    settle_cost = "0.01"              # what producing a plan costs its scope
+    ledger = "postgresql://owner@db/app"  # AgentGov: the ledger's owner, or a SQLite file
+    same_transaction = true           # PostgreSQL: settle each plan with its commit
+    conflict_retries = 16             # a plan that lost a race is staged again
+    max_stage_seconds = 10
+    lock_timeout_seconds = 2
+
+    [receipts]                        # the receipt log: action and delivery receipts
+    log = "receipts.jsonl"
+    key = "receipts.key"              # its Ed25519 key
+    log_id = "interlock-receipts"
+
+    [settler]
+    database = "postgresql://interlock_settle@db/app"  # a settler role
+    every_seconds = 5
+
+    [vacuum]                          # with the keys above
+    every_seconds = 3600              # the daemon's vacuums; 0 or unset: none
+    database = "postgresql://owner@db/app"  # the installer
+    key = "vacuum.key"                # an operator key in [operators.keys]
+
+    [daemon]
+    drain_timeout_seconds = 30        # each shutdown step's bound
+    restart_min_seconds = 0.5         # a failed service backs off from here...
+    restart_max_seconds = 30          # ...doubling to here
+
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
 relay's in ``INTERLOCK_RELAY_DATABASE``, the inbox's in
@@ -182,11 +216,16 @@ __all__ = [
     "DATABASE_ENV",
     "INBOX_DATABASE_ENV",
     "RELAY_DATABASE_ENV",
+    "SETTLER_DATABASE_ENV",
+    "DaemonConfig",
     "Endpoint",
+    "EngineConfig",
     "InboxConfig",
     "InterlockConfig",
     "OperatorsConfig",
+    "ReceiptsConfig",
     "RelayConfig",
+    "SettlerConfig",
     "VacuumConfig",
     "load_config",
 ]
@@ -194,10 +233,17 @@ __all__ = [
 DATABASE_ENV = "INTERLOCK_DATABASE"
 RELAY_DATABASE_ENV = "INTERLOCK_RELAY_DATABASE"
 INBOX_DATABASE_ENV = "INTERLOCK_INBOX_DATABASE"
+SETTLER_DATABASE_ENV = "INTERLOCK_SETTLER_DATABASE"
 
 
 class ConfigError(ValueError):
     """The configuration file is missing, unreadable or malformed."""
+
+
+def is_dsn(text: str) -> bool:
+    """Whether ``text`` is a PostgreSQL connection string, a URI or libpq's
+    ``key=value`` form, rather than a file's path."""
+    return "://" in text or "=" in text
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,11 +320,103 @@ class VacuumConfig:
     :ivar margin: How long window history stays past the longest span.
     :ivar archive: A directory each checkpoint's pruned rows are written to
         first, or ``None``.
+    :ivar every: How often the daemon vacuums, or ``None`` for never.
+    :ivar database: The installer's connection the daemon vacuums through;
+        ``""`` for the file's own.
+    :ivar key: The operator key the daemon signs its vacuums with: one of
+        ``[operators.keys]``, as accountable as any operator's.
     """
 
     retain: timedelta = timedelta(days=30)
     margin: timedelta = timedelta(hours=1)
     archive: Path | None = None
+    every: timedelta | None = None
+    database: str = ""
+    key: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EngineConfig:
+    """``[engine]``: the engines that execute agents' plans, in a runtime
+    (``EscrowRuntime.from_config``) or the daemon (``docs/EPIC6_DESIGN.md``).
+
+    :ivar workers: How many plans the daemon stages at once: one engine per
+        worker, each with its own substrate, governor and escrow chain.
+    :ivar database: The stage role's connection; ``""`` for the file's own.
+    :ivar chain: The escrow chain's file, or ``None`` to keep chains in
+        memory. Worker ``n`` of several writes ``<stem>-<n><suffix>``.
+    :ivar settle_cost: What producing a plan costs, charged to its scope.
+    :ivar ledger: The AgentGov ledger plans are charged to: a
+        ``postgresql://`` connection string, as the ledger's owner, or a
+        SQLite file. ``None``: no ledger.
+    :ivar same_transaction: Settle each plan with its commit: claim and
+        settle (PostgreSQL, with the ledger in the same database).
+    :ivar conflict_retries: How often the daemon stages a plan again after it
+        lost a race for a row or a window key.
+    """
+
+    workers: int = 1
+    database: str = ""
+    chain: Path | None = None
+    settle_cost: Decimal = Decimal(0)
+    ledger: str | None = None
+    ledger_schema: str = "agentgov"
+    same_transaction: bool = False
+    conflict_retries: int = 16
+    max_stage_seconds: float = 10.0
+    lock_timeout_seconds: float = 2.0
+
+    def chain_for(self, worker: int, workers: int | None = None) -> Path | None:
+        """The chain file worker ``worker`` writes: the configured one for a
+        single worker, ``<stem>-<n><suffix>`` for each of several."""
+        if self.chain is None:
+            return None
+        if (workers if workers is not None else self.workers) == 1:
+            return self.chain
+        return self.chain.with_name(f"{self.chain.stem}-{worker}{self.chain.suffix}")
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptsConfig:
+    """``[receipts]``: the receipt log the engines issue action receipts
+    into, and the settler delivery receipts. One process writes it.
+
+    :ivar log: Its file.
+    :ivar key: Its Ed25519 key's file (``interlock keygen``).
+    """
+
+    log: Path
+    key: Path
+    log_id: str = "interlock-receipts"
+    issuer: str = "interlock"
+    policy_epoch: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SettlerConfig:
+    """``[settler]``: how the daemon settles delivered requests.
+
+    :ivar database: A settler role's connection (``settler_roles``); ``""``
+        for the file's own, or ``INTERLOCK_SETTLER_DATABASE``.
+    :ivar every: How often it settles.
+    """
+
+    database: str = ""
+    every: timedelta = timedelta(seconds=5)
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonConfig:
+    """``[daemon]``: the supervisor's own bounds.
+
+    :ivar drain_timeout: The most each step of a shutdown waits.
+    :ivar restart_min: A failed service is restarted after this...
+    :ivar restart_max: ...doubling each failure in a row, up to this.
+    """
+
+    drain_timeout: timedelta = timedelta(seconds=30)
+    restart_min: timedelta = timedelta(milliseconds=500)
+    restart_max: timedelta = timedelta(seconds=30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +471,12 @@ class InterlockConfig:
     inbox: InboxConfig = InboxConfig()
     """``[inbox]``: the inbox, and the keys its facts verify under."""
     inbox_roles: tuple[str, ...] = ()
+    engine: EngineConfig = EngineConfig()
+    """``[engine]``: the engines that execute agents' plans."""
+    receipts: ReceiptsConfig | None = None
+    """``[receipts]``: the receipt log, or ``None`` for no receipts."""
+    settler: SettlerConfig = SettlerConfig()
+    daemon: DaemonConfig = DaemonConfig()
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -415,6 +559,7 @@ def load_config(
     windows = _windows(raw.get("windows", []), tuple(tables), sinks)
     vacuum = _vacuum(raw.get("vacuum"), Path(path).parent)
     inbox = _inbox(raw.get("inbox"), Path(path).parent)
+    engine = _engine(raw.get("engine"), Path(path).parent, substrate)
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -433,6 +578,10 @@ def load_config(
         vacuum=vacuum,
         inbox=inbox,
         inbox_roles=inbox_roles,
+        engine=engine,
+        receipts=_receipts(raw.get("receipts"), Path(path).parent),
+        settler=_settler(raw.get("settler")),
+        daemon=_daemon(raw.get("daemon")),
     )
 
 
@@ -441,18 +590,142 @@ def _vacuum(raw: object, base: Path) -> VacuumConfig:
         return VacuumConfig()
     if not isinstance(raw, dict):
         raise ConfigError("'vacuum' must be a table ([vacuum])")
-    unknown = sorted(set(raw) - {"retain_days", "margin_seconds", "archive"})
+    known = {"retain_days", "margin_seconds", "archive", "every_seconds", "database", "key"}
+    unknown = sorted(set(raw) - known)
     if unknown:
         raise ConfigError(f"[vacuum]: unknown key(s) {', '.join(unknown)}")
     retain = _integer(raw, "retain_days", 30)
     margin = _integer(raw, "margin_seconds", 3600)
-    if retain < 0 or margin < 0:
-        raise ConfigError("[vacuum]: retain_days and margin_seconds are not negative")
+    every = _integer(raw, "every_seconds", 0)
+    if retain < 0 or margin < 0 or every < 0:
+        raise ConfigError(
+            "[vacuum]: retain_days, margin_seconds and every_seconds are not negative"
+        )
     archive = _string(raw, "archive", default="") or None
+    key = _string(raw, "key", default="")
     return VacuumConfig(
         retain=timedelta(days=retain),
         margin=timedelta(seconds=margin),
         archive=None if archive is None else base / archive,
+        every=timedelta(seconds=every) if every else None,
+        database=_string(raw, "database", default=""),
+        key=base / key if key else None,
+    )
+
+
+_ENGINE_KEYS = frozenset(
+    {
+        "workers",
+        "database",
+        "chain",
+        "settle_cost",
+        "ledger",
+        "ledger_schema",
+        "same_transaction",
+        "conflict_retries",
+        "max_stage_seconds",
+        "lock_timeout_seconds",
+    }
+)
+
+
+def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
+    if raw is None:
+        return EngineConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'engine' must be a table ([engine])")
+    unknown = sorted(set(raw) - _ENGINE_KEYS)
+    if unknown:
+        raise ConfigError(f"[engine]: unknown key(s) {', '.join(unknown)}")
+    workers = _integer(raw, "workers", 1)
+    retries = _integer(raw, "conflict_retries", 16)
+    if workers < 1 or retries < 0:
+        raise ConfigError("[engine]: workers is at least 1, conflict_retries not negative")
+    if workers > 1 and substrate == "sqlite":
+        raise ConfigError(
+            "[engine]: SQLite admits one writer, and a stage holds the write lock for its "
+            "whole life: one worker"
+        )
+    cost = _decimal(raw, "settle_cost")
+    if cost < 0:
+        raise ConfigError("[engine]: settle_cost is not negative")
+    ledger = _string(raw, "ledger", default="") or None
+    together = raw.get("same_transaction", False)
+    if not isinstance(together, bool):
+        raise ConfigError("[engine]: same_transaction is true or false")
+    if together and (substrate != "postgres" or ledger is None or not is_dsn(ledger)):
+        raise ConfigError(
+            "[engine]: same_transaction settles a plan inside its stage's transaction: it "
+            'needs substrate = "postgres" and a ledger in the same database'
+        )
+    chain = _string(raw, "chain", default="")
+    if ledger is not None and not is_dsn(ledger):
+        ledger = str(base / ledger)
+    return EngineConfig(
+        workers=workers,
+        database=_string(raw, "database", default=""),
+        chain=base / chain if chain else None,
+        settle_cost=cost,
+        ledger=ledger,
+        ledger_schema=_string(raw, "ledger_schema", default="agentgov"),
+        same_transaction=together,
+        conflict_retries=retries,
+        max_stage_seconds=_seconds(raw, "max_stage_seconds", 10.0),
+        lock_timeout_seconds=_seconds(raw, "lock_timeout_seconds", 2.0),
+    )
+
+
+def _receipts(raw: object, base: Path) -> ReceiptsConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("'receipts' must be a table ([receipts])")
+    unknown = sorted(set(raw) - {"log", "key", "log_id", "issuer", "policy_epoch"})
+    if unknown:
+        raise ConfigError(f"[receipts]: unknown key(s) {', '.join(unknown)}")
+    epoch = _integer(raw, "policy_epoch", 0)
+    if epoch < 0:
+        raise ConfigError("[receipts]: policy_epoch is not negative")
+    return ReceiptsConfig(
+        log=base / _string(raw, "log"),
+        key=base / _string(raw, "key"),
+        log_id=_string(raw, "log_id", default="interlock-receipts"),
+        issuer=_string(raw, "issuer", default="interlock"),
+        policy_epoch=epoch,
+    )
+
+
+def _settler(raw: object) -> SettlerConfig:
+    if raw is None:
+        return SettlerConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'settler' must be a table ([settler])")
+    unknown = sorted(set(raw) - {"database", "every_seconds"})
+    if unknown:
+        raise ConfigError(f"[settler]: unknown key(s) {', '.join(unknown)}")
+    return SettlerConfig(
+        database=_string(raw, "database", default=""),
+        every=timedelta(seconds=_seconds(raw, "every_seconds", 5.0)),
+    )
+
+
+def _daemon(raw: object) -> DaemonConfig:
+    if raw is None:
+        return DaemonConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'daemon' must be a table ([daemon])")
+    known = {"drain_timeout_seconds", "restart_min_seconds", "restart_max_seconds"}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(f"[daemon]: unknown key(s) {', '.join(unknown)}")
+    low = _seconds(raw, "restart_min_seconds", 0.5)
+    high = _seconds(raw, "restart_max_seconds", 30.0)
+    if high < low:
+        raise ConfigError("[daemon]: restart_max_seconds is at least restart_min_seconds")
+    return DaemonConfig(
+        drain_timeout=timedelta(seconds=_seconds(raw, "drain_timeout_seconds", 30.0)),
+        restart_min=timedelta(seconds=low),
+        restart_max=timedelta(seconds=high),
     )
 
 

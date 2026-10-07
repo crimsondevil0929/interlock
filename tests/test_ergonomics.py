@@ -20,6 +20,7 @@ from interlock import (
     EscrowRuntime,
     InterlockError,
     PlanBuilder,
+    SqliteSubstrate,
     TableSpec,
     TenantDrawdownGuard,
     TenantIsolation,
@@ -270,6 +271,7 @@ def test_runtime_exposes_the_primitives(db: str) -> None:
     runtime = runtime_for(db)
     assert runtime.engine is not None
     assert runtime.chain is not None
+    assert isinstance(runtime.substrate, SqliteSubstrate)
     assert runtime.substrate.observed_tables == frozenset({"orders"})
     assert runtime.plan(intent="x").build is not None
 
