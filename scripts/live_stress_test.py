@@ -155,6 +155,10 @@ LOCK_TIMEOUT = 2.0
 LEDGER_LOCK_TIMEOUT = 30.0
 """AgentGov's own: the longest any governor waits for the ledger."""
 
+TENANT_WINDOW = "rate_window:plans_per_tenant"
+BURST_EVERY = 15.0
+BURST_SECONDS = 5.0
+
 OUTCOMES = ("applied", "nothing", "refused", "rejected", "abandoned")
 """What a vacuum run can come to: only the first two are a vacuum keeping up."""
 
@@ -1072,6 +1076,11 @@ class Workload:
         self.by_plan: dict[str, int] = {}
         self.plans: dict[str, PlanRecord] = {}
         self.hot: dict[str, list[int]] = {t: [] for t in settings.tenant_names}
+        self.by_tenant: dict[str, list[int]] = {t: [] for t in settings.tenant_names}
+        self.burst: tuple[str, float] | None = None
+        """A tenant every lane writes for, until a moment or its window refuses:
+        whatever the machine's speed, the tenant window is pushed to its limit."""
+        self.bursts: Counter[str] = Counter()
         self.consumed: dict[str, list[InboundFact]] = defaultdict(list)
         self.kinds: Counter[str] = Counter()
         self.errors: Counter[str] = Counter()
@@ -1168,19 +1177,26 @@ class Workload:
         if result is not None and result.committed:
             with self.lock:
                 order.committed = True
+                self.by_tenant[tenant].append(order_id)
                 hot = self.hot[tenant]
                 if len(hot) < 3:
                     hot.append(order_id)
         return result
 
-    async def annotate(self, ctx: AgentContext, scope: str, rng: random.Random) -> Any:
-        """A note on one of a few hot rows every agent writes: contention."""
-        tenant = rng.choice(self.settings.tenant_names)
+    async def annotate(
+        self, ctx: AgentContext, scope: str, rng: random.Random, *, tenant: str | None = None
+    ) -> Any:
+        """A note on one of a few hot rows every agent writes: contention. For
+        a burst's ``tenant``, on any of its recent orders instead."""
+        pool = self.by_tenant
+        if tenant is None:
+            tenant = rng.choice(self.settings.tenant_names)
+            pool = self.hot
         with self.lock:
-            hot = list(self.hot[tenant])
-        if not hot:
+            rows = pool[tenant][-64:]
+        if not rows:
             return await self.checkout(ctx, scope, rng)
-        order_id = rng.choice(hot)
+        order_id = rng.choice(rows)
         plan = (
             ctx.plan(scope, intent=f"annotate order {order_id}")
             .update(
@@ -1300,6 +1316,13 @@ class Workload:
             )
         await self.submit(ctx, builder.build(), f"misbehave:{how}", scope)
 
+    def bursting(self) -> str | None:
+        """The tenant of the burst under way, if one is."""
+        burst = self.burst
+        if burst is None or time.monotonic() > burst[1]:
+            return None
+        return burst[0]
+
     def refund_candidate(self, rng: random.Random, within: float) -> Order | None:
         """A paid order, reconciled within the last ``within`` seconds, not
         compensated yet: what the operator refunds."""
@@ -1355,6 +1378,13 @@ def make_agent(workload: Workload, index: int) -> Callable[[AgentContext], Any]:
                     continue
                 if workload.winding_down.is_set():
                     await ctx.sleep(0.1)
+                    continue
+                tenant = workload.bursting()
+                if tenant is not None:
+                    result = await workload.annotate(ctx, scope, rng, tenant=tenant)
+                    if result is not None and TENANT_WINDOW in result.blocked_by:
+                        workload.bursts[tenant] += 1
+                        workload.burst = None  # the window is full: the burst made its point
                     continue
                 roll = rng.random()
                 if roll < 0.04:
@@ -1776,8 +1806,13 @@ async def load(run: Run, supervisor: InterlockSupervisor, runner: asyncio.Task[N
     settings = run.settings
     end = run.started + settings.minutes * 60
     next_report = run.started + 10
+    next_burst = run.started + BURST_EVERY
+    tenants = itertools.cycle(settings.tenant_names)
     while (now := time.monotonic()) < end and not runner.done():
         await asyncio.sleep(min(1.0, end - now))
+        if time.monotonic() >= next_burst:
+            run.workload.burst = (next(tenants), time.monotonic() + BURST_SECONDS)
+            next_burst += BURST_EVERY
         if time.monotonic() >= next_report:
             say(settings, progress(run, supervisor))
             next_report += 10
@@ -1852,11 +1887,13 @@ def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | 
     workdir = directory or Path(tempfile.mkdtemp(prefix="interlock-soak-"))
     workdir.mkdir(parents=True, exist_ok=True)
     captured = Captured()
-    logging.getLogger().addHandler(captured)
+    root = logging.getLogger()
+    level = root.level
+    root.addHandler(captured)
     file_log = logging.FileHandler(workdir / "soak.log")
     file_log.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    logging.getLogger().addHandler(file_log)
-    logging.getLogger().setLevel(logging.INFO)
+    root.addHandler(file_log)
+    root.setLevel(logging.INFO)
     site = new_site(cluster, workdir)
     vendor: Vendor | None = None
     api: PaymentAPI | None = None
@@ -1910,8 +1947,9 @@ def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | 
             vendor.close()
         if api is not None:
             api.close()
-        logging.getLogger().removeHandler(captured)
-        logging.getLogger().removeHandler(file_log)
+        root.removeHandler(captured)
+        root.removeHandler(file_log)
+        root.setLevel(level)
         file_log.close()
         if keep:
             print(f"kept: database {site.name} ({site.owner}), files in {workdir}")
@@ -2061,7 +2099,8 @@ def windows_hold(run: Run) -> Claim:
                 for w in sorted(limits)
             ),
             "refused by each window: "
-            + ", ".join(f"{w} {refusals.get(f'rate_window:{w}', 0)}" for w in sorted(limits)),
+            + ", ".join(f"{w} {refusals.get(f'rate_window:{w}', 0)}" for w in sorted(limits))
+            + f" ({sum(run.workload.bursts.values())} bursts for one tenant filled its window)",
             f"every committed plan's rows seen: {committed} committed, {checkouts} of them charges",
             *(breaches[:5] or ["no key ever held more than its limit within its span"]),
         ],

@@ -803,3 +803,33 @@ def test_a_charge_claimed_and_not_booked_yet_holds_its_compensation(
         report = settler.settle()
         assert (report.settled, report.credits, report.problems) == ((cancel,), 1, ())
         assert settlements(bench)[cancel].credit is not None
+
+
+def test_a_delivery_waits_for_its_plans_action_receipt(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In one process (the daemon's) a relay can deliver, and the settler run,
+    between a plan's commit and its action receipt: the commit's record names
+    the receipt, and the log does not hold it yet. The delivery waits for it;
+    it is never settled for good without one."""
+    from interlock import EscrowEngine
+
+    issue = EscrowEngine._issue_receipt
+    deferred: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def later(self: Any, *args: Any, **kwargs: Any) -> None:
+        deferred.append((self, args, kwargs))
+
+    monkeypatch.setattr(EscrowEngine, "_issue_receipt", later)
+    booked = bench.book(1)
+    monkeypatch.undo()
+    bench.deliver()
+    report = bench.settler().settle()
+    assert booked not in report.settled
+    assert any("is not in the receipt log yet" in p for p in report.problems), report
+    assert booked not in settlements(bench)
+    ((engine, args, kwargs),) = deferred
+    issue(engine, *args, **kwargs)  # the engine gets to it
+    report = bench.settler().settle()
+    assert (report.settled, report.receipts, report.problems) == ((booked,), 1, ())
+    assert settlements(bench)[booked].receipt_id is not None

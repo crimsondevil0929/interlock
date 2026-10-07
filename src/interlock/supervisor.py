@@ -357,6 +357,8 @@ class VacuumService(Service):
     log in use by another writer is put off to ``busy_retry`` seconds later.
 
     :param open_vacuum: A context manager yielding one run's vacuum.
+    :param close: Closes what the runs share between them, such as a governor
+        kept open: called when the service closes, or fails and is reopened.
     """
 
     phase = 5
@@ -368,13 +370,15 @@ class VacuumService(Service):
         every: float,
         name: str = "vacuum",
         reason: str = "scheduled by the daemon",
-        busy_retry: float = 5.0,
+        busy_retry: float = 1.0,
+        close: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(name)
         self._open_vacuum = open_vacuum
         self._every = every
         self._reason = reason
         self._busy_retry = busy_retry
+        self._close = close
 
     def step(self) -> float:
         try:
@@ -390,6 +394,10 @@ class VacuumService(Service):
         for problem in report.problems:
             logger.warning("vacuum: %s", problem)
         return self._every
+
+    def close(self) -> None:
+        if self._close is not None:
+            self._close()
 
 
 # --------------------------------------------------------------------------

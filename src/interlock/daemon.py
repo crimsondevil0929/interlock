@@ -451,39 +451,60 @@ def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
             f"the vacuum's key {signer.key_id} is no registered operator's: register it in "
             f'[operators.keys], as "{signer.public_key().spec()}"'
         )
-    ledger_path = operators.ledger
+    # One governor for every run, caught up at the start of each: opening one
+    # reads the whole ledger, which grows with every plan.
+    kept = _Kept(lambda: governors.open(str(operators.ledger)))
 
     @contextlib.contextmanager
     def open_vacuum() -> Iterator[Vacuum]:
-        governor, release = governors.open(ledger_path)
+        governor = kept.get()
+        governor.refresh()
+        source, close = compactor(config, vacuum.database or None)
         try:
-            source, close = compactor(config, vacuum.database or None)
+            log = OperatorLog(
+                operators.log,
+                signer,
+                operators.keyring(),
+                ledger=governor,
+                scope=operators.scope,
+            )
             try:
-                log = OperatorLog(
-                    operators.log,
-                    signer,
-                    operators.keyring(),
+                yield Vacuum(
+                    log,
+                    source,
+                    operators=operators.keyring(),
+                    relays=relays,
                     ledger=governor,
-                    scope=operators.scope,
+                    windows=config.windows,
+                    retain=vacuum.retain,
+                    margin=vacuum.margin,
+                    archive=vacuum.archive,
+                    inbox=config.inbox_keyring(),
                 )
-                try:
-                    yield Vacuum(
-                        log,
-                        source,
-                        operators=operators.keyring(),
-                        relays=relays,
-                        ledger=governor,
-                        windows=config.windows,
-                        retain=vacuum.retain,
-                        margin=vacuum.margin,
-                        archive=vacuum.archive,
-                        inbox=config.inbox_keyring(),
-                    )
-                finally:
-                    log.close()
             finally:
-                close()
+                log.close()
         finally:
-            release()
+            close()
 
-    return VacuumService(open_vacuum, every=vacuum.every.total_seconds())
+    return VacuumService(open_vacuum, every=vacuum.every.total_seconds(), close=kept.close)
+
+
+class _Kept:
+    """A governor opened on first use and kept until closed."""
+
+    def __init__(self, open_governor: Callable[[], tuple[BudgetManager, Callable[[], None]]]):
+        self._open = open_governor
+        self._lock = threading.Lock()
+        self._opened: tuple[BudgetManager, Callable[[], None]] | None = None
+
+    def get(self) -> BudgetManager:
+        with self._lock:
+            if self._opened is None:
+                self._opened = self._open()
+            return self._opened[0]
+
+    def close(self) -> None:
+        with self._lock:
+            opened, self._opened = self._opened, None
+        if opened is not None:
+            opened[1]()

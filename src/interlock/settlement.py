@@ -243,6 +243,16 @@ class Settler:
                 f"was not derived from: not settled"
             )
 
+        # A plan's commit is recorded before its action receipt is issued: in
+        # one process a relay can deliver, and this run, in between. A receipt
+        # the commit names is coming; until the log holds it, nothing is settled.
+        pending = context.receipt_pending(message.plan_id)
+        if pending is not None and str(message.message_id) not in context.receipts:
+            raise _UnsettledError(
+                f"its plan's action receipt {pending}, which the plan's commit names, is not "
+                f"in the receipt log yet: not settled until it is"
+            )
+
         # Whether a compensation earns its credit is decided before anything is
         # issued: one not decided yet leaves the message alone, unreceipted.
         credit: LedgerEntry | None = None
@@ -530,6 +540,14 @@ class _Context:
             operators=operators,
             legacy=legacy,
         )
+
+    def receipt_pending(self, plan_id: str) -> str | None:
+        """The action receipt the plan's commit record names, while the log
+        does not hold it yet."""
+        receipt_id = self.plan_receipts.get(plan_id)
+        if receipt_id is None or self.log.index_of(receipt_id) is not None:
+            return None
+        return receipt_id
 
     def action_receipt(self, plan_id: str) -> ActionReceipt | None:
         """The action receipt the plan that committed was issued, if the log holds it."""
