@@ -263,22 +263,28 @@ def test_every_shutdown_wait_is_bounded() -> None:
     deadline = time.monotonic() + 3
     while ("stuck", "close") not in log and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert log[-1] == ("stuck", "close")
+    # Nor drained once the step ended: a drain queued behind it would run then.
+    assert log[-1] == ("stuck", "close") and ("stuck", "drain") not in log
 
 
 def test_a_forced_stop_skips_the_drains() -> None:
     log: list[tuple[str, str]] = []
     service = Recorder("relay", log)
-    supervisor = InterlockSupervisor(services=[service])
+    stuck = Recorder("stuck", log, step_seconds=1.0)
+    supervisor = InterlockSupervisor(services=[service, stuck], drain_timeout=30)
 
-    async def main() -> None:
+    async def main() -> float:
         running = asyncio.create_task(supervisor.run())
         await supervisor.ready()
+        await asyncio.sleep(0.05)
+        began = time.monotonic()
         supervisor.stop(force=True)
         await running
+        return time.monotonic() - began
 
-    asyncio.run(main())
-    assert ("relay", "drain") not in log
+    # Not the step in flight, nor the 30s drain bound: nothing is waited for.
+    assert asyncio.run(main()) < 0.5
+    assert ("relay", "drain") not in log and ("stuck", "drain") not in log
     assert ("relay", "close") in log
 
 
@@ -369,6 +375,78 @@ def test_a_race_lost_every_time_is_the_agents() -> None:
     assert isinstance(run(supervisor, body), StageConflictError)
     assert len(engine.staged) == 3
     assert supervisor.status()["engines"].counters["conflicts_exhausted"] == 1
+
+
+def test_a_plan_waiting_to_race_again_is_refused_when_the_supervisor_stops() -> None:
+    """A plan between two attempts is not staged again once the supervisor
+    stops: it is refused, never half-staged, and the stop does not wait out
+    its backoff."""
+    engine = FakeEngine(["conflict"] * 10)
+    supervisor = InterlockSupervisor(
+        engines=pool([engine], conflict_retries=5, retry_base=5.0, retry_cap=5.0)
+    )
+
+    async def main() -> BaseException | None:
+        running = asyncio.create_task(supervisor.run())
+        await supervisor.ready()
+        waiting = asyncio.create_task(supervisor.execute(plan()))
+        while not engine.staged:
+            await asyncio.sleep(0.01)
+        began = time.monotonic()
+        supervisor.stop()
+        await running
+        assert time.monotonic() - began < 3
+        try:
+            await waiting
+        except SupervisorStoppedError as exc:
+            return exc
+        return None
+
+    assert isinstance(asyncio.run(main()), SupervisorStoppedError)
+    assert len(engine.staged) == 1
+    assert supervisor.status()["engines"].counters["cancelled"] == 1
+
+
+def test_a_vacuum_that_finds_the_operator_log_busy_tries_again_soon() -> None:
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from interlock.exceptions import ChainInUseError
+    from interlock.supervisor import VacuumService
+
+    runs: list[str] = []
+
+    class Run:
+        def run(self, *, reason: str) -> Any:
+            runs.append(reason)
+            return SimpleNamespace(
+                outcome="applied", messages=2, window_rows=3, inbox_events=4, problems=()
+            )
+
+    @contextmanager
+    def open_vacuum() -> Any:
+        if not runs and not busy:
+            busy.append(True)
+            raise ChainInUseError("an operator holds the log")
+        yield Run()
+
+    busy: list[bool] = []
+    closed: list[bool] = []
+    service = VacuumService(
+        open_vacuum, every=60, busy_retry=0.05, close=lambda: closed.append(True)
+    )
+    supervisor = InterlockSupervisor(services=[service])
+
+    async def body() -> None:
+        deadline = time.monotonic() + 2  # the busy retry, not the 60s interval
+        while not runs:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
+
+    run(supervisor, body)
+    counters = supervisor.status()["vacuum"].counters
+    assert (counters["busy"], counters["applied"], counters["messages"]) == (1, 1, 2)
+    assert runs == ["scheduled by the daemon"] and closed == [True]
 
 
 def test_at_a_stop_queued_plans_run_until_the_deadline_and_the_rest_are_refused() -> None:

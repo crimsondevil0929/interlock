@@ -1,7 +1,7 @@
 # Epic 6: the runtime daemon, and the system under load
 
-**Status: building**, step by step on `feat/epic6-v1-orchestrator`; §8 will record where
-the build settles what this design leaves open. Builds on
+**Status: built** on `feat/epic6-v1-orchestrator`. §8 records where the build settled what
+this design left open, and what the soak found. Builds on
 [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md) and the designs of Epics 3 to 5. Four parts:
 
 1. **One runtime** (§1). `EscrowRuntime` grows from a SQLite convenience into the
@@ -335,4 +335,96 @@ requirements by number) and gets two new sections:
 
 ## 8. As built
 
-Where the implementation settles what the design left open; filled in step by step.
+### 8.1 Where the build settled what the design left open
+
+- **Configuration lives with its part.** `[daemon]` holds only the drain and restart
+  bounds. How many relays run is `[relay] workers`, how often the inbox matches is
+  `[inbox] match_every_seconds`, and how often the daemon vacuums is `[vacuum]
+  every_seconds`, beside each part's other settings. `[vacuum] retain_seconds` joins
+  `retain_days`, for retention on the scale the soak and the tests run at.
+- **The settler runs only beside the engines.** It issues delivery receipts into the
+  engines' receipt log and reads their chains, so it is built only when the application
+  brings engines. A daemon without `--app` settles nothing.
+- **Escrow chains per worker**: `[engine] chain = "escrow.chain"` gives worker *n*
+  `escrow-<n>.chain`; a single worker writes the path as configured.
+- **Lost races** are staged again up to `[engine] conflict_retries` times (16), backing off
+  from 5 ms, doubling, jittered, to 250 ms. A plan waiting to race again when the
+  supervisor stops is refused, never half-staged.
+- **The inbox's HTTP server** is `InboxServer`, which `interlock inbox serve` and the daemon
+  share; its `GET /healthz` answers with the supervisor's health.
+- **The vacuum keeps one governor** between runs, caught up at the start of each. Opening
+  one reads the whole ledger, which grows with every plan. A run that finds the operator
+  log in use tries again a second later.
+- **E4-1.** The daemon's relays run in the engines' process, as a separate service with
+  its own database role and connection: they read only committed rows and never run
+  inside a stage. `interlock relay` remains for process isolation.
+
+### 8.2 The soak, as built
+
+As §3 designed it, with two differences. The workload adds **bursts**: every 15 seconds
+each lane writes for one tenant, for up to 5 seconds or until that tenant's window
+refuses, so the tenant window reaches its limit whatever the machine's speed. And "a
+webhook after the matching window" became **noise**: events about objects nobody created,
+which bind to nothing. "The vacuum compacts as it goes" is measured as checkpoints applied
+throughout, every kind of history pruned, no run refused, and nothing prunable outliving
+its retention by more than three vacuum intervals plus ten seconds, sampled every two.
+
+The run recorded for this epic: `--docker --minutes 5`, a fresh `postgres:16`, 4 agents
+with 6 plans each in flight, 8 engines and 3 relays. It ran 3,628 plans: 3,219 committed,
+398 refused (349 by the rate windows) and 11 stopped at admission, every one of the 74
+plans meant to misbehave among them. It made 1,129 payments and 130 refunds, and sent
+1,605 webhooks, of which 94 were forged. It wrote 44
+checkpoints, and the live outbox peaked at 121 messages of 1,259. 48 lost races were
+retried, none given up, and the longest lock wait was 1.48 s against a 2 s bound. There
+was no deadlock, the ledger balanced to the cent, every claim held, and the daemon
+stopped in 0.33 s. The host was heavily loaded throughout, which
+the claims do not depend on.
+
+### 8.3 What the soak found
+
+Five defects, none visible to a test of one part, each fixed with a test that fails
+without its fix:
+
+1. **The vacuum refused nearly every run while webhooks arrived.** Its survey read the
+   inbox's events, heads and facts, and the outbox, in separate statements; a fact recorded
+   between two of them was read without its event, which is what tampering looks like.
+   Every survey and verifier now reads one snapshot (`deliveries.consistent`).
+2. **Compensations were settled for good without their credit.** The settler's governor saw
+   the shared ledger as of when it opened, so it found no charge for plans other
+   governors had charged since. It now catches up before every pass.
+3. **A charge claimed and not yet booked counted as no charge.** An engine killed between
+   its commit and redeeming its claim leaves exactly that, until recovery redeems it. The
+   compensation now waits.
+4. **Deliveries were settled for good without their receipt.** In one process, a relay
+   delivers, and the settler runs, between a plan's commit and its action receipt. A
+   receipt the commit names that the log does not hold yet now holds the delivery.
+5. **The operator log anchored records twice**, reading a stale view of what other
+   governors had anchored. It catches up first.
+
+And three lesser: `[operators] ledger` took a keyword connection string for a path; the
+supervisor waited out its drain bound for queued plans no worker was left to take; the
+daemon's vacuum read the whole ledger every run. The common thread: parts that had only
+run one at a time, each in its own process, now run together, and each had assumed what
+it read was current. Each fix makes a read current or consistent, or turns "not yet" into
+"not settled yet" rather than "never".
+
+### 8.4 The mutation pass
+
+Each mechanism this epic added or fixed was removed in turn, and a targeted test had to
+fail: 21 in all. The engines' retry, their refusal of an unsettled commit and of a plan
+waiting to race again at a stop; the doubling restart backoff; the shutdown's order, its
+bounded and forced waits; health; the vacuum's retry of a busy log; the daemon's
+refusals of an unregistered relay or vacuum key; a keyword connection string for the
+operators' ledger; the runtime passing windows and inbox keys through; one snapshot per
+survey on each store; and the settler's and the operator log's four fixes. The first run
+killed 18. The three survivors were tests that checked too early or too gently: a drain
+queued behind a step ran only after the test looked; a forced stop had nothing slow to
+skip; the busy retry had no clock on it. Each was strengthened, and then all 21 were killed.
+
+### 8.5 Limits, as built
+
+§7 stands. Beyond it: a daemon without engines settles nothing (§8.1); the soak's
+throughput depends on the host, while its claims do not; `tests/test_soak.py` runs it
+for half a minute, and minutes take the script. What the specification still lacks is in
+its conformance section: expiry to `ORPHANED`, a `COMPENSATED` record in the escrow chain,
+`schema_allowlist`, `distribution_shift`, cross-substrate plans, replay.

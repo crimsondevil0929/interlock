@@ -9,6 +9,7 @@ import pytest
 
 from interlock.cli import main
 from interlock.config import DATABASE_ENV, ConfigError, load_config
+from interlock.operators import generate_key
 
 GOOD = """
 substrate = "postgres"
@@ -230,3 +231,16 @@ def test_one_sqlite_worker(tmp_path: Path) -> None:
         load_config(write(tmp_path, text + "[engine]\nworkers = 2\n"))
     with pytest.raises(ConfigError, match="same database"):
         load_config(write(tmp_path, text + '[engine]\nsame_transaction = true\nledger = "g.db"\n'))
+
+
+def test_an_operators_ledger_may_be_a_keyword_connection_string(tmp_path: Path) -> None:
+    path = tmp_path / "interlock.toml"
+    path.write_text(
+        'substrate = "sqlite"\ndatabase = "app.db"\n'
+        '[[tables]]\nname = "orders"\ncolumns = ["id"]\n'
+        '[operators]\nlog = "operators.ilok1"\nledger = "host=db dbname=app user=owner"\n'
+        "[operators.keys]\n"
+        f'ops = "{generate_key(tmp_path / "ops.key").public_key().spec()}"\n'
+    )
+    operators = load_config(path).operators
+    assert operators is not None and operators.ledger == "host=db dbname=app user=owner"
