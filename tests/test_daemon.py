@@ -313,6 +313,14 @@ def test_every_part_runs_as_the_configuration_says(site: Site) -> None:
     assert all(s.failures == 0 and s.state == "stopped" for s in second.values()), second
 
 
+# The daemon writes every thread's stack to stderr on SIGUSR1: a wait for its
+# words that runs out shows where it is.
+ENTRY = (
+    "import faulthandler, signal, sys; faulthandler.register(signal.SIGUSR1); "
+    "from interlock.cli import main; sys.exit(main(sys.argv[1:]))"
+)
+
+
 class Daemon:
     """``interlock daemon`` in a process of its own, stopped with SIGTERM."""
 
@@ -324,7 +332,7 @@ class Daemon:
                 sys.executable,
                 "-u",
                 "-c",
-                "import sys; from interlock.cli import main; sys.exit(main(sys.argv[1:]))",
+                ENTRY,
                 "daemon",
                 "--config",
                 str(path),
@@ -357,8 +365,21 @@ class Daemon:
                 if text in line:
                     return line
             if exited or time.monotonic() > deadline:
-                raise AssertionError(f"no {text!r} in {self.lines}; stderr: {self.errors}")
+                if not exited:
+                    self._dump()
+                raise AssertionError(
+                    f"no {text!r} in {self.lines}; exit code {self.process.poll()}; "
+                    "stderr:\n" + "\n".join(self.errors)
+                )
             time.sleep(0.02)
+
+    def _dump(self) -> None:
+        """Every thread's stack, into stderr, as soon as it stops growing."""
+        self.process.send_signal(signal.SIGUSR1)
+        settled, size = time.monotonic() + 5, -1
+        while len(self.errors) != size and time.monotonic() < settled:
+            size = len(self.errors)
+            time.sleep(0.5)
 
     def stop(self) -> int:
         """SIGTERM, and the exit code. A daemon still running a minute later
