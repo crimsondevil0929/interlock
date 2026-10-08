@@ -35,6 +35,7 @@ import hmac
 import json
 import logging
 import re
+import socketserver
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -1149,6 +1150,19 @@ def _verify_inbox(reader: Any, keys: Keyring, relays: Keyring | None) -> InboxRe
 # --------------------------------------------------------------------------
 
 
+class _Server(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` without the lookup its bind makes:
+    ``HTTPServer.server_bind`` resolves the address it bound to a name
+    (``socket.getfqdn``), which nothing here reads, and which a resolver that
+    times out turns into half a minute before the first request is taken (CI's
+    macOS runners: 35 seconds, in every new process)."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = int(self.server_address[1])
+
+
 class InboxServer:
     """The inbox's HTTP endpoint: ``POST /inbox/<source>`` for vendors, and
     ``GET /healthz`` when given a ``health`` to report. Plain HTTP: put TLS in
@@ -1212,7 +1226,7 @@ class InboxServer:
             def log_message(self, format: str, *args: Any) -> None:
                 logger.info("%s %s", self.address_string(), format % args)
 
-        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server = _Server((host, port), Handler)
         # Answered before a stop returns: threads joined on close, each
         # bounded by the handler's timeout.
         self._server.daemon_threads = False

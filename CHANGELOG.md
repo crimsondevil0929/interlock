@@ -48,7 +48,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 - `docs/ESCROW_SPEC.md`: §5, the architecture as built, and its conformance section,
   rewritten for 0.5.0, requirement by requirement.
 
-### Fixed (Epic 6: found by the soak, each with a test that fails without its fix)
+### Fixed (Epic 6: found by the soak and by CI, each with a test that fails without its fix)
 
 - **The vacuum refused nearly every run under live webhooks.** Its survey read the
   inbox's events, heads, facts and the outbox in separate statements; a fact recorded in
@@ -68,6 +68,11 @@ Releases before 0.1.2 are described by their tags and commit history.
   refreshes first; a ledger it cannot read leaves the records to the next open.
 - `[operators] ledger` took a keyword connection string for a file path.
 - The supervisor waited out its drain bound for queued plans no worker was left to take.
+- **The inbox's server could take half a minute to start.** `http.server` resolves the
+  address it binds to a name, which nothing reads; where the resolver times out (GitHub's
+  macOS runners: 35 seconds, in every new process), `interlock daemon` and `interlock
+  inbox serve` waited that long before taking a request. The server binds without the
+  lookup.
 
 ### Changed (Epic 6)
 

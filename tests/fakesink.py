@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import socket
+import socketserver
 import threading
 import time
 from collections import Counter, deque
@@ -30,6 +31,17 @@ DROP = ("drop",)
 HOLD = ("hold",)
 """Act, signal :attr:`FakeSink.arrived`, and answer only once
 :attr:`FakeSink.release` is set: the window a test kills a relay in."""
+
+
+class _Server(ThreadingHTTPServer):
+    """Without the name lookup ``HTTPServer`` makes as it binds, as
+    :class:`interlock.inbox.InboxServer` is: on CI's macOS runners it takes
+    35 seconds, once in every process."""
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = int(self.server_address[1])
 
 
 def status(code: int, retry_after: int | None = None) -> tuple[Any, ...]:
@@ -99,7 +111,7 @@ class FakeSink:
             def log_message(self, *args: object) -> None:
                 return None
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = _Server(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)

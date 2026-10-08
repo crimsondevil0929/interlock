@@ -11,6 +11,7 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -27,7 +28,7 @@ import pytest
 
 from interlock import EscrowEngine, PlanBuilder, SqliteSubstrate
 from interlock.config import ConfigError, load_config
-from interlock.inbox import Response, serve
+from interlock.inbox import InboxServer, Response, serve
 from interlock.operators import generate_key
 from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
 from interlock.relay import NoBreaker, Relay
@@ -466,6 +467,22 @@ def _raw(port: int, path: str, body: bytes, headers: dict[str, str]) -> tuple[in
         return answer.status, json.loads(answer.read())
     finally:
         conn.close()
+
+
+def test_the_server_binds_without_looking_up_a_name(
+    site: InboxSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # http.server's own bind resolves the address to a name, which nothing
+    # reads: half a minute, in every new process, where a resolver times out.
+    def lookup(name: str = "") -> str:
+        raise AssertionError(f"looked up {name!r}")
+
+    monkeypatch.setattr(socket, "getfqdn", lookup)
+    server = InboxServer(site.inbox(), "127.0.0.1", 0)
+    try:
+        assert server.start() > 0
+    finally:
+        server.stop()
 
 
 def test_the_server_answers_each_webhook_as_the_inbox_does(site: InboxSite) -> None:
