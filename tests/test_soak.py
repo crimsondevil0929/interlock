@@ -74,4 +74,6 @@ def test_the_daemon_under_load_holds_every_claim(
         "the vacuum compacts as it goes",
         "everything verifies after",
         "shutdown is graceful",
+        "trace context survives",
+        "metrics agree",
     }
