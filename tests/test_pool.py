@@ -9,7 +9,8 @@
   is prepared on the server, for a transaction-mode pooler.
 - An agent's facts are read the pooler-safe way too, waiting their turn.
 - Behind a real PgBouncer (``INTERLOCK_TEST_PGBOUNCER``), the stage that would
-  wait on itself fails fast, and plans from several workers all commit.
+  wait on itself fails fast; plans from several workers all commit; and the
+  server connections are left as the pool found them.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from tests.schemas import specs
 
 PGBOUNCER = os.environ.get("INTERLOCK_TEST_PGBOUNCER", "")
 """``host:port`` of a PgBouncer in transaction mode, two server connections per
-pool, in front of the test cluster (``tests/pgbouncer.ini``)."""
+pool, in front of the test cluster (``tests/pgbouncer/pgbouncer.ini``)."""
 
 
 def _substrate(dsn: str, pool: float) -> PostgresSubstrate:
@@ -282,3 +283,36 @@ def test_behind_pgbouncer_a_pool_too_small_is_slow_and_never_stuck(
     # ask for a second. Each fails fast, is staged again, and every plan commits.
     results, retried = _pooled_workers(outbox, workers=2, plans=4)
     assert results == [True] * 8 and retried > 0
+
+
+@pytest.mark.skipif(not PGBOUNCER, reason="set INTERLOCK_TEST_PGBOUNCER (host:port) to run")
+def test_behind_pgbouncer_the_server_connections_are_left_as_found(
+    outbox: PostgresOutbox,
+) -> None:
+    window = RateWindow("mail_per_hour", timedelta(hours=1), 10, Requests("mail"))
+    pooled = PostgresSubstrate(_through_pgbouncer(outbox.pg.agent), tables=specs(*OBSERVED))
+    engine = outbox.engine(substrate=pooled, windows=[window], checkers=[BlastRadius(10)])
+    # Each plan takes both server connections: its stage's, and its windows' read.
+    for _ in range(3):
+        assert engine.execute(_locking_plan()).committed
+    # Two clients, each in a transaction, hold both server connections: between
+    # them they see every session the pool keeps.
+    clients = [
+        psycopg.connect(_through_pgbouncer(outbox.pg.agent), prepare_threshold=None)
+        for _ in range(2)
+    ]
+    try:
+        seen = [
+            client.execute(
+                "SELECT pg_backend_pid(), current_setting('statement_timeout'), "
+                "current_setting('lock_timeout'), "
+                "current_setting('default_transaction_isolation'), "
+                "current_setting('default_transaction_read_only')"
+            ).fetchone()
+            for client in clients
+        ]
+    finally:
+        for client in clients:
+            client.close()
+    assert len({row[0] for row in seen if row}) == 2
+    assert [row[1:] for row in seen if row] == [("0", "0", "read committed", "off")] * 2
