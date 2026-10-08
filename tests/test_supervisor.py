@@ -6,8 +6,8 @@ real parts, on both stores.
 - A step that raises closes the service and opens it again, after a backoff
   that doubles with each failure in a row.
 - Shutdown runs in order: agents, engines, then services by phase, each
-  drained and closed; every wait is bounded, and a forced stop waits for
-  nothing.
+  drained; then they all close together. Every wait is bounded, and a forced
+  stop waits for nothing but the closes, for a grace.
 - The engines retry a plan that lost a race, never one whose commit is
   unsettled; plans queued at a stop are staged until the deadline, and the
   rest refused, never half-staged.
@@ -33,6 +33,7 @@ from interlock.exceptions import (
     SupervisorStoppedError,
 )
 from interlock.supervisor import (
+    CLOSE_GRACE,
     AgentContext,
     EnginePool,
     InterlockSupervisor,
@@ -62,6 +63,9 @@ class Recorder(Service):
         step_seconds: float = 0.0,
         every: float = 0.01,
         fail_open: int = 0,
+        hold: threading.Event | None = None,
+        close_seconds: float = 0.0,
+        closing: threading.Barrier | None = None,
     ) -> None:
         super().__init__(name)
         self.phase = phase  # type: ignore[misc]
@@ -70,6 +74,9 @@ class Recorder(Service):
         self.fail_open = fail_open
         self.step_seconds = step_seconds
         self.every = every
+        self.hold = hold
+        self.close_seconds = close_seconds
+        self.closing = closing
         self.threads: set[str] = set()
 
     def open(self) -> None:
@@ -86,6 +93,8 @@ class Recorder(Service):
             raise RuntimeError("a step failed")
         if self.step_seconds:
             time.sleep(self.step_seconds)
+        if self.hold is not None:  # stuck until released, or for 10s
+            self.hold.wait(10)
         self.count("steps")
         return self.every
 
@@ -93,6 +102,10 @@ class Recorder(Service):
         self.log.append((self.name, "drain"))
 
     def close(self) -> None:
+        if self.closing is not None:
+            self.closing.wait()
+        if self.close_seconds:
+            time.sleep(self.close_seconds)
         self.log.append((self.name, "close"))
 
 
@@ -267,25 +280,76 @@ def test_every_shutdown_wait_is_bounded() -> None:
     assert log[-1] == ("stuck", "close") and ("stuck", "drain") not in log
 
 
-def test_a_forced_stop_skips_the_drains() -> None:
+def test_the_services_close_together() -> None:
     log: list[tuple[str, str]] = []
-    service = Recorder("relay", log)
-    stuck = Recorder("stuck", log, step_seconds=1.0)
-    supervisor = InterlockSupervisor(services=[service, stuck], drain_timeout=30)
+    # Each close waits for the others to begin: closed one at a time, none ends.
+    together = threading.Barrier(3, timeout=5)
+    services = [Recorder(name, log, closing=together) for name in ("inbox", "relay", "settler")]
+    supervisor = InterlockSupervisor(services=services)
+
+    async def body() -> None:
+        await asyncio.sleep(0.02)
+
+    run(supervisor, body)
+    assert sorted(n for n, e in log if e == "close") == ["inbox", "relay", "settler"]
+
+
+def test_a_close_that_fails_is_reported_and_the_others_still_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Broken(Recorder):
+        def close(self) -> None:
+            raise RuntimeError("the socket is gone")
+
+    log: list[tuple[str, str]] = []
+    supervisor = InterlockSupervisor(services=[Broken("relay", log), Recorder("settler", log)])
+
+    async def body() -> None:
+        await asyncio.sleep(0.02)
+
+    run(supervisor, body)
+    assert ("settler", "close") in log
+    assert "relay: closing failed" in caplog.text and "the socket is gone" in caplog.text
+    assert {name: s.state for name, s in supervisor.status().items()} == {
+        "relay": "stopped",
+        "settler": "stopped",
+    }
+
+
+def test_a_forced_stop_skips_the_drains_and_gives_the_closes_a_grace() -> None:
+    log: list[tuple[str, str]] = []
+    release = threading.Event()
+    idle = Recorder("relay", log, close_seconds=0.2)
+    stuck = Recorder("stuck", log, hold=release)
+    supervisor = InterlockSupervisor(services=[idle, stuck], drain_timeout=30)
 
     async def main() -> float:
         running = asyncio.create_task(supervisor.run())
         await supervisor.ready()
-        await asyncio.sleep(0.05)
+        deadline = time.monotonic() + 5
+        while ("stuck", "step") not in log:  # its step is in flight
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.01)
         began = time.monotonic()
         supervisor.stop(force=True)
         await running
         return time.monotonic() - began
 
-    # Not the step in flight, nor the 30s drain bound: nothing is waited for.
-    assert asyncio.run(main()) < 0.5
-    assert ("relay", "drain") not in log and ("stuck", "drain") not in log
-    assert ("relay", "close") in log
+    try:
+        elapsed = asyncio.run(main())
+        # Not the step in flight, nor the 30s drain bound: the closes' grace.
+        assert elapsed < CLOSE_GRACE + 1.0
+        assert ("relay", "drain") not in log and ("stuck", "drain") not in log
+        # The idle service's close ran to its end before the stop returned; the
+        # one behind the step in flight is left to run after it.
+        assert ("relay", "close") in log
+        assert ("stuck", "close") not in log
+    finally:
+        release.set()
+    deadline = time.monotonic() + 3
+    while ("stuck", "close") not in log and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert log[-1] == ("stuck", "close") and ("stuck", "drain") not in log
 
 
 def test_health_is_ok_only_while_everything_runs() -> None:

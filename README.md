@@ -1519,8 +1519,8 @@ port answers `200` while every part runs, `503` otherwise, with each part's coun
 `SIGTERM` stops it in order, every step bounded: the agents; the engines (queued plans run
 until the deadline, and a running stage always finishes); the inbox, then one last match;
 the relays; the settler, one last pass; a vacuum in progress. A second signal skips the
-drains, and the next start recovers as after a crash. Without `--app`, the daemon runs the
-relays, the inbox and the vacuum.
+drains and gives the parts a second to close, and the next start recovers as after a
+crash. Without `--app`, the daemon runs the relays, the inbox and the vacuum.
 
 In a process of your own, `build_supervisor(config, application)` returns the same
 `InterlockSupervisor`, to run on your event loop.

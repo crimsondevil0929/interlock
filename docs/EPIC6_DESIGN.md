@@ -159,10 +159,12 @@ sequence. Every step has a deadline (`drain_timeout`):
    out and another relay takes it over.
 5. **Settler.** A last pass settles what the relays just delivered.
 6. **Vacuum.** A run in progress finishes, and no new one starts.
-7. **Close.** Engines, chains, governors, stores and the receipt log, in that order.
+7. **Close.** The services together, each releasing its stores and governors; then the
+   engines, with their chains; then the receipt log they share.
 
-A second signal skips the remaining drains and closes at once: the next start recovers
-from whatever was left, exactly as after a crash.
+A second signal skips the remaining drains and closes at once, waiting a second at most
+for the services to close: the next start recovers from whatever was left, exactly as
+after a crash.
 
 ### 2.6 Health
 
@@ -420,6 +422,12 @@ survey on each store; and the settler's and the operator log's four fixes. The f
 killed 18. The three survivors were tests that checked too early or too gently: a drain
 queued behind a step ran only after the test looked; a forced stop had nothing slow to
 skip; the busy retry had no clock on it. Each was strengthened, and then all 21 were killed.
+
+CI then found a race in one of those tests: it looked for a close that a forced stop had
+started but not waited for, and on a loaded runner the close had not run yet. A forced
+stop now waits up to a second for the services to close, all together, and the test holds
+the step it skips instead of timing it. The grace, closing together and reporting a failed
+close were each removed in turn as well, and each removal failed a test.
 
 ### 8.5 Limits, as built
 

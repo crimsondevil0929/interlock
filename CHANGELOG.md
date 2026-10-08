@@ -25,8 +25,8 @@ Releases before 0.1.2 are described by their tags and commit history.
   reopened after a doubling backoff when it fails. Agents are coroutines or threads
   given an `AgentContext` (`execute`, `facts`, `plan`, `sleep`, `stopping`). Shutdown runs
   in order with every step bounded, and never cuts a stage, a delivery, a webhook or a
-  vacuum in half; a second signal skips the drains. `status()` and `GET /healthz` report
-  every part.
+  vacuum in half; a second signal skips the drains, and gives the parts a second to
+  close. `status()` and `GET /healthz` report every part.
 - **`interlock daemon`** (`--app module:callable`, `--listen`, `--relay-key`,
   `--inbox-key`), and `build_supervisor(config, application)`: the supervisor
   `interlock.toml` describes, each part connecting as its own role. New sections:

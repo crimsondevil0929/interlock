@@ -37,7 +37,8 @@ them, bounds them and stops them::
   stops accepting and matches once more; the relays finish their batches; the
   settler settles once more; a vacuum in progress finishes. Then everything is
   closed. Nothing is cut in half: a stage, a delivery, a webhook being recorded
-  and a vacuum each finish or never start. A second signal skips the drains.
+  and a vacuum each finish or never start. A second signal skips the drains,
+  and gives the closes :data:`CLOSE_GRACE` seconds.
 """
 
 from __future__ import annotations
@@ -86,6 +87,10 @@ __all__ = [
 logger = logging.getLogger("interlock.supervisor")
 
 T = TypeVar("T")
+
+CLOSE_GRACE = 1.0
+"""Seconds a forced stop still gives the services to close, all of them
+together: a close releases connections and sockets, quick but never instant."""
 
 RUNNING = "running"
 STARTING = "starting"
@@ -756,7 +761,8 @@ class InterlockSupervisor:
 
     def stop(self, *, force: bool = False) -> None:
         """Begin the shutdown. Thread-safe and idempotent. ``force`` skips the
-        drains: what is cut is left as a crash leaves it, and recovered."""
+        drains, and waits :data:`CLOSE_GRACE` seconds at most for the services
+        to close: what is cut is left as a crash leaves it, and recovered."""
         loop = self._loop
         if loop is None or self._stop is None:
             return
@@ -1035,16 +1041,28 @@ class InterlockSupervisor:
                         )
                     except Exception:
                         logger.exception("%s: its drain failed", running.service.name)
-        # 7. Close: the services, the engines, then what they share. A close
-        # behind a step still running is left to run after it.
+        # 7. Close: the services, the engines, then what they share. The
+        # services close together, each on its own thread, within one bound:
+        # the drain bound, or once forced a grace, since a close only releases
+        # connections and sockets, quick but never instant. A close behind a
+        # step still running is left to run after it.
+        closing: dict[asyncio.Future[None], str] = {}
         for running in self._running.values():
             try:
-                await self._wait(
-                    [self._loop.run_in_executor(running.executor, running.service.close)],
-                    f"{running.service.name}'s close",
+                closing[self._loop.run_in_executor(running.executor, running.service.close)] = (
+                    running.service.name
                 )
             except Exception:
                 logger.exception("%s: closing failed", running.service.name)
+        if closing:
+            bound = min(CLOSE_GRACE, self._drain) if self._force else self._drain
+            await asyncio.wait(list(closing), timeout=bound)
+            for closed, name in closing.items():
+                if not closed.done():
+                    logger.warning("shutdown: %s's close did not finish in time", name)
+                elif not closed.cancelled() and closed.exception() is not None:
+                    logger.error("%s: closing failed", name, exc_info=closed.exception())
+        for running in self._running.values():
             running.opened = False
             running.state = STOPPED
             running.executor.shutdown(wait=False)
