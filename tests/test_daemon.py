@@ -31,7 +31,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import IO, Any, TypeVar
 
 import pytest
 from agentgov import BudgetManager
@@ -337,32 +337,48 @@ class Daemon:
             text=True,
         )
         self.lines: list[str] = []
-        self._reader = threading.Thread(target=self._read, daemon=True)
-        self._reader.start()
-
-    def _read(self) -> None:
-        assert self.process.stdout is not None
-        for line in self.process.stdout:
-            self.lines.append(line.rstrip("\n"))
+        self.errors: list[str] = []
+        # Both pipes are read as the daemon writes: one left full would stall it.
+        self._readers = [
+            threading.Thread(target=_read, args=(self.process.stdout, self.lines), daemon=True),
+            threading.Thread(target=_read, args=(self.process.stderr, self.errors), daemon=True),
+        ]
+        for reader in self._readers:
+            reader.start()
 
     def wait_for(self, text: str, timeout: float = 30.0) -> str:
         deadline = time.monotonic() + timeout
         while True:
+            exited = self.process.poll() is not None
+            if exited:  # what it wrote last is read to the end
+                for reader in self._readers:
+                    reader.join(timeout=5)
             for line in list(self.lines):
                 if text in line:
                     return line
-            if self.process.poll() is not None or time.monotonic() > deadline:
-                assert self.process.stderr is not None
-                raise AssertionError(
-                    f"no {text!r} in {self.lines}; stderr: {self.process.stderr.read()}"
-                )
+            if exited or time.monotonic() > deadline:
+                raise AssertionError(f"no {text!r} in {self.lines}; stderr: {self.errors}")
             time.sleep(0.02)
 
     def stop(self) -> int:
+        """SIGTERM, and the exit code. A daemon still running a minute later
+        is killed, and the test fails: none is left behind."""
         self.process.send_signal(signal.SIGTERM)
-        code = self.process.wait(timeout=60)
-        self._reader.join(timeout=10)
+        try:
+            code = self.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+            raise
+        for reader in self._readers:
+            reader.join(timeout=10)
         return code
+
+
+def _read(stream: IO[str] | None, into: list[str]) -> None:
+    assert stream is not None
+    for line in stream:
+        into.append(line.rstrip("\n"))
 
 
 @pytest.mark.parametrize(
@@ -383,7 +399,7 @@ def test_interlock_daemon_runs_until_sigterm(site: Site, app: str | None, parts:
             daemon.wait_for("agent: plan committed")
     finally:
         code = daemon.stop()
-    assert code == 0, daemon.lines
+    assert code == 0, (daemon.lines, daemon.errors)
     assert status == 200 and health["status"] == "ok"
     stopped = [line.split(":", 1)[0] for line in daemon.lines if ": stopped," in line]
     assert stopped == parts
