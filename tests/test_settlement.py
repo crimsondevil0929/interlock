@@ -31,20 +31,24 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
+from agentgov import BudgetManager
 from agentgov.core import EntryType
 from agentgov.receipts import ActionReceipt, verify_bundle
 
+from interlock import BlastRadius
 from interlock.deliveries import Settled
 from interlock.deliveries import settlements as wrap
 from interlock.outbound import SinkRegistry, SinkSpec
 from interlock.records import Keyring
-from interlock.settlement import CREDIT_MEMO, verify_settlements
+from interlock.settlement import CREDIT_MEMO, Settler, verify_settlements
+from tests.conftest import Pg
 from tests.outbox_env import (
     BACKENDS,
     RELAY_SINKS,
@@ -689,3 +693,143 @@ def test_verify_settlements_holds_each_attestation_to_its_relay(bench: Bench) ->
     assert found[1] == (
         f"delivery receipt {issued.receipt_id} (message {second}) is named by no settlement"
     )
+
+
+# --------------------------------------------------------------------------
+# a ledger every part shares (the daemon's, on PostgreSQL)
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def shared_ledger(pg: Pg) -> Iterator[Callable[[], BudgetManager]]:
+    """Governors of one AgentGov ledger on PostgreSQL, as the daemon's parts
+    each hold one: every call opens another, closed after the test."""
+    opened: list[BudgetManager] = []
+
+    def governor() -> BudgetManager:
+        opened.append(BudgetManager.open_postgres(pg.admin))
+        return opened[-1]
+
+    try:
+        yield governor
+    finally:
+        for each in opened:
+            each.close()
+
+
+def _settler(bench: Bench, ledger: BudgetManager) -> Settler:
+    return Settler(
+        bench.source(),
+        receipts=bench.issuer,
+        chain=bench.chain,
+        relays=RELAYS,
+        ledger=ledger,
+        operator_log=bench.outbox.operator_log,
+        operators=bench.outbox.keyring(),
+        sinks=REGISTRY,
+    )
+
+
+@POSTGRES_ONLY
+def test_a_settler_reads_a_shared_ledger_as_it_stands_when_it_settles(bench: Bench, pg: Pg) -> None:
+    """The settler's governor was opened before the plan was charged, through
+    another: it catches up before it settles, and the compensation is
+    credited, not settled for good as the compensation of a plan never
+    charged."""
+    with shared_ledger(pg) as governor:
+        engines = governor()
+        engines.open_root(SCOPE, "100")
+        settles = governor()  # before any charge
+        local, bench.outbox.governor = bench.outbox.governor, engines
+        try:
+            booked = bench.book(1)
+        finally:
+            bench.outbox.governor = local
+        bench.deliver()
+        cancel = bench.compensate(booked)
+        bench.deliver()
+        report = _settler(bench, settles).settle()
+        assert (report.credits, report.problems) == (1, ())
+        credit = settlements(bench)[cancel].credit
+        assert credit is not None
+        engines.refresh()
+        (entry,) = [e for e in engines.audit_trail(SCOPE) if e.entry_type is EntryType.REVERSAL]
+        assert entry.entry_hash == credit and entry.amount == BOOKINGS.cost_per_call
+
+
+@POSTGRES_ONLY
+def test_a_charge_claimed_and_not_booked_yet_holds_its_compensation(
+    bench: Bench, pg: Pg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claim and settle: an engine killed between its commit and booking the
+    claim leaves the plan's charge a claim, until recovery redeems it. The
+    compensation of that plan waits for it; it is never settled for good as
+    uncharged."""
+    from agentgov.postgres import PostgresStore
+
+    from interlock import EscrowEngine, LedgerAnchor
+    from tests.settling import booking
+
+    with shared_ledger(pg) as governor:
+        engines = governor()
+        engines.open_root(SCOPE, "100")
+        store = engines.store
+        assert isinstance(store, PostgresStore)
+        store.grant_join(pg.role)
+        engine = bench.outbox.engine(
+            checkers=[BlastRadius(100)],
+            sinks=REGISTRY,
+            receipts=bench.issuer,
+            chain=bench.chain,
+            anchor=LedgerAnchor(governed=engines, same_transaction=True),
+            settle_cost=str(SETTLE_COST),
+        )
+        # Killed after the commit, before the claim is booked.
+        monkeypatch.setattr(EscrowEngine, "_redeem", lambda self, plan, claim: None)
+        plan = booking(1).build()
+        assert engine.execute(plan).committed
+        monkeypatch.undo()
+        (booked,) = bench.outbox.messages(plan.plan_id)
+        bench.deliver()
+        cancel = bench.compensate(booked)
+        bench.deliver()
+        settler = _settler(bench, governor())
+        report = settler.settle()
+        assert cancel not in report.settled and report.credits == 0
+        assert any("is claimed and not booked yet" in p for p in report.problems), report
+        assert cancel not in settlements(bench)
+        # Recovery books the claim; the compensation earns its credit.
+        assert len(engines.redeem()) > 0
+        report = settler.settle()
+        assert (report.settled, report.credits, report.problems) == ((cancel,), 1, ())
+        assert settlements(bench)[cancel].credit is not None
+
+
+def test_a_delivery_waits_for_its_plans_action_receipt(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In one process (the daemon's) a relay can deliver, and the settler run,
+    between a plan's commit and its action receipt: the commit's record names
+    the receipt, and the log does not hold it yet. The delivery waits for it;
+    it is never settled for good without one."""
+    from interlock import EscrowEngine
+
+    issue = EscrowEngine._issue_receipt
+    deferred: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def later(self: Any, *args: Any, **kwargs: Any) -> None:
+        deferred.append((self, args, kwargs))
+
+    monkeypatch.setattr(EscrowEngine, "_issue_receipt", later)
+    booked = bench.book(1)
+    monkeypatch.undo()
+    bench.deliver()
+    report = bench.settler().settle()
+    assert booked not in report.settled
+    assert any("is not in the receipt log yet" in p for p in report.problems), report
+    assert booked not in settlements(bench)
+    ((engine, args, kwargs),) = deferred
+    issue(engine, *args, **kwargs)  # the engine gets to it
+    report = bench.settler().settle()
+    assert (report.settled, report.receipts, report.problems) == ((booked,), 1, ())
+    assert settlements(bench)[booked].receipt_id is not None

@@ -17,6 +17,9 @@ jobs:
   test:
     name: test (py${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hang fails the job within the hour rather than at GitHub's six, with
+    # the stacks pytest dumps after five minutes in its log.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +76,7 @@ jobs:
   postgres:
     name: test against PostgreSQL ${{ matrix.postgres }} (py3.12)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

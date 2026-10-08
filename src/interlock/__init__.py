@@ -50,6 +50,7 @@ from interlock.anchor import AnchorPoint, LedgerAnchor
 from interlock.builder import PlanBuilder, new_effect_id, new_plan_id
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
+from interlock.daemon import Application, build_supervisor, load_application
 from interlock.deliveries import verify_delivery_log
 from interlock.engine import EscrowEngine, StageResult
 from interlock.exceptions import (
@@ -76,6 +77,7 @@ from interlock.exceptions import (
     StageExpiredError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
+    SupervisorStoppedError,
     ToolRevokedError,
     UncompensatableEffectError,
 )
@@ -89,7 +91,7 @@ from interlock.extension import (
     Spend,
 )
 from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEvidence, Refusal
-from interlock.inbox import InboundSource, Inbox, verify_fact, verify_inbox
+from interlock.inbox import InboundSource, Inbox, InboxServer, verify_fact, verify_inbox
 from interlock.invariants import (
     BlastRadius,
     ColumnValueGuard,
@@ -140,6 +142,17 @@ from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
 from interlock.settlement import SettlementReport, Settler, verify_settlements
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
+from interlock.supervisor import (
+    AgentContext,
+    EnginePool,
+    InboxService,
+    InterlockSupervisor,
+    RelayService,
+    Service,
+    ServiceStatus,
+    SettlerService,
+    VacuumService,
+)
 from interlock.types import (
     Compensation,
     Effect,
@@ -171,9 +184,11 @@ __version__ = "0.5.0"
 
 __all__ = [
     "AdmissionError",
+    "AgentContext",
     "AgentFeedback",
     "AnchorError",
     "AnchorPoint",
+    "Application",
     "BlastRadius",
     "BudgetGuard",
     "CascadeReport",
@@ -196,6 +211,7 @@ __all__ = [
     "EffectId",
     "EffectKind",
     "EffectPlan",
+    "EnginePool",
     "EscrowChain",
     "EscrowEngine",
     "EscrowRecord",
@@ -211,7 +227,10 @@ __all__ = [
     "InboundFactError",
     "InboundSource",
     "Inbox",
+    "InboxServer",
+    "InboxService",
     "InterlockError",
+    "InterlockSupervisor",
     "InvariantChecker",
     "InvariantViolation",
     "LedgerAnchor",
@@ -250,6 +269,7 @@ __all__ = [
     "Refusal",
     "Relay",
     "RelayReport",
+    "RelayService",
     "Repair",
     "RepairFeedback",
     "RequestSum",
@@ -258,8 +278,11 @@ __all__ = [
     "RowSum",
     "Rung",
     "ScopeHaltedError",
+    "Service",
+    "ServiceStatus",
     "SettlementReport",
     "Settler",
+    "SettlerService",
     "Severity",
     "ShadowSubstrate",
     "SignedRecord",
@@ -277,6 +300,7 @@ __all__ = [
     "StatedFootprint",
     "SubstrateConfigurationError",
     "SubstrateUnavailableError",
+    "SupervisorStoppedError",
     "TableAllowlist",
     "TableSpec",
     "TenantDrawdownGuard",
@@ -288,11 +312,14 @@ __all__ = [
     "UncompensatableEffectError",
     "Vacuum",
     "VacuumReport",
+    "VacuumService",
     "Verdict",
     "WindowMeasure",
     "__version__",
+    "build_supervisor",
     "check_anchors",
     "default_checkers",
+    "load_application",
     "new_effect_id",
     "new_plan_id",
     "retry_delay",

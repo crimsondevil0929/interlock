@@ -54,6 +54,7 @@ from interlock.records import Keyring, RecordKind, RecordLog, read_records
 from interlock.relay import NoBreaker, Relay
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE, StripeAdapter, stripe_sink
 from interlock.types import EffectId, OutboundRequest
+from tests.conftest import Pg
 from tests.fakesink import status
 from tests.fakestripe import KEY, FakeStripe
 from tests.outbox_env import (
@@ -404,6 +405,33 @@ def test_a_record_the_ledger_could_not_take_is_anchored_later(outbox: Outbox) ->
     with outbox.signed("alice", ledger=outbox.governor):
         pass  # opening the log anchors what is pending
     assert len([e for e in outbox.governor.audit_trail() if e.memo.startswith("ILOK1 ")]) == 2
+
+
+def test_a_record_is_anchored_once_whichever_governor_opens_the_log(pg: Pg, tmp_path: Path) -> None:
+    """On a ledger every part shares, the daemon's vacuum and an operator's
+    command each anchor the log through a governor of their own. One opened
+    before the other anchored a record catches up before it looks for what is
+    unanchored: no record is anchored twice."""
+    from agentgov import BudgetManager
+    from agentgov.core import EntryType
+
+    first = BudgetManager.open_postgres(pg.admin)
+    second = BudgetManager.open_postgres(pg.admin)  # before anything is anchored
+    try:
+        first.open_root("operators", "1")
+        key = Ed25519Signer(bytes.fromhex("6c" * 32))
+        keyring = Keyring({"ops": key.public_key()})
+        path = tmp_path / "operators.ilok1"
+        with OperatorLog(path, key, keyring, ledger=first, scope="operators") as log:
+            log.append(RecordKind.OPERATOR_INTENT, {"action": "release", "targets": []})
+        with OperatorLog(path, key, keyring, ledger=second, scope="operators") as log:
+            assert log.anchor_pending() == 0
+        first.refresh()
+        memos = [e.memo for e in first.audit_trail() if e.entry_type is EntryType.ANCHOR]
+        assert len(memos) == len(set(memos)) == 1
+    finally:
+        second.close()
+        first.close()
 
 
 def test_a_registry_changed_around_a_signed_install_is_named(outbox: Outbox) -> None:

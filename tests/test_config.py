@@ -9,6 +9,7 @@ import pytest
 
 from interlock.cli import main
 from interlock.config import DATABASE_ENV, ConfigError, load_config
+from interlock.operators import generate_key
 
 GOOD = """
 substrate = "postgres"
@@ -111,3 +112,135 @@ def test_the_cli_on_sqlite(back_office: str, tmp_path: Path) -> None:
     ]
     missing = write(tmp_path, GOOD.replace('"postgres"', '"sqlite"'))
     assert main(["check", "--config", str(missing), "--database", str(tmp_path / "no.db")]) == 4
+
+
+DAEMON = (
+    GOOD
+    + """
+[engine]
+workers = 4
+database = "postgresql://interlock_agent@db/app"
+chain = "escrow.chain"
+settle_cost = "0.01"
+ledger = "host=db dbname=app user=owner"
+same_transaction = true
+conflict_retries = 8
+max_stage_seconds = 5
+lock_timeout_seconds = 1.5
+
+[receipts]
+log = "receipts.jsonl"
+key = "receipts.key"
+log_id = "app-receipts"
+policy_epoch = 3
+
+[settler]
+database = "postgresql://interlock_settle@db/app"
+every_seconds = 2.5
+
+[vacuum]
+every_seconds = 600
+database = "postgresql://owner@db/app"
+key = "vacuum.key"
+
+[daemon]
+drain_timeout_seconds = 12
+restart_min_seconds = 0.25
+restart_max_seconds = 8
+"""
+)
+
+
+def test_the_daemons_sections_load(tmp_path: Path) -> None:
+    from datetime import timedelta
+    from decimal import Decimal
+
+    config = load_config(write(tmp_path, DAEMON))
+    engine = config.engine
+    assert (engine.workers, engine.settle_cost, engine.conflict_retries) == (4, Decimal("0.01"), 8)
+    assert engine.ledger == "host=db dbname=app user=owner" and engine.same_transaction
+    assert (engine.max_stage_seconds, engine.lock_timeout_seconds) == (5.0, 1.5)
+    assert engine.chain == tmp_path / "escrow.chain"
+    assert engine.chain_for(0) == tmp_path / "escrow-0.chain"
+    assert engine.chain_for(3) == tmp_path / "escrow-3.chain"
+    assert engine.chain_for(0, 1) == tmp_path / "escrow.chain"
+    receipts = config.receipts
+    assert receipts is not None
+    assert (receipts.log, receipts.key, receipts.log_id, receipts.policy_epoch) == (
+        tmp_path / "receipts.jsonl",
+        tmp_path / "receipts.key",
+        "app-receipts",
+        3,
+    )
+    assert config.settler.every == timedelta(seconds=2.5)
+    assert config.vacuum.every == timedelta(minutes=10)
+    assert config.vacuum.key == tmp_path / "vacuum.key"
+    assert config.vacuum.database == "postgresql://owner@db/app"
+    assert config.daemon.drain_timeout == timedelta(seconds=12)
+    assert (config.daemon.restart_min, config.daemon.restart_max) == (
+        timedelta(milliseconds=250),
+        timedelta(seconds=8),
+    )
+    # Absent, each section has its defaults; a SQLite ledger sits beside the file.
+    bare = load_config(write(tmp_path, GOOD))
+    assert (bare.engine.workers, bare.receipts, bare.vacuum.every) == (1, None, None)
+    sqlite = load_config(
+        write(
+            tmp_path,
+            GOOD.replace('substrate = "postgres"', 'substrate = "sqlite"').replace(
+                'stage_roles = ["interlock_agent"]\n', ""
+            )
+            + '[engine]\nledger = "governor.db"\n',
+        )
+    )
+    assert sqlite.engine.ledger == str(tmp_path / "governor.db")
+
+
+@pytest.mark.parametrize(
+    ("replace", "message"),
+    [
+        (("workers = 4", "workers = 0"), "workers is at least 1"),
+        (("conflict_retries = 8", "conflict_retries = -1"), "not negative"),
+        (('settle_cost = "0.01"', 'settle_cost = "-1"'), "settle_cost is not negative"),
+        (("same_transaction = true", 'same_transaction = "yes"'), "true or false"),
+        (('ledger = "host=db dbname=app user=owner"', 'ledger = "governor.db"'), "same database"),
+        (("workers = 4", "workers = 4\nthreads = 2"), r"\[engine\]: unknown key"),
+        (('log_id = "app-receipts"', "log_id = 7"), "must be a string"),
+        (("policy_epoch = 3", "policy_epoch = -1"), "policy_epoch is not negative"),
+        (('log = "receipts.jsonl"\n', ""), "missing 'log'"),
+        (("every_seconds = 2.5", "every_seconds = 0"), "positive number"),
+        (("every_seconds = 600", "every_seconds = -1"), "not negative"),
+        (("restart_max_seconds = 8", "restart_max_seconds = 0.1"), "at least restart_min"),
+        (("drain_timeout_seconds = 12", "drain_after = 12"), r"\[daemon\]: unknown key"),
+        (('database = "postgresql://interlock_settle@db/app"', "interval = 2"), "unknown key"),
+    ],
+)
+def test_a_misconfigured_daemon_is_refused(
+    tmp_path: Path, replace: tuple[str, str], message: str
+) -> None:
+    assert replace[0] in DAEMON
+    with pytest.raises(ConfigError, match=message):
+        load_config(write(tmp_path, DAEMON.replace(replace[0], replace[1], 1)))
+
+
+def test_one_sqlite_worker(tmp_path: Path) -> None:
+    text = GOOD.replace('substrate = "postgres"', 'substrate = "sqlite"').replace(
+        'stage_roles = ["interlock_agent"]\n', ""
+    )
+    with pytest.raises(ConfigError, match="one worker"):
+        load_config(write(tmp_path, text + "[engine]\nworkers = 2\n"))
+    with pytest.raises(ConfigError, match="same database"):
+        load_config(write(tmp_path, text + '[engine]\nsame_transaction = true\nledger = "g.db"\n'))
+
+
+def test_an_operators_ledger_may_be_a_keyword_connection_string(tmp_path: Path) -> None:
+    path = tmp_path / "interlock.toml"
+    path.write_text(
+        'substrate = "sqlite"\ndatabase = "app.db"\n'
+        '[[tables]]\nname = "orders"\ncolumns = ["id"]\n'
+        '[operators]\nlog = "operators.ilok1"\nledger = "host=db dbname=app user=owner"\n'
+        "[operators.keys]\n"
+        f'ops = "{generate_key(tmp_path / "ops.key").public_key().spec()}"\n'
+    )
+    operators = load_config(path).operators
+    assert operators is not None and operators.ledger == "host=db dbname=app user=owner"

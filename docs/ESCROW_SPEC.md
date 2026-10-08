@@ -1,9 +1,10 @@
 # Effect escrow: specification and interface contract
 
-**Status:** specification. `interlock` 0.2.0 implements a subset; see
-[Conformance](#conformance-of-interlock-020) at the end of this document for
-what is implemented, what is partial, and what is unimplemented.
-**Applies to:** `interlock` 0.2.0 against `agentgov` v0.2.0 (tag, commit `6d3cac2`).
+**Status:** specification. Sections 1 to 4 are the contract; section 5 is the
+architecture `interlock` 0.5.0 builds it into; [Conformance](#conformance-of-interlock-050)
+at the end says, requirement by requirement, what is implemented, what is
+partial, and what is not.
+**Applies to:** `interlock` 0.5.0 against `interlock-agentgov` 0.4.0.
 **Normative language:** MUST, MUST NOT, SHOULD, MAY per RFC 2119.
 
 ---
@@ -21,17 +22,19 @@ The dependency is one-way and read-only:
     agentgov   ──── imports ───▶  interlock     (FORBIDDEN)
 ```
 
-`interlock` imports `agentgov` **purely as a read-only audit dependency**. It
-opens the governor's SQLite ledger through
-`BudgetManager.open_sqlite(path, read_only=True)`, reads the hash chain, and
-anchors its own records to that chain. It does not write to the ledger, does not
-subclass `Ledger` or `BudgetManager`, and does not depend on any private name.
+By default `interlock` imports `agentgov` **as a read-only audit dependency**:
+it opens the governor's ledger read-only, reads and verifies the hash chain, and
+anchors its own records to it. A deployment MAY instead give it a write-capable
+governor (*governed* mode, section 3.4), and then it writes entries of its own,
+every one through AgentGov's public surface: a plan's charge (`authorize` and
+`capture`, or on PostgreSQL a claim committed in the stage's own transaction and
+redeemed after it), a free `anchor()`, the operator log's anchors, and the
+settlement credit a compensation earns (`refund()`). It never subclasses
+`Ledger` or `BudgetManager`, and depends on no private name.
 
 `agentgov`'s public surface is the whole contract. Nothing in this document
-depends on a private name. `agentgov` v0.1.2 added two public calls that
-`interlock` v0.1.2 uses, `BudgetManager.refresh()` and `BudgetManager.anchor()`;
-a requirement that appears to need anything beyond the public surface is wrong
-and MUST be redesigned around it.
+depends on a private name; a requirement that appears to need anything beyond
+the public surface is wrong and MUST be redesigned around it.
 
 The `agentgov` surface listed in section 3.1 is the compatibility promise.
 Changing it is a breaking change for `interlock`.
@@ -742,7 +745,8 @@ class EscrowRecord:
     record_hash: str
 ```
 
-- **E3-4.** Row data MUST NOT enter the chain. Only digests. The chain is an
+- **E3-11.** (Numbered E3-4 before 0.5.0, beside the other E3-4.) Row data
+  MUST NOT enter the chain. Only digests. The chain is an
   audit artifact and MUST NOT become a copy of the production database. This
   mirrors `agentgov`'s posture, where `retain_arguments=False` is the default.
 
@@ -796,7 +800,7 @@ Three mitigations, in increasing strength:
   into the `memo` of the entry that call posts:
 
   ```
-  memo = f"aesc:{record_hash[:16]}"
+  memo = f"interlock:{record_hash[:16]}"
   ```
 
   `memo` is part of `_hash_entry`'s payload, so the reverse anchor is itself
@@ -945,6 +949,136 @@ rather than a uniform guarantee that is quietly false at the edges.
 
 ---
 
+# 5. Architecture of `interlock` 0.5.0
+
+What sections 1 to 4 are built into. Each part has a design document beside this
+one, which gives its reasons: [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md) (the
+transactional outbox), [`EPIC3_DESIGN.md`](EPIC3_DESIGN.md) (typed sinks,
+operators, compensations), [`EPIC4_DESIGN.md`](EPIC4_DESIGN.md) (relay
+attestations, rate windows, settlement), [`EPIC5_DESIGN.md`](EPIC5_DESIGN.md)
+(compaction, the inbox) and [`EPIC6_DESIGN.md`](EPIC6_DESIGN.md) (the runtime and
+the daemon).
+
+## 5.1 Components
+
+| Component | Module | What it does | What it writes |
+|---|---|---|---|
+| **Engine** | `engine.EscrowEngine` | Admits a plan, stages it, measures the diff, runs every checker, and commits or aborts. At start, resolves the commit intents a crashed predecessor left open. | Escrow chain records; an ARC1 action receipt per adjudicated plan |
+| **Substrates** | `substrate.SqliteSubstrate`, `postgres.PostgresSubstrate` | One transaction per stage (`BEGIN IMMEDIATE`; `REPEATABLE READ`). Row triggers capture every change to an observed table. A commit marker is written inside the stage's own transaction. | The capture; `interlock.stages` markers; the log of unmediated writes |
+| **AgentGov seam** | `anchor.LedgerAnchor` | Audit mode: a read-only view, verified, refreshed before every head read and breaker check. Governed mode: each plan charged its settle cost and its requests' prices. On PostgreSQL that is claim and settle: a hold before the stage, a claim committed inside it, redeemed after. | Holds, spends, anchors |
+| **Transactional outbox** | `outbound`, `outbox_sql`, `sqlite_outbox` | An `ENQUEUE` effect writes its request inside the stage, through a function gated by the stage's token. The sink registry admits it: operation, schema, size, deadline, price, the compensation it carries. | Outbox rows; a hash-linked delivery log per message |
+| **Relays** | `relay.Relay`, `adapters`, `stripe`, `sendgrid` | Lease due messages (`FOR UPDATE SKIP LOCKED`, fenced). Check the scope's AgentGov breaker. Deliver under the idempotency key, classify the reply, and sign every outcome. | Delivery-log rows, each carrying an Ed25519 attestation |
+| **Operators** | `operators.OperatorLog`, `operators.Operator` | Release, cancel, requeue, compensate, install and vacuum, each in two phases: a signed intent, the database's act under the intent's hash, then a signed outcome. | The ILOK1 operator log, each record anchored in AgentGov |
+| **Settlement** | `settlement.Settler` | Receipts each delivered request against its plan's action receipt. Credits a compensation the price its original was charged, back to the scope that paid. | ARC1 delivery receipts; `REVERSAL` credits; one settlement row per message |
+| **Rate windows** | `windows` | Measure what a plan adds to each window from its diff. Read the window's history under a lock on each key, and refuse a plan that would take one past its limit. | `interlock.window_ledger` rows, written with the commit |
+| **Inbox** | `inbox.Inbox`, `inbox.InboxServer`, `inbox_store` | Verify a vendor's webhook (Stripe, Standard Webhooks, SendGrid) and record each event once. Bind it to the relay-attested delivery it names, and attest the fact. | A hash-linked event log per source; attested facts; consumed rows |
+| **Compaction** | `vacuum.Vacuum`, `compaction` | Prunes final, settled history past its retention under a checkpoint an operator signs and AgentGov anchors. The checkpoint's folds commit to everything pruned. | Checkpoints; tombstones; an optional provable archive |
+| **Runtime** | `runtime.EscrowRuntime` | One engine, configured whole: any substrate, windows, inbox keys, sinks, the claim-and-settle anchor. Or `from_config`. | — |
+| **Supervisor** | `supervisor.InterlockSupervisor`, `daemon.build_supervisor` | Runs the engines, relays, inbox, settler and vacuum in one process on one event loop. Restarts a failed part with backoff, and stops in order without cutting anything in half. | Health (`GET /healthz`) |
+
+## 5.2 How a plan's effects flow
+
+```
+ agent ──plan──▶ engine ──stage──▶ substrate: ONE transaction
+                   │                  ├─ rows, captured by triggers
+                   │                  ├─ outbox requests (ENQUEUE), through the stage's token
+                   │                  ├─ inbound facts consumed, through the stage's token
+                   │                  ├─ what the plan adds to each rate window
+                   │                  └─ the commit marker, and the AgentGov claim
+                   ├─ escrow chain records, action receipt
+                   ▼
+           COMMIT: every one of these, or none
+                   │
+  relay ──lease──▶ sink (HTTP) ─────────────▶ vendor
+    │  signed outcome                           │  webhook, signed by the vendor
+    ▼                                           ▼
+  delivery log ◀───────── bound to ───────── inbox ──▶ attested fact ──▶ a later plan
+    │
+  settler ──▶ delivery receipt; a compensation's credit
+    │
+  vacuum ──▶ signed, anchored checkpoint; what it covers is pruned
+```
+
+A request is adjudicated with the rows it rides with (`CrossEffectAgreement`),
+counted against the windows it adds to (`RateWindowCheck`), and delivered only
+after the commit. The answer a vendor sends later comes back as a fact, attested
+twice: by the relay that recorded the delivery, and by the inbox that verified
+the webhook. A plan consumes a fact at most once, and `FactAgreement` holds what
+the plan writes to what the fact says.
+
+## 5.3 Roles, secrets and trust
+
+Every part connects as a database role of its own, granted what its part needs
+by `interlock install` and nothing else.
+
+| Role | May | May not |
+|---|---|---|
+| installer (`database`) | own the tables, install, run the vacuum, act for operators through the outbox functions | — |
+| stage (`stage_roles`) | DML on the observed tables inside a stage; enqueue and consume through the stage's token; join the AgentGov claim | write the capture, the markers, the outbox or the inbox directly; read window history or pending facts from inside a stage |
+| relay (`relay_roles`) | read the outbox; lease and record outcomes through the relay functions, under its lease's fence | change a request; write anything else |
+| settler (`settler_roles`) | read the outbox; record a settlement | anything else |
+| inbox (`inbox_roles`) | read the outbox and the inbox; record events and facts through the inbox functions | anything else |
+| audit (`audit_roles`) | read | write |
+
+The database holds no secret. API credentials live only in the relays'
+environment, and webhook signing secrets only in the inbox's. Private keys (a
+relay's, the inbox's, each operator's, the receipt log's) are files beside the
+configuration. Their public halves are registered in `[relays.keys]`,
+`[inbox.keys]` and `[operators.keys]`, and every verifier checks against those.
+A row the database's owner writes around the functions carries no signature
+that verifies, and the verifiers name it.
+
+## 5.4 The evidence, and what verifies it
+
+| Artifact | Written by | Verified by |
+|---|---|---|
+| Escrow chain (one per engine) | engine | `EscrowChain.verify`, `EscrowChain.verify_anchors` |
+| AgentGov ledger | governors | `BudgetManager.verify_integrity` |
+| Delivery logs | relays, operators | `verify_delivery_log`, `verify_attestations` |
+| Operator log | operators, the vacuum | `verify_operators`, with the ledger's anchors |
+| Receipt log | engines, the settler | `verify_settlements`; AgentGov's `verify_bundle` per receipt |
+| Inbound logs and facts | inbox | `verify_inbox`, `verify_fact` |
+| Checkpoints, tombstones, archives | the vacuum | `verify_operators`, `verify_archive` |
+| Writes outside every stage | triggers, the SQLite journal | `interlock reconcile-effects` |
+
+Each verifier reads the database as of one instant
+(`deliveries.consistent`: a `REPEATABLE READ` snapshot on PostgreSQL, a read
+transaction on SQLite). What relays, the inbox or the settler commit while it
+reads is after it, and is never mistaken for tampering.
+
+## 5.5 Concurrency
+
+- **Engines.** An engine stages one plan at a time. The daemon runs several,
+  each writing a chain of its own: engines sharing one would interleave
+  AgentGov observations and break E3-5. A plan that loses a race (a
+  serialization failure, a lock timeout) is staged again with jittered backoff.
+- **Window keys.** A stage locks every key it adds to with transaction-scoped
+  advisory locks, in one sorted order, before it reads the history, and holds
+  them to its commit. Counts are exact, and no two stages wait on each other in
+  a cycle.
+- **The ledger.** Claim and settle takes AgentGov's writer lock inside the
+  stage's transaction, at commit, after the window keys: one lock order
+  everywhere.
+- **Relays** share work through `FOR UPDATE SKIP LOCKED`. Every lease is fenced,
+  so a relay whose lease ran out cannot record over its successor.
+- **Facts** are consumed under a unique key: at most once, whatever races.
+- **Governors.** Every part of the daemon holds a governor of its own. A
+  governor reading what another wrote, as the settler reads charges and the
+  operator log reads anchors, refreshes its view first.
+- **Single writers.** An escrow chain, the receipt log and the operator log
+  each refuse a second writer. The daemon keeps the engines and the settler,
+  which share the receipt log, in one process. The vacuum opens the operator
+  log only for its run.
+
+`scripts/live_stress_test.py` runs all of it for minutes against a live
+PostgreSQL, under injected faults and forged webhooks, and proves from the
+database, the ledger and the logs that no deadlock occurred, lock waits
+resolved, the windows held exactly, the ledger balanced, every effect happened
+once, no forgery was accepted, compaction kept up, and everything verified.
+`tests/test_soak.py` runs it scaled down in the test suite.
+
+---
+
 ## Open questions
 
 Unresolved, and listed because they are unresolved rather than minor.
@@ -970,116 +1104,129 @@ Unresolved, and listed because they are unresolved rather than minor.
 
 ---
 
-# Conformance of `interlock` 0.2.0
+# Conformance of `interlock` 0.5.0
 
-What the shipped package actually does against this document. Verified by
-reading `src/interlock/` and by running adversarial plans against it, not by
-reading the test suite.
+What the shipped package does against this document, requirement by requirement.
+Verified by reading `src/interlock/`, by the test suite (every test named below
+runs on SQLite and on PostgreSQL unless it says which), and under sustained load
+by `scripts/live_stress_test.py`. **Implemented** means the requirement holds as
+written; **partial** says what is missing; **unimplemented** is stated plainly.
 
-## Implemented
+## The state machine (section 1)
 
-| Requirement | Where |
-|---|---|
-| One-way `interlock -> agentgov` dependency, read-only by default | `anchor.LedgerAnchor`, opens with `read_only=True` |
-| Ledger verified at attach; refuses to stage against a chain that fails | `anchor.LedgerAnchor.__init__` |
-| `E3-4`: read-only view refreshed and verified before every record and breaker check | `anchor.LedgerAnchor.observe`, `assert_scope_live` |
-| Reverse anchor into AgentGov when co-resident: a free `ANCHOR` entry, or the memo of a settled spend | `anchor.LedgerAnchor.reverse_anchor` |
-| Breaker re-read immediately before commit, not at admission; with a governed manager, the governor's lock held from the check through the commit | `anchor.LedgerAnchor.guard_commit`, `engine.EscrowEngine.execute` |
-| Commit intent written ahead of the commit and fsynced; a crashed commit resolved exactly from a marker written inside the stage's transaction | `substrate.SqliteSubstrate.commit`, `.resolve_intent`, `engine.EscrowEngine.recover` |
-| Chain resumed from its file and verified before any append; one writer per file | `chain.EscrowChain.__init__` |
-| Writes outside `TableSpec` denied at prepare time | `substrate.SqliteSubstrate._authorize` |
-| Cascade check: foreign-key reach into unobserved tables read from the schema, refused unless acknowledged; the gap recorded per stage | `cascade`, `substrate.SqliteSubstrate.check_cascades`, `engine.EscrowEngine.execute` |
-| The capture table, the commit marker and transaction control are out of a statement's reach | `substrate.SqliteSubstrate._authorize`, `substrate.FORBIDDEN_VERBS` |
-| PostgreSQL substrate: `REPEATABLE READ` stages, row triggers installed once, `statement_timeout` / `lock_timeout` / idle timeout per stage, the capture, marker and gates out of the stage role's reach, installation and grants verified at every stage | `postgres.PostgresSubstrate`, `postgres.install` |
-| A crashed PostgreSQL commit resolved from its marker and `pg_xact_status`, so a transaction the server still holds is not read as rolled back | `postgres.PostgresSubstrate.resolve_intent`, `engine.EscrowEngine.recover` |
-| A commit whose connection is lost with `COMMIT` in flight resolved from its marker at once: reported committed, rolled back, or left open with no terminal record (`CommitUnsettledError`) while the server has not decided | `postgres.PostgresSubstrate.commit`, `engine.EscrowEngine._settle_lost_commit` |
-| Unrecorded writes: every row change to an observed table outside a stage is logged (PostgreSQL trigger, SQLite journal), and every committed stage must be recorded as committed in a chain | `reconcile`, `interlock reconcile-effects` |
-| Refusals split by audience: operator evidence in full; agent feedback limited to the plan's own tables and tenants, bucketed counts, no aggregates, fixed templates, canonical order | `feedback`, `adjudication`, `engine.StageResult.feedback` |
-| Checked repair: candidate sub-plans staged in savepoints of one stage, each adjudicated by the same checkers and rolled back, with no monotonicity assumed; the proposal admitted only as recorded, only once, and re-adjudicated from scratch | `repair`, `engine.EscrowEngine.repair`, `engine.EscrowEngine._repair_claim` |
-| A signed ARC1 receipt per adjudicated plan, naming its terminal chain record (which names it back), issued after the reverse anchor so its cost verifies against the ledger; a repair's names the refusal's | `receipts.ReceiptIssuer`, `engine.EscrowEngine._issue_receipt` |
-| Budgeted recovery from a halt: a fixed, deterministic ladder of constraints before guidance; a reserve beside the halted scope; the transcript only ever appended to; every step signed (ILOK1) before it is returned and anchored in the AgentGov ledger | `recovery`, `records` |
-| Budget exhaustion answered with a signed quote instead of a tripped breaker: spend to date from the ledger, proof of work from ARC1 receipts with a checkpoint, an estimate by a named method; answered once by a signed grant or decline; never offered for a safety halt | `extension` |
-| `tenant_column` must be one of the captured columns | `substrate.TableSpec.__init__` |
-| `E1-3`: no path from `STAGED` to `COMMITTED` that skips adjudication | `engine.EscrowEngine.execute` |
-| `E1-4`: `REJECTED` not overridable in-process | no override surface exists |
-| Row-level diff measured from the substrate via `AFTER` triggers | `substrate.SqliteSubstrate` |
-| Truncation is explicit and blocking | `types.EffectDiff.truncated`, `invariants.TruncationGuard` |
-| Checkers are pure `(plan, diff)`; a raising checker becomes BLOCKING | `engine.EscrowEngine._adjudicate` |
-| Hash-linked chain with sequence, link and digest verification | `chain.EscrowChain.verify` |
-| Anchor monotonicity check | `chain.EscrowChain.verify_anchors` |
+| Req | Status | Where | Proven by |
+|---|---|---|---|
+| E1-1: no substrate before `PLANNED` | Implemented | `EscrowEngine.admit` runs before `substrate.open` | `test_engine`, `test_outbound` |
+| E1-2: `diff()` only when staged | Partial | The engine calls `diff()` only after every effect is applied; a substrate's own `diff()` does not refuse a call mid-staging | `test_engine` |
+| E1-3: commit only from `VERIFIED` | Implemented | `EscrowEngine._execute`: no path reaches `commit` without the verdict | `test_engine`, `test_core_guarantees` |
+| E1-4: `REJECTED` not overridable | Implemented | No override surface; an operator's change is a new plan (a checked repair is one, admitted only as recorded) | `test_repair` |
+| E1-5: expiry to `ORPHANED` | Unimplemented | Below | — |
+| E1-6: `COMPENSATED` only from `COMMITTED` | Partial | A committed plan's outbound requests are compensated by an operator's signed action, delivered, settled and credited; the escrow chain itself never records `COMPENSATED` | `test_operators`, `test_settlement` |
+| E1-7: double-commit protection at the ledger | Implemented | `capture()` against the plan's hold; on PostgreSQL a claim keyed to the hold, committed once with the stage and redeemed once | `test_anchor`, `test_shared_transaction`, `test_crash_consistency` (PostgreSQL) |
+| E1-8: orphaned holds found through AgentGov | Implemented | A plan that did not commit voids its hold; recovery redeems pending claims and voids the holds of plans that never committed (`stale_authorizations`) | `test_shared_transaction`, `test_crash_consistency` (PostgreSQL) |
+| E1-9: every stage terminal, checkable offline | Partial | `EscrowChain.unresolved_intents` and `recover()` resolve every open commit intent from the substrate's marker; a stage whose process died before its intent has no terminal record (E1-5) | `test_crash_consistency`, `test_sqlite_stage_crash` |
+
+## The interface (section 2)
+
+| Req | Status | Where | Proven by |
+|---|---|---|---|
+| E2-1: deterministic topological order | Implemented | `EffectPlan.topological_order`, ties on `effect_id` | `test_engine` |
+| E2-2: no irreversible effect without a compensation | Partial | An outbound request whose operation has an undo must carry it (refused at admission, E4-3); an operation the operator's registry declares `none-possible` is admitted without one, by that declaration | `test_outbound` |
+| E2-3: parameterised statements | Implemented | Parameters are bound by the driver; the leading verb is vetted | `test_engine`, `test_postgres` |
+| E2-4: plans immutable | Implemented | Frozen dataclasses; content-hashed at admission | `test_engine` |
+| E2-5: one connection per stage | Implemented | One per stage; on PostgreSQL a second, short-lived reader outside the stage reads window history and pending facts, which the stage's snapshot cannot see | `test_postgres`, `test_windows` |
+| E2-6: `diff()` pure | Implemented | Reads the capture | `test_engine` |
+| E2-7: no reversible effect on a non-transactional driver | Implemented | Both drivers are transactional; an `ENQUEUE` is irreversible by construction | `test_outbound` |
+| E2-8: `abort()` safe in any state | Implemented | `SqliteSubstrate.abort`, `PostgresSubstrate.abort` | `test_engine`, `test_postgres` |
+| E2-9: counts measured, not reported | Implemented | Row triggers on every observed table, cascades included | `test_engine`, `test_postgres`, `test_cascades` |
+| E2-10: deltas ordered | Implemented | `EffectDiff.content_hash` orders deltas by table and key | `test_engine` |
+| E2-11: truncation blocks | Implemented | `TruncationGuard` | `test_engine` |
+| E2-12: checkers pure | Implemented | Window history and consumed facts are read by the substrate into the diff, so `RateWindowCheck` and `FactAgreement` decide from `(plan, diff)` alone | `test_windows`, `test_fact_agreement` |
+| E2-13: a model is a sensor, never the checker | Implemented | No checker calls a model | — |
+| E2-14: every checker runs | Implemented | `EscrowEngine._adjudicate` unions every violation | `test_engine` |
+| E2-15: a raising checker blocks | Implemented | `EscrowEngine._adjudicate` | `test_engine` |
+| Baseline checkers (2.5.1) | Partial | `blast_radius`, `tenant_isolation`, `no_ddl`, `truncation_guard` ship; `schema_allowlist` and `distribution_shift` do not | `test_engine` |
+
+## The AgentGov seam (section 3)
+
+| Req | Status | Where | Proven by |
+|---|---|---|---|
+| E3-1: a read-only handle | Partial, by design | Audit mode opens read-only; governed mode, chosen by the deployment, writes through the public surface only (the preamble) | `test_anchor` |
+| E3-2: no stage on a ledger that does not verify | Implemented | `LedgerAnchor.__init__`, and each refresh | `test_anchor` |
+| E3-3: an absent ledger is distinguishable | Implemented | Unanchored records carry `anchored=False` | `test_anchor` |
+| E3-4: refresh before the breaker check | Implemented | `LedgerAnchor.observe`, `guard_commit`, `joined_commit` | `test_core_guarantees` |
+| E3-5: anchor monotonicity | Implemented | `EscrowChain.verify_anchors`; the daemon gives each engine a chain of its own so it holds | `test_tamper_evidence`, the soak |
+| E3-6: reverse anchoring | Implemented | The memo `interlock:<record>` on a free `ANCHOR` or on the plan's spend | `test_anchor`, `test_shared_transaction` |
+| E3-7: external transparency log | Unimplemented | Out of scope, as stated | — |
+| E3-8, E3-9: a halted scope does not commit; checked right before commit | Implemented | `LedgerAnchor.guard_commit`; on PostgreSQL the breaker is read under the ledger's writer lock inside the stage's transaction | `test_core_guarantees`, `test_shared_transaction` |
+| E3-10: a join key both ways | Implemented with receipts | The spend's memo names the commit intent; the plan's ARC1 receipt names its terminal record and the AgentGov transaction | `test_shared_transaction`, `test_settlement` |
+| E3-11: no row data in the chain | Implemented | Records carry digests only | `test_engine` |
+
+## Non-transactional sinks (section 4.4)
+
+| Req | Status | Where | Proven by |
+|---|---|---|---|
+| E4-1: a relay reads committed rows only, never inside a stage | Implemented | `interlock relay`, or a relay service in the daemon: its own role and connection, either way. In the daemon it shares the OS process with the engines, not a stage | `test_relay`, `test_relay_crash`, `test_daemon` |
+| E4-2: idempotency key from `(plan_id, effect_id)` | Implemented | `types.outbound_key`; Stripe honours it, and a relay's every attempt sends it | `test_relay`, `test_stripe`, the soak |
+| E4-3: the undo written down before the do | Implemented | The compensation is part of the request, hashed into the plan at admission and committed in its outbox row | `test_outbound`, `test_operators` |
+| E4-4: compensations in reverse topological order | Implemented | `Operator.compensate` | `test_operators` |
+| E4-5: a stale compensation is a decision | Implemented | Past its original's deadline, only with `late=True`, signed | `test_operators` |
+
+## Beyond sections 1 to 4
+
+| Capability | Where | Proven by |
+|---|---|---|
+| The outbox on both stores: requests adjudicated with their rows (`CrossEffectAgreement`, `SinkAllowlist`, `OutboundCount`), delivered at least once and absorbed to once by the vendor's key, every attempt in a hash-linked delivery log | `outbound`, `outbound_checks`, `relay`, `deliveries` | `test_outbound`, `test_outbound_checks`, `test_relay`, `test_deliveries`, `test_sqlite_outbox`, `test_outbox_postgres`, `test_relay_crash` |
+| Typed sinks: Stripe and SendGrid, their schemas, their adapters, their replies classified | `stripe`, `sendgrid` | `test_stripe`, `test_sendgrid`, `test_typed_config` |
+| Every outcome signed by its relay; a row no registered relay signed is named | `attestations` | `test_attestations` |
+| Operators: every action signed in two phases, anchored in AgentGov; a signed install vouches for the registry; actions killed between phases resolved | `operators`, `records` | `test_operators`, `test_operator_crash`, `test_records` |
+| Settlement: delivery receipts bound to action receipts; compensations credited at the registry's price, once, to the scope that paid; settled again, nothing twice | `settlement` | `test_settlement`, `test_settlement_crash` |
+| Rate windows: exact under concurrency, per scope, tenant or globally, over requests, request sums, row sums or plans | `windows`, `postgres`, `sqlite_outbox` | `test_windows`, the soak |
+| The zero-trust inbox: vendors' signatures, an append-only attested log per source, facts bound only to relay-attested deliveries, consumed at most once, held to what they say (`FactAgreement`) | `inbox`, `inbox_store`, `inbox_sql` | `test_inbox`, `test_inbox_engine`, `test_inbox_vendors`, `test_inbox_cli`, `test_inbox_crash`, `test_fact_agreement` |
+| Compaction: final, settled history pruned under signed, anchored checkpoints; folds, tombstones and archives prove what went; a vacuum reads one snapshot of a live database | `vacuum`, `compaction` | `test_vacuum`, `test_vacuum_inbox`, `test_vacuum_crash`, `test_upgrade_v5` |
+| The runtime, configured whole, and the daemon: every part in one process, restarted on failure, stopped in order, healthy or not at `/healthz` | `runtime`, `supervisor`, `daemon`, `cli` | `test_runtime`, `test_supervisor`, `test_daemon` |
+| The whole, under load | `scripts/live_stress_test.py` | `test_soak` (PostgreSQL), and the script run for minutes |
+| Checked repair, refusal feedback, budgeted recovery, extension quotes | `repair`, `feedback`, `recovery`, `extension` | `test_repair`, `test_feedback`, `test_recovery`, `test_extension` |
 
 ## Partial
 
-- **Diff completeness is scoped to `TableSpec`.** A statement that writes a
-  table outside it is denied by SQLite's authorizer when the statement is
-  prepared (unless `enforce_table_access=False`). A foreign-key action that
-  would reach an unobserved table is refused before a row changes (see
-  `cascade.analyze_cascades`), unless the operator acknowledged that table; an
-  acknowledged cascade runs unmeasured and the stage's `STAGE_OPENED` record
-  names the gap. A schema trigger that writes an unobserved table is denied by
-  the authorizer, like the statement that fired it.
-- **`no_ddl` is enforced on the statement, not on `Effect.kind`.** The
-  checker still reads the agent-supplied kind, but `SqliteSubstrate` vets the
-  statement's leading verb through `reject_reason()`, which `admit()` calls
-  before a connection is opened and `apply()` re-checks for callers that skip
-  the engine. A verb allowlist is not a SQL parser: it says nothing about which
-  table a permitted statement reaches.
-- **`blast_radius` counts capture rows, not distinct rows.** A row mutated twice
-  inside one plan contributes 2. The bound is therefore conservative for row
-  count and is not a count of affected rows.
-- **Chain durability is opt-in.** `EscrowEngine` defaults to an in-memory
-  `EscrowChain`, which does not survive the process. With a path, the intent is
-  write-ahead and fsynced, and `EscrowEngine.recover()` (run by `EscrowRuntime`
-  at startup) resolves every open intent from the substrate's commit marker.
-  An intent written before v0.1.2, or by a substrate without markers, carries
-  no armed marker and stays open for an operator. The marker table is not
-  pruned. `tests/test_crash_consistency.py` kills a real process with
-  `SIGKILL` at each step of a PostgreSQL commit, and at random instants, and
-  checks what recovery appends against the database.
-- **The pre-commit breaker check across processes.** In audit mode no lock
-  spans the governor's database and the substrate, so a trip the governor
-  commits between the check and the commit cannot be excluded. When one is
-  observed immediately after the commit, the `COMMITTED` record says so.
+- **Diff completeness is scoped to the observed tables.** A statement that
+  writes any other table is denied before it runs, on SQLite by the authorizer
+  and on PostgreSQL by the stage role's grants. A foreign-key cascade into an
+  unobserved table is refused unless acknowledged, and an acknowledged one is
+  named in the stage's `STAGE_OPENED` record.
+- **`no_ddl` is enforced on the statement's verb, not parsed SQL.** A verb
+  allowlist says nothing about which table a permitted statement reaches.
+- **`blast_radius` counts captured mutations.** A row changed twice counts
+  twice: the bound is conservative.
 - **The escrow chain is keyless.** Anyone who can write the file can recompute
-  the chain from start to finish and it verifies. A reverse anchor in a
-  governed AgentGov is one copy of its head outside the file; with receipts on,
-  each adjudicated plan's signed receipt names its terminal record, under a key
-  the file does not hold. The chain's own records stay unsigned.
-  `tests/test_tamper_evidence.py` rewrites the chain and checks that both catch
-  it, from the first rewritten record on. No packaged command checks those
-  links yet.
+  it. A reverse anchor in a governed AgentGov holds a copy of its head outside
+  the file, and each plan's signed receipt names its terminal record; the
+  chain's own records stay unsigned.
+- **The breaker across processes in audit mode.** No lock spans the governor's
+  database and the substrate, so a trip committed between the check and the
+  commit cannot be excluded; the `COMMITTED` record says so when it is seen
+  after. Governed and same-transaction modes exclude it.
+- **One daemon process.** Engines, the settler and the receipt log they share
+  run in one process; several daemons need chain files and receipt logs of
+  their own. Relays, inboxes and vacuums already share work across processes.
+- **Compensation leaves the escrow chain as it was** (E1-6): its evidence is in
+  the delivery logs, the operator log, the receipt log and the ledger.
 
 ## Unimplemented
 
-- **Logical decoding.** Section 4.2's alternative to trigger capture is not
-  used; `PostgresSubstrate` captures with triggers.
-- **`E1-5`: expiry to `ORPHANED`.** `StageState.ORPHANED` and
-  `RecordType.ORPHANED` exist and are never assigned. Expiry raises
-  `StageExpiredError` from `apply()` and `commit()`; there is no reaper, and
-  `diff()` does not check expiry at all. A stage whose process dies before
-  its commit intent is left with no terminal record. It never committed (no
-  intent, no commit), and the crash tests check that its rows and marker are
-  absent, but nothing records it as orphaned or aborted.
-- **`COMPENSATED` and the compensation path.** `Compensation` is validated at
-  admission and never executed. `RecordType.COMPENSATED` is never appended.
-- **`schema_allowlist`.** `TableAllowlist` operates on table names;
-  `diff.schemas_touched` does not exist.
-- **Cross-substrate plans (2PC / saga).** `admit()` now refuses a plan whose
-  effects name a substrate other than the engine's, so such a plan is rejected
-  rather than misrouted, but nothing coordinates two substrates.
-- **`distribution_shift`.** No historical store, no MAD computation.
-- **Transactional outbox and relay** (section 4.4): partial. On PostgreSQL an
-  `ENQUEUE` effect is written to `interlock.outbox` inside the stage, through a
-  function gated by a per-stage token, and commits with the stage's rows and
-  marker or not at all. Its idempotency key derives from `(plan_id, effect_id)`
-  (E4-2). Its compensation is part of the request, so it is hashed into the plan
-  the chain records at admission and committed in the outbox row with the do
-  (E4-3). `interlock relay` is a separate process that reads committed rows only
-  (E4-1) and delivers at least once under that key, recording every call and
-  every change of state in a hash-linked delivery log; it holds a message whose
-  scope's breaker has tripped. No compensation is applied yet (E4-4, E4-5), and
-  operator actions are recorded in the delivery log, not the escrow chain. SQLite
-  refuses the effect. See `docs/OUTBOX_DESIGN.md`.
-- **Deterministic replay.** Nothing captures or re-injects substrate-assigned
-  values (`now()`, sequences, `random()`), so a recorded verdict cannot be
-  re-derived by re-running the plan.
+- **E1-5: expiry to `ORPHANED`.** `StageState.ORPHANED` and
+  `RecordType.ORPHANED` are never assigned. A stage past its bound fails with
+  `StageExpiredError`, and the database's own timeouts end it; there is no
+  reaper, and a stage whose process died before its commit intent has no
+  terminal record. The crash tests check that its rows and marker are absent:
+  it never committed.
+- **`schema_allowlist` and `distribution_shift`.** The first needs
+  `diff.schemas_touched`; the second a historical store and a calibrated
+  threshold.
+- **Cross-substrate plans.** A plan naming another substrate is refused at
+  admission; nothing coordinates two.
+- **Logical decoding.** Capture is by triggers.
+- **Deterministic replay.** Nothing captures or re-injects `now()`, sequences or
+  `random()`.
+- **E3-7: an external transparency log.**

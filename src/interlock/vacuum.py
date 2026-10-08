@@ -66,6 +66,7 @@ from interlock.deliveries import (
     LoggedMessage,
     OutboxOperations,
     _verify_one,
+    consistent,
     parse_instant,
     verify_delivery_log,
 )
@@ -147,7 +148,10 @@ def survey(
     margin: timedelta = timedelta(hours=1),
     inbox: Keyring | None = None,
 ) -> Survey:
-    """Verify the outbox, then collect what a vacuum may prune.
+    """Verify the outbox, then collect what a vacuum may prune. Everything is
+    read as of one state of the database (:func:`~interlock.deliveries.consistent`):
+    what relays, the inbox and the settler commit meanwhile is for the next
+    vacuum, and never looks like a log or a fact out of place.
 
     :param records: The operator log's records, as read.
     :param operators: Every operator's public key.
@@ -161,6 +165,30 @@ def survey(
         are verified, and their prefixes pruned, only under them. Without,
         the inbox stays.
     """
+    with consistent(outbox):
+        return _survey(
+            outbox,
+            records=records,
+            operators=operators,
+            relays=relays,
+            windows=windows,
+            retain=retain,
+            margin=margin,
+            inbox=inbox,
+        )
+
+
+def _survey(
+    outbox: OutboxOperations,
+    *,
+    records: Sequence[Any],
+    operators: Keyring,
+    relays: Keyring,
+    windows: Sequence[RateWindow],
+    retain: timedelta,
+    margin: timedelta,
+    inbox: Keyring | None,
+) -> Survey:
     from interlock.attestations import verify_attestations
     from interlock.operators import legacy_vouch, verify_operators
 

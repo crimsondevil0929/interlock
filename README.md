@@ -49,7 +49,7 @@ from another (would a *real* model produce it?) -- but it means demo.py cannot a
 second question, and an adversarial audit of this project found that a real, current
 Claude model declines the exact injected instruction shown above, across several
 realistic framings of the same prompt injection. For the first question answered against
-a real model instead of a scripted stand-in, see [`scripts/live_stress_test.py`](scripts/live_stress_test.py):
+a real model instead of a scripted stand-in, see [`scripts/live_gauntlet.py`](scripts/live_gauntlet.py):
 eight scenarios, a real `anthropic.Anthropic` client, real governed spend, and verdicts the
 script itself says are not reproducible, because what the model chooses to do is not.
 
@@ -125,6 +125,11 @@ print(result.committed, result.blocked_by)
 
 That stages the statement in a real transaction, measures what the database
 actually did, adjudicates the measurement, and commits or rolls back.
+
+The runtime takes every option the engine does: `substrate=` in place of the
+path (any substrate, PostgreSQL included), `windows=`, `inbox=`, `sinks=`, and
+`anchor=` for claim and settle. `EscrowRuntime.from_config(config, scope_id=...)`
+builds the one `interlock.toml` describes.
 
 **Placeholders must be named.** `Effect.parameters` is a `Mapping`, so the
 driver binds by name: write `:id`, never `?`. A positional placeholder is
@@ -1449,6 +1454,101 @@ what the database holds, and deletes; the database refuses any other delete. Aft
 every verifier passes, accounting for pruned history by its tombstones and cuts, and a
 window that would reach back past pruned history fails closed.
 
+## The daemon: every part in one process
+
+`interlock daemon` runs the engines that execute your agents' plans beside the relays, the
+inbox, the settler and the vacuum: one process, one asyncio event loop, every database call
+on a thread of its own part's (`docs/EPIC6_DESIGN.md`). Each part connects as its own role,
+from the sections `interlock.toml` already has, and these:
+
+```toml
+[engine]                              # the engines executing agents' plans
+workers = 4                           # plans staged at once (SQLite: one)
+database = "postgresql://interlock_agent@db/app"   # the stage role
+chain = "escrow.chain"                # worker n writes escrow-<n>.chain
+settle_cost = "0.01"
+ledger = "postgresql://owner@db/app"  # AgentGov in the same database...
+same_transaction = true               # ...settles each plan with its commit
+conflict_retries = 16                 # a plan that lost a race is staged again
+
+[receipts]                            # one receipt log, the engines' and the settler's
+log = "receipts.jsonl"
+key = "receipts.key"
+
+[settler]
+database = "postgresql://interlock_settle@db/app"
+every_seconds = 5
+
+[vacuum]                              # the daemon's own vacuums
+every_seconds = 300
+key = "vacuum.key"                    # an operator's key, in [operators.keys]
+database = "postgresql://owner@db/app"
+
+[daemon]
+drain_timeout_seconds = 30            # each shutdown step's bound
+```
+
+Your agents and their policy come in as an application: a function that takes the
+configuration and returns an `Application` of checkers and agents. An agent is a coroutine
+taking an `AgentContext`, or a plain function, run on a thread of its own:
+
+```python
+from interlock import AgentContext, Application, BlastRadius, TenantIsolation
+
+
+async def support(ctx: AgentContext) -> None:
+    while not ctx.stopping:
+        for fact in await ctx.facts("support-agent"):
+            plan = ctx.plan("support-agent", intent=f"react to {fact.kind}")
+            ...  # .consume(fact), then the writes it justifies
+            await ctx.execute(plan.build())
+        await ctx.sleep(1.0)
+
+
+def build(config: object) -> Application:
+    return Application(checkers=[BlastRadius(50), TenantIsolation()], agents=[support])
+```
+
+```bash
+interlock daemon --config interlock.toml --app myapp.agents:build
+```
+
+A plan that loses a race for a row or a window key is staged again, with jittered backoff.
+A part that fails is reopened after a backoff that doubles. `GET /healthz` on the inbox's
+port answers `200` while every part runs, `503` otherwise, with each part's counters.
+`SIGTERM` stops it in order, every step bounded: the agents; the engines (queued plans run
+until the deadline, and a running stage always finishes); the inbox, then one last match;
+the relays; the settler, one last pass; a vacuum in progress. A second signal skips the
+drains and gives the parts a second to close, and the next start recovers as after a
+crash. Without `--app`, the daemon runs the relays, the inbox and the vacuum.
+
+In a process of your own, `build_supervisor(config, application)` returns the same
+`InterlockSupervisor`, to run on your event loop.
+
+### The soak
+
+`scripts/live_stress_test.py` runs the whole daemon for minutes against a live PostgreSQL,
+in a container it starts or on a server you name:
+
+```bash
+uv run python scripts/live_stress_test.py --docker --minutes 5
+uv run python scripts/live_stress_test.py --dsn postgresql://admin:pw@localhost:5432/postgres
+```
+
+Agents keep plans in flight: checkouts that insert an order and charge for it, carrying the
+refund that undoes it; reconciliations of what the payment API's webhooks say; notes on
+rows every agent contends for; and, now and then, a plan that must be refused. A fake
+payment API answers in Stripe's shape, honours idempotency keys, and fails on purpose:
+500s after acting, 429s, replies slower than the relay waits. Its webhooks come back
+signed, duplicated, early, about objects nobody created, and forged. An operator refunds
+paid orders, every action signed. Then the soak proves, from the database, the ledger and
+the logs: no deadlock; lock waits within their bounds and every lost race retried to an
+outcome; every rate window within its limit at every instant of its history; the ledger
+balanced to the cent, each plan charged once and each refund credited once; one charge per
+order and one receipt per delivery; no forgery accepted; the vacuum keeping the outbox
+bounded as it runs; every verifier passing after; and a graceful stop, a second daemon
+recovering nothing. `tests/test_soak.py` runs it for half a minute in the test suite.
+
 ## Unrecorded writes
 
 The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
@@ -1579,7 +1679,8 @@ against the shipped code, not inferred.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
 
-[`docs/ESCROW_SPEC.md`](docs/ESCROW_SPEC.md) is the interface contract, with a conformance
+[`docs/ESCROW_SPEC.md`](docs/ESCROW_SPEC.md) is the interface contract, the architecture
+built on it (§5: components, data flows, roles, evidence, concurrency), and a conformance
 section listing implemented, partial and unimplemented requirements.
 
 ## Install

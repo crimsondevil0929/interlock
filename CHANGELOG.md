@@ -9,6 +9,80 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 6: the runtime daemon, and the system under load; `docs/EPIC6_DESIGN.md`)
+
+- **`EscrowRuntime`, configured whole.** `substrate=` takes any substrate in place of the
+  SQLite path, and `windows=`, `inbox=` (with `runtime.facts(scope)`), `sinks=`,
+  `receipts=` and `anchor=` reach the engine unchanged. `EscrowRuntime.from_config(config,
+  scope_id=...)` builds the runtime `interlock.toml` describes: its substrate, tables,
+  acknowledged cascades, sinks, windows, inbox keys, ledger (claim and settle with
+  `[engine] same_transaction`), chain and receipt log.
+- **`InterlockSupervisor`** (`interlock.supervisor`): every part of Interlock in one
+  process, on one asyncio event loop. An `EnginePool` of workers, each with its own
+  engine, substrate, governor and escrow chain, retrying a plan that lost a race with
+  jittered backoff; `RelayService`, `InboxService` (the HTTP receiver and the matcher),
+  `SettlerService` and `VacuumService`, each stepping on a thread pool of its own and
+  reopened after a doubling backoff when it fails. Agents are coroutines or threads
+  given an `AgentContext` (`execute`, `facts`, `plan`, `sleep`, `stopping`). Shutdown runs
+  in order with every step bounded, and never cuts a stage, a delivery, a webhook or a
+  vacuum in half; a second signal skips the drains, and gives the parts a second to
+  close. `status()` and `GET /healthz` report every part.
+- **`interlock daemon`** (`--app module:callable`, `--listen`, `--relay-key`,
+  `--inbox-key`), and `build_supervisor(config, application)`: the supervisor
+  `interlock.toml` describes, each part connecting as its own role. New sections:
+  `[engine]` (workers, the stage role's database, the chain, the settle cost, the ledger,
+  `same_transaction`, `conflict_retries`, stage and lock timeouts), `[receipts]`,
+  `[settler]` and `[daemon]`; `[vacuum]` gains `every_seconds`, `retain_seconds`,
+  `database` and `key`.
+- `InboxServer`: the inbox's HTTP server, which `interlock inbox serve` and the daemon
+  share, with `GET /healthz`. `Settler(chain=[...])` reads several engines' chains.
+- `deliveries.consistent(source)`: every read inside sees one state of the database (a
+  `REPEATABLE READ` snapshot on PostgreSQL, a read transaction on SQLite). The vacuum's
+  survey and every verifier read through it.
+- **The soak**, `scripts/live_stress_test.py`: the whole daemon for minutes against a live
+  PostgreSQL (`--docker` or `--dsn`), under a faulty Stripe-shaped API, duplicated, early,
+  noisy and forged webhooks, contending agents and a refunding operator. It proves nine
+  claims from the database, the ledger and the logs, and exits non-zero on any that fails.
+  `tests/test_soak.py` runs it scaled down; `tests/test_daemon.py` runs every part from
+  `interlock.toml` on SQLite, and `interlock daemon` until `SIGTERM`.
+- `docs/ESCROW_SPEC.md`: §5, the architecture as built, and its conformance section,
+  rewritten for 0.5.0, requirement by requirement.
+
+### Fixed (Epic 6: found by the soak and by CI, each with a test that fails without its fix)
+
+- **The vacuum refused nearly every run under live webhooks.** Its survey read the
+  inbox's events, heads, facts and the outbox in separate statements; a fact recorded in
+  between was read without its event, and the survey took it for tampering. It now
+  reads one snapshot, as do `verify_inbox`, `verify_settlements`, `verify_operators` and
+  `verify_attestations`, and the SQLite store's `snapshot()`.
+- **Compensations settled for good without their credit.** The settler read its own
+  governor's view of a shared PostgreSQL ledger, as of when it opened, and found no
+  charge for plans other governors had charged since. It refreshes before every pass,
+  and a charge committed as a claim and not yet booked holds the compensation until it
+  is, instead of counting as no charge.
+- **Deliveries settled for good without their receipt.** In one process a relay can
+  deliver, and the settler run, between a plan's commit and its action receipt. A
+  receipt the commit names and the log does not hold yet now holds the delivery until it
+  is issued.
+- `OperatorLog` anchored records a second time from a stale view of a shared ledger. It
+  refreshes first; a ledger it cannot read leaves the records to the next open.
+- `[operators] ledger` took a keyword connection string for a file path.
+- The supervisor waited out its drain bound for queued plans no worker was left to take.
+- **The inbox's server could take half a minute to start.** `http.server` resolves the
+  address it binds to a name, which nothing reads; where the resolver times out (GitHub's
+  macOS runners: 35 seconds, in every new process), `interlock daemon` and `interlock
+  inbox serve` waited that long before taking a request. The server binds without the
+  lookup.
+
+### Changed (Epic 6)
+
+- The live-model gauntlet moved from `scripts/live_stress_test.py` to
+  `scripts/live_gauntlet.py`, unchanged; the soak took its name.
+- `EscrowRuntime.substrate` is typed `ShadowSubstrate`, since the runtime takes any.
+- The daemon's vacuum keeps one governor between runs, caught up at the start of each,
+  instead of reading the whole ledger every run; a run that finds the operator log in use
+  tries again after a second.
+
 ### Added (Epic 5: the zero-trust inbox, cryptographic compaction, the last checkers; `docs/EPIC5_DESIGN.md`)
 
 - **The vacuum** (`interlock.vacuum.Vacuum`, `interlock vacuum`; schema version 5). Prunes

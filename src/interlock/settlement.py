@@ -59,6 +59,7 @@ from agentgov.receipts import (
     OutcomeStatus,
     ReceiptLog,
 )
+from agentgov.storage import JoinableStore
 
 from interlock.attestations import attestation_of
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
@@ -66,6 +67,7 @@ from interlock.deliveries import (
     LogEvent,
     LoggedMessage,
     Settled,
+    consistent,
     settlements,
     verify_delivery_log,
 )
@@ -116,7 +118,9 @@ class Settler:
     :param receipts: The engine's receipt issuer. Its log holds the plans'
         action receipts; delivery receipts are issued into it.
     :param chain: The engine's escrow chain, or its file: which receipt each
-        committed plan was issued, and which records its charge names.
+        committed plan was issued, and which records its charge names. Several
+        engines' (the daemon's workers, each writing a chain of its own), as a
+        sequence of chains or files.
     :param relays: The relays' public keys (``[relays.keys]``).
     :param ledger: The AgentGov ledger the engine charges plans to. Without
         it, nothing is credited.
@@ -149,7 +153,7 @@ class Settler:
         outbox: object,
         *,
         receipts: ReceiptIssuer,
-        chain: EscrowChain | str | Path,
+        chain: EscrowChain | str | Path | Sequence[EscrowChain | str | Path],
         relays: Keyring,
         ledger: BudgetManager | None = None,
         operator_log: str | Path | None = None,
@@ -174,6 +178,10 @@ class Settler:
         due = [m for m in messages if m.state == "delivered" and m.message_id not in settled_before]
         if not due:
             return SettlementReport((), 0, 0, ())
+        if self._ledger is not None:
+            # A governor's view of a shared ledger is as of its last read or
+            # write: the charges other governors booked since are not in it.
+            self._ledger.refresh()
         context = _Context.build(
             messages,
             events,
@@ -233,6 +241,16 @@ class Settler:
             raise _UnsettledError(
                 f"its row names plan {message.plan_id}, which its attested idempotency key "
                 f"was not derived from: not settled"
+            )
+
+        # A plan's commit is recorded before its action receipt is issued: in
+        # one process a relay can deliver, and this run, in between. A receipt
+        # the commit names is coming; until the log holds it, nothing is settled.
+        pending = context.receipt_pending(message.plan_id)
+        if pending is not None and str(message.message_id) not in context.receipts:
+            raise _UnsettledError(
+                f"its plan's action receipt {pending}, which the plan's commit names, is not "
+                f"in the receipt log yet: not settled until it is"
             )
 
         # Whether a compensation earns its credit is decided before anything is
@@ -366,6 +384,11 @@ class Settler:
             )
         charge = context.charge(original)
         if charge is None:
+            if context.charge_claimed(original):
+                raise _UnsettledError(
+                    f"plan {original.plan_id}'s charge is claimed and not booked yet: not "
+                    f"settled until it is"
+                )
             return f"the ledger holds no charge for plan {original.plan_id}"
         room = charge.amount - context.credited(original.plan_id)
         if sink.cost_per_call > room:
@@ -400,9 +423,14 @@ class Settler:
     # -- reading what the engine wrote --------------------------------------------
 
     def _chain_records(self) -> tuple[EscrowRecord, ...]:
-        if isinstance(self._chain, EscrowChain):
-            return self._chain.records()
-        return EscrowChain.load(self._chain).records()
+        chains = [self._chain] if isinstance(self._chain, EscrowChain | str | Path) else self._chain
+        records: list[EscrowRecord] = []
+        for chain in chains:
+            if isinstance(chain, EscrowChain):
+                records += chain.records()
+            else:
+                records += EscrowChain.load(chain).records()
+        return tuple(records)
 
     def _operator_records(self) -> _Operators | None:
         if self._operator_log is None or self._operators is None:
@@ -442,6 +470,9 @@ class _Context:
     spends: dict[str, LedgerEntry]
     """The ledger's first spend under each memo, in whatever scope it was
     charged to."""
+    claims: frozenset[str]
+    """The memos of the settlement claims the ledger holds and has not booked
+    yet: charges committed with their plans, and not redeemed into the chain."""
     log: ReceiptLog
     operators: _Operators | None
     legacy: Any
@@ -474,7 +505,10 @@ class _Context:
         credits: dict[uuid.UUID, LedgerEntry] = {}
         plan_credits: dict[str, Decimal] = {}
         spends: dict[str, LedgerEntry] = {}
+        claims: frozenset[str] = frozenset()
         if ledger is not None:
+            if isinstance(ledger.store, JoinableStore):  # only a shared ledger holds claims
+                claims = frozenset(claim.memo for claim in ledger.pending_claims())
             for entry in ledger.audit_trail():
                 if entry.entry_type is EntryType.SPEND:
                     spends.setdefault(entry.memo, entry)
@@ -501,10 +535,19 @@ class _Context:
             plan_receipts=plan_receipts,
             plan_records=plan_records,
             spends=spends,
+            claims=claims,
             log=log,
             operators=operators,
             legacy=legacy,
         )
+
+    def receipt_pending(self, plan_id: str) -> str | None:
+        """The action receipt the plan's commit record names, while the log
+        does not hold it yet."""
+        receipt_id = self.plan_receipts.get(plan_id)
+        if receipt_id is None or self.log.index_of(receipt_id) is not None:
+            return None
+        return receipt_id
 
     def action_receipt(self, plan_id: str) -> ActionReceipt | None:
         """The action receipt the plan that committed was issued, if the log holds it."""
@@ -527,6 +570,14 @@ class _Context:
             if memo in self.spends
         ]
         return min(found, key=lambda entry: entry.sequence, default=None)
+
+    def charge_claimed(self, original: LoggedMessage) -> bool:
+        """Whether the plan's charge is a claim the ledger has not booked yet:
+        committed with the plan, redeemed by its engine or by recovery soon."""
+        return any(
+            f"interlock:{h[:16]}" in self.claims
+            for h in self.plan_records.get(original.plan_id, ())
+        )
 
     def credited(self, plan_id: str) -> Decimal:
         return self.plan_credits.get(plan_id, Decimal(0))
@@ -642,10 +693,11 @@ def verify_settlements(
     and what it compensates.
     """
     source = settlements(outbox)
-    rows = dict(source.settlements())
-    messages, _ = source.snapshot(None)
+    with consistent(source):  # one state of the database, whatever settles meanwhile
+        rows = dict(source.settlements())
+        messages, _ = source.snapshot(None)
+        pruned = source.compacted()
     by_id = {m.message_id: m for m in messages}
-    pruned = source.compacted()
     for message_id, tombstone in pruned.items():
         if tombstone.state == "delivered" and message_id not in rows:
             rows[message_id] = Settled(

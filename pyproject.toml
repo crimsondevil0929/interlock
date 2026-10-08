@@ -54,7 +54,7 @@ dev = [
     # Property tests: the zero-leak guarantee on agent feedback is a property
     # over every plan and diff, not a list of examples.
     "hypothesis>=6.100",
-    # scripts/live_stress_test.py only. Not a runtime dependency: nothing in
+    # scripts/live_gauntlet.py only. Not a runtime dependency: nothing in
     # src/ imports it, and the library never talks to a model provider.
     "anthropic>=1.0.0",
     "cryptography>=42",
@@ -64,6 +64,9 @@ dev = [
 minversion = "8.0"
 addopts = "-ra --strict-markers --strict-config"
 testpaths = ["tests"]
+# A test still running after five minutes has every thread's stack dumped, so
+# a hang shows where it is.
+faulthandler_timeout = 300
 
 [tool.ruff]
 line-length = 100
@@ -96,6 +99,10 @@ ignore = ["S101"]
 # into constant SQL; every value is a bound parameter.
 "src/interlock/inbox_sql.py" = ["S608"]
 "src/interlock/inbox_store.py" = ["S608"]
+# The soak draws its workload from seeded generators, so a run can be
+# reproduced; every secret it makes comes from `secrets` (S311). It runs
+# docker by name, as its operator would (S603, S607).
+"scripts/live_stress_test.py" = ["S311", "S603", "S607"]
 
 [tool.mypy]
 python_version = "3.11"
