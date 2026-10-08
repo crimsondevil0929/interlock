@@ -1,6 +1,7 @@
 # Epic 7: observability, trace context and metrics
 
-**Status: design** on `feat/epic7-observability`. Builds on
+**Status: built** on `feat/epic7-observability`. §9 records where the build departs from
+this design, what it measured, and what the soak proved. Builds on
 [`EPIC6_DESIGN.md`](EPIC6_DESIGN.md): the daemon runs every part of Interlock in one
 process, and this epic makes what it does visible from outside it. Four parts:
 
@@ -317,3 +318,122 @@ with metrics on:
 - **Sampled gauges need a role** on PostgreSQL that may read the window ledger (§2.4).
 - **Other parts' connections** (relays', inbox's, settler's) keep their defaults: they
   hold no locks while they wait, so a pool's queue only delays them.
+
+## 9. As built
+
+Where the build departs from the design above, or measured what it could only predict.
+
+### 9.1 Trace context (§1)
+
+- **Pinned, traced or not.** `tests/test_trace.py` holds golden vectors computed on the
+  code before this epic: a plan's hash, a request's, the outbox genesis, a delivery-log
+  event, a relay's ARC1 attestation, an inbound event, its statement and a fact's. Each is
+  recomputed with no context and with two different ones, and none moves.
+- **An outbox not yet upgraded.** PostgreSQL's substrate refuses to stage on an
+  installation older than version 6, as it has at every version: `interlock install`
+  first. SQLite's commits a traced plan with its context dropped, and logs a warning:
+  nothing the plan does depends on its trace.
+- **The relay reads context once per claim**, for the batch it leased; a relay of
+  version 5 on an upgraded database reads none and sends none, and is otherwise unchanged.
+
+### 9.2 The pool (§3), corrected
+
+- **The deadlock ended sooner, and worse, than §3.1 says.** Measured against PgBouncer 1.26
+  in transaction mode, on the code before step 4: a stage left no connection held its
+  locks for 10.1 seconds and failed with `SubstrateUnavailableError`, which nothing
+  retries. Its own `idle_in_transaction_session_timeout` (`max_stage_seconds`, 10 by
+  default) had PostgreSQL end its transaction while it waited; with a `max_stage_seconds`
+  above `query_wait_timeout`, the pooler's timeout ends the wait first, with the same
+  error. The same scenario after: `PoolExhaustedError` in 2.3 seconds, and the plan
+  staged again.
+- **The session leak was real.** The old windows' read ran `SET statement_timeout` as an
+  autocommit statement: behind the same PgBouncer it stayed on a pooled server
+  connection, `10s`, for whichever client was served next. After: every server connection
+  as the pool found it.
+- **PgBouncer does not answer the cancel (§3.2).** It accepts a cancel request for a
+  client it is queueing and leaves the client queued; only the socket's shutdown ends the
+  wait. The grace between the two is a quarter second, not a second, so an acquisition
+  waits at most the pool timeout and a quarter second. The fake pooler in
+  `tests/fakepg.py` is tested both ways, answering the cancel and ignoring it.
+- **Facts are read unbounded.** §3.2 says facts read for an agent take the bounded path.
+  They hold no locks while they wait, so a full pool only delays them; bounding them
+  would only turn a delay into an error for the agent to retry. They wait their turn.
+- **Statements go unnamed.** With `prepare_threshold=None` nothing is prepared on the
+  server, but psycopg then sends a statement without parameters by the simple protocol,
+  which runs `UPDATE ...; COMMIT` whole. An agent's statement is sent with `binary=True`,
+  which keeps it on the extended protocol (an unnamed statement), and the server still
+  refuses a string of two.
+- **Sizing.** With the stage role's pool at least one larger than `[engine] workers`, a
+  windows' read waits at most for other windows' reads, each a few milliseconds, never for
+  a commit: one worker on two server connections staged every plan without a retry. A
+  pool no larger than the workers is slow, never stuck: two workers on two connections
+  lost races to the pool, were staged again, and committed every plan. CI runs these
+  tests behind a PgBouncer pinned by digest.
+
+### 9.3 Metrics (§2)
+
+- **Overhead (§2.5).** `scripts/metrics_overhead.py`: the registry's calls for one plan
+  cost 1.8 µs, and PostgreSQL's two waits 2.8 µs more, timed alone; 0.17% and 0.25% of a
+  plan on this machine. Through the supervisor, a real SQLite stage per plan, 15
+  alternating rounds of 1,000 plans each way: −0.9% in the median of the paired rounds,
+  where one round differs from the next by ±25%. Within the noise.
+- **The peak is kept to the second.** `interlock_wait_max_seconds` keeps the largest wait
+  of each second, at most 61 per series, where the first build kept every observation for
+  a minute: 60,000 of them per series at 1,000 plans a second.
+- **Trace context is counted for webhooks taken.** `interlock_webhook_traceparent_total`
+  counts the webhooks the inbox answered 200, by what they carried; an unverified
+  request's headers are anyone's, and would let anyone move the count.
+- **An unknown source is `_unknown`.** The path names the source, and the path is the
+  sender's: a label taken from it would let a sender add series.
+
+### 9.4 The soak (§5)
+
+The vendor sends, on each object's webhooks, the context of the call that made the
+object, continued (`echo`, 45%); a trace of its own (`foreign`, 15%); a malformed one
+(`invalid`, 5%); or none, as Stripe does (35%). The claim **trace context survives**
+checks every call the payment API saw, every refund against its charge, every fact the
+agents consumed against the four cases, every consuming plan, and the trace rows still in
+the database; **metrics agree** checks every scrape as Prometheus would read it and the
+settled daemon's figures against the run's own counts.
+
+Run for five minutes in a `postgres:16` container (`--docker`: 4 agents with 6 plans in
+flight each, 8 engines, 3 relays), on a machine busy with other work, every claim held:
+
+- 3,286 plans; 1,120 calls to the payment API, each carrying one context, its plan's: 994
+  charges their checkout's, 126 refunds their charge's.
+- 1,120 facts consumed, each continuing its delivery's trace: 519 under the vendor's
+  continuation of ours, 152 against a trace of the vendor's own, 45 after a malformed one,
+  404 after none; each consuming plan a new span of the same trace.
+- 1,120 messages and 1,168 events seen in the database before the vacuum pruned them, each
+  beside the right context: 671 of the events kept one, exactly the webhooks that carried
+  a valid one.
+- 309 scrapes, every one well formed, all 39 families exported with data, no counter ever
+  falling, no window above its limit (both reached it), all 8 engines busy at the peak; the
+  settled daemon's figures what the run counted: 2,925 plans committed, 348 refused, 13
+  failed (fact replays refused at admission); 1,339 webhooks taken, 76 forgeries refused;
+  1,120 delivering calls, 1,120 receipts, 1,120 settlement lags; the database sampled as
+  the audit role every second without an error.
+
+`tests/test_soak.py` runs the same for half a minute in CI's PostgreSQL job.
+
+### 9.5 The mutation pass
+
+Each of 56 mechanisms was removed in turn (trace context 24, the pool 8, the metrics 24),
+and a test had to fail. Every target passed on the unmutated code first, and a mutation
+counted as killed only when a test failed or hung, never when pytest could not run: the
+pass's first run counted an interpreter outside the virtual environment, where nothing
+imports, as 56 kills.
+
+- **Found before the pass, from its plan:** nothing fed `parse_traceparent` an all-zero
+  trace or span id, and nothing called `interlock.outbox_trace` with a forged token from
+  an agent's statement. Both tests added.
+- **Found by the pass:** a repair proposal the engine's own search builds dropped nothing,
+  but nothing checked it kept the plan's context; only `subplan` was tested. Test
+  extended, mutation killed.
+- **Equivalent:** `SET` for `SET LOCAL` in the windows' read changes nothing, since the
+  read's transaction is never committed and closing the connection rolls a `SET` back
+  with it. The mutation that matters drops the transaction, as the code before step 4
+  did, and the test behind PgBouncer kills it: the `SET` commits on its own and stays on
+  the server connection.
+
+56 of 56 killed.

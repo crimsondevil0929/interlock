@@ -554,6 +554,11 @@ FORGED = (
     [
         (FORGED, "did not authorize an enqueue"),
         (
+            "SELECT interlock.outbox_trace('\\x00'::bytea, "
+            "'00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')",
+            "did not authorize a trace",
+        ),
+        (
             "INSERT INTO interlock.outbox (message_id) VALUES (gen_random_uuid())",
             "refused by the database",
         ),

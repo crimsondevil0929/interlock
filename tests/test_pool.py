@@ -88,7 +88,7 @@ def test_a_queued_read_fails_fast_and_retryably(answers_cancel: bool) -> None:
             pass
         took = time.monotonic() - began
         # Cancelled when the bound ran out; when the pooler kept holding the
-        # client, the socket shut a second later ended the wait.
+        # client, the socket shut a quarter second later ended the wait.
         assert fake.cancels == 1
         first = fake.queries[0]
     assert isinstance(raised.value, StageConflictError)

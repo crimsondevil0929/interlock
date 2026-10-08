@@ -61,6 +61,7 @@ from tests.outbox_env import (
     relay_signer,
     sms,
 )
+from tests.plans import sqlite_engine, support_batch
 from tests.settling import Bench
 from tests.test_operators import TYPED, charge, charged
 
@@ -105,7 +106,18 @@ def test_a_received_traceparent_is_read_as_a_receiver_must() -> None:
     assert parse_traceparent(TP) == TP
     assert parse_traceparent(f" \t{TP} ") == TP
     assert parse_traceparent(None) is None
-    for invalid in (TP.upper(), TP + "-x", TP[:-1], "ff" + TP[2:], "garbage", ""):
+    zero_trace = f"00-{'0' * 32}-00f067aa0ba902b7-01"
+    zero_span = f"00-4bf92f3577b34da6a3ce929d0e0e4736-{'0' * 16}-01"
+    for invalid in (
+        TP.upper(),
+        TP + "-x",
+        TP[:-1],
+        "ff" + TP[2:],
+        zero_trace,
+        zero_span,
+        "garbage",
+        "",
+    ):
         assert parse_traceparent(invalid) is None, invalid
     # A later version is read for its 00 fields, whatever it adds after them.
     assert parse_traceparent("cc" + TP[2:] + "-what-comes-next") == TP
@@ -132,10 +144,13 @@ def test_a_fact_continues_the_trace_of_the_plan_whose_delivery_it_is() -> None:
     assert fact_traceparent(None, None) is None
 
 
-def test_a_repair_keeps_the_trace_of_the_plan_it_repairs() -> None:
+def test_a_repair_keeps_the_trace_of_the_plan_it_repairs(back_office: str) -> None:
     plan = dataclasses.replace(_plan(), traceparent=TP)
     kept = frozenset({plan.effects[0].effect_id})
     assert subplan(plan, kept).traceparent == TP
+    # And the proposal the engine's own search makes: the same work, tried again.
+    repair = sqlite_engine(back_office).repair(dataclasses.replace(support_batch(), traceparent=TP))
+    assert repair.proposal is not None and repair.proposal.traceparent == TP
 
 
 # --------------------------------------------------------------------------

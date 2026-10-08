@@ -970,8 +970,9 @@ What differs from SQLite:
 
 - **Placeholders are psycopg's:** `%(name)s`, and `%%` for a literal percent sign.
 - **Only row statements stage:** `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`,
-  `WITH`, `VALUES`, `TABLE`. Each is sent as a prepared statement, which the server will
-  not split, so `UPDATE ...; COMMIT` fails instead of committing before adjudication.
+  `WITH`, `VALUES`, `TABLE`. Each is sent by the extended query protocol, as one unnamed
+  statement, which the server will not split, so `UPDATE ...; COMMIT` fails instead of
+  committing before adjudication. Nothing is prepared on the server.
 - **A cascade gate fires per row.** A delete of a gated row, or an update that changes a
   gated key, is refused inside the statement and PostgreSQL rolls the statement back,
   cascade included. SQLite refuses when it prepares the statement.
@@ -987,6 +988,17 @@ What differs from SQLite:
   first open. A connection lost with `COMMIT` in flight is answered from the same marker.
   PostgreSQL stops `statement_timeout` before running a commit's deferred triggers, so
   work there is bounded by the stage's `lock_timeout` and not by its statement bound.
+
+**Behind a connection pooler.** A stage holds its connection for its whole life, and reads
+the rate windows on a second, in `READ COMMITTED`: its own snapshot cannot see what other
+plans committed after it began. With PgBouncer in transaction mode, give the stage role's pool at least one connection more than
+`[engine] workers`: a windows' read then waits only for other windows' reads, never for a
+commit. A pool no larger is slow, never stuck. The second connection must be had within
+`[engine] pool_timeout_seconds` (the lock timeout by default); when it cannot be, the stage
+is aborted with `PoolExhaustedError`, a `StageConflictError`, its locks and its connection
+released, and the daemon's engine pool stages the plan again. The read is one transaction
+that sets nothing beyond it, and nothing is prepared, so PgBouncer needs no
+`max_prepared_statements` and no client inherits another's session.
 
 What grants cannot see, so the substrate cannot either: a `SECURITY DEFINER` function the
 role may call that writes elsewhere, an extension such as `dblink` that opens another
@@ -1486,6 +1498,11 @@ database = "postgresql://owner@db/app"
 
 [daemon]
 drain_timeout_seconds = 30            # each shutdown step's bound
+
+[metrics]                             # Prometheus, on a listener of its own
+listen = "127.0.0.1:9464"             # GET /metrics and /healthz: a private address
+every_seconds = 15                    # how often the database is sampled
+database = "postgresql://interlock_audit@db/app"   # an audit_roles role
 ```
 
 Your agents and their policy come in as an application: a function that takes the
@@ -1525,6 +1542,70 @@ crash. Without `--app`, the daemon runs the relays, the inbox and the vacuum.
 In a process of your own, `build_supervisor(config, application)` returns the same
 `InterlockSupervisor`, to run on your event loop.
 
+### Metrics
+
+With `[metrics] listen` set, or `interlock daemon --metrics HOST:PORT`, the daemon serves
+Prometheus's text format on a port of its own, never the inbox's, which faces vendors:
+`GET /metrics`, and `GET /healthz`. Each part measures what it does: the engines, every
+plan by outcome and time, the races lost (to a row's lock or to the pool), the waits for
+window keys' locks and for the windows' connection, and the longest of each in the last
+minute; the relays, every call by sink and outcome; the settler, each delivery receipt's
+lag behind its delivery; the inbox, every webhook by answer and by the trace context it
+carried; the vacuum, its runs and what they pruned; every part, its state, steps and
+failures. What only the database knows is sampled every `every_seconds`, in one read-only
+snapshot, as the `database` role: the outbox's depth by state and its oldest message due,
+settlement's backlog, the facts no plan has consumed, and each rate window's fullest key
+against its limit (`interlock_window_saturation`). A scrape reads memory and never the
+database. No label is a tenant, a scope, a plan or a key, so the number of series is set
+by the configuration, never by the traffic. `interlock.telemetry.CATALOG` lists every
+metric; `docs/EPIC7_DESIGN.md` §2 says what each measures. The registry costs a plan under
+two microseconds (`scripts/metrics_overhead.py`).
+
+The endpoint is not authenticated: bind it to an address only your scraper reaches. It
+shows the system's shape, never its data.
+
+### Trace context
+
+A plan may carry a W3C `traceparent`, and Interlock carries it wherever the plan's effects
+go: beside each request in the outbox; out as the `traceparent` header of every call the
+relay makes (`HttpAdapter`, Stripe's and SendGrid's adapters), retries included; onto the
+refund an operator issues to compensate a charge. A webhook whose signature verifies has
+the context it carried kept beside its event, and the fact the inbox binds to a delivery
+continues the delivery's trace: under the webhook's context when the vendor continued
+ours, and the delivery's own when it sent a trace of its own, a malformed one, or none. A
+plan that consumes the fact continues it, and agent, outbox, relay, vendor, webhook and
+agent again are one trace:
+
+```python
+from interlock import PlanBuilder, child_traceparent, new_traceparent, parse_traceparent
+
+checkout = new_traceparent()  # or your tracing library's current context
+plan = (
+    PlanBuilder("support-agent", intent="charge order 7", traceparent=checkout)
+    .update(
+        table="orders",
+        statement="UPDATE orders SET status = :status WHERE id = :id",
+        parameters={"status": "charging", "id": 7},
+    )
+    .build()
+)
+assert plan.traceparent == checkout
+
+# What arrives over HTTP is read as W3C asks a receiver to: malformed is None.
+assert parse_traceparent("not a traceparent") is None
+
+# A plan consuming a fact bound to the charge: a span of its own, in the same trace.
+follow_up = child_traceparent(checkout)
+assert follow_up.split("-")[1] == checkout.split("-")[1] and follow_up != checkout
+```
+
+In the daemon, `ctx.plan(scope, traceparent=...)` does the same, and each fact from
+`ctx.facts(scope)` has its `traceparent`. Trace context is outside every hash: a plan, a
+request, a delivery log, a relay's attestation, a receipt, an event and a fact hash the
+same with it or without it, and nothing Interlock decides reads it. It is kept in tables
+of its own, pruned by the vacuum with the rows it describes. Interlock propagates context
+and records it; it exports no spans of its own.
+
 ### The soak
 
 `scripts/live_stress_test.py` runs the whole daemon for minutes against a live PostgreSQL,
@@ -1546,8 +1627,11 @@ the logs: no deadlock; lock waits within their bounds and every lost race retrie
 outcome; every rate window within its limit at every instant of its history; the ledger
 balanced to the cent, each plan charged once and each refund credited once; one charge per
 order and one receipt per delivery; no forgery accepted; the vacuum keeping the outbox
-bounded as it runs; every verifier passing after; and a graceful stop, a second daemon
-recovering nothing. `tests/test_soak.py` runs it for half a minute in the test suite.
+bounded as it runs; every verifier passing after; a graceful stop, a second daemon
+recovering nothing; every checkout's trace context carried to the payment API, onto its
+refund, back on the facts its webhooks became and on to the plans that consumed them,
+whatever the vendor sent; and the metrics, scraped every second, telling what the run
+counted itself. `tests/test_soak.py` runs it for half a minute in the test suite.
 
 ## Unrecorded writes
 
