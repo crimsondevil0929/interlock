@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -38,17 +39,20 @@ from agentgov import BudgetManager
 
 from interlock import BlastRadius
 from interlock.cli import main
-from interlock.config import InterlockConfig, load_config
+from interlock.config import METRICS_DATABASE_ENV, InterlockConfig, load_config
 from interlock.daemon import Application, build_supervisor, load_application
 from interlock.engine import StageResult
 from interlock.exceptions import SubstrateConfigurationError
 from interlock.operators import generate_key
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE
 from interlock.supervisor import AgentContext
+from interlock.trace import child_traceparent
 from interlock.types import OutboundRequest
 from tests.conftest import build_sqlite_back_office
 from tests.fakestripe import KEY, FakeStripe
 from tests.inbox_env import STRIPE_SECRET, stripe_webhook
+
+TRACED = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
 ROOT = Path(__file__).resolve().parent.parent
 T = TypeVar("T")
@@ -480,3 +484,164 @@ def test_an_application_that_cannot_be_loaded_is_refused(site: Site) -> None:
         with pytest.raises(SubstrateConfigurationError, match=why):
             load_application(target, config)
     assert load_application("tests.daemon_app:build", config).agents
+
+
+# --------------------------------------------------------------------------
+# metrics (docs/EPIC7_DESIGN.md §2)
+# --------------------------------------------------------------------------
+
+METRICS = '[metrics]\nlisten = "127.0.0.1:0"\nevery_seconds = 0.1\n\n[daemon]'
+
+
+def scrape(port: int) -> dict[str, dict[tuple[tuple[str, str], ...], float]]:
+    from tests.test_metrics import parse
+
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/metrics")
+    with urllib.request.urlopen(request, timeout=10) as answer:  # noqa: S310 - our server
+        return parse(answer.read().decode())
+
+
+def test_the_daemon_serves_what_every_part_measures(site: Site) -> None:
+    config = site.rewrite("[daemon]", METRICS)
+    charged: list[StageResult] = []
+
+    async def agent(ctx: AgentContext) -> None:
+        charged.append(await ctx.execute(charge(ctx)))
+        while not ctx.stopping:
+            await ctx.sleep(0.05)
+
+    supervisor = build_supervisor(config, Application(checkers=[BlastRadius(5)], agents=[agent]))
+
+    async def run() -> dict[str, dict[tuple[tuple[str, str], ...], float]]:
+        running = asyncio.create_task(supervisor.run())
+        await asyncio.wait_for(supervisor.ready(), 30)
+        inbox, port = supervisor.inbox_port, supervisor.metrics_port
+        assert inbox is not None and port is not None
+        await until(lambda: supervisor.status()["settler"].counters.get("receipts", 0) == 1)
+        (intent,) = site.stripe.of("payment_intent")
+        event = {
+            "id": "evt_1",
+            "object": "event",
+            "type": "payment_intent.succeeded",
+            "data": {"object": {**intent, "status": "succeeded"}},
+        }
+        assert (await asyncio.to_thread(post, inbox, stripe_webhook(event)))[0] == 200
+        # Webhooks taken, by the trace context they carried: ours, continued;
+        # one that is not a context; and, not counted, one whose signature
+        # does not verify, since anyone can send that.
+        for n, traceparent in ((2, child_traceparent(TRACED)), (3, "00-abc-def-01")):
+            headers, body = stripe_webhook({**event, "id": f"evt_{n}"})
+            headers["traceparent"] = traceparent
+            assert (await asyncio.to_thread(post_to, inbox, "/inbox/stripe", headers, body)) == 200
+        headers, body = stripe_webhook({**event, "id": "evt_4"}, secret="whsec_not_the_one")
+        headers["traceparent"] = TRACED
+        assert (await asyncio.to_thread(post_to, inbox, "/inbox/stripe", headers, body)) == 401
+        # A source no one configured: counted, under no name of the sender's choosing.
+        headers, body = stripe_webhook(event)
+        assert (await asyncio.to_thread(post_to, inbox, "/inbox/whatever", headers, body)) == 404
+
+        def sampled() -> dict[str, dict[tuple[tuple[str, str], ...], float]]:
+            # Sampled since the webhook: every state named. (The vacuum, every
+            # second with no retention, may have pruned the payment by now.)
+            scraped = scrape(port)
+            states = {dict(k)["state"] for k in scraped.get("interlock_outbox_messages", {})}
+            sampled_at = scraped.get("interlock_metrics_sampled_at_seconds", {}).get((), 0)
+            return scraped if len(states) == 6 and sampled_at > began else {}
+
+        began = time.time()
+
+        scraped = await until(sampled)
+        supervisor.stop()
+        await running
+        return scraped
+
+    scraped = asyncio.run(run())
+    assert [r.committed for r in charged] == [True]
+    import interlock
+
+    assert scraped["interlock_build_info"] == {(("version", interlock.__version__),): 1}
+    assert scraped["interlock_plans_total"] == {(("outcome", "committed"),): 1}
+    assert scraped["interlock_deliveries_total"] == {
+        (("sink", "payments"), ("outcome", "delivered")): 1
+    }
+    assert scraped["interlock_receipts_issued_total"] == {(): 1}
+    assert scraped["interlock_settlement_lag_seconds_count"] == {(): 1}
+    assert scraped["interlock_webhooks_total"] == {
+        (("source", "stripe"), ("status", "200")): 3,
+        (("source", "stripe"), ("status", "401")): 1,
+        (("source", "_unknown"), ("status", "404")): 1,
+    }
+    assert scraped["interlock_webhook_traceparent_total"] == {
+        (("source", "stripe"), ("result", "absent")): 1,
+        (("source", "stripe"), ("result", "valid")): 1,
+        (("source", "stripe"), ("result", "invalid")): 1,
+    }
+    up = scraped["interlock_service_up"]
+    assert {dict(k)["service"] for k in up} == {
+        "engines",
+        "relay-0",
+        "inbox",
+        "settler",
+        "vacuum",
+        "metrics",
+    }
+    assert set(up.values()) == {1}
+    assert scraped["interlock_metrics_sampled_at_seconds"][()] > 0
+
+
+def post_to(port: int, path: str, headers: dict[str, str], body: bytes) -> int:
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as answer:  # noqa: S310 - our server
+            return int(answer.status)
+    except urllib.error.HTTPError as refused:
+        return int(refused.code)
+
+
+def test_postgresql_is_sampled_only_as_a_role_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "interlock.toml"
+    path.write_text(
+        'substrate = "postgres"\ndatabase = "postgresql://owner@127.0.0.1:1/app"\n'
+        '[[tables]]\nname = "orders"\ncolumns = ["id"]\n'
+        "[metrics]\nevery_seconds = 0.05\n"
+    )
+    config = load_config(path)
+    with pytest.raises(SubstrateConfigurationError, match="HOST:PORT"):
+        build_supervisor(config, metrics_listen="9464")
+    # No role to sample as: served, and said so.
+    monkeypatch.delenv(METRICS_DATABASE_ENV, raising=False)
+    with caplog.at_level(logging.WARNING, logger="interlock.daemon"):
+        build_supervisor(config, metrics_listen="127.0.0.1:0")
+    assert "no role to sample the database as" in caplog.text
+    # One given by the environment is sampled as: here a server that is not
+    # there, so each sample fails, is counted, and the service runs on.
+    monkeypatch.setenv(METRICS_DATABASE_ENV, "postgresql://audit@127.0.0.1:1/app")
+    supervisor = build_supervisor(config, metrics_listen="127.0.0.1:0")
+
+    async def run() -> None:
+        running = asyncio.create_task(supervisor.run())
+        await asyncio.wait_for(supervisor.ready(), 30)
+        await until(lambda: supervisor.metrics.value("interlock_metrics_sample_errors_total") >= 2)
+        assert supervisor.status()["metrics"].state == "running"
+        supervisor.stop()
+        await running
+
+    asyncio.run(run())
+
+
+def test_interlock_daemon_serves_metrics_where_asked(site: Site) -> None:
+    daemon = Daemon(site.path, "--metrics", "127.0.0.1:0")
+    try:
+        line = daemon.wait_for("serving metrics on port")
+        scraped = scrape(int(line.rsplit(" ", 1)[1]))
+    finally:
+        code = daemon.stop()
+    assert code == 0, (daemon.lines, daemon.errors)
+    assert {dict(k)["service"] for k in scraped["interlock_service_up"]} == {
+        "inbox",
+        "relay-0",
+        "vacuum",
+        "metrics",
+    }

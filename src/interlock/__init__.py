@@ -148,12 +148,14 @@ from interlock.supervisor import (
     EnginePool,
     InboxService,
     InterlockSupervisor,
+    MetricsService,
     RelayService,
     Service,
     ServiceStatus,
     SettlerService,
     VacuumService,
 )
+from interlock.telemetry import Metrics
 from interlock.trace import child_traceparent, new_traceparent, parse_traceparent
 from interlock.types import (
     Compensation,
@@ -238,6 +240,8 @@ __all__ = [
     "LedgerAnchor",
     "LedgerBreaker",
     "LedgerUnverifiedError",
+    "Metrics",
+    "MetricsService",
     "Milestones",
     "NoBreaker",
     "NoDelete",

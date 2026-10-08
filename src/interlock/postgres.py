@@ -51,6 +51,7 @@ import os
 import secrets
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -91,6 +92,7 @@ from interlock.outbox_sql import (
     OUTBOX_TRIGGERS,
 )
 from interlock.substrate import TableSpec, _verb_reason, leading_verb
+from interlock.telemetry import Metrics, NullMetrics
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -939,6 +941,7 @@ class PostgresSubstrate:
         "_handle",
         "_lock_seconds",
         "_max_rows",
+        "_metrics",
         "_order",
         "_pool_seconds",
         "_report",
@@ -963,6 +966,7 @@ class PostgresSubstrate:
         enforce_table_access: bool = True,
         acknowledge_cascades: Collection[str] = (),
         pool_timeout_seconds: float | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         _identifier(schema)
         pool = lock_timeout_seconds if pool_timeout_seconds is None else pool_timeout_seconds
@@ -984,6 +988,7 @@ class PostgresSubstrate:
         self._stage_seconds = max_stage_seconds
         self._lock_seconds = min(lock_timeout_seconds, max_stage_seconds)
         self._pool_seconds = min(pool, max_stage_seconds)
+        self._metrics: Metrics = metrics if metrics is not None else NullMetrics()
         self._max_rows = max_diff_rows
         self._enforce = enforce_table_access
         self._report: CascadeReport | None = None
@@ -1464,15 +1469,18 @@ class PostgresSubstrate:
         # stage's own locks are held meanwhile; closed once it has read, so
         # the stage holds one session again by its commit.
         with self._reader(bounded=True) as side:
+            locking = time.monotonic()
             try:
                 conn.execute(self._timeouts())
                 self._lock_windows(conn, charges)
             except psycopg.Error as exc:
                 if exc.sqlstate in _CONFLICTS:
+                    self._waited("window_lock", time.monotonic() - locking)
                     raise StageConflictError(
                         f"a rate window this plan adds to stayed locked by another stage: {exc}"
                     ) from exc
                 raise self._setup_error(exc) from exc
+            self._waited("window_lock", time.monotonic() - locking)
             try:
                 rows = side.execute(
                     "SELECT out_window, out_key, out_total "
@@ -1494,6 +1502,16 @@ class PostgresSubstrate:
             for c in charges
         )
 
+    def _waited(self, wait: str, seconds: float) -> None:
+        """A wait the stage made: for its windows' connection, or for their keys' locks."""
+        name = (
+            "interlock_pool_wait_seconds"
+            if wait == "pool"
+            else "interlock_window_lock_wait_seconds"
+        )
+        self._metrics.observe(name, seconds)
+        self._metrics.observe("interlock_wait_max_seconds", seconds, wait=wait)
+
     def _lock_windows(self, conn: psycopg.Connection[Any], charges: Sequence[WindowCharge]) -> None:
         """Lock every key the plan adds to until the stage ends, in one order."""
         locks = sorted({window_lock(c.window, c.key) for c in charges})
@@ -1512,11 +1530,12 @@ class PostgresSubstrate:
         """
         import psycopg
 
+        asked = time.monotonic()
         try:
             side = self._connect(timeout=self._pool_seconds if bounded else None)
         except SubstrateUnavailableError as exc:
             if bounded and _exhausted(exc.__cause__ or exc):
-                raise self._exhausted_error(exc) from exc
+                raise self._exhausted_error(exc, asked) from exc
             raise
         try:
             watch = _Watch(side, self._pool_seconds if bounded else None)
@@ -1528,15 +1547,19 @@ class PostgresSubstrate:
                     )
             except psycopg.Error as exc:
                 if bounded and (watch.fired or _exhausted(exc)):
-                    raise self._exhausted_error(exc) from exc
+                    raise self._exhausted_error(exc, asked) from exc
                 raise SubstrateUnavailableError(f"cannot read outside the stage: {exc}") from exc
             if watch.fired:  # had, but only after the bound: a cancel may follow it
-                raise self._exhausted_error(None)
+                raise self._exhausted_error(None, asked)
+            if bounded:
+                self._waited("pool", time.monotonic() - asked)
             yield side
         finally:
             side.close()
 
-    def _exhausted_error(self, cause: BaseException | None) -> PoolExhaustedError:
+    def _exhausted_error(self, cause: BaseException | None, asked: float) -> PoolExhaustedError:
+        self._metrics.inc("interlock_pool_exhausted_total")
+        self._waited("pool", time.monotonic() - asked)
         return PoolExhaustedError(
             f"no connection came free within {self._pool_seconds:g}s to read the rate windows: "
             f"the pool, or the server's limit, is held by other stages"

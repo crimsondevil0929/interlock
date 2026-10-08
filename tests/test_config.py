@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from interlock.cli import main
-from interlock.config import DATABASE_ENV, ConfigError, load_config
+from interlock.config import DATABASE_ENV, ConfigError, MetricsConfig, load_config
 from interlock.operators import generate_key
 
 GOOD = """
@@ -148,6 +148,11 @@ key = "vacuum.key"
 drain_timeout_seconds = 12
 restart_min_seconds = 0.25
 restart_max_seconds = 8
+
+[metrics]
+listen = "10.0.0.5:9464"
+every_seconds = 5
+database = "postgresql://interlock_audit@db/app"
 """
 )
 
@@ -183,9 +188,13 @@ def test_the_daemons_sections_load(tmp_path: Path) -> None:
         timedelta(milliseconds=250),
         timedelta(seconds=8),
     )
+    assert config.metrics == MetricsConfig(
+        "10.0.0.5:9464", timedelta(seconds=5), "postgresql://interlock_audit@db/app"
+    )
     # Absent, each section has its defaults; a SQLite ledger sits beside the file.
     bare = load_config(write(tmp_path, GOOD))
     assert (bare.engine.workers, bare.receipts, bare.vacuum.every) == (1, None, None)
+    assert bare.metrics == MetricsConfig(None, timedelta(seconds=15), "")
     sqlite = load_config(
         write(
             tmp_path,
@@ -214,6 +223,11 @@ def test_the_daemons_sections_load(tmp_path: Path) -> None:
         (("every_seconds = 600", "every_seconds = -1"), "not negative"),
         (("restart_max_seconds = 8", "restart_max_seconds = 0.1"), "at least restart_min"),
         (("drain_timeout_seconds = 12", "drain_after = 12"), r"\[daemon\]: unknown key"),
+        (('listen = "10.0.0.5:9464"', 'listen = "9464"'), r"listen is HOST:PORT"),
+        (('listen = "10.0.0.5:9464"', 'listen = "10.0.0.5:http"'), r"listen is HOST:PORT"),
+        (('listen = "10.0.0.5:9464"', 'listen = "10.0.0.5:70000"'), r"listen is HOST:PORT"),
+        (("every_seconds = 5", "every_seconds = 0"), "positive number"),
+        (("every_seconds = 5", "every_seconds = 5\nport = 9464"), r"\[metrics\]: unknown key"),
         (('database = "postgresql://interlock_settle@db/app"', "interval = 2"), "unknown key"),
     ],
 )

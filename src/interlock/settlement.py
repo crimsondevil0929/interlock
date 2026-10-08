@@ -107,6 +107,8 @@ class SettlementReport:
     problems: tuple[str, ...]
     """Deliveries refused settlement: no attestation a registered relay made, or
     a log that does not verify. They stay unsettled, and are reported again."""
+    lags: tuple[float, ...] = ()
+    """For each delivery receipt issued now, the seconds since its delivery."""
 
 
 class Settler:
@@ -195,6 +197,7 @@ class Settler:
         broken = {p.split(":", 1)[0].removeprefix("message ") for p in problems}
         settled: list[uuid.UUID] = []
         found: list[str] = list(problems)
+        lags: list[float] = []
         issued = credited = 0
         for message in due:
             if str(message.message_id) in broken:
@@ -206,9 +209,11 @@ class Settler:
                 continue
             issued += outcome.issued
             credited += outcome.credited
+            if outcome.lag is not None:
+                lags.append(outcome.lag)
             if outcome.settled:
                 settled.append(message.message_id)
-        return SettlementReport(tuple(settled), issued, credited, tuple(found))
+        return SettlementReport(tuple(settled), issued, credited, tuple(found), tuple(lags))
 
     # -- one message ----------------------------------------------------------
 
@@ -264,6 +269,7 @@ class Settler:
 
         # 1. The delivery receipt, or the one a crashed run issued.
         issued = 0
+        lag: float | None = None
         receipt = context.receipts.get(str(message.message_id))
         if receipt is None:
             action = context.action_receipt(message.plan_id)
@@ -289,6 +295,7 @@ class Settler:
                 )
                 context.receipts[str(message.message_id)] = receipt
                 issued = 1
+                lag = max(0.0, (datetime.now(UTC) - delivered.at).total_seconds())
                 self._checkpoint("receipt", message.message_id)
 
         # 2. The credit, for a compensation, or the one a crashed run posted.
@@ -307,7 +314,7 @@ class Settler:
             credit.entry_hash if credit is not None else None,
             notes,
         )
-        return _Outcome(settled, issued, credited)
+        return _Outcome(settled, issued, credited, lag)
 
     def _record(
         self,
@@ -445,6 +452,7 @@ class _Outcome:
     settled: bool
     issued: int
     credited: int
+    lag: float | None = None
 
 
 class _UnsettledError(Exception):
