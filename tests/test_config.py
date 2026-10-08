@@ -127,6 +127,7 @@ same_transaction = true
 conflict_retries = 8
 max_stage_seconds = 5
 lock_timeout_seconds = 1.5
+pool_timeout_seconds = 0.75
 
 [receipts]
 log = "receipts.jsonl"
@@ -160,6 +161,7 @@ def test_the_daemons_sections_load(tmp_path: Path) -> None:
     assert (engine.workers, engine.settle_cost, engine.conflict_retries) == (4, Decimal("0.01"), 8)
     assert engine.ledger == "host=db dbname=app user=owner" and engine.same_transaction
     assert (engine.max_stage_seconds, engine.lock_timeout_seconds) == (5.0, 1.5)
+    assert engine.pool_timeout_seconds == 0.75
     assert engine.chain == tmp_path / "escrow.chain"
     assert engine.chain_for(0) == tmp_path / "escrow-0.chain"
     assert engine.chain_for(3) == tmp_path / "escrow-3.chain"

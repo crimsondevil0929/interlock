@@ -156,6 +156,7 @@ vacuum, each part connecting as its own role::
     conflict_retries = 16             # a plan that lost a race is staged again
     max_stage_seconds = 10
     lock_timeout_seconds = 2
+    pool_timeout_seconds = 2          # PostgreSQL: the rate windows' connection, or retried
 
     [receipts]                        # the receipt log: action and delivery receipts
     log = "receipts.jsonl"
@@ -366,6 +367,7 @@ class EngineConfig:
     conflict_retries: int = 16
     max_stage_seconds: float = 10.0
     lock_timeout_seconds: float = 2.0
+    pool_timeout_seconds: float | None = None
 
     def chain_for(self, worker: int, workers: int | None = None) -> Path | None:
         """The chain file worker ``worker`` writes: the configured one for a
@@ -641,6 +643,7 @@ _ENGINE_KEYS = frozenset(
         "conflict_retries",
         "max_stage_seconds",
         "lock_timeout_seconds",
+        "pool_timeout_seconds",
     }
 )
 
@@ -688,6 +691,9 @@ def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
         conflict_retries=retries,
         max_stage_seconds=_seconds(raw, "max_stage_seconds", 10.0),
         lock_timeout_seconds=_seconds(raw, "lock_timeout_seconds", 2.0),
+        pool_timeout_seconds=(
+            _seconds(raw, "pool_timeout_seconds", 2.0) if "pool_timeout_seconds" in raw else None
+        ),
     )
 
 

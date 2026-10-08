@@ -54,6 +54,7 @@ def open_substrate(config: InterlockConfig, *, database: str | None = None) -> S
             schema=config.schema,
             max_stage_seconds=config.engine.max_stage_seconds,
             lock_timeout_seconds=config.engine.lock_timeout_seconds,
+            pool_timeout_seconds=config.engine.pool_timeout_seconds,
             acknowledge_cascades=config.acknowledge_cascades,
         )
     return SqliteSubstrate(

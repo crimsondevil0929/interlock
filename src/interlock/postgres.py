@@ -42,10 +42,15 @@ percent sign.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
+import math
+import os
 import secrets
+import socket
+import threading
 import uuid
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -68,6 +73,7 @@ from interlock.exceptions import (
     InboundFactError,
     InterlockError,
     OutboundRequestError,
+    PoolExhaustedError,
     StageConflictError,
     StageError,
     StageExpiredError,
@@ -139,6 +145,82 @@ _TRUNCATE_TRIGGER_TYPE: Final = 32
 _GATED: Final = "IL001"
 _TAMPERED: Final = "IL002"
 _CONFLICTS: Final = frozenset({"40001", "40P01", "55P03"})
+
+_GRACE: Final = 0.25
+"""Seconds a bounded statement has, once cancelled, before its socket is shut.
+A server answers a cancel at once; PgBouncer takes the cancel of a client it is
+holding in its queue and leaves the client waiting, so only the shut ends it."""
+
+_EXHAUSTED: Final = (
+    "too many connections",
+    "too many clients",
+    "remaining connection slots",
+    "no more connections allowed",
+    "query_wait_timeout",
+    "timeout expired",
+)
+"""How a refusal for want of connections reads: PostgreSQL's (``53300``),
+and a pooler's, whose errors carry no SQLSTATE of their own."""
+
+
+def _exhausted(exc: BaseException) -> bool:
+    """Whether ``exc`` refused a connection, or a statement, for want of one."""
+    if getattr(exc, "sqlstate", None) in ("53300", "53400"):
+        return True
+    text = str(exc).lower()
+    return any(phrase in text for phrase in _EXHAUSTED)
+
+
+class _Watch:
+    """Bounds the statements run on a connection inside it (``docs/EPIC7_DESIGN.md``
+    §3.2): when ``seconds`` run out, the one running is cancelled; if it is
+    still blocked :data:`_GRACE` later, the socket is shut down, so the wait
+    ends whatever answers the cancel. ``None`` bounds nothing."""
+
+    def __init__(self, conn: psycopg.Connection[Any], seconds: float | None) -> None:
+        self._conn = conn
+        self._lock = threading.Lock()
+        self._over = False
+        self.fired = False
+        """Whether the time ran out: then a cancel may be in flight, and
+        nothing more should run on the connection."""
+        self._timer = None if seconds is None else threading.Timer(seconds, self._cancel)
+
+    def __enter__(self) -> _Watch:
+        if self._timer is not None:
+            self._timer.daemon = True
+            self._timer.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        with self._lock:
+            self._over = True
+        if self._timer is not None:
+            self._timer.cancel()
+
+    def _cancel(self) -> None:
+        with self._lock:
+            if self._over:
+                return
+            self.fired = True
+        with contextlib.suppress(Exception):
+            self._conn.cancel_safe(timeout=_GRACE)
+        shut = threading.Timer(_GRACE, self._shut)
+        shut.daemon = True
+        shut.start()
+
+    def _shut(self) -> None:
+        with self._lock:
+            if self._over:
+                return
+            try:
+                fd = os.dup(self._conn.pgconn.socket)
+            except Exception:  # closed meanwhile: nothing left to end
+                return
+            with contextlib.suppress(OSError), socket.socket(fileno=fd) as sock:
+                sock.shutdown(socket.SHUT_RDWR)
+
+
 """Serialization failure, deadlock, lock not available: another writer won."""
 _OUTBOUND: Final = "IL004"
 """The outbox refused a request: an unregistered or disabled sink, an operation
@@ -827,6 +909,13 @@ class PostgresSubstrate:
     :param max_stage_seconds: Bound on stage lifetime, and the server's
         ``statement_timeout`` and ``idle_in_transaction_session_timeout`` for
         the stage, so a stage whose client died cannot hold locks past it.
+    :param pool_timeout_seconds: How long the stage waits for its second
+        connection, the one that reads the rate windows, while it holds its
+        locks: connecting is bounded by libpq's ``connect_timeout`` (whole
+        seconds, two at least), and its first statement, where a
+        transaction-mode pooler queues a client, by this.
+        :class:`~interlock.exceptions.PoolExhaustedError` when it runs out.
+        Defaults to the lock timeout.
     :param lock_timeout_seconds: How long any statement in the stage waits for
         a lock before the stage fails with :class:`StageConflictError`.
     :param enforce_table_access: Refuse to open a stage when the role can
@@ -851,6 +940,7 @@ class PostgresSubstrate:
         "_lock_seconds",
         "_max_rows",
         "_order",
+        "_pool_seconds",
         "_report",
         "_schema",
         "_scope",
@@ -872,8 +962,12 @@ class PostgresSubstrate:
         max_diff_rows: int = 50_000,
         enforce_table_access: bool = True,
         acknowledge_cascades: Collection[str] = (),
+        pool_timeout_seconds: float | None = None,
     ) -> None:
         _identifier(schema)
+        pool = lock_timeout_seconds if pool_timeout_seconds is None else pool_timeout_seconds
+        if pool <= 0:
+            raise ValueError("pool_timeout_seconds is positive")
         self._dsn = dsn
         self._schema = schema
         self._tables = tuple(tables)
@@ -889,6 +983,7 @@ class PostgresSubstrate:
         self._acknowledged = acknowledged
         self._stage_seconds = max_stage_seconds
         self._lock_seconds = min(lock_timeout_seconds, max_stage_seconds)
+        self._pool_seconds = min(pool, max_stage_seconds)
         self._max_rows = max_diff_rows
         self._enforce = enforce_table_access
         self._report: CascadeReport | None = None
@@ -1104,10 +1199,11 @@ class PostgresSubstrate:
                 # lift them, and a stage bound that the agent can lift is not a
                 # bound.
                 conn.execute(self._timeouts())
-                # prepare=True sends the statement with the extended protocol,
+                # binary=True sends the statement with the extended protocol,
                 # which the server refuses to split: "UPDATE ...; COMMIT" fails
-                # instead of committing the stage before adjudication.
-                cursor = conn.execute(effect.statement, dict(effect.parameters), prepare=True)
+                # instead of committing the stage before adjudication. Unnamed,
+                # so nothing is prepared that a pooler would hand on.
+                cursor = conn.execute(effect.statement, dict(effect.parameters), binary=True)
             except psycopg.Error as exc:
                 raise self._statement_error(effect, exc) from exc
             outcome = EffectOutcome(
@@ -1159,7 +1255,6 @@ class PostgresSubstrate:
                     None if request.not_after is None else int(request.not_after.total_seconds()),
                     self._scope,
                 ),
-                prepare=True,
             )
         except psycopg.Error as exc:
             raise self._enqueue_error(effect, exc) from exc
@@ -1289,7 +1384,7 @@ class PostgresSubstrate:
         """
         import psycopg
 
-        with self._reader() as side:
+        with self._reader(bounded=False) as side:
             try:
                 rows = side.execute(
                     "SELECT * FROM interlock.inbox_pending(%s)", (scope_id,)
@@ -1328,7 +1423,6 @@ class PostgresSubstrate:
             conn.execute(
                 "SELECT interlock.inbox_consume(%s, %s::uuid[], %s)",
                 (self._token, list(fact_ids), scope_id),
-                prepare=True,
             )
         except psycopg.Error as exc:
             if exc.sqlstate == _INBOUND:
@@ -1366,9 +1460,10 @@ class PostgresSubstrate:
         conn = self._require(handle)
         self._assert_live(handle)
         # Connected before locking, so connecting is not inside the wait the
-        # lock imposes on others; closed once it has read, so the stage holds
-        # one session again by its commit.
-        with self._reader() as side:
+        # lock imposes on others, and within the pool timeout, since the
+        # stage's own locks are held meanwhile; closed once it has read, so
+        # the stage holds one session again by its commit.
+        with self._reader(bounded=True) as side:
             try:
                 conn.execute(self._timeouts())
                 self._lock_windows(conn, charges)
@@ -1405,23 +1500,48 @@ class PostgresSubstrate:
         conn.execute("SELECT interlock.window_lock(%s::bigint[])", (locks,))
 
     @contextmanager
-    def _reader(self) -> Iterator[psycopg.Connection[Any]]:
-        """A second connection, outside the stage, for one read: ``READ
-        COMMITTED``, so each statement sees every commit before it."""
+    def _reader(self, *, bounded: bool) -> Iterator[psycopg.Connection[Any]]:
+        """A second connection, outside the stage, for one read, in one
+        ``READ COMMITTED`` transaction: each statement sees every commit before
+        it, and nothing set outlives the transaction in a session that a
+        transaction-mode pooler hands on to the next client.
+
+        :param bounded: Whether the connection must be had within the pool
+            timeout, or :class:`PoolExhaustedError`: for a stage that holds
+            its locks while it waits.
+        """
         import psycopg
 
-        side = self._connect()
         try:
+            side = self._connect(timeout=self._pool_seconds if bounded else None)
+        except SubstrateUnavailableError as exc:
+            if bounded and _exhausted(exc.__cause__ or exc):
+                raise self._exhausted_error(exc) from exc
+            raise
+        try:
+            watch = _Watch(side, self._pool_seconds if bounded else None)
             try:
-                side.execute(
-                    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
-                )
-                side.execute(f"SET statement_timeout = {max(1, int(self._stage_seconds * 1000))}")
+                with watch:
+                    side.execute(
+                        "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY; "
+                        f"SET LOCAL statement_timeout = {max(1, int(self._stage_seconds * 1000))}"
+                    )
             except psycopg.Error as exc:
-                raise SubstrateUnavailableError(f"cannot read the rate windows: {exc}") from exc
+                if bounded and (watch.fired or _exhausted(exc)):
+                    raise self._exhausted_error(exc) from exc
+                raise SubstrateUnavailableError(f"cannot read outside the stage: {exc}") from exc
+            if watch.fired:  # had, but only after the bound: a cancel may follow it
+                raise self._exhausted_error(None)
             yield side
         finally:
             side.close()
+
+    def _exhausted_error(self, cause: BaseException | None) -> PoolExhaustedError:
+        return PoolExhaustedError(
+            f"no connection came free within {self._pool_seconds:g}s to read the rate windows: "
+            f"the pool, or the server's limit, is held by other stages"
+            + ("" if cause is None else f" ({cause})")
+        )
 
     def commit(self, handle: StageHandle) -> CommitReceipt:
         """Make the staged work durable, with its ``interlock.stages`` row,
@@ -1598,7 +1718,10 @@ class PostgresSubstrate:
 
     # -- internals ------------------------------------------------------------
 
-    def _connect(self) -> psycopg.Connection[Any]:
+    def _connect(self, *, timeout: float | None = None) -> psycopg.Connection[Any]:
+        """A connection of the stage role's. Nothing is prepared on the server:
+        a transaction-mode pooler hands the server's session, and what was
+        prepared in it, on to other clients."""
         try:
             import psycopg
         except ImportError as exc:  # pragma: no cover - the extra is installed in tests
@@ -1609,8 +1732,13 @@ class PostgresSubstrate:
             return psycopg.connect(
                 self._dsn,
                 autocommit=True,
+                prepare_threshold=None,
                 application_name="interlock",
-                connect_timeout=max(1, int(self._stage_seconds)),
+                connect_timeout=(
+                    max(1, int(self._stage_seconds))
+                    if timeout is None
+                    else max(2, math.ceil(timeout))
+                ),
             )
         except psycopg.Error as exc:
             raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
