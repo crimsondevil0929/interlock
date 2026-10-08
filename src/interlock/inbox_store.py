@@ -28,8 +28,15 @@ from agentgov.receipts.canonical import canonical_bytes
 from interlock.compaction import instant_text
 from interlock.deliveries import PostgresReader, parse_instant
 from interlock.inbox import DeliveredRef, InboundEvent, event_hash, frozen_fields, inbox_genesis
-from interlock.inbox_sql import SQLITE_CONSUMED, SQLITE_EVENTS, SQLITE_FACTS, SQLITE_SOURCES
+from interlock.inbox_sql import (
+    SQLITE_CONSUMED,
+    SQLITE_EVENTS,
+    SQLITE_FACTS,
+    SQLITE_SOURCES,
+    SQLITE_TRACES,
+)
 from interlock.outbox_store import Checkpoint, _no_checkpoint
+from interlock.trace import fact_traceparent
 from interlock.types import InboundFact
 
 if TYPE_CHECKING:
@@ -60,10 +67,19 @@ def _instant(value: object) -> datetime:
 def fact_row(r: Sequence[Any]) -> InboundFact:
     """An :class:`~interlock.types.InboundFact` from a row of the fact's and
     its event's columns, as both stores and ``interlock.stage_facts`` return
-    them. A fact whose event row is gone (read for verification) carries an
-    empty event, which no attestation verifies."""
+    them; and, when the row goes on, its delivery's and its webhook's trace
+    context, which decide the fact's (:func:`interlock.trace.fact_traceparent`).
+    A fact whose event row is gone (read for verification) carries an empty
+    event, which no attestation verifies."""
     if r[12] is None:
         return _orphan(r)
+    traceparent = (
+        fact_traceparent(
+            None if r[22] is None else str(r[22]), None if r[23] is None else str(r[23])
+        )
+        if len(r) > 23
+        else None
+    )
     return InboundFact(
         fact_id=r[0] if isinstance(r[0], uuid.UUID) else uuid.UUID(str(r[0])),
         source=str(r[1]),
@@ -87,6 +103,7 @@ def fact_row(r: Sequence[Any]) -> InboundFact:
         fields=frozen_fields(str(r[19])),
         withheld=tuple(json.loads(str(r[20]))),
         event_attestation=str(r[21]),
+        traceparent=traceparent,
     )
 
 
@@ -179,6 +196,7 @@ class PostgresInboxStore(PostgresReader):
         fields: Mapping[str, Any],
         withheld: Sequence[str],
         attestation: str,
+        traceparent: str | None = None,
     ) -> tuple[int, bool]:
         with self._conn.transaction():
             row = self._conn.execute(
@@ -200,8 +218,12 @@ class PostgresInboxStore(PostgresReader):
                     attestation,
                 ),
             ).fetchone()
+            assert row is not None
+            if traceparent is not None and row[2]:
+                self._conn.execute(
+                    "SELECT interlock.inbox_trace(%s, %s, %s)", (source, int(row[0]), traceparent)
+                )
             self.checkpoint("record-uncommitted", None)
-        assert row is not None
         return int(row[0]), bool(row[2])
 
     def event(self, source: str, seq: int) -> InboundEvent:
@@ -394,8 +416,10 @@ def sqlite_record_event(
     fields: Mapping[str, Any],
     withheld: Sequence[str],
     attestation: str,
+    traceparent: str | None = None,
 ) -> tuple[int, bool]:
-    """Within a ``BEGIN IMMEDIATE`` transaction: append the event once."""
+    """Within a ``BEGIN IMMEDIATE`` transaction: append the event once, and
+    its trace context beside it."""
     from interlock.exceptions import InterlockError
 
     head = conn.execute(
@@ -450,6 +474,11 @@ def sqlite_record_event(
             digest,
         ),
     )
+    if traceparent is not None and sqlite_has(conn, SQLITE_TRACES):
+        conn.execute(
+            f"INSERT INTO {SQLITE_TRACES} (source, seq, traceparent) VALUES (?, ?, ?)",
+            (source, seq, traceparent),
+        )
     return seq, True
 
 
@@ -578,15 +607,24 @@ def sqlite_facts(
 ) -> list[InboundFact]:
     """Facts with their events; with ``orphans``, those whose event row is
     gone too, for verification to find."""
+    from interlock.sqlite_outbox import TRACES
+
     if not sqlite_has(conn, SQLITE_FACTS):
         return []
     join = "LEFT JOIN" if orphans else "JOIN"
+    columns, traces = _FACT_COLUMNS, ""
+    if sqlite_has(conn, TRACES):
+        columns += ", ot.traceparent, it.traceparent"
+        traces = (
+            f" LEFT JOIN {TRACES} AS ot ON ot.message_id = f.message_id"
+            f" LEFT JOIN {SQLITE_TRACES} AS it ON it.source = f.source AND it.seq = f.event_seq"
+        )
     return [
         fact_row(r)
         for r in conn.execute(
-            f"SELECT {_FACT_COLUMNS} FROM {SQLITE_FACTS} AS f "
-            f"{join} {SQLITE_EVENTS} AS e ON e.source = f.source AND e.seq = f.event_seq "
-            f"WHERE {where} ORDER BY f.fact_id",
+            f"SELECT {columns} FROM {SQLITE_FACTS} AS f "
+            f"{join} {SQLITE_EVENTS} AS e ON e.source = f.source AND e.seq = f.event_seq"
+            f"{traces} WHERE {where} ORDER BY f.fact_id",
             params,
         ).fetchall()
     ]

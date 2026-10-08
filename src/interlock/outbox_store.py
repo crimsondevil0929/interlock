@@ -19,6 +19,7 @@ Every relay test runs against both, which is what keeps them one machine.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -172,10 +173,25 @@ class PostgresOutboxStore:
                     "SELECT * FROM interlock.relay_claim(%s, %s, %s, %s)",
                     (relay_id, lease.total_seconds(), limit, sorted(sinks)),
                 ).fetchall()
+                traces = self._traces(conn, [row[0] for row in rows]) if rows else {}
                 self.checkpoint("claim-uncommitted", None)
         except psycopg.OperationalError as exc:
             raise self._lost(exc) from exc
-        return [Lease.from_row(row, deadline) for row in rows]
+        return [
+            dataclasses.replace(Lease.from_row(row, deadline), traceparent=traces.get(row[0]))
+            for row in rows
+        ]
+
+    def _traces(self, conn: psycopg.Connection[Any], messages: list[Any]) -> dict[Any, str]:
+        """Each leased request's trace context, its plan's
+        (``docs/EPIC7_DESIGN.md`` §1.3): one read a batch."""
+        return dict(
+            conn.execute(
+                "SELECT message_id, traceparent FROM interlock.outbox_traces "
+                "WHERE message_id = ANY (%s)",
+                (messages,),
+            ).fetchall()
+        )
 
     def sending(self, lease: Lease, relay_id: str, detail: str) -> int | None:
         import psycopg

@@ -575,10 +575,14 @@ class AgentContext:
         """Whether the supervisor has begun to shut down."""
         return self._stopping.is_set()
 
-    def plan(self, scope_id: str, *, intent: str = "") -> PlanBuilder:
+    def plan(
+        self, scope_id: str, *, intent: str = "", traceparent: str | None = None
+    ) -> PlanBuilder:
+        """A plan for ``scope_id``, continuing ``traceparent``'s trace when
+        given (:mod:`interlock.trace`)."""
         from interlock.builder import PlanBuilder
 
-        return PlanBuilder(scope_id, intent=intent)
+        return PlanBuilder(scope_id, intent=intent, traceparent=traceparent)
 
     async def execute(self, plan: EffectPlan) -> StageResult:
         return await self._supervisor.execute(plan)

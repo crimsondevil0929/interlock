@@ -264,7 +264,8 @@ def downgrade_to_version_1(env: Pg) -> None:
     column, and the three-argument ``begin_stage``."""
     with psycopg.connect(env.admin, autocommit=True) as conn:
         conn.execute(
-            "DROP TABLE interlock.inbox_consumed, interlock.inbox_facts, "
+            "DROP TABLE interlock.inbox_traces, interlock.outbox_traces, "
+            "interlock.inbox_consumed, interlock.inbox_facts, "
             "interlock.inbox_events, interlock.inbox_sources, "
             "interlock.outbox_compacted, interlock.checkpoints, "
             "interlock.outbox_settlements, interlock.outbox_legacy, "

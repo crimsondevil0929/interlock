@@ -42,8 +42,9 @@ from email.utils import parsedate_to_datetime
 from typing import Final
 
 from interlock.relay import DELIVERED, PERMANENT, RETRYABLE, UNKNOWN, Delivery, DeliveryResult
+from interlock.trace import parse_traceparent
 
-__all__ = ["HttpAdapter", "Reply", "exchange", "retry_after_seconds"]
+__all__ = ["HttpAdapter", "Reply", "exchange", "retry_after_seconds", "trace_headers"]
 
 RETRYABLE_STATUSES: Final = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 """Statuses that say the sink did not act and may if asked again. 409 is
@@ -166,12 +167,21 @@ class HttpAdapter:
                 "X-Interlock-Message-Id": str(delivery.message_id),
                 "X-Interlock-Attempt": str(delivery.attempt),
                 "X-Interlock-Payload-SHA256": delivery.payload_hash,
+                **trace_headers(delivery),
             }
         )
         reply = exchange(self._base + path, delivery.payload, headers, method, delivery.timeout)
         if isinstance(reply, DeliveryResult):
             return reply
         return _classify(reply.status, reply.body, reply.header("Retry-After"), self._retryable)
+
+
+def trace_headers(delivery: Delivery) -> dict[str, str]:
+    """The ``traceparent`` header to send with the call, if the request has
+    trace context (``docs/EPIC7_DESIGN.md`` §1.3): the plan's, as stored,
+    once more checked to be one before it becomes a header."""
+    traceparent = parse_traceparent(delivery.traceparent)
+    return {} if traceparent is None else {"traceparent": traceparent}
 
 
 def _classify(

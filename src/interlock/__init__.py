@@ -153,6 +153,7 @@ from interlock.supervisor import (
     SettlerService,
     VacuumService,
 )
+from interlock.trace import child_traceparent, new_traceparent, parse_traceparent
 from interlock.types import (
     Compensation,
     Effect,
@@ -318,10 +319,13 @@ __all__ = [
     "__version__",
     "build_supervisor",
     "check_anchors",
+    "child_traceparent",
     "default_checkers",
     "load_application",
     "new_effect_id",
     "new_plan_id",
+    "new_traceparent",
+    "parse_traceparent",
     "retry_delay",
     "verify_archive",
     "verify_delivery_log",

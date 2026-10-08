@@ -240,6 +240,17 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_compacted (
 CREATE INDEX IF NOT EXISTS outbox_compacted_by_checkpoint
     ON interlock.outbox_compacted (checkpoint);
 REVOKE ALL ON interlock.outbox_compacted FROM PUBLIC;
+
+-- Version 6 (docs/EPIC7_DESIGN.md §1.3): each request's trace context, its
+-- plan's, beside it and in none of its hashes, and deleted with it.
+CREATE TABLE IF NOT EXISTS interlock.outbox_traces (
+    message_id  uuid PRIMARY KEY REFERENCES interlock.outbox (message_id) ON DELETE CASCADE,
+    traceparent text NOT NULL
+                CHECK (traceparent ~ '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+                       AND pg_catalog.substr(traceparent, 4, 32) <> pg_catalog.repeat('0', 32)
+                       AND pg_catalog.substr(traceparent, 37, 16) <> pg_catalog.repeat('0', 16))
+);
+REVOKE ALL ON interlock.outbox_traces FROM PUBLIC;
 DO $legacy$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
@@ -480,6 +491,35 @@ BEGIN
         interlock.outbox_genesis(p_message, stage, plan, p_scope, p_effect, p_sink, p_operation,
                                  p_idempotency_key, p_payload_hash)
     );
+END
+$fn$;
+
+-- The stage keeps its plan's trace context beside every request it enqueued,
+-- with the token that authorized them, as it commits (docs/EPIC7_DESIGN.md
+-- §1.3). Granted to stage roles. Returns how many requests it traced.
+CREATE OR REPLACE FUNCTION interlock.outbox_trace(p_token bytea, p_traceparent text)
+RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    stage uuid;
+    expected bytea;
+    written integer;
+BEGIN
+    SELECT s.stage_id, s.enqueue_hash INTO stage, expected
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL OR expected IS NULL
+       OR pg_catalog.sha256(p_token) IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'interlock: this transaction''s stage did not authorize a trace'
+            USING ERRCODE = 'IL002';
+    END IF;
+    INSERT INTO interlock.outbox_traces (message_id, traceparent)
+    SELECT o.message_id, p_traceparent FROM interlock.outbox o WHERE o.stage_id = stage
+    ON CONFLICT (message_id) DO NOTHING;
+    GET DIAGNOSTICS written = ROW_COUNT;
+    RETURN written;
 END
 $fn$;
 
@@ -1368,6 +1408,10 @@ BEGIN
                                  comp ->> 'sink', comp ->> 'operation', p_idempotency_key,
                                  p_payload_hash)
     );
+    -- The undo of the same work: in the trace of what it undoes.
+    INSERT INTO interlock.outbox_traces (message_id, traceparent)
+    SELECT p_message, t.traceparent FROM interlock.outbox_traces t
+     WHERE t.message_id = p_original;
     PERFORM interlock.outbox_log(
         p_original, NULL, 'compensated', p_actor, NULL, NULL,
         'compensated by ' || p_message::text, NULL, NULL, p_authority);

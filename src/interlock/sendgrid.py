@@ -40,7 +40,7 @@ from typing import Any, Final
 
 from agentgov.receipts.canonical import loads_strict
 
-from interlock.adapters import Reply, exchange
+from interlock.adapters import Reply, exchange, trace_headers
 from interlock.outbound import DEAD_LETTER, OperationSpec, SinkSpec, placeholders
 from interlock.relay import DELIVERED, PERMANENT, RETRYABLE, UNKNOWN, Delivery, DeliveryResult
 
@@ -212,7 +212,11 @@ class SendGridAdapter:
         reply = exchange(
             self._base + "/v3/mail/send",
             body,
-            {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                **trace_headers(delivery),
+            },
             "POST",
             delivery.timeout,
         )

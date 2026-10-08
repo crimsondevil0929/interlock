@@ -77,6 +77,8 @@ class Call:
     had already acted on."""
     at: float
     authorization: str | None = None
+    traceparent: str | None = None
+    """The W3C trace context the call carried, if any."""
 
 
 class FakeSink:
@@ -161,6 +163,7 @@ class FakeSink:
                     acted=acted,
                     at=time.monotonic(),
                     authorization=handler.headers.get("Authorization"),
+                    traceparent=handler.headers.get("traceparent"),
                 )
             )
         if kind == "status":

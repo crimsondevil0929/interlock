@@ -67,7 +67,7 @@ from typing import Any, Final
 
 from agentgov.receipts.canonical import loads_strict
 
-from interlock.adapters import Reply, exchange, retry_after_seconds
+from interlock.adapters import Reply, exchange, retry_after_seconds, trace_headers
 from interlock.outbound import NONE_POSSIBLE, REDELIVER, OperationSpec, SinkSpec, placeholders
 from interlock.relay import DELIVERED, PERMANENT, RETRYABLE, UNKNOWN, Delivery, DeliveryResult
 
@@ -345,6 +345,7 @@ class StripeAdapter:
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Idempotency-Key": delivery.idempotency_key,
                 "Stripe-Version": self._version,
+                **trace_headers(delivery),
             },
             "POST",
             delivery.timeout,

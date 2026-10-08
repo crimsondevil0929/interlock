@@ -118,7 +118,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "5"
+INSTALL_VERSION: Final = "6"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -490,6 +490,8 @@ _STAGE_FUNCTIONS: Final = (
     "interlock.inbox_pending(text)",
     "interlock.inbox_consume(bytea, uuid[], text)",
     "interlock.stage_facts(bigint)",
+    "interlock.outbox_trace(bytea, text)",
+    "interlock.inbox_pending_traces(text)",
 )
 
 _OUTBOX_TABLES: Final = (
@@ -502,6 +504,7 @@ _OUTBOX_TABLES: Final = (
     "interlock.outbox_settlements",
     "interlock.checkpoints",
     "interlock.outbox_compacted",
+    "interlock.outbox_traces",
 )
 
 _SETTLER_FUNCTIONS: Final = ("interlock.outbox_settle(uuid, text, text, text)",)
@@ -511,6 +514,7 @@ _INBOX_TABLES: Final = (
     "interlock.inbox_events",
     "interlock.inbox_facts",
     "interlock.inbox_consumed",
+    "interlock.inbox_traces",
 )
 
 _INBOX_FUNCTIONS: Final = (
@@ -518,9 +522,10 @@ _INBOX_FUNCTIONS: Final = (
     "integer, text, text, text, text)",
     "interlock.inbox_match(uuid, text, integer, text, uuid, integer, text, text, text, text, "
     "text, text)",
+    "interlock.inbox_trace(text, integer, text)",
 )
 """What an inbox process may call: every event and fact it records goes
-through one of these."""
+through one of these, and the trace context an event came with."""
 
 _RELAY_FUNCTIONS: Final = (
     "interlock.relay_claim(text, double precision, integer, text[])",
@@ -777,10 +782,11 @@ def _install_sources(conn: psycopg.Connection[Any], sources: Sequence[InboundSou
 
 
 def installed_version(conn: psycopg.Connection[Any]) -> int:
-    """Which version installed the outbox in this database: 5 when vacuums
-    compact it under checkpoints, 4 when its delivery log records relays'
-    attestations and rate windows keep their history, 3 when the log records
-    what calls created, 2 before; 0 when there is no outbox."""
+    """Which version installed the outbox in this database: 6 when it keeps
+    trace context, 5 when vacuums compact it under checkpoints, 4 when its
+    delivery log records relays' attestations and rate windows keep their
+    history, 3 when the log records what calls created, 2 before; 0 when there
+    is no outbox."""
     row = conn.execute(
         "SELECT pg_catalog.to_regclass('interlock.outbox_attempts') IS NOT NULL, "
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
@@ -790,12 +796,15 @@ def installed_version(conn: psycopg.Connection[Any]) -> int:
         "        WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_attempts') "
         "        AND attname = 'attestation' AND NOT attisdropped), "
         "pg_catalog.to_regclass('interlock.window_ledger') IS NOT NULL, "
-        "pg_catalog.to_regclass('interlock.checkpoints') IS NOT NULL"
+        "pg_catalog.to_regclass('interlock.checkpoints') IS NOT NULL, "
+        "pg_catalog.to_regclass('interlock.outbox_traces') IS NOT NULL"
     ).fetchone()
     if row is None or not row[0]:
         return 0
     if row[2] and row[3]:
-        return 5 if row[4] else 4
+        if not row[4]:
+            return 4
+        return 6 if row[5] else 5
     return 3 if row[1] else 2
 
 
@@ -835,6 +844,7 @@ class PostgresSubstrate:
         "_conn",
         "_dsn",
         "_enforce",
+        "_enqueued",
         "_facts",
         "_folded",
         "_handle",
@@ -847,6 +857,7 @@ class PostgresSubstrate:
         "_stage_seconds",
         "_tables",
         "_token",
+        "_traceparent",
         "_xid",
     )
 
@@ -944,6 +955,8 @@ class PostgresSubstrate:
         self._order = EnqueueOrder()
         self._charges: tuple[WindowCharge, ...] = ()
         self._facts: tuple[uuid.UUID, ...] = ()
+        self._traceparent: str | None = None
+        self._enqueued = 0
 
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
@@ -1063,6 +1076,7 @@ class PostgresSubstrate:
         self._reset_outbound()
         self._token = token
         self._scope = plan.scope_id
+        self._traceparent = plan.traceparent
         return handle
 
     def apply(self, handle: StageHandle, effect: Effect) -> EffectOutcome:
@@ -1149,6 +1163,7 @@ class PostgresSubstrate:
             )
         except psycopg.Error as exc:
             raise self._enqueue_error(effect, exc) from exc
+        self._enqueued += 1
         return EffectOutcome(
             effect_id=effect.effect_id, rows_affected=1, applied_at=datetime.now(UTC)
         )
@@ -1279,9 +1294,17 @@ class PostgresSubstrate:
                 rows = side.execute(
                     "SELECT * FROM interlock.inbox_pending(%s)", (scope_id,)
                 ).fetchall()
+                traces = {
+                    r[0]: (r[1], r[2])
+                    for r in side.execute(
+                        "SELECT * FROM interlock.inbox_pending_traces(%s)", (scope_id,)
+                    ).fetchall()
+                }
             except psycopg.Error as exc:
                 raise self._setup_error(exc) from exc
-        return tuple(fact_row(r) for r in rows)
+        # Each fact with what decides its trace context: its delivery's and
+        # its webhook's (docs/EPIC7_DESIGN.md §1.4).
+        return tuple(fact_row((*r, *traces.get(r[0], (None, None)))) for r in rows)
 
     def consume_facts(
         self, handle: StageHandle, fact_ids: Sequence[uuid.UUID], scope_id: str
@@ -1439,6 +1462,13 @@ class PostgresSubstrate:
                 raise StageError(
                     f"could not record what the plan adds to its windows: {exc}"
                 ) from exc
+        if self._traceparent is not None and self._enqueued:
+            try:
+                conn.execute(
+                    "SELECT interlock.outbox_trace(%s, %s)", (self._token, self._traceparent)
+                )
+            except psycopg.Error as exc:
+                raise StageError(f"could not keep the plan's trace context: {exc}") from exc
         try:
             cursor = conn.execute("COMMIT")
         except psycopg.Error as exc:

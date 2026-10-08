@@ -79,6 +79,7 @@ from interlock.inbox_sql import (
     SQLITE_INBOX_SCHEMA,
     SQLITE_INBOX_TABLES,
     SQLITE_SOURCES,
+    SQLITE_TRACES,
 )
 from interlock.outbound import bind, placeholders, typed_sink
 from interlock.outbox_store import Checkpoint, milliseconds
@@ -97,13 +98,15 @@ __all__ = [
     "install_sqlite_outbox",
     "outbox_installed",
     "stage_requests",
+    "trace_stage",
 ]
 
 logger = logging.getLogger("interlock.sqlite_outbox")
 
-VERSION: Final = 5
-"""The outbox version this module installs: 5 compacts under checkpoints
-(``docs/EPIC5_DESIGN.md`` §1)."""
+VERSION: Final = 6
+"""The outbox version this module installs: 6 keeps trace context beside the
+outbox and the inbox (``docs/EPIC7_DESIGN.md`` §1); 5 compacts under
+checkpoints (``docs/EPIC5_DESIGN.md`` §1)."""
 
 SINKS: Final = "_interlock_sinks"
 OUTBOX: Final = "_interlock_outbox"
@@ -114,8 +117,11 @@ LEGACY: Final = "_interlock_outbox_legacy"
 SETTLEMENTS: Final = "_interlock_outbox_settlements"
 CHECKPOINTS: Final = "_interlock_checkpoints"
 COMPACTED: Final = "_interlock_outbox_compacted"
+TRACES: Final = "_interlock_outbox_traces"
+"""Each request's trace context, its plan's (version 6, ``docs/EPIC7_DESIGN.md``
+§1.3): in no hash, and gone with the request."""
 OUTBOX_TABLES: Final = frozenset(
-    {SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS, CHECKPOINTS, COMPACTED}
+    {SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS, CHECKPOINTS, COMPACTED, TRACES}
     | SQLITE_INBOX_TABLES
 )
 
@@ -138,6 +144,13 @@ WINDOWS_DDL: Final = (
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 _STATES: Final = "'pending', 'leased', 'held', 'delivered', 'dead', 'cancelled'"
+_HEX: Final = "[0-9a-f]"
+_TRACE_CHECK: Final = (
+    f"traceparent GLOB '00-{_HEX * 32}-{_HEX * 16}-{_HEX * 2}' "
+    f"AND substr(traceparent, 4, 32) <> '{'0' * 32}' "
+    f"AND substr(traceparent, 37, 16) <> '{'0' * 16}'"
+)
+"""A stored ``traceparent`` is one: :data:`interlock.trace.TRACEPARENT_PATTERN`."""
 _EVENTS: Final = (
     "'sending', 'delivered', 'retryable', 'permanent', 'unknown', 'lost', 'held', "
     "'deferred', 'expired', 'refused', 'dependency_failed', 'released', 'requeued', "
@@ -363,6 +376,19 @@ _SCHEMA_TEMPLATE: Final = (
     BEGIN SELECT RAISE(ABORT, 'interlock: {WINDOWS_TABLE} is the rate windows'' history'); END""",
     # Version 5: the inbox (docs/EPIC5_DESIGN.md §2).
     *SQLITE_INBOX_SCHEMA,
+    # Version 6 (docs/EPIC7_DESIGN.md §1): trace context, beside the rows it
+    # describes, in none of their hashes, and deleted with them.
+    f"""CREATE TABLE IF NOT EXISTS main.{TRACES} (
+        message_id  TEXT PRIMARY KEY REFERENCES {OUTBOX} (message_id) ON DELETE CASCADE,
+        traceparent TEXT NOT NULL CHECK ({_TRACE_CHECK})
+    )""",
+    f"""CREATE TABLE IF NOT EXISTS main.{SQLITE_TRACES} (
+        source      TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        traceparent TEXT NOT NULL CHECK ({_TRACE_CHECK}),
+        PRIMARY KEY (source, seq),
+        FOREIGN KEY (source, seq) REFERENCES {SQLITE_EVENTS} (source, seq) ON DELETE CASCADE
+    )""",
 )
 _SCHEMA: Final = tuple(
     statement.replace("{compacting}", _COMPACTING) for statement in _SCHEMA_TEMPLATE
@@ -460,18 +486,24 @@ def _event_hash_sql(
 
 
 def installed_version(conn: sqlite3.Connection) -> int:
-    """Which version installed the outbox in this file: 5 when vacuums compact
-    it under checkpoints, 4 when its delivery log records relays'
-    attestations, 3 before; 0 when there is none."""
+    """Which version installed the outbox in this file: 6 when it keeps trace
+    context, 5 when vacuums compact it under checkpoints, 4 when its delivery
+    log records relays' attestations, 3 before; 0 when there is none."""
     if not outbox_installed(conn):
         return 0
     columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({LOG})").fetchall()}
     if "attestation" not in columns:
         return 3
-    compacting = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (CHECKPOINTS,)
-    ).fetchone()
-    return 5 if compacting is not None else 4
+    tables = {
+        str(r[0])
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+            (CHECKPOINTS, TRACES),
+        ).fetchall()
+    }
+    if CHECKPOINTS not in tables:
+        return 4
+    return 6 if TRACES in tables else 5
 
 
 def outbox_installed(conn: sqlite3.Connection) -> bool:
@@ -767,6 +799,16 @@ def enqueue(
     return message_id
 
 
+def trace_stage(conn: sqlite3.Connection, stage_id: uuid.UUID, traceparent: str) -> None:
+    """Give every request the stage enqueued its plan's trace context, in the
+    stage's transaction (``docs/EPIC7_DESIGN.md`` §1.3)."""
+    conn.execute(
+        f"INSERT INTO {TRACES} (message_id, traceparent) "
+        f"SELECT message_id, ? FROM {OUTBOX} WHERE stage_id = ?",
+        (traceparent, str(stage_id)),
+    )
+
+
 def stage_requests(
     conn: sqlite3.Connection, stage_id: uuid.UUID, limit: int
 ) -> list[OutboundDelta]:
@@ -800,11 +842,12 @@ def stage_requests(
 
 RELAY: Final = frozenset({STATE, LOG})
 """What a relay's connection may write."""
-OPERATOR: Final = frozenset({OUTBOX, STATE, LOG})
-"""What an operator's connection may write: compensations are new requests."""
+OPERATOR: Final = frozenset({OUTBOX, STATE, LOG, TRACES})
+"""What an operator's connection may write: compensations are new requests,
+in the trace of the request they compensate."""
 SETTLER: Final = frozenset({SETTLEMENTS})
 """What settlement's connection may write: its record, and nothing else."""
-INBOX: Final = frozenset({SQLITE_SOURCES, SQLITE_EVENTS, SQLITE_FACTS})
+INBOX: Final = frozenset({SQLITE_SOURCES, SQLITE_EVENTS, SQLITE_FACTS, SQLITE_TRACES})
 """What the inbox process's connection may write: its log and its facts."""
 COMPACTOR: Final = frozenset(
     {
@@ -818,11 +861,13 @@ COMPACTOR: Final = frozenset(
         SQLITE_EVENTS,
         SQLITE_FACTS,
         SQLITE_CONSUMED,
+        TRACES,
+        SQLITE_TRACES,
     }
 )
 """What a vacuum's connection may write: checkpoints and tombstones, and the
 rows it prunes under them, the inbox's prefixes included (an operator's,
-whose other actions it takes too)."""
+whose other actions it takes too), and with them their trace context."""
 
 _OUTCOMES: Final = ("delivered", "retryable", "permanent", "unknown")
 
@@ -1078,9 +1123,11 @@ class SqliteOutboxStore:
                 f"SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner, "
                 f"o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id, "
                 f"o.payload, o.payload_hash, o.idempotency_key, o.not_after, k.idempotency, "
-                f"k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms, k.unknown_outcome "
+                f"k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms, k.unknown_outcome, "
+                f"t.traceparent "
                 f"FROM {STATE} AS s JOIN {OUTBOX} AS o ON o.message_id = s.message_id "
                 f"JOIN {SINKS} AS k ON k.name = o.sink "
+                f"LEFT JOIN {TRACES} AS t ON t.message_id = o.message_id "
                 f"WHERE s.state IN ('pending', 'leased') AND s.next_attempt_at <= ? "
                 f"AND o.sink IN (SELECT value FROM json_each(?)) "
                 f"AND NOT EXISTS (SELECT 1 FROM {OUTBOX} AS dep "
@@ -1157,6 +1204,7 @@ class SqliteOutboxStore:
                         unknown_outcome=str(m[19]),
                         lease_expires=instant(until),
                         deadline=deadline,
+                        traceparent=None if m[20] is None else str(m[20]),
                     )
                 )
             self.checkpoint("claim-uncommitted", None)
@@ -1598,6 +1646,12 @@ class SqliteOutboxStore:
                     enqueued,
                     enqueued,
                 ),
+            )
+            # The undo of the same work: in the trace of what it undoes.
+            conn.execute(
+                f"INSERT INTO {TRACES} (message_id, traceparent) "
+                f"SELECT ?, traceparent FROM {TRACES} WHERE message_id = ?",
+                (str(message_id), message),
             )
             self._log(
                 conn,

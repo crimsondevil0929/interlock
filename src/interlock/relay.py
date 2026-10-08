@@ -130,6 +130,9 @@ class Delivery:
     attempt: int
     tenant_id: str | None
     timeout: float
+    traceparent: str | None = None
+    """The W3C trace context to send as the ``traceparent`` header: the
+    plan's, unchanged (``docs/EPIC7_DESIGN.md`` §1.3)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +337,9 @@ class Lease:
     unknown_outcome: str
     lease_expires: datetime
     deadline: float
+    traceparent: str | None = None
+    """The request's trace context, its plan's: sent with the call, and in
+    nothing the relay attests."""
 
     @classmethod
     def from_row(cls, row: Sequence[Any], deadline: float) -> Lease:
@@ -580,6 +586,7 @@ class Relay:
             attempt=attempt,
             tenant_id=lease.tenant_id,
             timeout=min(self._timeout.total_seconds(), remaining),
+            traceparent=lease.traceparent,
         )
         try:
             result = adapter.send(delivery)

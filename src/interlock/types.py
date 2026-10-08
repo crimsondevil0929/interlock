@@ -434,6 +434,11 @@ class EffectPlan:
     """The inbound facts this plan consumes (``docs/EPIC5_DESIGN.md`` §2.6):
     each one its scope's, pending, attested; consumed exactly when the plan
     commits."""
+    traceparent: str | None = None
+    """The W3C trace context the plan's work continues (:mod:`interlock.trace`):
+    carried to every request it enqueues, and sent with each. Outside the
+    plan's hash, as outside every other: the same plan, traced or not, hashes
+    the same (``docs/EPIC7_DESIGN.md`` §1.2)."""
 
     def topological_order(self) -> tuple[Effect, ...]:
         """Effects in a deterministic execution order.
@@ -618,6 +623,10 @@ class InboundFact:
     fields: Mapping[str, Any]
     withheld: tuple[str, ...]
     event_attestation: str
+    traceparent: str | None = None
+    """The trace context the fact continues (``docs/EPIC7_DESIGN.md`` §1.4):
+    its delivery's plan's, or the webhook's when that carried the same trace.
+    Neither attested nor checked."""
 
 
 @dataclass(frozen=True, slots=True)

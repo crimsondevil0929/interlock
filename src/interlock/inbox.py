@@ -50,6 +50,7 @@ from agentgov.receipts.signing import Signer
 from interlock.compaction import instant_text
 from interlock.deliveries import _digest
 from interlock.records import Keyring
+from interlock.trace import parse_traceparent
 from interlock.types import InboundFact, _frozen, exact_number, field_path, outbound_key, value_at
 
 __all__ = [
@@ -746,8 +747,10 @@ class InboxStore(Protocol):
         fields: Mapping[str, Any],
         withheld: Sequence[str],
         attestation: str,
+        traceparent: str | None = None,
     ) -> tuple[int, bool]:
-        """Append an event to its source's log, once. ``(seq, fresh)``."""
+        """Append an event to its source's log, once. ``(seq, fresh)``. Its
+        trace context, if any, is kept beside it, outside its hash."""
         ...
 
     def event(self, source: str, seq: int) -> InboundEvent: ...
@@ -856,6 +859,9 @@ class Inbox:
             return Response(rejected.status, {"error": rejected.reason})
         body_hash = hashlib.sha256(body).hexdigest()
         signature = self._signature_headers(source, headers)
+        # Read only once the signature verified; ignored, never refused, when
+        # it is not one (docs/EPIC7_DESIGN.md §1.4).
+        traceparent = parse_traceparent(_header(headers, "traceparent"))
         recorded = matched = 0
         try:
             with self._lock:
@@ -891,6 +897,7 @@ class Inbox:
                         fields=event.fields,
                         withheld=event.withheld,
                         attestation=attestation,
+                        traceparent=traceparent,
                     )
                     recorded += int(fresh)
                     self._checkpoint("recorded")

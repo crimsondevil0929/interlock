@@ -40,6 +40,7 @@ __all__ = [
     "SQLITE_INBOX_SCHEMA",
     "SQLITE_INBOX_TABLES",
     "SQLITE_SOURCES",
+    "SQLITE_TRACES",
 ]
 
 _ATTESTATION: Final = r'^\{"alg":"ed25519","key_id":"[0-9a-f]{16}","signature":"[0-9a-f]{128}"\}$'
@@ -108,6 +109,20 @@ REVOKE ALL ON interlock.inbox_consumed FROM PUBLIC;
 -- What an event names is found by what a delivered call created.
 CREATE INDEX IF NOT EXISTS outbox_attempts_remote_ref
     ON interlock.outbox_attempts (remote_ref) WHERE remote_ref IS NOT NULL;
+
+-- Version 6 (docs/EPIC7_DESIGN.md §1.4): the trace context a webhook carried,
+-- beside its event and in none of its hashes, and deleted with it.
+CREATE TABLE IF NOT EXISTS interlock.inbox_traces (
+    source      text NOT NULL,
+    seq         integer NOT NULL,
+    traceparent text NOT NULL
+                CHECK (traceparent ~ '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+                       AND pg_catalog.substr(traceparent, 4, 32) <> pg_catalog.repeat('0', 32)
+                       AND pg_catalog.substr(traceparent, 37, 16) <> pg_catalog.repeat('0', 16)),
+    PRIMARY KEY (source, seq),
+    FOREIGN KEY (source, seq) REFERENCES interlock.inbox_events (source, seq) ON DELETE CASCADE
+);
+REVOKE ALL ON interlock.inbox_traces FROM PUBLIC;
 """
 
 INBOX_FUNCTIONS: Final = (
@@ -391,6 +406,47 @@ BEGIN
 END
 $fn$;
 """
+    r"""
+-- The inbox keeps a webhook's trace context beside its event, once
+-- (docs/EPIC7_DESIGN.md §1.4). Granted to inbox roles.
+CREATE OR REPLACE FUNCTION interlock.inbox_trace(
+    p_source text, p_seq integer, p_traceparent text)
+RETURNS void
+LANGUAGE sql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+    INSERT INTO interlock.inbox_traces (source, seq, traceparent)
+    VALUES (p_source, p_seq, p_traceparent)
+    ON CONFLICT (source, seq) DO NOTHING;
+$fn$;
+
+-- What decides each pending fact's trace context, for the agent of its scope:
+-- its delivery's and its webhook's (interlock.trace.fact_traceparent). Read
+-- outside every stage, as interlock.inbox_pending is. Granted to stage roles.
+CREATE OR REPLACE FUNCTION interlock.inbox_pending_traces(p_scope text)
+RETURNS TABLE (out_fact uuid, out_delivery text, out_webhook text)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    IF coalesce(pg_catalog.current_setting('interlock.stage_id', true), '') <> ''
+       OR EXISTS (SELECT 1 FROM interlock.stages s
+                   WHERE s.xid = pg_catalog.pg_current_xact_id_if_assigned()) THEN
+        RAISE EXCEPTION 'interlock: the inbox is read outside every stage' USING ERRCODE = 'IL009';
+    END IF;
+    RETURN QUERY
+        SELECT f.fact_id, ot.traceparent, it.traceparent
+          FROM interlock.inbox_facts AS f
+          LEFT JOIN interlock.outbox_traces AS ot ON ot.message_id = f.message_id
+          LEFT JOIN interlock.inbox_traces AS it
+                 ON it.source = f.source AND it.seq = f.event_seq
+         WHERE f.scope_id = p_scope
+           AND NOT EXISTS (SELECT 1 FROM interlock.inbox_consumed AS c
+                            WHERE c.fact_id = f.fact_id)
+           AND (ot.traceparent IS NOT NULL OR it.traceparent IS NOT NULL);
+END
+$fn$;
+"""
 )
 
 INBOX_TRIGGERS: Final = r"""
@@ -432,8 +488,11 @@ SQLITE_SOURCES: Final = "_interlock_inbox_sources"
 SQLITE_EVENTS: Final = "_interlock_inbox_events"
 SQLITE_FACTS: Final = "_interlock_inbox_facts"
 SQLITE_CONSUMED: Final = "_interlock_inbox_consumed"
+SQLITE_TRACES: Final = "_interlock_inbox_traces"
+"""The trace context a webhook carried, beside its event (version 6,
+``docs/EPIC7_DESIGN.md`` §1.4): in no hash, and gone with the event."""
 SQLITE_INBOX_TABLES: Final = frozenset(
-    {SQLITE_SOURCES, SQLITE_EVENTS, SQLITE_FACTS, SQLITE_CONSUMED}
+    {SQLITE_SOURCES, SQLITE_EVENTS, SQLITE_FACTS, SQLITE_CONSUMED, SQLITE_TRACES}
 )
 
 _SQLITE_CUT: Final = (

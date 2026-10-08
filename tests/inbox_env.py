@@ -228,14 +228,19 @@ class InboxSite:
         kwargs.setdefault("clock", lambda: self.clock())
         return Inbox(kwargs.pop("store", None) or self.store(), SOURCES, **kwargs)
 
-    def deliver(self, *refs: str, scope: str = "agent") -> list[uuid.UUID]:
+    def deliver(
+        self, *refs: str, scope: str = "agent", traceparent: str | None = None
+    ) -> list[uuid.UUID]:
         """Commit and deliver one refund per reference, each recorded by a
-        registered relay with the reference its call created. Their messages."""
+        registered relay with the reference its call created, in
+        ``traceparent``'s trace when given. Their messages."""
         try:
             self.outbox.governor.open_root(scope, "100")
         except DuplicateScopeError:
             pass
-        _, messages = self.outbox.commit(*(refund(ref) for ref in refs), scope=scope)
+        _, messages = self.outbox.commit(
+            *(refund(ref) for ref in refs), scope=scope, traceparent=traceparent
+        )
         relay = Relay(
             self.outbox.store(),
             adapters={"payments": Referencing()},

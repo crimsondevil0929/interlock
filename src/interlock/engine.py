@@ -80,6 +80,7 @@ from interlock.outbound import SinkRegistry
 from interlock.records import Keyring
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
 from interlock.substrate import ShadowSubstrate, _verb_reason
+from interlock.trace import require_traceparent
 from interlock.types import (
     Effect,
     EffectDiff,
@@ -392,12 +393,18 @@ class EscrowEngine:
             other than the one this engine holds, or a table that substrate
             does not observe. Both checks read the label, not the statement: a
             statement writing an unobserved table is not caught here and will
-            not appear in the diff.
+            not appear in the diff. Or if the plan's ``traceparent`` is not one:
+            it becomes a header on every request the plan enqueues.
         """
         try:
             plan.topological_order()
         except ValueError as exc:
             raise CyclicPlanError(str(exc)) from exc
+        if plan.traceparent is not None:
+            try:
+                require_traceparent(plan.traceparent)
+            except ValueError as exc:
+                raise PlanError(f"plan {plan.plan_id}: {exc}") from exc
 
         # An outbound request carries no statement: it answers to the sink
         # registry instead, and to a substrate that can stage it at all.
@@ -893,6 +900,7 @@ class EscrowEngine:
                     intent=plan.intent,
                     repair_of=plan.plan_id,
                     facts=plan.facts,
+                    traceparent=plan.traceparent,
                 )
                 how = "exhaustive" if result.exhaustive else f"stopped: {result.stopped}"
                 self._record(

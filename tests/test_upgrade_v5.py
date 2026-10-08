@@ -142,6 +142,9 @@ class Version4Store(PostgresOutboxStore):
         self._conn = psycopg.connect(self._dsn, autocommit=True, application_name="relay-v4")
         return self._conn
 
+    def _traces(self, conn: Any, messages: list[Any]) -> dict[Any, str]:
+        return {}  # a version before 6 kept no trace context
+
 
 @pytest.fixture
 def roles(pg_admin_dsn: str, pg_back_office: str) -> Iterator[tuple[str, str]]:
@@ -227,7 +230,8 @@ def test_version_5_over_version_4_on_postgres(
     install()
     install()
     with psycopg.connect(pg_back_office, autocommit=True) as conn:
-        assert installer.installed_version(conn) == int(installer.INSTALL_VERSION) == 5
+        # Over version 4, an install brings the current version: 5's, and 6's.
+        assert installer.installed_version(conn) == int(installer.INSTALL_VERSION) == 6
         assert (
             conn.execute(
                 "SELECT message_id, seq, event_hash FROM interlock.outbox_attempts ORDER BY 1, 2"
@@ -297,11 +301,11 @@ def test_version_5_over_version_4_on_sqlite(tmp_path: Path) -> None:
             "SELECT message_id, seq, event_hash FROM _interlock_outbox_attempts ORDER BY 1, 2"
         ).fetchall()
 
-    # Version 5, in place, twice.
+    # Version 5, in place, twice; and with it the current version, 6.
     install_sqlite_outbox(path, RELAY_SINKS)
     install_sqlite_outbox(path, RELAY_SINKS)
     with closing(sqlite3.connect(path)) as conn:
-        assert installed_version(conn) == VERSION == 5
+        assert installed_version(conn) == VERSION == 6
         assert (
             conn.execute(
                 "SELECT message_id, seq, event_hash FROM _interlock_outbox_attempts ORDER BY 1, 2"
