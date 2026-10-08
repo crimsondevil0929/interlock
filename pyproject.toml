@@ -64,6 +64,9 @@ dev = [
 minversion = "8.0"
 addopts = "-ra --strict-markers --strict-config"
 testpaths = ["tests"]
+# A test still running after five minutes has every thread's stack dumped, so
+# a hang shows where it is.
+faulthandler_timeout = 300
 
 [tool.ruff]
 line-length = 100
