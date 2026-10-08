@@ -20,6 +20,10 @@ jobs:
     # A hang fails the job within the hour rather than at GitHub's six, with
     # the stacks pytest dumps after five minutes in its log.
     timeout-minutes: 45
+    # .python-version pins 3.11, and `uv run` follows it unless told otherwise:
+    # without this, every job named for 3.12 ran 3.11.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +105,7 @@ jobs:
     env:
       INTERLOCK_TEST_POSTGRES_DSN: postgresql://interlock_admin:interlock@localhost:5432/postgres
       INTERLOCK_REQUIRE_POSTGRES: "1"
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
 
