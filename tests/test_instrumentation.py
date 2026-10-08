@@ -97,7 +97,9 @@ def test_every_part_is_measured_step_by_step() -> None:
     supervisor = InterlockSupervisor(services=[flaky], restart_min=0.01, restart_max=0.01)
 
     async def body() -> None:
-        while flaky.counters.get("steps", 0) < 3:
+        # The supervisor's own count: the service's ticks inside its step,
+        # before the supervisor has seen the step end.
+        while supervisor.status()["flaky"].steps < 3:
             await asyncio.sleep(0.005)
         scraped = parse(supervisor.metrics.render())
         assert scraped["interlock_service_up"] == {(("service", "flaky"),): 1}
