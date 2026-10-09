@@ -393,7 +393,7 @@ def test_the_inbox_refuses_to_start_without_what_it_needs(
         )[0]
         == 2
     )
-    assert "cannot read the inbox key" in capsys.readouterr().err
+    assert "cannot open the inbox key" in capsys.readouterr().err
     # No [inbox.keys]; no [relays.keys]; no source.
     configured.write_text(text.split("\n[inbox.keys]")[0] + relays_section(configured.parent))
     assert cli("inbox", "verify", "--config", str(configured))[0] == 2

@@ -142,6 +142,7 @@ from interlock.relay import (
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
 from interlock.settlement import SettlementReport, Settler, verify_settlements
+from interlock.signers import HttpRemoteSigner, RemoteSigner
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.supervisor import (
     AgentContext,
@@ -227,6 +228,7 @@ __all__ = [
     "FactAgreement",
     "ForbiddenStatementError",
     "HttpAdapter",
+    "HttpRemoteSigner",
     "InboundFact",
     "InboundFactError",
     "InboundSource",
@@ -277,6 +279,7 @@ __all__ = [
     "Relay",
     "RelayReport",
     "RelayService",
+    "RemoteSigner",
     "Repair",
     "RepairFeedback",
     "RequestSum",

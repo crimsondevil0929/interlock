@@ -37,6 +37,7 @@ __all__ = [
     "open_governor",
     "open_ledger",
     "open_receipts",
+    "open_signer",
     "open_substrate",
     "relay_adapter",
     "relay_adapters",
@@ -97,12 +98,11 @@ def open_receipts(config: InterlockConfig) -> ReceiptIssuer | None:
     claimed by this process until :meth:`ReceiptLog.close`."""
     from agentgov.receipts import ReceiptLog
 
-    from interlock.operators import load_key
-
     settings = config.receipts
     if settings is None:
         return None
-    log = ReceiptLog(settings.log_id, load_key(settings.key), path=settings.log)
+    signer = open_signer(config, settings.signer, settings.key)
+    log = ReceiptLog(settings.log_id, signer, path=settings.log)
     return ReceiptIssuer(log, issuer=settings.issuer, policy_epoch=settings.policy_epoch)
 
 
@@ -125,23 +125,41 @@ class RefusedError(Exception):
     or registered nowhere. Usage, not the database."""
 
 
-def relay_signer(config: InterlockConfig, path: str | Path | None) -> Any:
-    """The relay's key, registered in ``[relays.keys]``; or why the relay
-    may not start. An attestation no registered key verifies proves nothing,
-    so a relay does not make one."""
-    from agentgov.exceptions import SignerUnavailableError
+def open_signer(config: InterlockConfig, signer: str | None, key: str | Path | None) -> Any:
+    """What a part signs with: the key the ``[signers.<name>]`` that
+    ``signer`` names holds, its version pinned now (``docs/EPIC8_DESIGN.md``
+    §1), or the key file at ``key``.
 
+    :raises OSError: If the file cannot be read.
+    :raises ValueError: If neither is given, or the file holds no key.
+    :raises SignerUnavailableError: If the signing service cannot be used.
+    """
+    if signer is not None:
+        return config.signers[signer].open()
+    if not key:
+        raise ValueError("no key file and no signer")
     from interlock.operators import load_key
 
-    if not path:
+    return load_key(key)
+
+
+def relay_signer(config: InterlockConfig, path: str | Path | None) -> Any:
+    """The relay's key: the file at ``path`` (``--key``, ``INTERLOCK_RELAY_KEY``
+    or ``[relay] key``), else ``[relay] signer``'s; registered in
+    ``[relays.keys]``; or why the relay may not start. An attestation no
+    registered key verifies proves nothing, so a relay does not make one."""
+    from agentgov.exceptions import SignerUnavailableError
+
+    remote = None if path or config.relay is None else config.relay.signer
+    if not path and remote is None:
         raise RefusedError(
-            f"a relay signs every outcome it records: give it its key with [relay] key, "
-            f"--key PATH or {RELAY_KEY_ENV} (a new one: interlock keygen --role relay)"
+            f"a relay signs every outcome it records: give it its key with [relay] key or "
+            f"signer, --key PATH or {RELAY_KEY_ENV} (a new one: interlock keygen --role relay)"
         )
     try:
-        signer = load_key(path)
+        signer = open_signer(config, remote, path)
     except (OSError, ValueError, SignerUnavailableError) as exc:
-        raise RefusedError(f"cannot read the relay key: {exc}") from exc
+        raise RefusedError(f"cannot open the relay key: {exc}") from exc
     keyring = config.relay_keyring()
     if keyring is None or signer.key_id not in keyring:
         raise RefusedError(
@@ -222,22 +240,23 @@ def _environment(names: Mapping[str, str]) -> Callable[[], dict[str, str]]:
 
 
 def inbox_signer(config: InterlockConfig, path: str | Path | None) -> Any:
-    """The inbox's key, registered in ``[inbox.keys]``; or why the inbox may
-    not start. A fact no registered key verifies is consumed by no engine, so
-    the inbox does not make one."""
+    """The inbox's key: the file at ``path`` (``--key``,
+    ``INTERLOCK_INBOX_KEY`` or ``[inbox] key``), else ``[inbox] signer``'s;
+    registered in ``[inbox.keys]``; or why the inbox may not start. A fact no
+    registered key verifies is consumed by no engine, so the inbox does not
+    make one."""
     from agentgov.exceptions import SignerUnavailableError
 
-    from interlock.operators import load_key
-
-    if not path:
+    remote = None if path else config.inbox.signer
+    if not path and remote is None:
         raise RefusedError(
-            f"an inbox attests every event and fact: give it its key with [inbox] key, "
-            f"--key PATH or {INBOX_KEY_ENV} (a new one: interlock keygen --role inbox)"
+            f"an inbox attests every event and fact: give it its key with [inbox] key or "
+            f"signer, --key PATH or {INBOX_KEY_ENV} (a new one: interlock keygen --role inbox)"
         )
     try:
-        signer = load_key(path)
+        signer = open_signer(config, remote, path)
     except (OSError, ValueError, SignerUnavailableError) as exc:
-        raise RefusedError(f"cannot read the inbox key: {exc}") from exc
+        raise RefusedError(f"cannot open the inbox key: {exc}") from exc
     keyring = config.inbox_keyring()
     if keyring is None or signer.key_id not in keyring:
         raise RefusedError(

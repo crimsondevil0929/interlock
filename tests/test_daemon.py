@@ -232,6 +232,74 @@ def charge(ctx: AgentContext) -> Any:
     )
 
 
+def test_the_daemon_signs_with_every_key_at_a_signing_service(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay, the inbox, the vacuum and the receipt log each sign through a
+    key service (docs/EPIC8_DESIGN.md §1): no key file is left to read."""
+    from tests.fakekms import FakeKms
+
+    base = site.path.parent
+    parts = ("relay", "inbox", "vacuum", "receipts")
+    kms = FakeKms(token="daemon-kms-token")
+    monkeypatch.setenv("DAEMON_KMS_TOKEN", "daemon-kms-token")
+    text = site.path.read_text()
+    for name in parts:
+        key_file = base / f"{name}.key"
+        kms.create(name, bytes.fromhex(key_file.read_text().strip()))
+        key_file.unlink()
+        text = text.replace(f'key = "{name}.key"', f'signer = "{name}"').replace(
+            "[daemon]",
+            f'[signers.{name}]\ntype = "http"\nurl = "{kms.url}"\nkey = "{name}"\n'
+            f'token_env = "DAEMON_KMS_TOKEN"\n\n[daemon]',
+        )
+    site.path.write_text(text)
+    config = site.config
+    assert {config.signers[n].key for n in parts} == set(parts)
+    charged: list[StageResult] = []
+
+    async def agent(ctx: AgentContext) -> None:
+        charged.append(await ctx.execute(charge(ctx)))
+        while not ctx.stopping:
+            await ctx.sleep(0.05)
+
+    supervisor = build_supervisor(config, Application(checkers=[BlastRadius(5)], agents=[agent]))
+
+    async def run() -> None:
+        running = asyncio.create_task(supervisor.run())
+        await asyncio.wait_for(supervisor.ready(), 30)
+        inbox = supervisor.inbox_port
+        assert inbox is not None
+        await until(lambda: supervisor.status()["settler"].counters.get("receipts", 0) == 1)
+        (intent,) = site.stripe.of("payment_intent")
+        event = {
+            "id": "evt_1",
+            "object": "event",
+            "type": "payment_intent.succeeded",
+            "data": {"object": {**intent, "status": "succeeded"}},
+        }
+        # Recorded, so attested. (Its fact may not be: the vacuum, every second
+        # with no retention, may have pruned the payment by now.)
+        status, answer = await asyncio.to_thread(post, inbox, stripe_webhook(event))
+        assert status == 200 and answer["recorded"] == 1
+        await until(lambda: supervisor.status()["vacuum"].counters.get("applied", 0) >= 1)
+        supervisor.stop()
+        await running
+
+    try:
+        asyncio.run(run())
+    finally:
+        kms.close()
+    assert [r.committed for r in charged] == [True]
+    # Every signature came from the service: the outcome, the event, both
+    # receipts, and the vacuum's intent and outcome.
+    assert kms.signed[("relay", 1)] >= 1
+    assert kms.signed[("inbox", 1)] >= 1
+    assert kms.signed[("receipts", 1)] >= 2
+    assert kms.signed[("vacuum", 1)] >= 2
+    assert not [n for n in parts if (base / f"{n}.key").exists()]
+
+
 def test_every_part_runs_as_the_configuration_says(site: Site) -> None:
     results: list[StageResult] = []
 
@@ -645,3 +713,32 @@ def test_interlock_daemon_serves_metrics_where_asked(site: Site) -> None:
         "vacuum",
         "metrics",
     }
+
+
+def test_an_operator_signs_through_a_signing_service(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from interlock.records import read_records
+    from tests.fakekms import FakeKms
+
+    base = site.path.parent
+    with FakeKms(token="ops-token") as kms:
+        key = kms.create("ops", bytes.fromhex((base / "vacuum.key").read_text().strip()))
+        monkeypatch.setenv("OPS_KMS_TOKEN", "ops-token")
+        site.path.write_text(
+            site.path.read_text().replace(
+                "[daemon]",
+                f'[signers.ops]\ntype = "http"\nurl = "{kms.url}"\nkey = "ops"\n'
+                f'token_env = "OPS_KMS_TOKEN"\n\n[daemon]',
+            )
+        )
+        config = str(site.path)
+        before = len(read_records(base / "operators.ilok1"))
+        assert main(["install", "--config", config, "--signer", "ops"], out=io.StringIO()) == 0
+        records = read_records(base / "operators.ilok1")
+        assert len(records) == before + 1 and records[-1].key_id == key.key_id
+        assert kms.signed[("ops", 1)] == 1
+        both = ["install", "--config", config, "--signer", "ops", "--key", str(base / "vacuum.key")]
+        assert main(both, out=io.StringIO()) != 0
+        assert main(["install", "--config", config, "--signer", "nobody"], out=io.StringIO()) != 0
+        assert kms.signed[("ops", 1)] == 1

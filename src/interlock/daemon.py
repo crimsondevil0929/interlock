@@ -181,7 +181,7 @@ def build_supervisor(
         if engines is not None and config.receipts is not None:
             services.append(_settler(config, engines, receipts, governors))
         vacuum = config.vacuum
-        if vacuum.every is not None and vacuum.key is not None:
+        if vacuum.every is not None and (vacuum.key is not None or vacuum.signer is not None):
             services.append(_vacuum(config, governors))
         where = metrics_listen or config.metrics.listen
         if where:
@@ -479,9 +479,11 @@ def _settler(
 
 
 def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
-    from interlock.operators import OperatorLog, load_key
+    from agentgov.exceptions import SignerUnavailableError
+
+    from interlock.operators import OperatorLog
     from interlock.vacuum import Vacuum
-    from interlock.wiring import compactor
+    from interlock.wiring import compactor, open_signer
 
     operators = config.operators
     relays = config.relay_keyring()
@@ -496,8 +498,11 @@ def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
             "a vacuum prunes only what verifies, relays' attestations included: register "
             "their keys in [relays.keys]"
         )
-    assert vacuum.key is not None and vacuum.every is not None
-    signer = load_key(vacuum.key)
+    assert vacuum.every is not None
+    try:
+        signer = open_signer(config, vacuum.signer, vacuum.key)
+    except (OSError, ValueError, SignerUnavailableError) as exc:
+        raise SubstrateConfigurationError(f"cannot open the vacuum's key: {exc}") from exc
     if signer.key_id not in operators.keyring():
         raise SubstrateConfigurationError(
             f"the vacuum's key {signer.key_id} is no registered operator's: register it in "

@@ -171,6 +171,7 @@ OPERATOR_KEY_ENV = "INTERLOCK_OPERATOR_KEY"
 """The path to an operator's key file, when ``--key`` is not given."""
 SIGNED: Final = frozenset({"release", "cancel", "requeue", "compensate", "resolve"})
 """The outbox actions an operator signs."""
+_SIGNER_HELP: Final = "in place of --key: the [signers.<name>] holding your operator key"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -230,6 +231,7 @@ def _parser() -> argparse.ArgumentParser:
             action.add_argument(
                 "--key", help=f"your operator key file (default: ${OPERATOR_KEY_ENV})"
             )
+            action.add_argument("--signer", help=_SIGNER_HELP)
             action.add_argument(
                 "--reason",
                 required=name == "cancel",
@@ -245,6 +247,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     _common(vacuum, _DATABASE_HELP)
     vacuum.add_argument("--key", help=f"your operator key file (default: ${OPERATOR_KEY_ENV})")
+    vacuum.add_argument("--signer", help=_SIGNER_HELP)
     vacuum.add_argument("--reason", help="recorded in the signed intent")
     vacuum.add_argument("--dry-run", action="store_true", help="say what would go; sign nothing")
     vacuum.add_argument(
@@ -332,6 +335,7 @@ def _parser() -> argparse.ArgumentParser:
                 help=f"with [operators]: your operator key, to sign the sink registry "
                 f"(default: ${OPERATOR_KEY_ENV})",
             )
+            command.add_argument("--signer", help=_SIGNER_HELP)
         if name == "reconcile-effects":
             command.add_argument(
                 "--chain",
@@ -354,7 +358,7 @@ def _install(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> 
         # A change to the sink registry is an operator's, and signed: the key
         # is read before anything is installed.
         try:
-            signer = _signer(config, args.key)
+            signer = _signer(config, args.key, args.signer)
         except _RefusedError as exc:
             print(f"interlock: install changes the sink registry: {exc}", file=sys.stderr)
             return EXIT_USAGE
@@ -723,22 +727,31 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
     return EXIT_OK
 
 
-def _signer(config: InterlockConfig, key: str | None) -> Any:
-    """The operator's key, or why there is none."""
-    from interlock.operators import load_key
+def _signer(config: InterlockConfig, key: str | None, signer: str | None = None) -> Any:
+    """The operator's key: the file at ``--key`` or ``INTERLOCK_OPERATOR_KEY``,
+    or the ``[signers.<name>]`` that ``--signer`` names; or why there is none."""
+    from agentgov.exceptions import SignerUnavailableError
+
+    from interlock.wiring import open_signer
 
     if config.operators is None:
         raise _RefusedError(
             "operator actions are signed: configure [operators] with each operator's public "
             "key (docs/EPIC3_DESIGN.md §6)"
         )
-    path = key or os.environ.get(OPERATOR_KEY_ENV)
-    if not path:
-        raise _RefusedError(f"sign with your operator key: --key PATH, or {OPERATOR_KEY_ENV}")
+    if key and signer:
+        raise _RefusedError("sign with --key or --signer, not both")
+    if signer is not None and signer not in config.signers:
+        raise _RefusedError(f"--signer {signer!r} names no [signers.{signer}]")
+    path = None if signer else key or os.environ.get(OPERATOR_KEY_ENV)
+    if not path and signer is None:
+        raise _RefusedError(
+            f"sign with your operator key: --key PATH, --signer NAME, or {OPERATOR_KEY_ENV}"
+        )
     try:
-        return load_key(path)
-    except (OSError, ValueError) as exc:
-        raise _RefusedError(f"cannot read the operator key: {exc}") from exc
+        return open_signer(config, signer, path)
+    except (OSError, ValueError, SignerUnavailableError) as exc:
+        raise _RefusedError(f"cannot open the operator key: {exc}") from exc
 
 
 @contextmanager
@@ -776,7 +789,7 @@ def _signed(config: InterlockConfig, source: Any, args: argparse.Namespace, out:
     from interlock.operators import OperatorRefusedError
 
     try:
-        signer = _signer(config, args.key)
+        signer = _signer(config, args.key, args.signer)
         with _session(config, source, signer) as operator:
             if args.action == "resolve":
                 resolved = operator.resolve()
@@ -844,7 +857,7 @@ def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         )
         return EXIT_USAGE
     try:
-        signer = _signer(config, args.key)
+        signer = _signer(config, args.key, args.signer)
     except _RefusedError as exc:
         print(f"interlock: {exc}", file=sys.stderr)
         return EXIT_USAGE
