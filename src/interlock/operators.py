@@ -59,7 +59,14 @@ from interlock.deliveries import (
     registry_digest,
 )
 from interlock.exceptions import InterlockError, OutboundRequestError, RecordIntegrityError
-from interlock.keys import REVOKE, ROLES, SEALED_ROLES, KeyRegistry, registered_body
+from interlock.keys import (
+    REVOKE,
+    ROLES,
+    SEALED_ROLES,
+    KeyRegistry,
+    registered_body,
+    revoked_ids_of,
+)
 from interlock.outbound import SinkRegistry, bind, placeholders
 from interlock.records import (
     GENESIS,
@@ -481,8 +488,9 @@ class Operator:
         by its intent, and only by another operator.
 
         :raises OperatorRefusedError: If the key is no trusted key of the role,
-            is revoked already, is this operator's own, or is the last operator
-            key. Nothing is signed.
+            is revoked already, or is this operator's own (so it is never the
+            last operator key: the one revoking it still signs). Nothing is
+            signed.
         """
         if role not in ROLES:
             raise OperatorRefusedError(f"a key's role is one of {', '.join(ROLES)}, not {role!r}")
@@ -493,20 +501,14 @@ class Operator:
         logged = registry.revocation(key_id)
         if logged is not None and logged.applied is not None:
             raise OperatorRefusedError(f"key {key_id} is revoked already; nothing signed")
-        if role in SEALED_ROLES and key_id in self._outbox.revocations():
+        if role in SEALED_ROLES and key_id in revoked_ids_of(self._outbox):
             raise OperatorRefusedError(f"key {key_id} is revoked already; nothing signed")
         if role == "operator":
-            trusted = self._log.trusted
-            assert trusted is not None
+            # Never the last operator key, then: the one revoking it still signs.
             if key_id == self._log.signer.key_id:
                 raise OperatorRefusedError(
                     "an operator does not revoke their own key: another operator does, so the "
                     "revocation is recorded by a key that still signs; nothing signed"
-                )
-            others = [k for k in registry.keyring("operator").ids() if k != key_id]
-            if not any(trusted.trusts(k) for k in others):
-                raise OperatorRefusedError(
-                    "that is the last operator key: no one could sign again; nothing signed"
                 )
         intent = self._log.append(
             INTENT,

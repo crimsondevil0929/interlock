@@ -901,8 +901,11 @@ def test_a_reload_rotates_the_relay_and_inbox_keys_while_the_daemon_runs(
             register = ("keys", "register", "--role", role, "--name", f"{role}-2")
             code, said = await asyncio.to_thread(as_operator, site, *register, "--public-of", role)
             assert code == 0, said
-        # 2. Every part opens again, signing with the new keys.
+        # 2. Every part opens again, signing with the new keys; the inbox
+        # behind the listener it had, which never closed.
+        listening = supervisor._running["inbox"].service._server  # type: ignore[attr-defined]
         told["reload"] = await supervisor.reload()
+        assert supervisor._running["inbox"].service._server is listening  # type: ignore[attr-defined]
         # 3. The old keys revoked: what they attested, sealed.
         for role, key_id in old.items():
             revoke = ("keys", "revoke", "--role", role, key_id, "--reason", "rotated")

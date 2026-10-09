@@ -23,7 +23,13 @@ role. Around it:
   and the order updated to say what the fact says), each continuing the
   fact's trace; notes on a few hot rows every agent contends for; and, now
   and then, a plan that must be refused.
-- **An operator** compensating paid orders, every action signed.
+- **A key service** in the soak's process, holding the relays', the inbox's
+  and the vacuum's Ed25519 keys as a KMS does: the daemon signs through
+  ``HttpRemoteSigner`` and never holds one (``docs/EPIC8_DESIGN.md`` §5).
+- **An operator** compensating paid orders, every action signed; and, halfway
+  through the load, rotating the relays' key: a new version at the service,
+  registered in the operator log; the daemon reloaded; and the old key
+  revoked while a stale relay, still holding it, has a call in flight.
 - **An auditor** sampling the database throughout: lock waits, the rate
   windows' history, the outbox's size, what the vacuum has yet to prune.
 - **A scraper** reading the daemon's ``/metrics`` every second, as Prometheus
@@ -61,6 +67,11 @@ trace context survives      every call the payment API saw carried its plan's co
 metrics agree               every scrape well formed and every family exported; no counter ever
                             fell, no window above its limit; the plans, webhooks, deliveries,
                             receipts and outbox they report are what the run counted itself
+keys rotate                 mid-load, every part reopened with the new key; every outcome the old
+                            key attested sealed, but the stale relay's, which the database
+                            refused, and its message delivered once under the new key; every
+                            outcome after the revocation the new key's; the seal the one its
+                            operator signed
 ==========================  ====================================================================
 
 Run::
@@ -79,6 +90,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import faulthandler
 import hashlib
@@ -110,7 +122,7 @@ from datetime import datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import psycopg
 from agentgov import BudgetManager
@@ -132,16 +144,20 @@ from interlock.daemon import Application, build_supervisor
 from interlock.exceptions import (
     ChainInUseError,
     InboundFactError,
+    KeyRevokedError,
     StageConflictError,
     SupervisorStoppedError,
 )
 from interlock.operators import Operator, OperatorLog, OperatorRefusedError, generate_key, load_key
+from interlock.relay import Delivery, DeliveryResult, NoBreaker, Relay
+from interlock.signers import HttpRemoteSigner
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE
 from interlock.supervisor import AgentContext, InterlockSupervisor, ServiceStatus
 from interlock.telemetry import CATALOG
 from interlock.trace import child_traceparent, new_traceparent, parse_traceparent, trace_id
 from interlock.types import InboundFact, OutboundRequest
 
+T = TypeVar("T")
 logger = logging.getLogger("soak")
 
 # --------------------------------------------------------------------------
@@ -152,6 +168,10 @@ SINK = "payments"
 SOURCE = "stripe"
 API_KEY_ENV = "SOAK_STRIPE_KEY"
 WEBHOOK_SECRET_ENV = "SOAK_WEBHOOK_SECRET"  # noqa: S105 - the name of a variable
+KMS_TOKEN_ENV = "SOAK_KMS_TOKEN"  # noqa: S105 - the name of a variable
+REMOTE = ("relay", "inbox", "vacuum")
+"""The parts whose keys the key service holds: each signs as
+``[signers.<part>]``, the key named ``soak-<part>``."""
 OPERATORS_SCOPE = "interlock-operators"
 
 SETTLE_COST = Decimal("0.01")
@@ -432,24 +452,137 @@ def create_site(site: Site, settings: Settings) -> None:
 # --------------------------------------------------------------------------
 
 
+class KeyService:
+    """A key service on localhost, in :class:`~interlock.signers.HttpRemoteSigner`'s
+    protocol: named Ed25519 keys with versions, held in memory as a KMS holds
+    them, a bearer token on every request. Every signature it makes is
+    counted, by key and version."""
+
+    def __init__(self, token: str) -> None:
+        from agentgov.receipts.signing import Ed25519Signer
+
+        self._new = Ed25519Signer.generate
+        self.token = token
+        self._lock = threading.Lock()
+        self._keys: dict[str, list[Any]] = {}
+        self.signed: Counter[tuple[str, int]] = Counter()
+        service = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                service._handle(self, "GET")
+
+            def do_POST(self) -> None:
+                service._handle(self, "POST")
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, name="soak-key-service", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def create(self, name: str) -> Any:
+        """A key, at version 1."""
+        key = self._new()
+        with self._lock:
+            self._keys[name] = [key]
+        return key
+
+    def rotate(self, name: str) -> Any:
+        """A new version of ``name``: what a signer built from now on pins."""
+        key = self._new()
+        with self._lock:
+            self._keys[name].append(key)
+        return key
+
+    def key(self, name: str, version: int | None = None) -> Any:
+        with self._lock:
+            versions = self._keys[name]
+            return versions[-1 if version is None else version - 1]
+
+    def signer(self, name: str, version: int | None = None) -> HttpRemoteSigner:
+        """A signer for ``name`` at this service, pinned to ``version``."""
+        return HttpRemoteSigner(self.url, name, token=self.token, version=version)
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def _handle(self, handler: BaseHTTPRequestHandler, method: str) -> None:
+        url = urllib.parse.urlsplit(handler.path)
+        parts = url.path.strip("/").split("/")
+        if handler.headers.get("Authorization") != f"Bearer {self.token}":
+            self._answer(handler, 401, {"errors": ["permission denied"]})
+            return
+        with self._lock:
+            versions = list(self._keys.get(parts[2], ())) if len(parts) >= 3 else []
+        if parts[:2] != ["v1", "keys"] or not versions:
+            self._answer(handler, 404, {"errors": ["no such key"]})
+            return
+        if method == "GET" and len(parts) == 3:
+            query = urllib.parse.parse_qs(url.query)
+            version = int(query["version"][0]) if "version" in query else len(versions)
+            if not 1 <= version <= len(versions):
+                self._answer(handler, 404, {"errors": ["no such version"]})
+                return
+            public = versions[version - 1].public_key().raw.hex()
+            self._answer(handler, 200, {"alg": "ed25519", "version": version, "public_key": public})
+            return
+        if method == "POST" and parts[3:] == ["sign"]:
+            length = int(handler.headers.get("Content-Length") or 0)
+            body = json.loads(handler.rfile.read(length))
+            version = int(body["version"])
+            if not 1 <= version <= len(versions):
+                self._answer(handler, 400, {"errors": ["no such version"]})
+                return
+            signature = versions[version - 1].sign(base64.b64decode(body["message"]))
+            with self._lock:
+                self.signed[(parts[2], version)] += 1
+            self._answer(handler, 200, {"version": version, "signature": signature.hex()})
+            return
+        self._answer(handler, 404, {"errors": ["no such route"]})
+
+    @staticmethod
+    def _answer(handler: BaseHTTPRequestHandler, status: int, body: Any) -> None:
+        payload = json.dumps(body).encode()
+        with contextlib.suppress(OSError):
+            handler.send_response(status)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+
 @dataclass(frozen=True)
 class Keys:
-    """Every key the run signs with, written beside the configuration."""
+    """Every key the run signs with: the desk's and the receipt log's in files
+    beside the configuration; the relays', the inbox's and the vacuum's at the
+    key service, which never hands one out."""
 
-    relay: Path
-    inbox: Path
     desk: Path
-    vacuum: Path
     receipts: Path
+    service: KeyService
 
     @classmethod
-    def generate(cls, directory: Path) -> Keys:
-        paths = {name: directory / f"{name}.key" for name in cls.__dataclass_fields__}
-        for path in paths.values():
-            generate_key(path)
-        return cls(**paths)
+    def generate(cls, directory: Path, service: KeyService) -> Keys:
+        for part in REMOTE:
+            service.create(f"soak-{part}")
+        keys = cls(directory / "desk.key", directory / "receipts.key", service)
+        generate_key(keys.desk)
+        generate_key(keys.receipts)
+        return keys
 
     def spec(self, name: str) -> str:
+        if name in REMOTE:
+            return str(self.service.key(f"soak-{name}").public_key().spec())
         return str(load_key(getattr(self, name)).public_key().spec())
 
 
@@ -462,7 +595,8 @@ def write_config(site: Site, settings: Settings, keys: Keys, api_port: int) -> P
     """The ``interlock.toml`` of the run: every part, configured as in production,
     with its times scaled down to seconds."""
     roles = site.roles
-    text = f"""
+    text = (
+        f"""
 substrate = "postgres"
 database = {_q(site.owner)}
 schema = "public"
@@ -514,7 +648,7 @@ measure = "plans"
 soak-relay = {_q(keys.spec("relay"))}
 
 [relay]
-key = "relay.key"
+signer = "relay"
 database = {_q(site.dsn("relay"))}
 ledger = {_q(site.dsn("relay"))}
 breaker = "agentgov"
@@ -539,7 +673,7 @@ desk = {_q(keys.spec("desk"))}
 vacuum = {_q(keys.spec("vacuum"))}
 
 [inbox]
-key = "inbox.key"
+signer = "inbox"
 database = {_q(site.dsn("inbox"))}
 listen = "127.0.0.1:0"
 match_window_seconds = 600
@@ -579,18 +713,31 @@ every_seconds = {settings.vacuum_every}
 retain_seconds = {settings.retain}
 margin_seconds = {settings.margin}
 database = {_q(site.owner)}
-key = "vacuum.key"
+signer = "vacuum"
 
 [daemon]
 drain_timeout_seconds = 30
 restart_min_seconds = 0.2
 restart_max_seconds = 5
+"""
+        + "".join(
+            f"""
+[signers.{part}]
+type = "http"
+url = {_q(keys.service.url)}
+key = "soak-{part}"
+token_env = "{KMS_TOKEN_ENV}"
+"""
+            for part in REMOTE
+        )
+        + f"""
 
 [metrics]
 listen = "127.0.0.1:0"
 every_seconds = {METRICS_EVERY}
 database = {_q(site.dsn("audit"))}
 """
+    )
     path = site.directory / "interlock.toml"
     path.write_text(text, encoding="utf-8")
     return path
@@ -1507,6 +1654,32 @@ class Desk(threading.Thread):
     def stop(self) -> None:
         self._halt.set()
 
+    def act(self, action: Callable[[Operator], T]) -> T:
+        """One more action, signed with the desk's key, from another thread:
+        the operator log's one writer at a time, as the desk's own wait. Its
+        records are anchored when the log is next opened with the ledger, by
+        the desk or the vacuum: a governor opened mid-run would read the whole
+        ledger under its writer lock, every engine waiting."""
+        from interlock.deliveries import operations
+
+        operators = self._config.operators
+        assert operators is not None
+        conn = psycopg.connect(self._site.owner, autocommit=True)
+        try:
+            deadline = time.monotonic() + 120
+            while True:
+                try:
+                    with OperatorLog(
+                        operators.log, self._signer, operators.keyring(), scope=operators.scope
+                    ) as log:
+                        return action(Operator(log, operations(conn)))
+                except ChainInUseError:
+                    if time.monotonic() > deadline:
+                        raise SoakError("the operator log was not free in two minutes") from None
+                    time.sleep(0.05)
+        finally:
+            conn.close()
+
     def run(self) -> None:
         from interlock.deliveries import operations
 
@@ -1560,6 +1733,152 @@ class Desk(threading.Thread):
         finally:
             conn.close()
             governor.close()
+
+
+# --------------------------------------------------------------------------
+# The rotation: the relays' key, mid-load (docs/EPIC8_DESIGN.md §2.6, §5)
+# --------------------------------------------------------------------------
+
+
+class _Held:
+    """The payment API's adapter, holding what each call answered until the
+    gate opens: its relay records the outcome only then."""
+
+    def __init__(self, inner: Any, called: threading.Event, gate: threading.Event) -> None:
+        self._inner = inner
+        self._called = called
+        self._gate = gate
+        self.message: str | None = None
+
+    def send(self, delivery: Delivery) -> DeliveryResult:
+        result: DeliveryResult = self._inner.send(delivery)
+        self.message = str(delivery.message_id)
+        self._called.set()
+        self._gate.wait(120)
+        return result
+
+
+class StaleRelay(threading.Thread):
+    """A relay that kept the old key: it claims a message and calls the
+    payment API before the key is revoked, and records the outcome after. The
+    database refuses it, the lease runs out, and a relay of the daemon's calls
+    again, the idempotency key answering with what was already done."""
+
+    def __init__(self, run: Run, signer: HttpRemoteSigner) -> None:
+        super().__init__(name="soak-stale-relay", daemon=True)
+        from interlock.wiring import relay_adapters
+
+        settings = run.config.relay
+        assert settings is not None
+        self.called = threading.Event()
+        self.gate = threading.Event()
+        adapters = dict(relay_adapters(settings))
+        self.held = _Held(adapters[SINK], self.called, self.gate)
+        adapters[SINK] = self.held
+        self._relay = Relay(
+            run.site.dsn("relay"),
+            adapters=adapters,
+            breaker=NoBreaker(),
+            relay_id="soak-stale-relay",
+            lease=settings.lease,
+            timeout=settings.timeout,
+            batch=1,
+            signer=signer,
+        )
+        self.result = "never ran"
+
+    def run(self) -> None:
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                report = self._relay.run_once()
+                if report.claimed:
+                    self.result = f"recorded its outcome: {report}"
+                    return
+                time.sleep(0.05)
+            self.result = "claimed nothing in a minute"
+        except KeyRevokedError as exc:
+            self.result = f"refused: {exc}"
+        except Exception as exc:
+            self.result = f"failed: {type(exc).__name__}: {exc}"
+        finally:
+            self._relay.close()
+
+
+@dataclass
+class Rotation:
+    """What the rotation did, and when, in seconds into the load."""
+
+    began: float = 0.0
+    ended: float = 0.0
+    old: str = ""
+    new: str = ""
+    registered: int = 0
+    """The ``key.registered`` record's sequence."""
+    reload: dict[str, str | None] = field(default_factory=dict)
+    called_first: bool = False
+    """The stale relay called the payment API before the revocation."""
+    revoked: int = 0
+    """The ``revoke-key`` intent's sequence."""
+    seal: dict[str, Any] = field(default_factory=dict)
+    stale: str = ""
+    held: str | None = None
+    """The message the stale relay held."""
+    old_signed_after: int = 0
+    """Signatures the old version made after the revocation: the stale relay's one."""
+    unsealed: int = -1
+    """The old key's outcomes outside its seal, read as the revocation committed."""
+    new_after: int = 0
+    """Outcomes by the new key after the revocation, read before a vacuum prunes them."""
+    old_after: int = 0
+    error: str | None = None
+
+
+async def rotate(run: Run, supervisor: InterlockSupervisor) -> None:
+    """Halfway through the load, the operator rotates the relays' key: a new
+    version at the key service, registered; every part reloaded; then, while
+    a stale relay still holding the old key has a call in flight, the old key
+    revoked. Never raises: what went wrong is the claim's to report."""
+    rotation = run.rotation
+    service = run.keys.service
+    roots = run.config.key_roots()
+    rotation.began = time.monotonic() - run.started
+    try:
+        old = service.key("soak-relay", 1)
+        rotation.old = old.key_id
+        new = service.rotate("soak-relay")
+        rotation.new = new.key_id
+        record = await asyncio.to_thread(
+            run.desk.act,
+            lambda op: op.register_key("relay", "soak-relay-2", new.public_key(), roots=roots),
+        )
+        rotation.registered = record.seq
+        rotation.reload = await supervisor.reload()
+        stale = StaleRelay(run, await asyncio.to_thread(service.signer, "soak-relay", 1))
+        stale.start()
+        rotation.called_first = await asyncio.to_thread(stale.called.wait, 30)
+        outcome = await asyncio.to_thread(
+            run.desk.act,
+            lambda op: op.revoke_key("relay", old.key_id, reason="rotated mid-soak", roots=roots),
+        )
+        before = service.signed[("soak-relay", 1)]
+        rotation.revoked = outcome.intent.seq
+        rotation.seal = dict(outcome.record.body.get("seal") or {})
+        stale.gate.set()
+        await asyncio.to_thread(stale.join, 60)
+        rotation.stale = stale.result
+        rotation.held = stale.held.message
+        rotation.old_signed_after = service.signed[("soak-relay", 1)] - before
+        await asyncio.to_thread(_after_revocation, run)
+    except Exception as exc:
+        rotation.error = f"{type(exc).__name__}: {exc}"
+        logger.exception("the rotation failed")
+    rotation.ended = time.monotonic() - run.started
+    say(
+        run.settings,
+        f"  {rotation.ended:6.0f}s  the relays' key rotated: {rotation.old} -> {rotation.new}; "
+        f"the stale relay {rotation.stale.split(':')[0] or 'did nothing'}",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1918,6 +2237,7 @@ class Run:
     total_at_end: int = 0
     scraper: Scraper | None = None
     settled: Settled | None = None
+    rotation: Rotation = field(default_factory=Rotation)
     failure: str | None = None
 
 
@@ -2049,17 +2369,23 @@ async def started(run: Run, supervisor: InterlockSupervisor, runner: asyncio.Tas
 async def load(run: Run, supervisor: InterlockSupervisor, runner: asyncio.Task[None]) -> None:
     settings = run.settings
     end = run.started + settings.minutes * 60
+    halfway = run.started + settings.minutes * 30
+    rotating: asyncio.Task[None] | None = None
     next_report = run.started + 10
     next_burst = run.started + BURST_EVERY
     tenants = itertools.cycle(settings.tenant_names)
     while (now := time.monotonic()) < end and not runner.done():
         await asyncio.sleep(min(1.0, end - now))
+        if rotating is None and time.monotonic() >= halfway:
+            rotating = asyncio.create_task(rotate(run, supervisor), name="soak-rotation")
         if time.monotonic() >= next_burst:
             run.workload.burst = (next(tenants), time.monotonic() + BURST_SECONDS)
             next_burst += BURST_EVERY
         if time.monotonic() >= next_report:
             say(settings, progress(run, supervisor))
             next_report += 10
+    if rotating is not None:
+        await rotating
     run.load_seconds = time.monotonic() - run.started
     if runner.done():
         raise SoakError("the daemon stopped during the load")
@@ -2143,9 +2469,13 @@ def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | 
     site = new_site(cluster, workdir)
     vendor: Vendor | None = None
     api: PaymentAPI | None = None
+    service: KeyService | None = None
     try:
         create_site(site, settings)
-        keys = Keys.generate(workdir)
+        token = secrets.token_hex(16)
+        os.environ[KMS_TOKEN_ENV] = token
+        service = KeyService(token)
+        keys = Keys.generate(workdir, service)
         api_key = "sk_test_" + secrets.token_hex(12)
         webhook_secret = "whsec_" + secrets.token_hex(16)
         os.environ[API_KEY_ENV] = api_key
@@ -2193,6 +2523,8 @@ def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | 
             vendor.close()
         if api is not None:
             api.close()
+        if service is not None:
+            service.close()
         root.removeHandler(captured)
         root.removeHandler(file_log)
         root.setLevel(level)
@@ -2237,6 +2569,7 @@ def prove(run: Run) -> list[Claim]:
                 graceful(run),
                 trace_survives(run),
                 metrics_agree(run, conn),
+                keys_rotate(run, conn),
             ]
         finally:
             governor.close()
@@ -2524,9 +2857,18 @@ def exactly_once(run: Run, conn: psycopg.Connection[Any]) -> Claim:
         )
     genuine = [s for s in run.vendor.sent if s.purpose == "genuine" and s.status == 200]
     duplicates = [s for s in run.vendor.sent if s.purpose == "duplicate" and s.status == 200]
-    recorded_twice = [s for s in duplicates if s.recorded]
+    # Recordings by event, whichever of its sends came first: under load a
+    # duplicate overtakes its genuine send now and then, and is the one that
+    # records it.
+    recordings = Counter(
+        s.event_id
+        for s in run.vendor.sent
+        if s.status == 200 and s.recorded and not s.purpose.startswith("forged:")
+    )
+    recorded_twice = sorted(e for e, n in recordings.items() if n > 1)
     if recorded_twice:
-        problems.append(f"{len(recorded_twice)} duplicate webhook(s) recorded again")
+        problems.append(f"{len(recorded_twice)} event(s) recorded more than once")
+    overtaken = sum(1 for s in duplicates if s.recorded)
     early = sum(1 for s in genuine if s.recorded and not s.matched)
     return Claim(
         "exactly once",
@@ -2539,9 +2881,10 @@ def exactly_once(run: Run, conn: psycopg.Connection[Any]) -> Claim:
             f"{len(refunds)} refunds for {run.desk.applied} compensations",
             f"{delivered} messages delivered once each, {delivered} delivery receipts "
             f"({actions} action receipts beside them)",
-            f"{events} events recorded, one per id ({len(duplicates)} duplicates answered and "
-            f"not recorded again; {early} arrived before their delivery was recorded and were "
-            f"bound later); {facts} facts, each consumed once",
+            f"{events} events recorded, one per id; each event the vendor sent recorded by one "
+            f"send ({len(duplicates)} duplicates answered, {overtaken} of them ahead of their "
+            f"genuine send; {early} arrived before their delivery was recorded and were bound "
+            f"later); {facts} facts, each consumed once",
             *problems[:8],
         ],
     )
@@ -2611,14 +2954,18 @@ def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequen
     from interlock.attestations import verify_attestations
     from interlock.deliveries import verify_delivery_log
     from interlock.inbox import verify_inbox
+    from interlock.keys import verify_keys
     from interlock.operators import legacy_vouch, verify_operators
     from interlock.records import read_records
     from interlock.settlement import verify_settlements
+    from interlock.wiring import trusted_keyring
 
     config = run.config
     operators = config.operators
-    relays = config.relay_keyring()
-    inbox = config.inbox_keyring()
+    # The configuration's keys, and those the operator log registered since:
+    # the relays' new key among them (docs/EPIC8_DESIGN.md §2.1).
+    relays = trusted_keyring(config, "relay")
+    inbox = trusted_keyring(config, "inbox")
     receipts = config.receipts
     assert operators is not None and relays is not None and inbox is not None
     assert receipts is not None
@@ -2633,6 +2980,8 @@ def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequen
     found["operators"] = list(
         verify_operators(conn, records, operators.keyring(), ledger=entries).problems
     )
+    keys = verify_keys(conn, records, config.key_roots())
+    found["keys"] = list(keys.problems)
     log = ReceiptLog(receipts.log_id, load_key(receipts.key), path=receipts.log)
     try:
         found["settlements"] = list(
@@ -2658,7 +3007,8 @@ def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequen
         not problems,
         [
             f"delivery logs, relays' attestations, {len(records)} operator records with their "
-            f"AgentGov anchors, settlements against {receipt_count} receipts, "
+            f"AgentGov anchors, {keys.registered} key(s) registered and {keys.revoked} revoked "
+            f"with the seal its operator signed, settlements against {receipt_count} receipts, "
             f"{report.events} inbound events and {report.facts} facts, "
             f"{len(chain_paths(run))} escrow chains ({chains} records) with their anchors",
             *(problems[:8] or ["no problem found"]),
@@ -2885,6 +3235,138 @@ def metrics_agree(run: Run, conn: psycopg.Connection[Any]) -> Claim:
 # --------------------------------------------------------------------------
 # The report
 # --------------------------------------------------------------------------
+
+
+ATTESTED_AFTER = """
+SELECT count(*) FROM interlock.outbox_attempts AS a
+ WHERE a.attestation IS NOT NULL AND (a.attestation::jsonb)->>'key_id' = %s AND a.at > %s
+"""
+UNSEALED = """
+SELECT count(*) FROM interlock.outbox_attempts AS a
+ WHERE a.attestation IS NOT NULL AND (a.attestation::jsonb)->>'key_id' = %s
+   AND NOT EXISTS (SELECT 1 FROM interlock.key_seals AS s
+                    WHERE s.key_id = %s AND s.kind = 'outcome'
+                      AND s.ref = a.message_id::text || ':' || a.seq
+                      AND s.row_hash = a.event_hash)
+"""
+
+
+def _count(conn: psycopg.Connection[Any], query: str, args: Sequence[Any]) -> int:
+    row = conn.execute(query, args).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _after_revocation(run: Run) -> None:
+    """What the database holds of each key once the old one is revoked, read
+    then: the vacuum prunes delivered messages within seconds. The new key's
+    outcomes are waited for, ten seconds at most."""
+    rotation = run.rotation
+    with psycopg.connect(run.site.owner, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT revoked_at FROM interlock.key_revocations WHERE key_id = %s", (rotation.old,)
+        ).fetchone()
+        if row is None:
+            return
+        rotation.unsealed = _count(conn, UNSEALED, (rotation.old, rotation.old))
+        deadline = time.monotonic() + 10
+        while True:
+            rotation.new_after = _count(conn, ATTESTED_AFTER, (rotation.new, row[0]))
+            rotation.old_after = _count(conn, ATTESTED_AFTER, (rotation.old, row[0]))
+            if rotation.new_after or time.monotonic() > deadline:
+                return
+            time.sleep(0.2)
+
+
+def keys_rotate(run: Run, conn: psycopg.Connection[Any]) -> Claim:
+    """The relays' key rotated mid-load (``docs/EPIC8_DESIGN.md`` §5): what the
+    old key attested sealed, or refused; what came after, the new key's."""
+    rotation = run.rotation
+    problems: list[str] = []
+    if rotation.error is not None:
+        problems.append(f"the rotation failed: {rotation.error}")
+    if not 0 < rotation.began < rotation.ended < run.load_seconds:
+        problems.append(
+            f"it ran from {rotation.began:.0f}s to {rotation.ended:.0f}s, not within the "
+            f"load's {run.load_seconds:.0f}s"
+        )
+    failed = {name: error for name, error in rotation.reload.items() if error is not None}
+    if not rotation.reload or failed:
+        problems.append(f"the reload did not open every part again: {failed or 'none ran'}")
+    if not rotation.called_first:
+        problems.append("the stale relay had no call in flight when the key was revoked")
+    if "the database refused" not in rotation.stale:
+        problems.append(f"the stale relay's outcome was not refused: {rotation.stale}")
+    if rotation.old_signed_after > 1:
+        problems.append(
+            f"the old version signed {rotation.old_signed_after} times after the revocation"
+        )
+    signed = run.keys.service.signed
+    old_signed, new_signed = signed[("soak-relay", 1)], signed[("soak-relay", 2)]
+    if not old_signed or not new_signed:
+        problems.append(f"signatures: {old_signed} by the old version, {new_signed} by the new")
+    row = conn.execute(
+        "SELECT revoked_at, seal_count, seal_digest FROM interlock.key_revocations"
+        " WHERE key_id = %s",
+        (rotation.old,),
+    ).fetchone()
+    old_after = unsealed = new_after = 0
+    if row is None:
+        problems.append("the database holds no revocation of the old key")
+    else:
+        revoked_at, count, digest = row
+        if {"count": count, "digest": digest} != rotation.seal:
+            problems.append(f"the seal recorded, {count} ({digest[:16]}), is not the one signed")
+        # Read as the revocation committed, and again now: the seal's rows
+        # may since be pruned, never joined by another.
+        old_after = rotation.old_after + _count(conn, ATTESTED_AFTER, (rotation.old, revoked_at))
+        unsealed = _count(conn, UNSEALED, (rotation.old, rotation.old))
+        if rotation.unsealed:
+            problems.append(f"as it was revoked, {rotation.unsealed} of its outcomes unsealed")
+        if old_after or unsealed:
+            problems.append(
+                f"the old key's outcomes: {old_after} after its revocation, {unsealed} outside "
+                f"its seal"
+            )
+        new_after = rotation.new_after
+        if not new_after:
+            problems.append("no outcome after the revocation is the new key's")
+    held = "nothing"
+    if rotation.held is not None:
+        keys = [
+            str(r[0])
+            for r in conn.execute(
+                "SELECT (attestation::jsonb)->>'key_id' FROM interlock.outbox_attempts"
+                " WHERE message_id = %s AND event = 'delivered'",
+                (rotation.held,),
+            )
+        ]
+        pruned = conn.execute(
+            "SELECT state FROM interlock.outbox_compacted WHERE message_id = %s", (rotation.held,)
+        ).fetchone()
+        if keys == [rotation.new]:
+            held = "delivered once, under the new key"
+        elif not keys and pruned is not None and pruned[0] == "delivered":
+            held = "delivered once, and pruned since"
+        else:
+            problems.append(f"the stale relay's message: delivered by {keys or 'none'}")
+    return Claim(
+        "keys rotate",
+        not problems,
+        [
+            f"from {rotation.began:.0f}s to {rotation.ended:.0f}s of {run.load_seconds:.0f}s: "
+            f"relay key {rotation.old} -> {rotation.new}, registered by operator record "
+            f"{rotation.registered}, revoked by {rotation.revoked}; the seal "
+            f"{rotation.seal.get('count')} rows ({str(rotation.seal.get('digest'))[:16]})",
+            f"the reload opened {len(rotation.reload)} parts again: "
+            + ", ".join(sorted(rotation.reload)),
+            f"the stale relay {rotation.stale[:160]}; its message {held}",
+            f"the key service signed {old_signed} times with the old version "
+            f"({rotation.old_signed_after} after the revocation: the stale relay's), "
+            f"{new_signed} with the new; {new_after} outcomes by the new key after it, "
+            f"{old_after} by the old, {unsealed} of the old key's outside its seal",
+            *problems[:6],
+        ],
+    )
 
 
 def report(run: Run, claims: Sequence[Claim]) -> None:

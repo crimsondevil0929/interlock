@@ -316,7 +316,10 @@ def _site(frame: FrameType | None) -> str | None:
     while frame is not None and len(ours) < 2:
         module = str(frame.f_globals.get("__name__", ""))
         name = frame.f_code.co_name
-        if module.startswith(OURS) and (ours or name not in HELPERS):
+        # A comprehension or a lambda is its enclosing function's: on Python
+        # 3.11 a comprehension runs in a frame of its own, ``<listcomp>``.
+        inner = name.startswith("<") and name.endswith(">")
+        if module.startswith(OURS) and not inner and (ours or name not in HELPERS):
             ours.append(f"{module}.{name}")
         frame = frame.f_back
     return " ← ".join(ours) or "a helper"

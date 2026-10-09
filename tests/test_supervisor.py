@@ -773,3 +773,100 @@ def test_sighup_reloads_and_says_what_it_did() -> None:
     assert log.count(("relay", "open")) == 2
     # The handlers are removed with the run.
     assert signal.getsignal(signal.SIGHUP) in (signal.SIG_DFL, cast(Any, None))
+
+
+def test_a_failed_service_is_backing_off_while_it_closes() -> None:
+    log: list[tuple[str, str]] = []
+    slow = Recorder("slow", log, fail=1, close_seconds=0.3)
+    supervisor = InterlockSupervisor(services=[slow], restart_min=0.01, restart_max=0.01)
+    seen: list[tuple[str, int]] = []
+
+    async def body() -> None:
+        while ("slow", "close") not in log:
+            status = supervisor.status()["slow"]
+            seen.append((status.state, status.failures))
+            await asyncio.sleep(0.01)
+
+    run(supervisor, body)
+    # Counted as failed, and never reported running, until it had closed.
+    assert ("running", 1) not in seen and ("backing-off", 1) in seen
+
+
+def test_an_inbox_swapped_answers_what_it_took_and_the_new_one_the_rest() -> None:
+    from interlock.supervisor import _CountingInbox
+
+    class Answer:
+        status = 202
+
+        def __init__(self) -> None:
+            self.body: dict[str, int] = {}
+
+    class Fake:
+        _max_body = 1024
+
+        def __init__(self, gate: threading.Event | None = None) -> None:
+            self.gate = gate
+            self.took: list[bytes] = []
+            self._sources = {"s": object()}
+
+        def receive(self, name: str, headers: dict[str, str], body: bytes) -> Answer:
+            self.took.append(body)
+            if self.gate is not None:
+                self.gate.wait(10)
+            return Answer()
+
+    gate = threading.Event()
+    old, new = Fake(gate), Fake()
+    counting = _CountingInbox(cast(Any, old), Recorder("inbox", []))
+    in_flight = threading.Thread(target=counting.receive, args=("s", {}, b"first"))
+    in_flight.start()
+    while not old.took:
+        time.sleep(0.005)
+    swapped = threading.Thread(target=counting.swap, args=(cast(Any, new),))
+    swapped.start()
+    time.sleep(0.05)
+    # Every later webhook is the new inbox's; the swap waits for the old one's.
+    counting.receive("s", {}, b"second")
+    assert swapped.is_alive() and new.took == [b"second"]
+    gate.set()
+    swapped.join(5)
+    in_flight.join(5)
+    assert not swapped.is_alive() and old.took == [b"first"]
+
+
+def test_a_reload_keeps_the_settlers_and_the_vacuums_governors() -> None:
+    """Neither holds a key a reload rotates, and each holds an AgentGov
+    governor, which opens under the ledger's writer lock while every engine
+    waits: a reload opens neither again (``docs/EPIC8_DESIGN.md`` §3)."""
+    from interlock.supervisor import SettlerService, VacuumService
+
+    opened: list[str] = []
+    closed: list[str] = []
+
+    class Settled:
+        def settle(self) -> Any:
+            class Report:
+                settled: tuple[()] = ()
+                receipts = credits = 0
+                problems: tuple[()] = ()
+                lags: tuple[()] = ()
+
+            return Report()
+
+    def open_settler() -> tuple[Any, Callable[[], None]]:
+        opened.append("settler")
+        return Settled(), lambda: closed.append("settler")
+
+    settler = SettlerService(open_settler, every=10.0)
+    vacuum = VacuumService(
+        lambda: cast(Any, None), every=10.0, close=lambda: closed.append("vacuum")
+    )
+    vacuum.step = lambda: 10.0  # type: ignore[method-assign]
+    supervisor = InterlockSupervisor(services=[settler, vacuum])
+
+    async def body() -> dict[str, str | None]:
+        return await supervisor.reload()
+
+    assert run(supervisor, body) == {"settler": None, "vacuum": None}
+    # Opened once, at the start; closed once, at the stop.
+    assert opened == ["settler"] and sorted(closed) == ["settler", "vacuum"]

@@ -40,11 +40,12 @@ them, bounds them and stops them::
   and a vacuum each finish or never start. A second signal skips the drains,
   and gives the closes :data:`CLOSE_GRACE` seconds.
 - **Reload** (:meth:`InterlockSupervisor.reload`, or ``SIGHUP``): every service
-  finishes its step and opens again (``docs/EPIC8_DESIGN.md`` §3), so a relay,
-  the inbox and the vacuum sign with the key their configuration points at
-  then, and every part holds rows to the keys the operator log trusts then.
-  The inbox opens again behind its listener, which never closes. Engines and
-  agents are untouched.
+  finishes its step and opens again (``docs/EPIC8_DESIGN.md`` §3), so the relays
+  and the inbox sign with the key their configuration points at then. The inbox
+  opens again behind its listener, which never closes. The settler, the vacuum
+  and the metrics endpoint have nothing to open again: the vacuum opens its key
+  at each run, and every part holds rows to keyrings that follow the operator
+  log as it runs. Engines and agents are untouched.
 """
 
 from __future__ import annotations
@@ -436,6 +437,13 @@ class SettlerService(Service):
         if close is not None:
             close()
 
+    def reopen(self) -> None:
+        """Nothing to open again at a reload: the settler signs through the
+        receipt log, which a reload does not rotate, and holds deliveries to a
+        keyring that follows the operator log as it runs. Its governor is
+        kept: one opens under the ledger's writer lock, every engine waiting
+        while it reads the whole ledger."""
+
 
 class VacuumService(Service):
     """A vacuum every ``every`` seconds (``docs/EPIC5_DESIGN.md`` §1). Each run
@@ -489,6 +497,12 @@ class VacuumService(Service):
     def close(self) -> None:
         if self._close is not None:
             self._close()
+
+    def reopen(self) -> None:
+        """Nothing to open again at a reload: each run opens its key, its log
+        and its keyrings as they are then. The governor the runs share is
+        kept: one opens under the ledger's writer lock, every engine waiting
+        while it reads the whole ledger."""
 
 
 class MetricsService(Service):

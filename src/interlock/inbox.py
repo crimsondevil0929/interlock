@@ -869,25 +869,31 @@ class Inbox:
         traceparent = parse_traceparent(_header(headers, "traceparent"))
         recorded = matched = 0
         try:
+            # Signed before the lock: a statement holds nothing the store
+            # decides, and a remote signer's round trip would hold up every
+            # other webhook.
+            attestations = [
+                _sign(
+                    self._signer,
+                    _event_statement(
+                        source.name,
+                        event.event_id,
+                        event.kind,
+                        vendor_at,
+                        now,
+                        body_hash,
+                        event.part,
+                        event.refs,
+                        event.fields,
+                        event.withheld,
+                        self._signer.alg,
+                        self._signer.key_id,
+                    ),
+                )
+                for event in parsed
+            ]
             with self._lock:
-                for event in parsed:
-                    attestation = _sign(
-                        self._signer,
-                        _event_statement(
-                            source.name,
-                            event.event_id,
-                            event.kind,
-                            vendor_at,
-                            now,
-                            body_hash,
-                            event.part,
-                            event.refs,
-                            event.fields,
-                            event.withheld,
-                            self._signer.alg,
-                            self._signer.key_id,
-                        ),
-                    )
+                for event, attestation in zip(parsed, attestations, strict=True):
                     seq, fresh = self._store.record_event(
                         source=source.name,
                         event_id=event.event_id,
@@ -925,12 +931,15 @@ class Inbox:
             webhook is answered 503 until it opens again with its new key. A
             supervisor reopens it with the key it is given then.
         """
-        revoked = getattr(self._store, "revoked", None)
-        if revoked is not None and revoked(self._signer.key_id):
-            raise KeyRevokedError(
-                f"inbox: its key {self._signer.key_id} was revoked; it records nothing more"
-            )
+        # Under the lock: the store's connection is the webhooks' too, and a
+        # read between another's BEGIN and its first statement would land in
+        # that transaction.
         with self._lock:
+            revoked = getattr(self._store, "revoked", None)
+            if revoked is not None and revoked(self._signer.key_id):
+                raise KeyRevokedError(
+                    f"inbox: its key {self._signer.key_id} was revoked; it records nothing more"
+                )
             since = self._clock() - self._window
             return sum(1 for event in self._store.unmatched(since) if self._match(event))
 
