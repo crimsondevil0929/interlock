@@ -25,7 +25,15 @@ from agentgov.receipts.signing import Ed25519Signer
 
 from interlock.records import Keyring, RecordKind, RecordLog
 from interlock.signers import HttpRemoteSigner, RemoteSigner, SignerUnavailableError
-from tests.fakekms import GARBAGE, NOT_JSON, OTHER_KEY, WRONG_VERSION, FakeKms
+from tests.fakekms import (
+    GARBAGE,
+    NOT_JSON,
+    OTHER_ALG,
+    OTHER_KEY,
+    WRONG_PIN,
+    WRONG_VERSION,
+    FakeKms,
+)
 
 TOKEN = "kms-token-" + secrets.token_hex(8)
 
@@ -97,6 +105,18 @@ def test_a_service_that_fails_to_sign_is_an_error_never_a_signature(
     assert TOKEN not in str(raised.value)
 
 
+def test_a_redirect_is_never_followed_and_the_token_never_leaves(kms: FakeKms) -> None:
+    """A service that answers 307 to another host is answered as one that
+    refused: following it would hand the bearer token to that host."""
+    with FakeKms(token=TOKEN) as elsewhere:
+        kms.create("relay")
+        elsewhere.create("relay")
+        kms.redirect = elsewhere.url
+        with pytest.raises(SignerUnavailableError, match="answered 307"):
+            remote(kms)
+        assert not elsewhere.requests
+
+
 def test_a_service_that_cannot_be_used_refuses_the_signer(kms: FakeKms) -> None:
     kms.create("relay")
     with pytest.raises(SignerUnavailableError, match="401") as raised:
@@ -113,6 +133,20 @@ def test_a_service_that_cannot_be_used_refuses_the_signer(kms: FakeKms) -> None:
     kms.close()
     with pytest.raises(SignerUnavailableError, match="could not be reached"):
         remote(kms)
+
+
+@pytest.mark.parametrize(
+    ("misbehave", "match"),
+    [(OTHER_ALG, "holds a 'rsa' key, not an Ed25519 one"), (WRONG_PIN, "for version 2, not 1")],
+)
+def test_a_service_publishing_another_key_refuses_the_signer(
+    kms: FakeKms, misbehave: str, match: str
+) -> None:
+    kms.create("relay")
+    kms.rotate("relay")
+    kms.misbehave = misbehave
+    with pytest.raises(SignerUnavailableError, match=match):
+        remote(kms, version=1)
 
 
 @pytest.mark.parametrize(

@@ -268,9 +268,14 @@ registration record is signed by an operator trusted at its position.
   service finishes its step and opens again (`Service.reopen`); its next step stays where
   its pace put it, so a reload never runs an hourly vacuum early. The inbox opens its new
   self behind its listener, which never closes: a webhook already taken is answered by the
-  inbox that took it, every later one by the new. A service backing off is opened at once.
-  One that cannot open again fails as at any reopen, backs off and retries, and the reload
-  says why. Engines and agents are untouched.
+  inbox that took it, every later one by the new. The settler, the vacuum and the metrics
+  endpoint have nothing to open again: the vacuum opens its key at each run, the settler
+  signs through the receipt log, and their keyrings follow the log as they run. Their
+  AgentGov governors are kept, and must be: a writable governor opens under the ledger's
+  writer lock, every engine waiting while it reads and verifies the whole ledger (the soak
+  saw two and a half seconds without a ledger write when one opened mid-run). A service
+  backing off is opened at once. One that cannot open again fails as at any reopen, backs
+  off and retries, and the reload says why. Engines and agents are untouched.
 - **Fresh keyrings.** A running part's keyrings resolve a key id they do not hold among
   the keys the operator log registers (`interlock.wiring.live_keyring`), reading the log
   again only when it changed: a key registered while the part runs is trusted at its first
@@ -325,13 +330,29 @@ a trace hashed into a plan, and a header kept in the event's signature column.
 
 ## 5. The soak
 
-The soak's relays, inbox and vacuum sign through `HttpRemoteSigner` against a fake key
-service in the soak's process. Mid-load, the operator rotates the relay key: the service
-adds a version, the desk registers it, the daemon reloads, and the desk revokes the old one.
-A stale relay that kept the old key then tries to record an outcome, and is refused. A new
-claim, **keys rotate**, holds when every attestation by the old key is sealed or was
-refused, every outcome after the revocation is attested by the new key, the seal hashes to
-its signed digest, and the claims of Epic 6 and 7 still hold across the rotation.
+The soak's relays, inbox and vacuum sign through `HttpRemoteSigner` against a key service in
+the soak's process (`KeyService`, the protocol of §1.2): no key file is written for them.
+Halfway through the load, the operator rotates the relays' key:
+
+1. the service adds a version;
+2. the desk registers it (`key.registered`), waiting its turn at the operator log;
+3. `supervisor.reload()`: every part opens again, the relays pinning the new version;
+4. a **stale relay** that kept the old version claims a message and calls the payment API,
+   its adapter holding the answer;
+5. the desk revokes the old key: the database seals what it attested;
+6. the stale relay records its outcome, and the database refuses it (IL013). Its lease
+   runs out; a relay of the daemon's calls again, and the payment API's idempotency key
+   answers with what it already did.
+
+The claim **keys rotate** holds when the rotation ran within the load; every part opened
+again; the stale relay's call was in flight at the revocation and its outcome was refused by
+the database, and its message delivered once, under the new key; the old version signed
+nothing after the revocation but that refused outcome; as the revocation committed, every
+outcome the old key had attested was in its seal, and none came after; outcomes by the new
+key followed; and the seal the database holds is the one the operator signed. **Everything
+verifies** now holds the database's revocations and seals to the operator log
+(`verify_keys`), under the keyrings the log extends. Every claim of Epics 6 and 7 holds
+across the rotation.
 
 ## 6. Proofs
 
@@ -345,7 +366,11 @@ its signed digest, and the claims of Epic 6 and 7 still hold across the rotation
   attested write; the race of a write against a revocation; history verifying; a row
   forged after the revocation named; a seal edited, a member deleted, named; crash between
   the phases resolved; upgrade from version 6.
-- The audit, on both stores, and its own canaries proven to reach their columns.
+- The audit, on both stores, and its own canaries proven to reach their columns; two
+  leaks planted (a trace in a plan's hash, a header in a column) and caught.
+- Rotation in a running daemon: a planned rotation through a reload, a compromise with no
+  reload, `SIGHUP`, live keyrings, revoked keys refused at start, the standalone parts'
+  exit; the supervisor's reload between steps, its pace kept.
 - The soak (§5); the mutation pass.
 
 ## 7. Sequence
@@ -369,3 +394,58 @@ its signed digest, and the claims of Epic 6 and 7 still hold across the rotation
   fails its step and retries; it does not fall back to a local key.
 - **The receipt log's key** can be remote, but rotating it starts a new receipt log: ARC1's
   log is signed by one key.
+- **An engine checks a fact's signatures, not its key's seal.** The stage role reads
+  neither revocations nor seals. The database refuses a fact a revoked inbox key would
+  write; one written around it by the database's owner is admitted by an engine until
+  `interlock inbox verify` names it.
+
+## 9. As built
+
+- **Remote signers** (`interlock.signers`, step 3): `RemoteSigner`, `HttpRemoteSigner`,
+  `[signers.<name>]`, `signer = "<name>"` for the relay, the inbox, the vacuum and the
+  receipt log, `--signer` for operators. `tests/fakekms.py` is a key service with versions
+  and every misbehaviour.
+- **Revocation** (`interlock.keys`, storage version 7, step 4): as §2, with three
+  decisions made in the building. An operator never revokes their own key, and the last
+  operator key is never revoked: every revocation is signed by a key that still signs, and
+  someone always can. A fact is named in a seal by its event, `source:event_seq`, which
+  holds one fact at most, so a fact pruned with its event is known as pruned. The digest
+  frames each field with its byte length, as every Interlock hash does, rather than
+  canonical JSON, so SQL computes it exactly. `interlock keys list | register | revoke`.
+- **Rotation in the daemon** (step 5): as §3. A failed service is backing off from the
+  moment it fails, its close included: status and health no longer report it running
+  while it closes.
+- **The audit** (`scripts/security_audit.py`, step 6): as §4. Clean on both stores.
+- **What the soak found**, and what changed for it:
+  - The inbox asked whether its key was revoked outside its lock, on the connection its
+    webhooks share: the read landed between a webhook's `BEGIN` and its `SET TRANSACTION
+    ISOLATION`, which PostgreSQL refused, and five webhooks were answered 503. The inbox
+    now touches its store only under its lock, and a test holds it to that on both stores.
+  - A reload reopened the settler and the vacuum, each opening a new AgentGov governor,
+    which opens under the ledger's writer lock: two and a half seconds without a ledger
+    write, every engine waiting. They now keep their governors (§3); the soak's operator
+    signs the rotation without opening one, its records anchored at the log's next open.
+  - The inbox signed each event while holding its lock: with a remote signer, a round
+    trip per webhook during which no other could be recorded. It now signs first.
+  - Under load a vendor's duplicate overtakes its genuine send now and then, and records
+    the event. **Exactly once** counted that as a second recording; it now counts
+    recordings by event, whichever send made them.
+- **The mutation pass**: 53 mechanisms, each removed in turn, and every one fails a test.
+  The first pass left ten alive and one it could not judge, and they called for tests now
+  in the suite: a key service publishing another algorithm's key, or another version than
+  the one pinned; a redirect really offered (the 307 the test sent had no `Location`, so
+  nothing was ever redirected); a key record signed by a revoked operator; a revocation
+  recorded under another authority than its intent; a log appending after a record of its
+  own revoked its key; the database refusing a fact by a revoked inbox key, and the
+  inbox's verifier naming the event and the fact written past it; and the `SIGHUP` test,
+  which the signal killed outright when no handler was installed, now fails instead.
+  Written ahead of the pass, for what it would have found unguarded: a sealed row
+  rewritten; a delivery written around the refusal, bound to no fact and never settled.
+  One mechanism could not be killed because it could never fire, an operator revoking
+  the last operator key: it is gone.
+- **The soak** (step 7): as §5. Its test now runs four engines and four lanes an agent.
+  The claims of Epic 6 want some plan to lose a race for a hot row and be retried, and
+  half a minute with three of each is close to the edge: the soak before this epic saw
+  one or two lost races in each of five runs, the soak with the rotation none in two of
+  three. With four of each, three to eight in each of five.
+

@@ -963,8 +963,10 @@ one, which gives its reasons: [`OUTBOX_DESIGN.md`](OUTBOX_DESIGN.md) (the
 transactional outbox), [`EPIC3_DESIGN.md`](EPIC3_DESIGN.md) (typed sinks,
 operators, compensations), [`EPIC4_DESIGN.md`](EPIC4_DESIGN.md) (relay
 attestations, rate windows, settlement), [`EPIC5_DESIGN.md`](EPIC5_DESIGN.md)
-(compaction, the inbox) and [`EPIC6_DESIGN.md`](EPIC6_DESIGN.md) (the runtime and
-the daemon).
+(compaction, the inbox), [`EPIC6_DESIGN.md`](EPIC6_DESIGN.md) (the runtime and
+the daemon), [`EPIC7_DESIGN.md`](EPIC7_DESIGN.md) (trace context, metrics) and
+[`EPIC8_DESIGN.md`](EPIC8_DESIGN.md) (keys held by a signing service, registered,
+revoked and rotated; the security audit).
 
 ## 5.1 Components
 
@@ -981,7 +983,8 @@ the daemon).
 | **Inbox** | `inbox.Inbox`, `inbox.InboxServer`, `inbox_store` | Verify a vendor's webhook (Stripe, Standard Webhooks, SendGrid) and record each event once. Bind it to the relay-attested delivery it names, and attest the fact. | A hash-linked event log per source; attested facts; consumed rows |
 | **Compaction** | `vacuum.Vacuum`, `compaction` | Prunes final, settled history past its retention under a checkpoint an operator signs and AgentGov anchors. The checkpoint's folds commit to everything pruned. | Checkpoints; tombstones; an optional provable archive |
 | **Runtime** | `runtime.EscrowRuntime` | One engine, configured whole: any substrate, windows, inbox keys, sinks, the claim-and-settle anchor. Or `from_config`. | — |
-| **Supervisor** | `supervisor.InterlockSupervisor`, `daemon.build_supervisor` | Runs the engines, relays, inbox, settler and vacuum in one process on one event loop. Restarts a failed part with backoff, and stops in order without cutting anything in half. | Health (`GET /healthz`) |
+| **Supervisor** | `supervisor.InterlockSupervisor`, `daemon.build_supervisor` | Runs the engines, relays, inbox, settler and vacuum in one process on one event loop. Restarts a failed part with backoff, reopens the relays and the inbox with the keys they are given now on `SIGHUP`, and stops in order without cutting anything in half. | Health (`GET /healthz`) |
+| **Keys** | `signers`, `keys`, `operators` | Signs through a key service that holds the private key (`RemoteSigner`). Registers keys in the operator log, and revokes them: a relay's or an inbox's in the database too, which seals what the key attested and refuses what it would attest next. | `key.registered` and `revoke-key` operator records; `key_revocations`, `key_seals` |
 
 ## 5.2 How a plan's effects flow
 
@@ -1030,10 +1033,15 @@ by `interlock install` and nothing else.
 The database holds no secret. API credentials live only in the relays'
 environment, and webhook signing secrets only in the inbox's. Private keys (a
 relay's, the inbox's, each operator's, the receipt log's) are files beside the
-configuration. Their public halves are registered in `[relays.keys]`,
-`[inbox.keys]` and `[operators.keys]`, and every verifier checks against those.
-A row the database's owner writes around the functions carries no signature
-that verifies, and the verifiers name it.
+configuration, or held by a key service the part signs through
+(`[signers.<name>]`), which never hands them out. Their public halves are
+registered in `[relays.keys]`, `[inbox.keys]` and `[operators.keys]`, or by an
+operator in the operator log since, and every verifier checks against those. A
+row the database's owner writes around the functions carries no signature that
+verifies, and the verifiers name it. A revoked key's rows hold exactly as its
+revocation sealed them: one written after, around the database's refusal, is
+named. `scripts/security_audit.py` shows that no webhook body, header, trace
+context or secret reaches a hash.
 
 ## 5.4 The evidence, and what verifies it
 
@@ -1046,6 +1054,7 @@ that verifies, and the verifiers name it.
 | Receipt log | engines, the settler | `verify_settlements`; AgentGov's `verify_bundle` per receipt |
 | Inbound logs and facts | inbox | `verify_inbox`, `verify_fact` |
 | Checkpoints, tombstones, archives | the vacuum | `verify_operators`, `verify_archive` |
+| Key registrations, revocations and seals | operators | `verify_keys`, with the operator log |
 | Writes outside every stage | triggers, the SQLite journal | `interlock reconcile-effects` |
 
 Each verifier reads the database as of one instant
@@ -1196,6 +1205,9 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | Trace context (E2-5): from the plan through the outbox, the relay's calls and compensations, back on verified webhooks and the facts bound to them; outside every hash | `trace`, `relay`, `adapters`, `inbox`, `inbox_store`, `outbox_store`, `sqlite_outbox` | `test_trace` (golden vectors for every hash), the soak |
 | Metrics: one catalog of fixed labels, served on a listener of its own; the database sampled in one read-only snapshot | `telemetry`, `sampling`, `supervisor` | `test_metrics`, `test_sampling`, `test_instrumentation`, `test_daemon`, the soak |
 | A stage behind a transaction-mode pooler: its second connection bounded and retried, nothing left in a pooled session | `postgres` | `test_pool` (PgBouncer, in CI) |
+| Keys held by a signing service: every signature verified under the pinned key before it is used; the daemon booted with every key remote | `signers`, `config`, `wiring` | `test_signers`, `test_daemon` |
+| Keys registered and revoked in the operator log; a revocation seals what the key attested and refuses the next; history verifies under the seal; rotated in a running daemon by a reload, or after a compromise with none | `keys`, `records`, `operators`, `outbox_sql`, `sqlite_outbox`, `supervisor`, `daemon` | `test_keys`, `test_supervisor`, `test_daemon`, the soak |
+| No sensitive value in a hash: canaries through the daemon on both stores, every hash input recorded, every column crawled | `scripts/security_audit.py` | `test_security_audit` |
 | Checked repair, refusal feedback, budgeted recovery, extension quotes | `repair`, `feedback`, `recovery`, `extension` | `test_repair`, `test_feedback`, `test_recovery`, `test_extension` |
 
 ## Partial

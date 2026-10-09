@@ -9,6 +9,45 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 8: keys held elsewhere, rotated and revoked; the security audit; `docs/EPIC8_DESIGN.md`)
+
+- **Remote signers** (`interlock.signers`). `RemoteSigner` implements agentgov's `Signer`
+  for an Ed25519 key a KMS, an HSM or Vault's transit engine holds: one version pinned for
+  the signer's life, every signature verified under it before it is returned, any failure a
+  `SignerUnavailableError` and never an attestation; `sign_async` signs off the event loop.
+  `HttpRemoteSigner` speaks a Vault-transit-shaped protocol with a bearer token from the
+  environment, and never follows a redirect. `[signers.<name>]` (`type`, `url`, `key`,
+  `token_env`, `timeout_seconds`, `version`); `signer = "<name>"` for `[relay]`, `[inbox]`,
+  `[vacuum]` and `[receipts]` in place of `key`; `--signer NAME` for operator commands.
+- **Key registration and revocation in the operator log.** `key.registered` records extend
+  each role's configured keys; an `operator.intent` with action `revoke-key` revokes one.
+  Operator keys follow the log positionally; `OperatorLog` refuses to open with a revoked
+  key, an operator never revokes their own key, nor the last. A relay's or an inbox's key
+  is revoked in the database too (**storage version 7**: `key_revocations`, `key_seals`,
+  append-only): in the intent's transaction, under a lock every attested write takes, the
+  database seals every row the key attested and refuses every new one (`IL013`,
+  `KeyRevokedError`). The applied record signs the seal's count and digest. An attestation
+  by a revoked key holds exactly when its row is in the seal at the same hash, so history
+  verifies as it did; `verify_keys` holds the database's revocations to the log.
+  `interlock keys list | register | revoke`. `interlock install` upgrades version 6 in place.
+- **Rotation in a running daemon.** Each part opens its key when it opens;
+  `InterlockSupervisor.reload()` and `SIGHUP` reopen every service between its steps, its
+  pace kept, the inbox behind a listener that never closes. Running parts trust a key
+  registered after they started at its first use, and read revocations once a pass. A
+  relay or an inbox whose key is revoked fails and opens again with the key it is given
+  then; `interlock relay` and `interlock inbox serve` stop with exit status 3.
+- **`scripts/security_audit.py`**: canaries planted in a plan's trace context, a webhook's
+  body, headers and secret, and the relay's API key, through the daemon on both stores; the
+  input of every SHA-256 and signature recorded; every column crawled. No sensitive value
+  reaches a hash, but the body's SHA-256 the inbound event commits to. Clean on both stores.
+- The soak's relays, inbox and vacuum sign through a key service, and the relays' key is
+  rotated under load: a new claim, **keys rotate**.
+
+### Fixed (Epic 8)
+
+- **A failed service reported itself running while it closed.** Its state is now
+  `backing-off` from the moment its step fails, so `status()` and `/healthz` agree with it.
+
 ### Added (Epic 7: trace context, metrics, a pooler-safe stage; `docs/EPIC7_DESIGN.md`)
 
 - **W3C trace context, end to end.** `EffectPlan.traceparent`, set by

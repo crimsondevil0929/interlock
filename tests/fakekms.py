@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
 import secrets
 import socketserver
@@ -26,6 +27,10 @@ OTHER_KEY = "other-key"
 WRONG_VERSION = "wrong-version"
 """Sign, and say it was another version."""
 NOT_JSON = "not-json"
+OTHER_ALG = "other-alg"
+"""Publish the key as another algorithm's."""
+WRONG_PIN = "wrong-pin"
+"""Publish a version other than the one asked for."""
 
 
 class _Server(ThreadingHTTPServer):
@@ -59,6 +64,8 @@ class FakeKms:
         """Answer every request with this status, when set."""
         self.misbehave: str | None = None
         """One of the module's misbehaviours, when set."""
+        self.redirect: str | None = None
+        """Answer every request with a 307 to this service, when set."""
         self._lock = threading.Lock()
         kms = self
 
@@ -126,6 +133,13 @@ class FakeKms:
         if self.status is not None:
             self._answer(handler, self.status, {"errors": ["scripted"]})
             return
+        if self.redirect is not None:
+            with contextlib.suppress(OSError):
+                handler.send_response(307)
+                handler.send_header("Location", self.redirect + handler.path)
+                handler.send_header("Content-Length", "0")
+                handler.end_headers()
+            return
         if len(parts) < 3 or parts[:2] != ["v1", "keys"] or parts[2] not in self.keys:
             self._answer(handler, 404, {"errors": ["no such key"]})
             return
@@ -138,7 +152,9 @@ class FakeKms:
                 self._answer(handler, 404, {"errors": ["no such version"]})
                 return
             public = versions[version - 1].public_key().raw.hex()
-            self._answer(handler, 200, {"alg": "ed25519", "version": version, "public_key": public})
+            alg = "rsa" if self.misbehave == OTHER_ALG else "ed25519"
+            answered = version + 1 if self.misbehave == WRONG_PIN else version
+            self._answer(handler, 200, {"alg": alg, "version": answered, "public_key": public})
             return
         if method == "POST" and parts[3:] == ["sign"]:
             length = int(handler.headers.get("Content-Length") or 0)

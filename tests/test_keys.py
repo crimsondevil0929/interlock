@@ -275,6 +275,10 @@ def _owner_sql(outbox: Outbox, *statements: str) -> None:
         ("DELETE FROM {t}seals WHERE ref LIKE '%:2'", "no longer hashes to its digest"),
         ("UPDATE {t}revocations SET seal_count = 9", "the operator signed 3"),
         ("DELETE FROM {t}revocations", "the database holds none: deleted around Interlock"),
+        (
+            "UPDATE {t}revocations SET authority = '" + "ab" * 32 + "'",
+            "under an authority no signed revoke-key intent holds",
+        ),
     ],
 )
 def test_a_seal_edited_or_deleted_is_named(outbox: Outbox, statement: str, named: str) -> None:
@@ -284,6 +288,29 @@ def test_a_seal_edited_or_deleted_is_named(outbox: Outbox, statement: str, named
     _owner_sql(outbox, statement)
     found = verify_keys(outbox.operator(), records(outbox), roots(outbox))
     assert any(named in p for p in found.problems), found.problems
+
+
+def test_a_sealed_row_rewritten_since_is_named(outbox: Outbox) -> None:
+    deliver(outbox, mail(1))
+    revoke(outbox, "relay", RELAY_ID)
+    rewrite = "UPDATE {log} SET event_hash = '{z}' WHERE attestation IS NOT NULL".format(
+        log="interlock.outbox_attempts"
+        if isinstance(outbox, PostgresOutbox)
+        else "_interlock_outbox_attempts",
+        z="0" * 64,
+    )
+    if isinstance(outbox, PostgresOutbox):
+        with outbox.admin() as conn:
+            conn.execute("ALTER TABLE interlock.outbox_attempts DISABLE TRIGGER USER")
+            conn.execute(rewrite)
+    else:
+        assert isinstance(outbox, SqliteOutbox)
+        with closing(sqlite3.connect(outbox.path)) as conn:
+            conn.execute("DROP TRIGGER _interlock_log_no_update")
+            conn.execute(rewrite)
+            conn.commit()
+    found = verify_keys(outbox.operator(), records(outbox), roots(outbox))
+    assert any("at another hash: rewritten since" in p for p in found.problems), found.problems
 
 
 def test_a_revocation_no_operator_signed_is_named(outbox: Outbox) -> None:
@@ -336,6 +363,95 @@ def test_an_inbox_key_revoked_seals_its_events_and_facts(site: InboxSite) -> Non
     assert verify_keys(outbox.operator(), records(outbox), roots(outbox)).problems == ()
 
 
+def test_a_delivery_written_around_the_refusal_binds_no_fact(
+    site: InboxSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An event names a delivery its revoked relay's key attested after the
+    revocation: the inbox binds what the seal holds, and nothing else."""
+    outbox = site.outbox
+    site.deliver("re_1")
+    revoke(outbox, "relay", RELAY_ID)
+    if isinstance(outbox, PostgresOutbox):
+        with outbox.admin() as conn:
+            conn.execute(
+                "CREATE OR REPLACE FUNCTION interlock.key_unrevoked(p_attestation text) "
+                "RETURNS void LANGUAGE sql AS 'SELECT NULL'"
+            )
+    else:
+        monkeypatch.setattr("interlock.sqlite_outbox.refuse_revoked", lambda conn, a: None)
+    from tests.inbox_env import refund
+
+    outbox.commit(refund("re_2"))
+    store = outbox.store()
+    (lease,) = store.claim("forger", timedelta(seconds=10), 1, ["payments"], time.monotonic() + 10)
+    attempt = store.sending(lease, "forger", "calling")
+    assert attempt is not None
+    result = DeliveryResult(
+        "delivered", status_code=200, response_digest="0" * 64, remote_ref="re_2"
+    )
+    store.outcome(
+        lease,
+        "forger",
+        attempt,
+        result,
+        timedelta(0),
+        attest(lease, attempt, result, relay_signer()),
+    )
+    store.close()
+    inbox = site.inbox()
+    sealed = site.receive(inbox, "stripe", stripe_webhook(refund_webhook("re_1", event_id="e1")))
+    forged = site.receive(inbox, "stripe", stripe_webhook(refund_webhook("re_2", event_id="e2")))
+    assert sealed.body == {"recorded": 1, "matched": 1}
+    assert forged.body == {"recorded": 1, "matched": 0}
+
+
+class _Unchecked:
+    """An inbox's store that never says its key was revoked: an inbox past
+    its own check, as a stale process would be."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def revoked(self, key_id: str) -> bool:
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
+def test_a_revoked_inbox_key_binds_nothing_new_and_what_is_forged_is_named(
+    site: InboxSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox = site.outbox
+    site.deliver("re_1")
+    inbox = site.inbox()
+    early = site.receive(inbox, "stripe", stripe_webhook(refund_webhook("re_2", event_id="e2")))
+    assert early.body == {"recorded": 1, "matched": 0}
+    revoke(outbox, "inbox", INBOX_ID)
+    site.deliver("re_2")
+    # An inbox past its own check: the database refuses the fact it attests.
+    stale = site.inbox(store=_Unchecked(site.store()))
+    with pytest.raises(KeyRevokedError):
+        stale.match_pending()
+    # Past the database's refusal too: what it writes is named.
+    if isinstance(outbox, PostgresOutbox):
+        with outbox.admin() as conn:
+            conn.execute(
+                "CREATE OR REPLACE FUNCTION interlock.key_unrevoked(p_attestation text) "
+                "RETURNS void LANGUAGE sql AS 'SELECT NULL'"
+            )
+    else:
+        monkeypatch.setattr("interlock.sqlite_outbox.refuse_revoked", lambda conn, a: None)
+    assert stale.match_pending() == 1
+    late = site.receive(stale, "stripe", stripe_webhook(refund_webhook("re_1", event_id="e3")))
+    assert late.body["recorded"] == 1
+    found = verify_inbox(site.reader(), INBOX_KEYS, relays=RELAYS).problems
+    unsealed = [p for p in found if "its revocation did not seal it" in p]
+    # The fact bound after the revocation, and the event recorded after it.
+    assert any(p.startswith("fact ") for p in unsealed), found
+    assert any(p.startswith("inbound source stripe: event 2:") for p in unsealed), found
+
+
 # --------------------------------------------------------------------------
 # an operator's key
 # --------------------------------------------------------------------------
@@ -358,11 +474,35 @@ def test_an_operator_key_is_registered_and_revoked_in_the_log(outbox: Outbox) ->
         )
     with pytest.raises(UntrustedSignerError, match="was revoked by record"):
         OperatorLog(outbox.operator_log, outbox.keys["ops"], outbox.keyring())
-    # A record the old key signs after its revocation does not hold.
-    forge(outbox.operator_log, outbox.keys["ops"], RecordKind.OPERATOR_INSTALLED, {"forged": 1})
+    # A record the old key signs after its revocation does not hold, nor
+    # registers what it names.
+    relay = Ed25519Signer.generate()
+    forge(
+        outbox.operator_log,
+        outbox.keys["ops"],
+        RecordKind.KEY_REGISTERED,
+        {"role": "relay", "name": "x", "key": relay.public_key().spec(), "key_id": relay.key_id},
+    )
     with pytest.raises(RecordIntegrityError, match=r"after record \d+ revoked it"):
         RecordLog.load(outbox.operator_log, outbox.keyring())
     assert any("revoked it" in p for p in outbox.verify_operators().problems)
+    built = KeyRegistry.build(keys, records(outbox))
+    assert relay.key_id not in built.keyring("relay") and built.ignored
+
+
+def test_a_log_signs_nothing_after_its_own_key_is_revoked(outbox: Outbox) -> None:
+    """Past the operators' own refusal, a log whose signer's key a record of
+    its own revokes appends nothing more."""
+    signer = outbox.operator_key("ops")
+    with RecordLog(signer, log_id="interlock-operators", keyring=outbox.keyring()) as log:
+        log.append(
+            RecordKind.OPERATOR_INTENT,
+            scope="operators",
+            body={"action": "revoke-key", "role": "operator", "key_id": signer.key_id},
+        )
+        with pytest.raises(UntrustedSignerError, match="was revoked by record 1"):
+            log.append(RecordKind.OPERATOR_INSTALLED, scope="operators", body={})
+        assert len(log.records()) == 1
 
 
 def test_a_registration_by_no_trusted_operator_adds_nothing(outbox: Outbox) -> None:

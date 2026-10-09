@@ -763,16 +763,25 @@ def test_sighup_reloads_and_says_what_it_did() -> None:
         running = asyncio.create_task(supervisor.run(handle_signals=True))
         await supervisor.ready()
         os.kill(os.getpid(), signal.SIGHUP)
-        while not told:
+        deadline = time.monotonic() + 5
+        while not told and time.monotonic() < deadline:
             await asyncio.sleep(0.005)
         supervisor.stop()
         await running
 
-    asyncio.run(main())
-    assert told == [{"relay": None}]
+    # Caught here when the supervisor does not: the test fails, and the
+    # process lives.
+    unhandled: list[int] = []
+    previous = signal.signal(signal.SIGHUP, lambda signum, frame: unhandled.append(signum))
+    try:
+        asyncio.run(main())
+        removed = signal.getsignal(signal.SIGHUP)
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert told == [{"relay": None}] and not unhandled
     assert log.count(("relay", "open")) == 2
-    # The handlers are removed with the run.
-    assert signal.getsignal(signal.SIGHUP) in (signal.SIG_DFL, cast(Any, None))
+    # The handler is removed with the run.
+    assert removed in (signal.SIG_DFL, cast(Any, None))
 
 
 def test_a_failed_service_is_backing_off_while_it_closes() -> None:
