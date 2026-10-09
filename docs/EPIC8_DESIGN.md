@@ -287,26 +287,41 @@ registration record is signed by an operator trusted at its position.
 ## 4. The security audit
 
 `scripts/security_audit.py` answers one question about both stores: does any sensitive value
-reach the input of a plan's hash, a request's, a delivery log's, an ARC1 statement, an
-inbound statement or a fact's?
+(a webhook's body, its headers, a plan's or a webhook's trace context, the webhook secret, a
+sink's credential) reach the input of a hash Interlock commits to: a plan's, an effect's, a
+request's, a delivery log's, an ARC1 statement's, an inbound statement's, a fact's?
 
-1. **Crawl.** Install both stores fresh and list every table and column
-   (`sqlite_master` and `pragma table_info`; `information_schema.columns` and
-   `pg_catalog` for the `interlock` schema).
-2. **Canaries.** Run one scenario through each store, the daemon's parts as they run in
-   production: plans traced with canary trace ids, requests delivered, webhooks sent with
-   canary bodies, canary headers and canary trace context, signed with a canary secret.
-3. **Taint.** Record the exact input of every hash and signature the run makes, through the
-   functions that compute them.
-4. **Assert.** No canary, and no SHA-256 of one, appears in any recorded input of an
-   `EffectPlan`, `Effect`, `OutboundRequest`, delivery-log, ARC1 or fact hash. Each canary
-   lands only in the columns made to hold it (the event body, the trace tables), which the
-   crawl locates; no other column holds one. The inbound event statement commits to the
-   body's hash and not the body; the audit lists that commitment as the one digest of a
-   sensitive value a statement may hold.
+1. **Canaries.** On each store, one scenario, run by the daemon's own parts as
+   `interlock.toml` builds them (`build_supervisor`): a plan traced with a canary trace id
+   charges a payment through a relay holding a canary API key; the payment's webhook comes
+   back with canaries in its body (in fields no source projects), a canary header and the
+   canary trace continued, signed with a canary secret; it becomes a fact, which an agent
+   consumes. The daemon stops; `outbox verify` and `inbox verify` run; `interlock vacuum`
+   prunes what it may; both run again.
+2. **Taint.** While the run lasts, `hashlib.sha256` is replaced by one that keeps its
+   input, and `Ed25519Signer.sign`, `RemoteSigner.sign` and every `verify` keep their
+   message: every input computed in Interlock or AgentGov is recorded with the function
+   that asked for it. HMAC's inner hashes (a webhook's signature checked) are its own and
+   commit to nothing. PostgreSQL computes some hashes itself; verification recomputes each,
+   and that is recorded. The run must record each family of hash it claims to cover (a
+   plan's, a request's payload and key, a delivery log row's, a relay attestation, a
+   receipt, an inbound statement and hash, a fact, an operator record, a chain record, a
+   checkpoint, a ledger entry), or the audit fails: a family never computed was never
+   looked at.
+3. **Crawl.** Every table and column: `sqlite_master` over the outbox's file and the
+   ledger's; `information_schema` over every schema of the PostgreSQL database
+   (Interlock's, the application's, AgentGov's), each row read whole. Before the vacuum
+   and after. And every file the run wrote: the chain, the receipt log, the operator log.
+4. **Assert.** No recorded input holds a sensitive value, or its SHA-256, but the body's
+   one commitment: the body's own SHA-256, and that digest inside the inbound event's
+   statement and hash. Only the columns made for one hold a sensitive value: the event's
+   `body`, `signature` and `body_hash`, and `traceparent` of the two trace tables. And the
+   first crawl finds each canary where it was planted: the audit is seen to look.
 
-It exits 0 when clean and prints, column by column, what holds a canary and which hash
-reads it.
+It exits 0 when clean, 1 on a leak or a canary not found where planted, 2 when it could not
+run; it prints, column by column, what holds a sensitive value and which hash reads it.
+`tests/test_security_audit.py` runs it on both stores, and plants two leaks it must catch:
+a trace hashed into a plan, and a header kept in the event's signature column.
 
 ## 5. The soak
 
