@@ -222,6 +222,7 @@ class FakeStripe(FakeSink):
                 acted=acted,
                 at=time.monotonic(),
                 authorization=handler.headers.get("Authorization"),
+                traceparent=handler.headers.get("traceparent"),
             )
         )
 

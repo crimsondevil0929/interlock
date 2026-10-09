@@ -264,7 +264,8 @@ def downgrade_to_version_1(env: Pg) -> None:
     column, and the three-argument ``begin_stage``."""
     with psycopg.connect(env.admin, autocommit=True) as conn:
         conn.execute(
-            "DROP TABLE interlock.inbox_consumed, interlock.inbox_facts, "
+            "DROP TABLE interlock.inbox_traces, interlock.outbox_traces, "
+            "interlock.inbox_consumed, interlock.inbox_facts, "
             "interlock.inbox_events, interlock.inbox_sources, "
             "interlock.outbox_compacted, interlock.checkpoints, "
             "interlock.outbox_settlements, interlock.outbox_legacy, "
@@ -552,6 +553,11 @@ FORGED = (
     ("statement", "match"),
     [
         (FORGED, "did not authorize an enqueue"),
+        (
+            "SELECT interlock.outbox_trace('\\x00'::bytea, "
+            "'00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01')",
+            "did not authorize a trace",
+        ),
         (
             "INSERT INTO interlock.outbox (message_id) VALUES (gen_random_uuid())",
             "refused by the database",

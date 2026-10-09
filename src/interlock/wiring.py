@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from agentgov import BudgetManager
 
     from interlock.config import Endpoint, InterlockConfig, RelayConfig
+    from interlock.telemetry import Metrics
 
 __all__ = [
     "INBOX_KEY_ENV",
@@ -43,9 +44,12 @@ __all__ = [
 ]
 
 
-def open_substrate(config: InterlockConfig, *, database: str | None = None) -> ShadowSubstrate:
+def open_substrate(
+    config: InterlockConfig, *, database: str | None = None, metrics: Metrics | None = None
+) -> ShadowSubstrate:
     """The substrate the file names, connected as the stage role: ``database``,
-    else ``[engine] database``, else the file's ``database``."""
+    else ``[engine] database``, else the file's ``database``; on PostgreSQL,
+    measuring its waits into ``metrics``."""
     dsn = database or config.engine.database or config.database
     if config.substrate == "postgres":
         return PostgresSubstrate(
@@ -54,7 +58,9 @@ def open_substrate(config: InterlockConfig, *, database: str | None = None) -> S
             schema=config.schema,
             max_stage_seconds=config.engine.max_stage_seconds,
             lock_timeout_seconds=config.engine.lock_timeout_seconds,
+            pool_timeout_seconds=config.engine.pool_timeout_seconds,
             acknowledge_cascades=config.acknowledge_cascades,
+            metrics=metrics,
         )
     return SqliteSubstrate(
         dsn,

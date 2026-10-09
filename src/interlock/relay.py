@@ -55,6 +55,7 @@ from agentgov.receipts.signing import Signer
 from interlock.anchor import _halted
 from interlock.exceptions import SubstrateUnavailableError
 from interlock.outbox_store import OutboxStore, PostgresOutboxStore
+from interlock.telemetry import Metrics, NullMetrics
 
 if TYPE_CHECKING:
     from agentgov.core import BudgetManager
@@ -130,6 +131,9 @@ class Delivery:
     attempt: int
     tenant_id: str | None
     timeout: float
+    traceparent: str | None = None
+    """The W3C trace context to send as the ``traceparent`` header: the
+    plan's, unchanged (``docs/EPIC7_DESIGN.md`` §1.3)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +338,9 @@ class Lease:
     unknown_outcome: str
     lease_expires: datetime
     deadline: float
+    traceparent: str | None = None
+    """The request's trace context, its plan's: sent with the call, and in
+    nothing the relay attests."""
 
     @classmethod
     def from_row(cls, row: Sequence[Any], deadline: float) -> Lease:
@@ -431,6 +438,7 @@ class Relay:
         "_signer",
         "_store",
         "_timeout",
+        "metrics",
     )
 
     def __init__(
@@ -445,6 +453,7 @@ class Relay:
         batch: int = 1,
         breaker_retry: timedelta = timedelta(seconds=5),
         signer: Signer,
+        metrics: Metrics | None = None,
     ) -> None:
         if not adapters:
             raise ValueError("a relay needs an adapter for at least one sink")
@@ -472,6 +481,8 @@ class Relay:
         self._signer = signer
         self._store: OutboxStore = PostgresOutboxStore(store) if isinstance(store, str) else store
         self._store.checkpoint = self._reached
+        self.metrics: Metrics = metrics if metrics is not None else NullMetrics()
+        """What the relay measures into (:mod:`interlock.telemetry`)."""
 
     @property
     def relay_id(self) -> str:
@@ -580,13 +591,19 @@ class Relay:
             attempt=attempt,
             tenant_id=lease.tenant_id,
             timeout=min(self._timeout.total_seconds(), remaining),
+            traceparent=lease.traceparent,
         )
+        called = time.monotonic()
         try:
             result = adapter.send(delivery)
         except Exception as exc:
             result = DeliveryResult(
                 UNKNOWN, detail=f"the adapter raised {type(exc).__name__}: {exc}"
             )
+        self.metrics.observe(
+            "interlock_delivery_seconds", time.monotonic() - called, sink=lease.sink
+        )
+        self.metrics.inc("interlock_deliveries_total", sink=lease.sink, outcome=result.outcome)
         self._reached("called", lease)
         delay = (
             retry_delay(
@@ -616,13 +633,16 @@ class Relay:
         return self._store.outcome(lease, self._relay_id, attempt, result, delay, attestation)
 
     def _hold(self, lease: Lease, reason: str) -> str:
+        self.metrics.inc("interlock_deliveries_total", sink=lease.sink, outcome=HELD)
         return HELD if self._store.hold(lease, self._relay_id, reason) else SKIPPED
 
     def _refuse(self, lease: Lease, reason: str) -> str:
         logger.error("relay %s: refusing message %s: %s", self._relay_id, lease.message_id, reason)
+        self.metrics.inc("interlock_deliveries_total", sink=lease.sink, outcome=REFUSED)
         return REFUSED if self._store.refuse(lease, self._relay_id, reason) else SKIPPED
 
     def _defer(self, lease: Lease, reason: str, delay: timedelta) -> str:
+        self.metrics.inc("interlock_deliveries_total", sink=lease.sink, outcome=DEFERRED)
         return DEFERRED if self._store.defer(lease, self._relay_id, reason, delay) else SKIPPED
 
     def _reached(self, point: str, lease: Lease | None) -> None:

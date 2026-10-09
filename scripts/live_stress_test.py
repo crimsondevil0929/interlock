@@ -14,15 +14,20 @@ role. Around it:
   and every refund: some duplicated, some sent before the relay has recorded
   the delivery they are about, some about objects Interlock never created,
   and some forged (another secret, a stale timestamp, a rewritten body, no
-  signature at all).
+  signature at all). Each carries the trace context of the call that made
+  its object, continued, as a propagating vendor would; or a trace of the
+  vendor's own; or a malformed one; or none, as Stripe sends.
 - **Agents**, each its own AgentGov scope with several plans in flight:
   checkouts (an order row, and the charge for it carrying the refund that
-  undoes it); reconciliations (a fact consumed, and the order updated to say
-  what the fact says); notes on a few hot rows every agent contends for;
-  and, now and then, a plan that must be refused.
+  undoes it), each the start of a trace; reconciliations (a fact consumed,
+  and the order updated to say what the fact says), each continuing the
+  fact's trace; notes on a few hot rows every agent contends for; and, now
+  and then, a plan that must be refused.
 - **An operator** compensating paid orders, every action signed.
 - **An auditor** sampling the database throughout: lock waits, the rate
   windows' history, the outbox's size, what the vacuum has yet to prune.
+- **A scraper** reading the daemon's ``/metrics`` every second, as Prometheus
+  would, while the daemon samples the database for them as an audit role.
 
 The load runs for ``--minutes``. Then no new work starts, everything in
 flight is delivered, settled and consumed, the daemon is stopped, and a
@@ -48,6 +53,14 @@ everything verifies         delivery logs, attestations, operators, settlements,
                             escrow chain and its anchors, the receipt log
 shutdown is graceful        stopped within the drain bound, nothing cut; a second daemon
                             recovers nothing
+trace context survives      every call the payment API saw carried its plan's context, every
+                            refund its charge's; every fact the trace of the delivery it binds
+                            (the webhook's context, when it continued ours); every reconcile plan
+                            the trace of the checkout it reconciles; every trace row still kept
+                            its plan's
+metrics agree               every scrape well formed and every family exported; no counter ever
+                            fell, no window above its limit; the plans, webhooks, deliveries,
+                            receipts and outbox they report are what the run counted itself
 ==========================  ====================================================================
 
 Run::
@@ -78,6 +91,7 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
 import shutil
 import signal
@@ -87,6 +101,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
@@ -123,6 +138,8 @@ from interlock.exceptions import (
 from interlock.operators import Operator, OperatorLog, OperatorRefusedError, generate_key, load_key
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE
 from interlock.supervisor import AgentContext, InterlockSupervisor, ServiceStatus
+from interlock.telemetry import CATALOG
+from interlock.trace import child_traceparent, new_traceparent, parse_traceparent, trace_id
 from interlock.types import InboundFact, OutboundRequest
 
 logger = logging.getLogger("soak")
@@ -163,6 +180,17 @@ OUTCOMES = ("applied", "nothing", "refused", "rejected", "abandoned")
 """What a vacuum run can come to: only the first two are a vacuum keeping up."""
 
 MISBEHAVIOURS = ("overcharge", "unfounded_status", "cross_tenant", "self_refund", "fact_replay")
+TRACE_MODES = ("echo", "foreign", "invalid", "none")
+"""What a webhook carries as ``traceparent``: the context of the call that
+made its object, continued, as a propagating vendor would; a trace of the
+vendor's own; a malformed one; or none, as Stripe sends."""
+MALFORMED_TRACES = (
+    "00-00000000000000000000000000000000-00f067aa0ba902b7-01",  # a trace id of zeros
+    "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",  # version ff, forbidden
+    "00-4bf92f3577b34da6a3ce929d0e0e4736-01",  # no span
+)
+METRICS_EVERY = 1.0
+"""How often the daemon samples the database for its metrics, and the soak scrapes them."""
 """Plans that must never commit: a charge for ten times the order, a status
 no fact says, a write across two tenants, a refund the agent issues itself,
 and a fact consumed twice."""
@@ -557,6 +585,11 @@ key = "vacuum.key"
 drain_timeout_seconds = 30
 restart_min_seconds = 0.2
 restart_max_seconds = 5
+
+[metrics]
+listen = "127.0.0.1:0"
+every_seconds = {METRICS_EVERY}
+database = {_q(site.dsn("audit"))}
 """
     path = site.directory / "interlock.toml"
     path.write_text(text, encoding="utf-8")
@@ -676,6 +709,10 @@ class PaymentAPI:
         self.executions: Counter[str] = Counter()
         """Calls that acted, by idempotency key."""
         self.answers: Counter[str] = Counter()
+        self.traces: dict[str, set[str | None]] = defaultdict(set)
+        """Every ``traceparent`` the calls with each idempotency key carried."""
+        self.trace_of: dict[str, str | None] = {}
+        """The ``traceparent`` of the call that created each object."""
         api = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -713,12 +750,14 @@ class PaymentAPI:
             return
         params = parse_form(body)
         path = handler.path
+        traceparent = handler.headers.get("traceparent")
         with self._lock:
             latency = self._rng.uniform(0.002, 0.03)
         time.sleep(latency)
         reply: tuple[int, dict[str, Any], dict[str, str]] | None = None
         mode = "ok"
         with self._lock:
+            self.traces[key].add(traceparent)
             roll = self._rng.random()
             faults = self._faults
             if key in self._running:
@@ -740,7 +779,7 @@ class PaymentAPI:
                 mode = "slow" if roll < faults.slow else "ok"
                 if mode == "ok" and roll - faults.slow < faults.error_after:
                     mode = "error_after"
-                status, result = self._execute(path, params)
+                status, result = self._execute(path, params, traceparent)
                 self._stored[key] = (path, params, status, result)
                 self.executions[key] += 1
                 self.answers[f"acted_{mode}"] += 1
@@ -761,7 +800,9 @@ class PaymentAPI:
         else:
             self._answer(handler, status, result)
 
-    def _execute(self, path: str, params: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+    def _execute(
+        self, path: str, params: Mapping[str, Any], traceparent: str | None
+    ) -> tuple[int, dict[str, Any]]:
         """Act: under the lock, once per key."""
         now = int(time.time())
         if path == "/v1/payment_intents":
@@ -780,7 +821,8 @@ class PaymentAPI:
             if declined:
                 intent["failure_code"] = "card_declined"
             self.objects[intent["id"]] = intent
-            self._vendor.created(dict(intent))
+            self.trace_of[intent["id"]] = traceparent
+            self._vendor.created(dict(intent), traceparent)
             return 200, dict(intent)
         if path == "/v1/refunds":
             charged = self.objects.get(str(params.get("payment_intent") or ""))
@@ -804,7 +846,8 @@ class PaymentAPI:
                 "created": now,
             }
             self.objects[refund["id"]] = refund
-            self._vendor.created(dict(refund))
+            self.trace_of[refund["id"]] = traceparent
+            self._vendor.created(dict(refund), traceparent)
             return 200, dict(refund)
         return 404, stripe_error("invalid_request_error", "unrecognized_url")
 
@@ -863,6 +906,9 @@ class Sent:
     status: int
     recorded: int
     matched: int
+    trace: str = "none"
+    """What the webhook carried as ``traceparent``: ``echo`` (ours, continued),
+    ``foreign`` (the vendor's own), ``invalid``, or ``none``."""
 
 
 FORGERIES = ("wrong_secret", "stale", "tampered", "unsigned")
@@ -891,6 +937,9 @@ class Vendor:
         self.sent: list[Sent] = []
         self.failures: Counter[str] = Counter()
         self.forged: set[str] = set()
+        self.traces: dict[str, tuple[str, str | None]] = {}
+        """For each genuine event, what its webhooks carry as ``traceparent``:
+        how it was chosen, and the header sent, if any."""
         self._threads = [
             threading.Thread(target=self._send_loop, name=f"soak-vendor-{n}", daemon=True)
             for n in range(senders)
@@ -917,8 +966,9 @@ class Vendor:
         with self._lock:
             return len(self._heap) + self._busy
 
-    def created(self, obj: Mapping[str, Any]) -> None:
-        """The API created ``obj``: its event goes out, and what rides with it."""
+    def created(self, obj: Mapping[str, Any], traceparent: str | None) -> None:
+        """The API created ``obj``, on a call carrying ``traceparent``: its
+        event goes out, and what rides with it."""
         if obj["object"] == "payment_intent":
             kind = STATUS_KINDS[0] if obj["status"] == "succeeded" else STATUS_KINDS[1]
         else:
@@ -927,6 +977,15 @@ class Vendor:
         with self._lock:
             rng = self._rng
             event = self._event(kind, obj)
+            roll = rng.random()
+            if traceparent is None or roll < 0.35:
+                self.traces[event["id"]] = ("none", None)
+            elif roll < 0.8:
+                self.traces[event["id"]] = ("echo", child_traceparent(traceparent))
+            elif roll < 0.95:
+                self.traces[event["id"]] = ("foreign", new_traceparent())
+            else:
+                self.traces[event["id"]] = ("invalid", rng.choice(MALFORMED_TRACES))
             early = rng.random() < 0.2
             delay = 0.0 if early else rng.uniform(0.05, 1.5)
             self._push(now + delay, Webhook(event, "genuine"))
@@ -998,6 +1057,9 @@ class Vendor:
             body = body.replace(b'"livemode":false', b'"livemode":true', 1)
         elif purpose != "forged:unsigned":
             headers["Stripe-Signature"] = stripe_signature(self._secret, body, at)
+        trace, traceparent = self.traces.get(webhook.event["id"], ("none", None))
+        if traceparent is not None:
+            headers["traceparent"] = traceparent
         host, port, path = url
         status, answer = 0, {}
         try:
@@ -1015,7 +1077,7 @@ class Vendor:
         recorded = int(answer.get("recorded", 0)) if isinstance(answer, dict) else 0
         matched = int(answer.get("matched", 0)) if isinstance(answer, dict) else 0
         with self._lock:
-            self.sent.append(Sent(webhook.event["id"], purpose, status, recorded, matched))
+            self.sent.append(Sent(webhook.event["id"], purpose, status, recorded, matched, trace))
             if not 200 <= status < 300 and not purpose.startswith("forged:"):
                 # As Stripe does: again, later, until the endpoint answers 2xx.
                 webhook.attempts += 1
@@ -1044,6 +1106,8 @@ class Order:
     refund_status: str | None = None
     reconciled_at: float = 0.0
     compensated: bool = False
+    traceparent: str | None = None
+    """The checkout plan's: the trace its charge, its refund and their facts continue."""
 
 
 @dataclass
@@ -1082,6 +1146,8 @@ class Workload:
         whatever the machine's speed, the tenant window is pushed to its limit."""
         self.bursts: Counter[str] = Counter()
         self.consumed: dict[str, list[InboundFact]] = defaultdict(list)
+        self.reconciled: list[tuple[InboundFact, str | None]] = []
+        """Each fact consumed, and the ``traceparent`` of the plan that consumed it."""
         self.kinds: Counter[str] = Counter()
         self.errors: Counter[str] = Counter()
         self.orphans = 0
@@ -1143,8 +1209,9 @@ class Workload:
         tenant = rng.choice(self.settings.tenant_names)
         order_id = next(self._ids)
         amount = rng.randrange(500, 4501)
+        traceparent = new_traceparent()
         plan = (
-            ctx.plan(scope, intent=f"check out order {order_id}")
+            ctx.plan(scope, intent=f"check out order {order_id}", traceparent=traceparent)
             .insert(
                 table="orders",
                 statement=INSERT_ORDER,
@@ -1167,7 +1234,7 @@ class Workload:
             )
             .build()
         )
-        order = Order(order_id, scope, tenant, amount, str(plan.plan_id))
+        order = Order(order_id, scope, tenant, amount, str(plan.plan_id), traceparent=traceparent)
         with self.lock:
             self.orders[order_id] = order
             self.by_plan[order.plan_id] = order_id
@@ -1233,8 +1300,15 @@ class Workload:
         else:
             statement = "UPDATE orders SET refund_status = %(status)s WHERE id = %(id)s"
             parameters = {"status": status, "id": order.order_id}
+        # The fact's trace, continued: agent, outbox, relay, vendor, webhook,
+        # fact, and the agent again.
+        parent = fact.traceparent
         plan = (
-            ctx.plan(scope, intent=f"record {fact.kind} for order {order.order_id}")
+            ctx.plan(
+                scope,
+                intent=f"record {fact.kind} for order {order.order_id}",
+                traceparent=None if parent is None else child_traceparent(parent),
+            )
             .consume(fact)
             .update(
                 table="orders",
@@ -1256,6 +1330,7 @@ class Workload:
             else:
                 order.refund_status = status
             self.consumed[scope].append(fact)
+            self.reconciled.append((fact, plan.traceparent))
         return True
 
     async def misbehave(self, ctx: AgentContext, scope: str, rng: random.Random) -> None:
@@ -1545,6 +1620,10 @@ class Auditor(threading.Thread):
         self.window_rows: dict[tuple[str, str, str], tuple[Decimal, datetime]] = {}
         self.event_ids: set[str] = set()
         self._last_seq = 0
+        self.message_traces: dict[str, tuple[str, str | None]] = {}
+        """Every message seen in the outbox: its plan, and the context kept beside it."""
+        self.event_traces: dict[str, str | None] = {}
+        """Every inbound event seen: the context kept beside it, by event id."""
         self.samples: list[Sample] = []
         self.errors: Counter[str] = Counter()
 
@@ -1586,6 +1665,17 @@ class Auditor(threading.Thread):
         for seq, event_id in rows:
             self.event_ids.add(str(event_id))
             self._last_seq = max(self._last_seq, int(seq))
+        # Trace context, before the vacuum prunes it with what it describes.
+        for message, plan, traceparent in conn.execute(
+            "SELECT o.message_id::text, o.plan_id, t.traceparent FROM interlock.outbox AS o "
+            "LEFT JOIN interlock.outbox_traces AS t ON t.message_id = o.message_id"
+        ).fetchall():
+            self.message_traces[str(message)] = (str(plan), traceparent)
+        for event_id, traceparent in conn.execute(
+            "SELECT e.event_id, t.traceparent FROM interlock.inbox_events AS e "
+            "LEFT JOIN interlock.inbox_traces AS t ON t.source = e.source AND t.seq = e.seq"
+        ).fetchall():
+            self.event_traces[str(event_id)] = traceparent
         if not heavy:
             return
         settings = self._settings
@@ -1615,6 +1705,149 @@ class Auditor(threading.Thread):
                 int(connections),
             )
         )
+
+
+Scrape = dict[str, dict[tuple[tuple[str, str], ...], float]]
+"""A scrape's samples: ``{name: {labels: value}}``."""
+
+_TYPE = re.compile(r"# TYPE ([a-zA-Z_:][a-zA-Z0-9_:]*) (counter|gauge|histogram)")
+_SAMPLE = re.compile(
+    r"([a-zA-Z_:][a-zA-Z0-9_:]*)"
+    r"(?:\{((?:[a-zA-Z_][a-zA-Z0-9_]*=\"(?:[^\"\\\n]|\\[\\\"n])*\",?)*)\})?"
+    r" ([-+]?(?:[0-9.]+(?:[eE][-+]?[0-9]+)?|Inf|NaN))"
+)
+_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\\n]|\\[\\"n])*)"')
+_MONOTONIC = ("_total", "_count", "_sum", "_bucket")
+
+
+def parse_scrape(text: str) -> tuple[set[str], Scrape]:
+    """The families a Prometheus text exposition declares, and its samples;
+    :class:`ValueError` on any line the format does not allow."""
+    families: set[str] = set()
+    samples: Scrape = {}
+    if not text.endswith("\n"):
+        raise ValueError("the exposition does not end with a newline")
+    for line in text.rstrip("\n").split("\n"):
+        if line.startswith("# HELP "):
+            continue
+        if line.startswith("# TYPE "):
+            typed = _TYPE.fullmatch(line)
+            if typed is None or typed.group(1) in families:
+                raise ValueError(f"a bad or repeated TYPE line: {line!r}")
+            families.add(typed.group(1))
+            continue
+        match = _SAMPLE.fullmatch(line)
+        if match is None:
+            raise ValueError(f"not a sample: {line!r}")
+        labels = tuple(_LABEL.findall(match.group(2) or ""))
+        series = samples.setdefault(match.group(1), {})
+        if labels in series:
+            raise ValueError(f"a series twice: {line!r}")
+        series[labels] = float("inf") if match.group(3) == "+Inf" else float(match.group(3))
+    return families, samples
+
+
+class Scraper(threading.Thread):
+    """Scrapes the daemon's ``/metrics`` every :data:`METRICS_EVERY` seconds,
+    as Prometheus would, and checks each scrape as it comes: well formed;
+    every counter and histogram at least what it was; no window above its
+    limit; no more engines busy than there are."""
+
+    def __init__(self, port: int) -> None:
+        super().__init__(name="soak-scraper", daemon=True)
+        self.port = port
+        self._halt = threading.Event()
+        self._serial = threading.Lock()
+        self.scrapes = 0
+        self.errors: Counter[str] = Counter()
+        self.fell: list[str] = []
+        self.saturation: dict[str, float] = defaultdict(float)
+        self.busy = 0.0
+        self.workers = 0.0
+        self.families: set[str] = set()
+        self._last: Scrape = {}
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def run(self) -> None:
+        while not self._halt.wait(METRICS_EVERY):
+            self.scrape()
+
+    def scrape(self) -> Scrape | None:
+        """One scrape, checked; ``None`` when it could not be had or read.
+        One at a time: a scrape checked after a later one would seem to fall."""
+        with self._serial:
+            return self._scrape()
+
+    def _scrape(self) -> Scrape | None:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/metrics", timeout=10) as r:
+                text = r.read().decode()
+        except OSError as exc:
+            self.errors[type(exc).__name__] += 1
+            return None
+        try:
+            families, samples = parse_scrape(text)
+        except ValueError as exc:
+            self.errors["malformed"] += 1
+            logger.error("an ill-formed scrape: %s", exc)
+            return None
+        self.scrapes += 1
+        self.families = families
+        for name, series in samples.items():
+            if not name.endswith(_MONOTONIC):
+                continue
+            before = self._last.get(name, {})
+            for labels, value in series.items():
+                if value < before.get(labels, 0.0):
+                    self.fell.append(f"{name}{dict(labels)}: {before[labels]} to {value}")
+        self._last = samples
+        for labels, value in samples.get("interlock_window_saturation", {}).items():
+            window = dict(labels)["window"]
+            self.saturation[window] = max(self.saturation[window], value)
+        self.busy = max(self.busy, samples.get("interlock_engine_workers_busy", {}).get((), 0))
+        self.workers = samples.get("interlock_engine_workers", {}).get((), self.workers)
+        return samples
+
+
+@dataclass
+class Settled:
+    """A scrape of the settled daemon, of a sample of the database that began
+    after ``before`` was read and ended before ``after`` was: the vacuum may
+    prune between them, so each state's count in the sample lies between."""
+
+    scrape: Scrape
+    before: dict[str, int]
+    after: dict[str, int]
+
+
+def outbox_states(conn: psycopg.Connection[Any]) -> dict[str, int]:
+    rows = conn.execute("SELECT state, count(*) FROM interlock.outbox_state GROUP BY state")
+    return {str(state): int(n) for state, n in rows.fetchall()}
+
+
+def read_settled(run: Run, conn: psycopg.Connection[Any]) -> Settled | None:
+    """The settled daemon's metrics, against the database. The sampler takes
+    one sample after another, so the second sampled after ``before`` was read
+    began after it; any scrape after that one shows it, or a later one."""
+    scraper = run.scraper
+    assert scraper is not None
+    before = outbox_states(conn)
+    asked = time.time()
+    seen: set[float] = set()
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        scraped = scraper.scrape()
+        at = (scraped or {}).get("interlock_metrics_sampled_at_seconds", {}).get((), 0.0)
+        if at > asked:
+            seen.add(at)
+        if len(seen) >= 2:
+            final = scraper.scrape()
+            if final is not None:
+                return Settled(final, before, outbox_states(conn))
+        time.sleep(METRICS_EVERY / 4)
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1683,6 +1916,8 @@ class Run:
     second_stop_seconds: float = 0.0
     live_at_end: int = 0
     total_at_end: int = 0
+    scraper: Scraper | None = None
+    settled: Settled | None = None
     failure: str | None = None
 
 
@@ -1763,6 +1998,9 @@ async def drive(run: Run, supervisor: InterlockSupervisor) -> None:
     finally:
         run.workload.winding_down.set()
         run.desk.stop()
+        if run.scraper is not None:  # first: its endpoint closes with the daemon
+            run.scraper.stop()
+            await asyncio.to_thread(run.scraper.join, 30)
         stopping = time.monotonic()
         supervisor.stop()
         with contextlib.suppress(Exception):
@@ -1791,14 +2029,20 @@ async def started(run: Run, supervisor: InterlockSupervisor, runner: asyncio.Tas
     port = supervisor.inbox_port
     if port is None:
         raise SoakError("the daemon runs no inbox")
+    metrics = supervisor.metrics_port
+    if metrics is None:
+        raise SoakError("the daemon serves no metrics")
     run.vendor.target(port)
     run.started = time.monotonic()
     run.auditor = Auditor(run.site, run.settings, run.started)
     run.auditor.start()
+    run.scraper = Scraper(metrics)
+    run.scraper.start()
     run.desk.start()
     say(
         run.settings,
-        f"daemon ready: inbox on 127.0.0.1:{port}; load for {run.settings.minutes:g} min",
+        f"daemon ready: inbox on 127.0.0.1:{port}, metrics on 127.0.0.1:{metrics}; "
+        f"load for {run.settings.minutes:g} min",
     )
 
 
@@ -1842,6 +2086,8 @@ async def settle(run: Run, supervisor: InterlockSupervisor) -> None:
                 run.quiesced = True
                 break
             await asyncio.sleep(0.5)
+        if run.quiesced:
+            run.settled = await asyncio.to_thread(read_settled, run, conn)
         live, total = await asyncio.to_thread(
             lambda: (
                 conn.execute(
@@ -1989,6 +2235,8 @@ def prove(run: Run) -> list[Claim]:
                 vacuum_compacts(run, conn),
                 everything_verifies(run, conn, entries),
                 graceful(run),
+                trace_survives(run),
+                metrics_agree(run, conn),
             ]
         finally:
             governor.close()
@@ -2446,6 +2694,190 @@ def graceful(run: Run) -> Claim:
             f"a second daemon: ready {run.second_ready}, recovered {recovered} intents, "
             f"stopped in {run.second_stop_seconds:.2f}s"
             + (f"; failures {failed}" if failed else ""),
+        ],
+    )
+
+
+def trace_survives(run: Run) -> Claim:
+    """Agent, outbox, relay, vendor, webhook, fact and agent again: one trace
+    for each checkout (``docs/EPIC7_DESIGN.md`` §5)."""
+    api, vendor, workload = run.api, run.vendor, run.workload
+    problems: list[str] = []
+    # Every call, retries and replays included, carried one context.
+    untraced = [k for k, seen in api.traces.items() if None in seen]
+    varied = [k for k, seen in api.traces.items() if len(seen) > 1]
+    if untraced or varied:
+        problems.append(
+            f"idempotency keys called with no traceparent: {len(untraced)}; "
+            f"with more than one: {len(varied)}"
+        )
+    # Each charge, its plan's context, exactly; each refund, its charge's.
+    orders = {str(o.order_id): o for o in workload.orders.values()}
+    intents = api.of("payment_intent")
+    for intent in intents:
+        order = orders.get(str(intent["metadata"].get("order")))
+        sent = api.trace_of.get(str(intent["id"]))
+        if order is None or order.traceparent is None or sent != order.traceparent:
+            problems.append(f"charge {intent['id']} carried {sent}, not its checkout's")
+    refunds = api.of("refund")
+    for refund in refunds:
+        charged = api.trace_of.get(str(refund["payment_intent"]))
+        sent = api.trace_of.get(str(refund["id"]))
+        if charged is None or sent != charged:
+            problems.append(f"refund {refund['id']} carried {sent}, its charge {charged}")
+    # Each fact consumed: the trace of the delivery it is bound to, under
+    # the webhook's context when that continued ours; and each plan that
+    # consumed one, a span of its own in that trace.
+    modes: Counter[str] = Counter()
+    for fact, planned in workload.reconciled:
+        mode, header = vendor.traces.get(fact.event_id, ("none", None))
+        delivered = api.trace_of.get(fact.remote_ref)
+        expected = header if mode == "echo" else delivered
+        if delivered is None or fact.traceparent != expected:
+            problems.append(
+                f"fact {fact.fact_id} ({mode}) continues {fact.traceparent}, not {expected}"
+            )
+        elif planned is None or trace_id(planned) != trace_id(delivered) or planned == expected:
+            problems.append(f"the plan consuming fact {fact.fact_id} is traced {planned}")
+        else:
+            modes[mode] += 1
+    if any(parse_traceparent(t) is not None for t in MALFORMED_TRACES):
+        problems.append("a malformed traceparent the soak sends is valid")
+    # What the database kept, as the auditor saw it throughout, before the
+    # vacuum pruned it with its messages and events: every message's context,
+    # its plan's; every webhook's, as sent, when it was one; none when not.
+    by_plan = {o.plan_id: o.traceparent for o in workload.orders.values()}
+    messages = run.auditor.message_traces
+    for message, (plan_id, traceparent) in messages.items():
+        if traceparent is None or traceparent != by_plan.get(plan_id):
+            problems.append(f"message {message} of plan {plan_id} keeps {traceparent}")
+    events = run.auditor.event_traces
+    kept = 0
+    for event_id, traceparent in events.items():
+        mode, header = vendor.traces.get(event_id, ("none", None))
+        valid = header if mode in ("echo", "foreign") else None
+        if traceparent != valid:
+            problems.append(f"event {event_id} ({mode}) keeps {traceparent}")
+        kept += traceparent is not None
+    sent = Counter(s.trace for s in vendor.sent if s.purpose in ("genuine", "duplicate"))
+    return Claim(
+        "trace context survives",
+        not problems and bool(workload.reconciled) and all(modes[m] for m in TRACE_MODES[:2]),
+        [
+            f"payment API: {sum(len(s) for s in api.traces.values())} contexts on "
+            f"{len(api.traces)} idempotency keys, one each; {len(intents)} charges carried "
+            f"their checkout's, {len(refunds)} refunds their charge's",
+            "webhooks sent, by trace context: "
+            + ", ".join(f"{m} {sent.get(m, 0)}" for m in TRACE_MODES),
+            f"{len(workload.reconciled)} facts consumed, each continuing its delivery's trace: "
+            + ", ".join(f"{m} {modes.get(m, 0)}" for m in TRACE_MODES)
+            + "; each consuming plan a new span of it",
+            f"seen in the database over the run: {len(messages)} messages, each beside its "
+            f"plan's context; {len(events)} events, {kept} beside the context they carried",
+            *(problems[:8] or ["every context where it was sent, and nothing invented"]),
+        ],
+    )
+
+
+def metrics_agree(run: Run, conn: psycopg.Connection[Any]) -> Claim:
+    """What the daemon exported, against what the run counted itself
+    (``docs/EPIC7_DESIGN.md`` §5)."""
+    scraper, settled = run.scraper, run.settled
+    if scraper is None or settled is None:
+        return Claim("metrics agree", False, ["the settled daemon was never scraped"])
+    problems: list[str] = []
+    final = settled.scrape
+
+    def value(name: str, **labels: str) -> float:
+        return final.get(name, {}).get(tuple(labels.items()), 0.0)
+
+    catalog = {m.name for m in CATALOG}
+    if scraper.errors or scraper.fell:
+        problems.append(f"scrape errors {dict(scraper.errors)}; counters fell {scraper.fell[:3]}")
+    silent = sorted(n for n in catalog if n not in final and f"{n}_count" not in final)
+    if scraper.families != catalog or silent:
+        problems.append(f"families missing: {sorted(catalog - scraper.families)}; silent {silent}")
+    over = {w: s for w, s in scraper.saturation.items() if s > 1}
+    if over or set(scraper.saturation) != {w.name for w in run.config.windows}:
+        problems.append(f"window saturation: {dict(scraper.saturation)}")
+    if not 0 < scraper.busy <= scraper.workers:
+        problems.append(f"{scraper.busy} engines busy of {scraper.workers}")
+    # The plans: each submitted, by its outcome.
+    plans = run.workload.plans.values()
+    counted = {
+        "committed": sum(1 for p in plans if p.committed),
+        "refused": sum(1 for p in plans if p.committed is False),
+        "failed": sum(1 for p in plans if p.committed is None),
+    }
+    exported = {o: value("interlock_plans_total", outcome=o) for o in counted}
+    if exported != counted:
+        problems.append(f"plans exported {exported}, counted {counted}")
+    # The webhooks, by the inbox's answer and by the trace context they carried.
+    answered = Counter(str(s.status) for s in run.vendor.sent if s.status)
+    webhooks = {
+        dict(k)["status"]: v
+        for k, v in final.get("interlock_webhooks_total", {}).items()
+        if dict(k)["source"] == SOURCE
+    }
+    if webhooks != dict(answered):
+        problems.append(f"webhooks exported {webhooks}, answered {dict(answered)}")
+    result = {"echo": "valid", "foreign": "valid", "invalid": "invalid", "none": "absent"}
+    carried = Counter(result[s.trace] for s in run.vendor.sent if s.status == 200)
+    traced = {
+        dict(k)["result"]: v
+        for k, v in final.get("interlock_webhook_traceparent_total", {}).items()
+        if dict(k)["source"] == SOURCE
+    }
+    if traced != dict(carried):
+        problems.append(f"webhooks' trace context exported {traced}, sent {dict(carried)}")
+    # The deliveries and their receipts: one lag observed per receipt.
+    (delivered,) = conn.execute(
+        "SELECT (SELECT count(*) FROM interlock.outbox_state WHERE state = 'delivered')"
+        " + (SELECT count(*) FROM interlock.outbox_compacted WHERE state = 'delivered')"
+    ).fetchone()
+    calls = value("interlock_deliveries_total", sink=SINK, outcome="delivered")
+    if calls < delivered:
+        problems.append(f"{calls} delivering calls exported for {delivered} messages delivered")
+    receipts = value("interlock_receipts_issued_total")
+    lags = value("interlock_settlement_lag_seconds_count")
+    if not receipts == lags == delivered:
+        problems.append(f"{receipts} receipts and {lags} lags exported, {delivered} delivered")
+    # The outbox, settled: the sample's count of each state between two reads.
+    sampled = {
+        dict(k)["state"]: int(v) for k, v in final.get("interlock_outbox_messages", {}).items()
+    }
+    for state in sorted(set(sampled) | set(settled.before)):
+        low, high = settled.after.get(state, 0), settled.before.get(state, 0)
+        if not low <= sampled.get(state, 0) <= high:
+            problems.append(f"{state}: sampled {sampled.get(state, 0)}, read {high} then {low}")
+    idle = {
+        name: value(name)
+        for name in (
+            "interlock_settlement_backlog",
+            "interlock_inbox_facts_pending",
+            "interlock_engine_queue_depth",
+            "interlock_metrics_sample_errors_total",
+        )
+    }
+    if any(idle.values()):
+        problems.append(f"settled, and yet: {idle}")
+    return Claim(
+        "metrics agree",
+        not problems,
+        [
+            f"{scraper.scrapes} scrapes, every one well formed, {len(catalog)} families "
+            f"exported, each with data; no counter fell; sampled as the audit role every "
+            f"{METRICS_EVERY:g}s, without an error",
+            "fullest window seen: "
+            + ", ".join(f"{w} {s:.0%}" for w, s in sorted(scraper.saturation.items()))
+            + f"; at most {scraper.busy:g} of {scraper.workers:g} engines busy",
+            f"plans by outcome {exported}, as counted; webhooks by answer {webhooks} and by "
+            f"trace context {traced}, as sent",
+            f"{calls:g} delivering calls for {delivered} messages delivered, {receipts:g} "
+            f"receipts, {lags:g} settlement lags observed",
+            f"the settled outbox, sampled: {sampled}; read before {settled.before} and after "
+            f"{settled.after}",
+            *(problems[:8] or ["every figure what the run counted itself"]),
         ],
     )
 

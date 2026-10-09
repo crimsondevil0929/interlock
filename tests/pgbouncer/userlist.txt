@@ -1,0 +1,2 @@
+; The throwaway admin of the test server (POSTGRES_PASSWORD in CI).
+"interlock_admin" "interlock"

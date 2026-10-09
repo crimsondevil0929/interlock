@@ -126,6 +126,7 @@ def subplan(plan: EffectPlan, kept: frozenset[EffectId]) -> EffectPlan:
         intent=plan.intent,
         repair_of=plan.repair_of,
         facts=plan.facts,
+        traceparent=plan.traceparent,
     )
 
 

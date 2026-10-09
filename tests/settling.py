@@ -46,9 +46,10 @@ FIAT = "500.00"
 """What a booking moves: the customer's money, never the agent's budget."""
 
 
-def booking(*ns: int) -> PlanBuilder:
-    """A plan that books each of ``ns``, one request each."""
-    builder = PlanBuilder(SCOPE)
+def booking(*ns: int, traceparent: str | None = None) -> PlanBuilder:
+    """A plan that books each of ``ns``, one request each, in
+    ``traceparent``'s trace when given."""
+    builder = PlanBuilder(SCOPE, traceparent=traceparent)
     for n in ns:
         builder = builder.enqueue(
             sink="bookings",
@@ -95,9 +96,11 @@ class Bench:
         (message,) = self.book_together(n, charged=charged)
         return message
 
-    def book_together(self, *ns: int, charged: bool = True) -> list[uuid.UUID]:
+    def book_together(
+        self, *ns: int, charged: bool = True, traceparent: str | None = None
+    ) -> list[uuid.UUID]:
         """Commit one plan that books each of ``ns``: its requests."""
-        plan = booking(*ns).build()
+        plan = booking(*ns, traceparent=traceparent).build()
         result = self.engine(charged=charged).execute(plan)
         assert result.committed, result.feedback
         return self.outbox.messages(plan.plan_id)

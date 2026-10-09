@@ -57,11 +57,13 @@ from interlock.outbound import EnqueueOrder
 from interlock.sqlite_outbox import (
     CHECKPOINTS,
     OUTBOX_TABLES,
+    TRACES,
     WINDOWS_TABLE,
     enqueue,
     now_us,
     outbox_installed,
     stage_requests,
+    trace_stage,
 )
 from interlock.sqlite_outbox import WINDOWS_DDL as _WINDOWS_DDL
 from interlock.types import (
@@ -359,6 +361,7 @@ class SqliteSubstrate:
         "_conn",
         "_denied",
         "_enforce",
+        "_enqueued",
         "_facts",
         "_folded",
         "_handle",
@@ -376,6 +379,7 @@ class SqliteSubstrate:
         "_stage_seconds",
         "_tables",
         "_target",
+        "_traceparent",
     )
 
     def __init__(
@@ -424,6 +428,8 @@ class SqliteSubstrate:
         self._outbox = False
         self._charges: tuple[WindowCharge, ...] = ()
         self._facts: tuple[uuid.UUID, ...] = ()
+        self._traceparent: str | None = None
+        self._enqueued = 0
 
     @property
     def substrate_id(self) -> str:
@@ -587,6 +593,8 @@ class SqliteSubstrate:
         self._scope = plan.scope_id
         self._charges = ()
         self._facts = ()
+        self._traceparent = plan.traceparent
+        self._enqueued = 0
         return handle
 
     def reject_reason(self, effect: Effect) -> str | None:
@@ -705,6 +713,7 @@ class SqliteSubstrate:
                 raise StageError(
                     f"effect {effect.effect_id!r} could not be written to the outbox: {exc}"
                 ) from exc
+        self._enqueued += 1
         return EffectOutcome(
             effect_id=effect.effect_id, rows_affected=1, applied_at=datetime.now(UTC)
         )
@@ -927,6 +936,8 @@ class SqliteSubstrate:
                         f"VALUES (?, ?, ?)",
                         (str(handle.stage_id), self._journal_start + 1, _journal_position(conn)),
                     )
+                if self._traceparent is not None and self._enqueued:
+                    self._trace(conn, handle, self._traceparent)
                 if self._markers:
                     conn.execute(
                         f"INSERT INTO main.{_MARKER_TABLE} (stage_id, plan_id, committed_at) "
@@ -944,6 +955,20 @@ class SqliteSubstrate:
             verdict_hash="",
             substrate_txn_id=None,
         )
+
+    @staticmethod
+    def _trace(conn: sqlite3.Connection, handle: StageHandle, traceparent: str) -> None:
+        """Keep the plan's trace context beside each request it enqueued. An
+        outbox installed before version 6 has nowhere to keep it: the plan
+        commits untraced, since nothing it does depends on its trace."""
+        if sqlite_has(conn, TRACES):
+            trace_stage(conn, handle.stage_id, traceparent)
+        else:
+            logger.warning(
+                "plan %s: the outbox predates version 6 and keeps no trace context; run "
+                "`interlock install` to upgrade it in place",
+                handle.plan_id,
+            )
 
     def resolve_intent(self, stage_id: uuid.UUID) -> bool | None:
         """Whether a stage's transaction committed, read from its commit marker.

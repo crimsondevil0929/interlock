@@ -9,6 +9,70 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 7: trace context, metrics, a pooler-safe stage; `docs/EPIC7_DESIGN.md`)
+
+- **W3C trace context, end to end.** `EffectPlan.traceparent`, set by
+  `PlanBuilder(..., traceparent=...)` or `AgentContext.plan(..., traceparent=...)` and
+  refused at admission when malformed (`PlanError`). A stage writes it beside each request
+  it enqueues; the relay sends it as the `traceparent` header of every call, through
+  `HttpAdapter` and the Stripe and SendGrid adapters; an operator's compensation inherits
+  the context of what it undoes; the inbox keeps the context a verified webhook carried,
+  read as W3C asks a receiver to; and `InboundFact.traceparent` continues the delivery's
+  trace, under the webhook's context when the vendor continued ours. `interlock.trace`:
+  `new_traceparent`, `child_traceparent`, `parse_traceparent`, `require_traceparent`,
+  `trace_id`, `span_id`, `fact_traceparent`. Outside every hash: golden vectors pin the
+  plan, request, genesis, delivery-log, ARC1 attestation, inbound event and fact hashes to
+  their values before this epic, traced or not.
+- **Storage version 6**, on both stores: `outbox_traces` and `inbox_traces`, each row
+  deleted with the message or event it describes, so the vacuum prunes them unchanged.
+  `interlock install` upgrades version 5 in place.
+- **Prometheus metrics** (`interlock.telemetry`): a registry with no dependency, every
+  metric declared once in `CATALOG`, with fixed labels and none per tenant, scope, plan or
+  key; the text format, version 0.0.4. `MetricsService` serves `GET /metrics` and
+  `GET /healthz` on a listener of its own, and samples the database (`interlock.sampling`)
+  in one read-only snapshot: the outbox by state, settlement's backlog, pending facts,
+  unmatched events, each rate window's fullest key against its limit. The engines,
+  relays, inbox, settler, vacuum and every part's loop measure into the supervisor's
+  registry: plans by outcome and time, races lost by cause, waits for window locks and for
+  the windows' connection and the longest of each in the last minute, deliveries by sink
+  and outcome, settlement lag, webhooks by answer and by trace context, vacuum runs.
+  `[metrics]` (`listen`, `every_seconds`, `database`, or `INTERLOCK_METRICS_DATABASE`) and
+  `interlock daemon --metrics HOST:PORT`. `scripts/metrics_overhead.py` measures the cost:
+  under two microseconds a plan.
+- **`PoolExhaustedError`**, a `StageConflictError`, and `[engine] pool_timeout_seconds`
+  (`PostgresSubstrate(pool_timeout_seconds=...)`), below.
+- The soak (`scripts/live_stress_test.py`) proves two more claims: **trace context
+  survives** and **metrics agree**.
+
+### Fixed (Epic 7)
+
+- **A stage behind a transaction-mode pooler waited on itself.** A stage on PostgreSQL
+  holds its connection and reads the rate windows on a second. Behind PgBouncer in
+  transaction mode, once as many stages were open as the pool had connections, each
+  waited for a connection only another's commit would free, holding its locks, until its
+  own stage timeout ended its transaction and it failed, not to be retried. The second
+  connection must now be had within the pool timeout, under a watchdog that cancels the
+  wait and then shuts the socket (PgBouncer takes the cancel of a queued client and keeps
+  it queued); otherwise the stage is aborted with `PoolExhaustedError`, its locks and
+  connection released, and the engine pool stages it again. Proven against a fake pooler,
+  a role's `CONNECTION LIMIT`, and PgBouncer 1.26, which CI now runs.
+- **The windows' read left a session setting behind.** It ran `SET statement_timeout` as
+  its own statement, which a transaction-mode pooler left on the server connection for the
+  next client. It is now one `READ COMMITTED READ ONLY` transaction with `SET LOCAL`.
+- **CI tested 3.11 in the job named 3.12.** `uv run` followed `.python-version`; each job
+  now sets `UV_PYTHON` to its matrix version. `uv.lock` records the package at 0.6.0.
+
+### Changed (Epic 7)
+
+- The PostgreSQL substrate prepares nothing on the server (`prepare_threshold=None`), so a
+  pooler needs no `max_prepared_statements`. An agent's statement is still sent by the
+  extended protocol, unnamed, and the server still refuses `UPDATE ...; COMMIT`.
+- `SettlementReport.lags`: each delivery receipt's seconds behind its delivery.
+- `InterlockSupervisor(metrics=...)`; `Service.metrics`; `Relay(metrics=...)`;
+  `PostgresSubstrate(metrics=...)`; `open_substrate(config, metrics=...)`. The package
+  exports `Metrics`, `MetricsService`, `new_traceparent`, `child_traceparent` and
+  `parse_traceparent`.
+
 ### Added (Epic 6: the runtime daemon, and the system under load; `docs/EPIC6_DESIGN.md`)
 
 - **`EscrowRuntime`, configured whole.** `substrate=` takes any substrate in place of the

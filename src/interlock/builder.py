@@ -35,6 +35,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from interlock.exceptions import PlanError
+from interlock.trace import require_traceparent
 from interlock.types import (
     OUTBOX_TARGET,
     Compensation,
@@ -76,6 +77,9 @@ class PlanBuilder:
     :param plan_id: Override the minted identifier. For replaying a recorded
         plan, not for normal use.
     :param created_at: Override the clock. Must be timezone-aware.
+    :param traceparent: The W3C trace context the plan continues
+        (:mod:`interlock.trace`), sent with every request it enqueues. Outside
+        the plan's hash.
     """
 
     __slots__ = (
@@ -85,6 +89,7 @@ class PlanBuilder:
         "_intent",
         "_plan_id",
         "_scope_id",
+        "_traceparent",
         "_trajectory_id",
     )
 
@@ -96,12 +101,19 @@ class PlanBuilder:
         intent: str = "",
         plan_id: PlanId | None = None,
         created_at: datetime | None = None,
+        traceparent: str | None = None,
     ) -> None:
         if created_at is not None and created_at.tzinfo is None:
             raise PlanError(
                 "created_at must be timezone-aware; a naive timestamp records a "
                 "moment that cannot be compared against the AgentGov chain"
             )
+        if traceparent is not None:
+            try:
+                require_traceparent(traceparent)
+            except ValueError as exc:
+                raise PlanError(str(exc)) from exc
+        self._traceparent = traceparent
         self._scope_id = scope_id
         self._trajectory_id = trajectory_id or f"traj-{uuid.uuid4().hex[:12]}"
         self._intent = intent
@@ -294,6 +306,7 @@ class PlanBuilder:
             effects=tuple(self._effects),
             intent=self._intent,
             facts=tuple(self._facts),
+            traceparent=self._traceparent,
         )
         try:
             plan.topological_order()

@@ -156,6 +156,7 @@ vacuum, each part connecting as its own role::
     conflict_retries = 16             # a plan that lost a race is staged again
     max_stage_seconds = 10
     lock_timeout_seconds = 2
+    pool_timeout_seconds = 2          # PostgreSQL: the rate windows' connection, or retried
 
     [receipts]                        # the receipt log: action and delivery receipts
     log = "receipts.jsonl"
@@ -176,6 +177,11 @@ vacuum, each part connecting as its own role::
     drain_timeout_seconds = 30        # each shutdown step's bound
     restart_min_seconds = 0.5         # a failed service backs off from here...
     restart_max_seconds = 30          # ...doubling to here
+
+    [metrics]                         # Prometheus: off unless listen is set
+    listen = "127.0.0.1:9464"         # GET /metrics and /healthz; a private address
+    every_seconds = 15                # how often the database is sampled
+    database = "postgresql://interlock_audit@db/app"  # an audit_roles role
 
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
@@ -216,6 +222,7 @@ from interlock.windows import Measure, Plans, RateWindow, Requests, RequestSum, 
 __all__ = [
     "DATABASE_ENV",
     "INBOX_DATABASE_ENV",
+    "METRICS_DATABASE_ENV",
     "RELAY_DATABASE_ENV",
     "SETTLER_DATABASE_ENV",
     "DaemonConfig",
@@ -223,6 +230,7 @@ __all__ = [
     "EngineConfig",
     "InboxConfig",
     "InterlockConfig",
+    "MetricsConfig",
     "OperatorsConfig",
     "ReceiptsConfig",
     "RelayConfig",
@@ -235,6 +243,7 @@ DATABASE_ENV = "INTERLOCK_DATABASE"
 RELAY_DATABASE_ENV = "INTERLOCK_RELAY_DATABASE"
 INBOX_DATABASE_ENV = "INTERLOCK_INBOX_DATABASE"
 SETTLER_DATABASE_ENV = "INTERLOCK_SETTLER_DATABASE"
+METRICS_DATABASE_ENV = "INTERLOCK_METRICS_DATABASE"
 
 
 class ConfigError(ValueError):
@@ -366,6 +375,7 @@ class EngineConfig:
     conflict_retries: int = 16
     max_stage_seconds: float = 10.0
     lock_timeout_seconds: float = 2.0
+    pool_timeout_seconds: float | None = None
 
     def chain_for(self, worker: int, workers: int | None = None) -> Path | None:
         """The chain file worker ``worker`` writes: the configured one for a
@@ -418,6 +428,25 @@ class DaemonConfig:
     drain_timeout: timedelta = timedelta(seconds=30)
     restart_min: timedelta = timedelta(milliseconds=500)
     restart_max: timedelta = timedelta(seconds=30)
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsConfig:
+    """``[metrics]``: the Prometheus endpoint (``docs/EPIC7_DESIGN.md`` §2).
+
+    :ivar listen: ``HOST:PORT`` to serve ``/metrics`` and ``/healthz`` on;
+        ``None``, the default, serves nothing. Unauthenticated: a private
+        address.
+    :ivar every: How often the database is sampled.
+    :ivar database: On PostgreSQL, a role that may read the window ledger and
+        the outbox's and inbox's tables, an ``audit_roles`` one; ``""`` for
+        ``INTERLOCK_METRICS_DATABASE``. Without one, nothing is sampled. On
+        SQLite, the file, read-only: the configuration's own by default.
+    """
+
+    listen: str | None = None
+    every: timedelta = timedelta(seconds=15)
+    database: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,6 +507,7 @@ class InterlockConfig:
     """``[receipts]``: the receipt log, or ``None`` for no receipts."""
     settler: SettlerConfig = SettlerConfig()
     daemon: DaemonConfig = DaemonConfig()
+    metrics: MetricsConfig = MetricsConfig()
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -583,6 +613,7 @@ def load_config(
         receipts=_receipts(raw.get("receipts"), Path(path).parent),
         settler=_settler(raw.get("settler")),
         daemon=_daemon(raw.get("daemon")),
+        metrics=_metrics(raw.get("metrics")),
     )
 
 
@@ -641,6 +672,7 @@ _ENGINE_KEYS = frozenset(
         "conflict_retries",
         "max_stage_seconds",
         "lock_timeout_seconds",
+        "pool_timeout_seconds",
     }
 )
 
@@ -688,6 +720,9 @@ def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
         conflict_retries=retries,
         max_stage_seconds=_seconds(raw, "max_stage_seconds", 10.0),
         lock_timeout_seconds=_seconds(raw, "lock_timeout_seconds", 2.0),
+        pool_timeout_seconds=(
+            _seconds(raw, "pool_timeout_seconds", 2.0) if "pool_timeout_seconds" in raw else None
+        ),
     )
 
 
@@ -722,6 +757,26 @@ def _settler(raw: object) -> SettlerConfig:
     return SettlerConfig(
         database=_string(raw, "database", default=""),
         every=timedelta(seconds=_seconds(raw, "every_seconds", 5.0)),
+    )
+
+
+def _metrics(raw: object) -> MetricsConfig:
+    if raw is None:
+        return MetricsConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'metrics' must be a table ([metrics])")
+    unknown = sorted(set(raw) - {"listen", "every_seconds", "database"})
+    if unknown:
+        raise ConfigError(f"[metrics]: unknown key(s) {', '.join(unknown)}")
+    listen = _string(raw, "listen", default="") or None
+    if listen is not None:
+        host, _, port = listen.rpartition(":")
+        if not host or not port.isdigit() or not 0 <= int(port) <= 65535:
+            raise ConfigError(f"[metrics]: listen is HOST:PORT, not {listen!r}")
+    return MetricsConfig(
+        listen=listen,
+        every=timedelta(seconds=_seconds(raw, "every_seconds", 15.0)),
+        database=_string(raw, "database", default=""),
     )
 
 

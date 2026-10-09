@@ -26,24 +26,27 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import os
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from interlock.config import SETTLER_DATABASE_ENV, is_dsn
+from interlock.config import METRICS_DATABASE_ENV, SETTLER_DATABASE_ENV, is_dsn
 from interlock.exceptions import SubstrateConfigurationError
 from interlock.supervisor import (
     AgentContext,
     EnginePool,
     InboxService,
     InterlockSupervisor,
+    MetricsService,
     RelayService,
     Service,
     SettlerService,
     VacuumService,
 )
+from interlock.telemetry import Metrics
 
 if TYPE_CHECKING:
     from agentgov import BudgetManager
@@ -54,10 +57,13 @@ if TYPE_CHECKING:
     from interlock.invariants import InvariantChecker
     from interlock.receipts import ReceiptIssuer
     from interlock.relay import Relay
+    from interlock.sampling import Sample
     from interlock.settlement import Settler
     from interlock.vacuum import Vacuum
 
 __all__ = ["Application", "build_supervisor", "load_application"]
+
+logger = logging.getLogger("interlock.daemon")
 
 
 @dataclass(frozen=True)
@@ -142,12 +148,15 @@ def build_supervisor(
     listen: str | None = None,
     relay_key: str | None = None,
     inbox_key: str | None = None,
+    metrics_listen: str | None = None,
 ) -> InterlockSupervisor:
     """The supervisor ``config`` describes, running ``application``'s agents
     (see the module). Keys are read and checked now; nothing else is opened
     until it runs.
 
     :param listen: Overrides ``[inbox] listen``, ``HOST:PORT``.
+    :param metrics_listen: Overrides ``[metrics] listen``, ``HOST:PORT``: where
+        ``/metrics`` is served.
     :param relay_key: Overrides ``[relay] key``, as ``INTERLOCK_RELAY_KEY`` does.
     :param inbox_key: Overrides ``[inbox] key``, as ``INTERLOCK_INBOX_KEY`` does.
     :raises SubstrateConfigurationError: If a part is configured but cannot
@@ -159,8 +168,9 @@ def build_supervisor(
     services: list[Service] = []
     engines: EnginePool | None = None
     receipts = _Receipts(config)
+    metrics = Metrics()
     if application is not None and (application.checkers or application.agents):
-        engines = _engines(config, application, governors, receipts)
+        engines = _engines(config, application, governors, receipts, metrics)
     try:
         if config.relay is not None:
             key = relay_key or os.environ.get(RELAY_KEY_ENV) or config.relay.key
@@ -173,6 +183,9 @@ def build_supervisor(
         vacuum = config.vacuum
         if vacuum.every is not None and vacuum.key is not None:
             services.append(_vacuum(config, governors))
+        where = metrics_listen or config.metrics.listen
+        if where:
+            services.append(_metrics(config, where))
     except RefusedError as exc:
         raise SubstrateConfigurationError(str(exc)) from exc
     supervisor = InterlockSupervisor(
@@ -181,6 +194,7 @@ def build_supervisor(
         drain_timeout=config.daemon.drain_timeout.total_seconds(),
         restart_min=config.daemon.restart_min.total_seconds(),
         restart_max=config.daemon.restart_max.total_seconds(),
+        metrics=metrics,
     )
     supervisor.on_close(receipts.close)
     if application is not None:
@@ -221,6 +235,7 @@ def _engines(
     application: Application,
     governors: _Governors,
     shared: _Receipts,
+    metrics: Metrics,
 ) -> EnginePool:
     from interlock.chain import EscrowChain
     from interlock.engine import EscrowEngine
@@ -244,7 +259,7 @@ def _engines(
             chain = EscrowChain(path) if path is not None else EscrowChain()
             closers.append(chain.close)
             engine = EscrowEngine(
-                open_substrate(config),
+                open_substrate(config, metrics=metrics),
                 checkers=application.checkers,
                 chain=chain,
                 anchor=open_anchor(config, governor),
@@ -262,6 +277,43 @@ def _engines(
     return EnginePool(
         open_engine, workers=settings.workers, conflict_retries=settings.conflict_retries
     )
+
+
+def _metrics(config: InterlockConfig, listen: str) -> Service:
+    """The metrics endpoint (``docs/EPIC7_DESIGN.md`` §2.2), sampling the
+    database every ``[metrics] every_seconds`` when it may read it."""
+    from interlock.sampling import sample_postgres, sample_sqlite
+    from interlock.sqlite_outbox import now_us
+
+    host, _, port = listen.rpartition(":")
+    if not host or not port.isdigit():
+        raise SubstrateConfigurationError(f"metrics listen is HOST:PORT, not {listen!r}")
+    every = config.metrics.every.total_seconds()
+    windows = tuple(config.windows)
+    sample: Callable[[], Sample] | None = None
+    if config.substrate == "postgres":
+        dsn = config.metrics.database or os.environ.get(METRICS_DATABASE_ENV, "")
+        if dsn:
+            bound = min(every, 10.0)
+
+            def sample_database() -> Sample:
+                return sample_postgres(dsn, windows, timeout=bound)
+
+            sample = sample_database
+        else:
+            logger.warning(
+                "metrics: no role to sample the database as ([metrics] database, an "
+                "audit_roles role, or %s): only what the process measures is exported",
+                METRICS_DATABASE_ENV,
+            )
+    else:
+        path = config.metrics.database or config.database
+
+        def sample_file() -> Sample:
+            return sample_sqlite(path, windows, now_us=now_us())
+
+        sample = sample_file
+    return MetricsService(host=host, port=int(port), every=every, sample=sample, windows=windows)
 
 
 def _relays(config: InterlockConfig, key: Any) -> list[Service]:

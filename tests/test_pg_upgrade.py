@@ -216,6 +216,9 @@ class OldStore(PostgresOutboxStore):
     def _arguments(self, result: DeliveryResult) -> tuple[object, ...]:
         raise NotImplementedError
 
+    def _traces(self, conn: Any, messages: list[Any]) -> dict[Any, str]:
+        return {}  # a version before 6 kept no trace context
+
     def outcome(
         self,
         lease: Any,

@@ -20,6 +20,10 @@ jobs:
     # A hang fails the job within the hour rather than at GitHub's six, with
     # the stacks pytest dumps after five minutes in its log.
     timeout-minutes: 45
+    # .python-version pins 3.11, and `uv run` follows it unless told otherwise:
+    # without this, every job named for 3.12 ran 3.11.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +105,8 @@ jobs:
     env:
       INTERLOCK_TEST_POSTGRES_DSN: postgresql://interlock_admin:interlock@localhost:5432/postgres
       INTERLOCK_REQUIRE_POSTGRES: "1"
+      INTERLOCK_TEST_PGBOUNCER: localhost:6432
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +120,19 @@ jobs:
 
       - name: Install the project
         run: uv sync --frozen --python 3.12
+
+      # The pool tests (tests/test_pool.py) also run behind a real PgBouncer in
+      # transaction mode, on the service's network, where the server is
+      # `postgres`. PgBouncer 1.26.0, pinned by digest.
+      - name: Start PgBouncer in front of PostgreSQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/pgbouncer"
+          sed 's/@HOST@/postgres/; s/@PORT@/5432/' tests/pgbouncer/pgbouncer.ini \
+            > "$RUNNER_TEMP/pgbouncer/pgbouncer.ini"
+          cp tests/pgbouncer/userlist.txt "$RUNNER_TEMP/pgbouncer/"
+          docker run -d --name pgbouncer --network "${{ job.services.postgres.network }}" \
+            -p 6432:6432 -v "$RUNNER_TEMP/pgbouncer:/etc/pgbouncer:ro" \
+            edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
 
       - name: Tests with coverage, PostgreSQL required
         run: uv run pytest -v --cov=interlock --cov-report=term-missing

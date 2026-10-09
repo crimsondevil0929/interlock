@@ -26,6 +26,7 @@ __all__ = [
     "LedgerUnverifiedError",
     "OutboundRequestError",
     "PlanError",
+    "PoolExhaustedError",
     "RecordIntegrityError",
     "RecoveryError",
     "RecoveryExhaustedError",
@@ -169,6 +170,13 @@ class SubstrateConfigurationError(StageError):
 
 class StageConflictError(StageError):
     """A conflicting stage already holds the resources this plan needs."""
+
+
+class PoolExhaustedError(StageConflictError):
+    """No connection came free in time for a stage's second session, the one
+    that reads the rate windows: a connection pool (PgBouncer), or the
+    server's own limit, held every one (``docs/EPIC7_DESIGN.md`` §3). The
+    stage was aborted, so it holds nothing. Retryable, as a lost race is."""
 
 
 class StageExpiredError(StageError):

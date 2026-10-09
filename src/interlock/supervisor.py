@@ -51,6 +51,7 @@ import logging
 import random
 import signal
 import threading
+import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -59,24 +60,30 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 from interlock.exceptions import (
     ChainInUseError,
     CommitUnsettledError,
+    PoolExhaustedError,
     StageConflictError,
     SupervisorStoppedError,
 )
+from interlock.telemetry import Metrics, MetricsServer, NullMetrics
+from interlock.trace import parse_traceparent
 
 if TYPE_CHECKING:
     from interlock.builder import PlanBuilder
     from interlock.engine import EscrowEngine, StageResult
     from interlock.inbox import Inbox, InboxServer
     from interlock.relay import Relay
+    from interlock.sampling import Sample
     from interlock.settlement import Settler
     from interlock.types import EffectPlan, InboundFact
     from interlock.vacuum import Vacuum
+    from interlock.windows import RateWindow
 
 __all__ = [
     "AgentContext",
     "EnginePool",
     "InboxService",
     "InterlockSupervisor",
+    "MetricsService",
     "RelayService",
     "Service",
     "ServiceStatus",
@@ -135,6 +142,8 @@ class Service:
         self.name = name
         self._counters: Counter[str] = Counter()
         self._counting = threading.Lock()
+        self.metrics: Metrics = NullMetrics()
+        """What the service measures into: the supervisor's, once bound."""
 
     def count(self, counter: str, n: int = 1) -> None:
         """Add ``n`` to one of the service's counters. Thread-safe."""
@@ -148,7 +157,8 @@ class Service:
             return dict(self._counters)
 
     def bind(self, supervisor: InterlockSupervisor) -> None:
-        """Called once, before the first :meth:`open`."""
+        """Called once, before the first :meth:`open`. An override calls it."""
+        self.metrics = supervisor.metrics
 
     def open(self) -> None:
         """Acquire what the service needs. Called again after a failure."""
@@ -201,6 +211,7 @@ class RelayService(Service):
             self._relay, self._close = opened
         else:
             self._relay, self._close = opened, opened.close
+        self._relay.metrics = self.metrics
 
     def step(self) -> float:
         assert self._relay is not None
@@ -251,6 +262,7 @@ class InboxService(Service):
         for port 0."""
 
     def bind(self, supervisor: InterlockSupervisor) -> None:
+        super().bind(supervisor)
         self._health = supervisor.health
 
     def open(self) -> None:
@@ -290,7 +302,10 @@ class InboxService(Service):
 
 
 class _CountingInbox:
-    """An inbox that counts what its server answered."""
+    """An inbox that counts what its server answered, and the trace context
+    each webhook it took carried: an unverified request's headers are
+    anyone's. A source the inbox does not have is counted as ``_unknown``:
+    the path names it, and the path is the sender's."""
 
     __slots__ = ("_inbox", "_max_body", "_service")
 
@@ -302,8 +317,17 @@ class _CountingInbox:
     def receive(self, name: str, headers: Mapping[str, str], body: bytes) -> Any:
         response = self._inbox.receive(name, headers, body)
         self._service.count(f"answered_{response.status}")
+        source = name if name in self._inbox._sources else "_unknown"
+        metrics = self._service.metrics
+        metrics.inc("interlock_webhooks_total", source=source, status=str(response.status))
         if response.status == 200:
             self._service.count("recorded", int(response.body.get("recorded", 0)))
+            header = next((v for k, v in headers.items() if k.lower() == "traceparent"), None)
+            if header is None:
+                result = "absent"
+            else:
+                result = "valid" if parse_traceparent(header) is not None else "invalid"
+            metrics.inc("interlock_webhook_traceparent_total", source=source, result=result)
         return response
 
 
@@ -340,6 +364,10 @@ class SettlerService(Service):
         self.count("receipts", report.receipts)
         self.count("credits", report.credits)
         self.count("problems", len(report.problems))
+        self.metrics.inc("interlock_receipts_issued_total", report.receipts)
+        self.metrics.inc("interlock_credits_total", report.credits)
+        for lag in report.lags:
+            self.metrics.observe("interlock_settlement_lag_seconds", lag)
         for problem in report.problems:
             logger.warning("settler: %s", problem)
         return self._every
@@ -391,11 +419,15 @@ class VacuumService(Service):
                 report = vacuum.run(reason=self._reason)
         except ChainInUseError:
             self.count("busy")
+            self.metrics.inc("interlock_vacuum_runs_total", outcome="busy")
             return self._busy_retry
         self.count(report.outcome)
         self.count("messages", report.messages)
         self.count("window_rows", report.window_rows)
         self.count("inbox_events", report.inbox_events)
+        self.metrics.inc("interlock_vacuum_runs_total", outcome=report.outcome)
+        for kind in ("messages", "window_rows", "inbox_events"):
+            self.metrics.inc("interlock_vacuum_pruned_total", getattr(report, kind), kind=kind)
         for problem in report.problems:
             logger.warning("vacuum: %s", problem)
         return self._every
@@ -403,6 +435,93 @@ class VacuumService(Service):
     def close(self) -> None:
         if self._close is not None:
             self._close()
+
+
+class MetricsService(Service):
+    """The metrics endpoint (``docs/EPIC7_DESIGN.md`` §2.2): ``GET /metrics``
+    and ``GET /healthz`` on a listener of their own, not the inbox's; and every
+    ``every`` seconds a sample of the database (:mod:`interlock.sampling`),
+    when given one to take. A sample that fails is counted and taken again at
+    the next interval; the endpoint stays up.
+
+    :param sample: Takes one sample; ``None`` exports what the process
+        measures, and nothing sampled.
+    :param windows: The configured rate windows: their limits, and the
+        saturation of each against its own.
+    """
+
+    phase = 9  # stops last: it is scraped through a shutdown
+
+    def __init__(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 9464,
+        every: float = 15.0,
+        sample: Callable[[], Sample] | None = None,
+        windows: Sequence[RateWindow] = (),
+        name: str = "metrics",
+    ) -> None:
+        super().__init__(name)
+        self._host = host
+        self._port = port
+        self._every = every
+        self._sample = sample
+        self._windows = tuple(windows)
+        self._server: MetricsServer | None = None
+        self._health: Callable[[], tuple[int, Mapping[str, Any]]] | None = None
+        self.port: int | None = None
+        """The port bound, once open."""
+
+    def bind(self, supervisor: InterlockSupervisor) -> None:
+        super().bind(supervisor)
+        self._health = supervisor.health
+
+    def open(self) -> None:
+        server = MetricsServer(self.metrics, self._host, self._port, health=self._health)
+        self.port = server.start()
+        # The port chosen is kept: a restart binds the same one.
+        self._port = self.port
+        self._server = server
+        for window in self._windows:
+            self.metrics.set("interlock_window_limit", float(window.limit), window=window.name)
+
+    def step(self) -> float:
+        if self._sample is None:
+            return self._every
+        try:
+            sample = self._sample()
+        except Exception as exc:
+            self.metrics.inc("interlock_metrics_sample_errors_total")
+            self.count("sample_errors")
+            logger.warning("metrics: the database could not be sampled: %s", exc)
+            return self._every
+        self._record(sample)
+        self.count("samples")
+        return self._every
+
+    def _record(self, sample: Sample) -> None:
+        metrics = self.metrics
+        for state, count in sample.states.items():
+            metrics.set("interlock_outbox_messages", count, state=state)
+        metrics.set("interlock_outbox_oldest_due_seconds", sample.oldest_due or 0.0)
+        metrics.set("interlock_settlement_backlog", sample.backlog)
+        metrics.set("interlock_settlement_oldest_seconds", sample.oldest_unsettled or 0.0)
+        metrics.set("interlock_inbox_facts_pending", sample.facts_pending)
+        metrics.set("interlock_inbox_events_unmatched", sample.events_unmatched)
+        limits = {w.name: w.limit for w in self._windows}
+        for name, (value, keys) in sample.windows.items():
+            metrics.set("interlock_window_value", float(value), window=name)
+            metrics.set("interlock_window_keys", keys, window=name)
+            limit = limits.get(name)
+            if limit:
+                metrics.set("interlock_window_saturation", float(value / limit), window=name)
+        metrics.set("interlock_metrics_sampled_at_seconds", time.time())
+
+    def close(self) -> None:
+        server, self._server = self._server, None
+        if server is not None:
+            server.stop()
 
 
 # --------------------------------------------------------------------------
@@ -456,11 +575,17 @@ class EnginePool:
         self._halt = threading.Event()
         self._counters: Counter[str] = Counter()
         self._counting = threading.Lock()
+        self.metrics: Metrics = NullMetrics()
+        """What the pool measures into: the supervisor's, once given to one."""
 
     def count(self, counter: str, n: int = 1) -> None:
         if n:
             with self._counting:
                 self._counters[counter] += n
+
+    def _staged(self, began: float, outcome: str) -> None:
+        self.metrics.inc("interlock_plans_total", outcome=outcome)
+        self.metrics.observe("interlock_plan_seconds", time.monotonic() - began, outcome=outcome)
 
     @property
     def counters(self) -> dict[str, int]:
@@ -495,17 +620,22 @@ class EnginePool:
             plan waited to be staged again: it is not staged.
         """
         engine = self._engines[index]
+        began = time.monotonic()
         for attempt in range(self._retries + 1):
             try:
                 result = engine.execute(plan)
-            except StageConflictError:
+            except StageConflictError as exc:
                 self.count("conflicts")
+                cause = "pool" if isinstance(exc, PoolExhaustedError) else "lock"
+                self.metrics.inc("interlock_plan_conflicts_total", cause=cause)
                 if attempt == self._retries:
                     self.count("conflicts_exhausted")
+                    self._staged(began, "failed")
                     raise
                 delay = min(self._retry_cap, self._retry_base * 2**attempt)
                 if self._halt.wait(random.uniform(delay / 2, delay)):  # noqa: S311 - jitter
                     self.count("cancelled")
+                    self._staged(began, "cancelled")
                     raise SupervisorStoppedError(
                         f"plan {plan.plan_id} lost a race, and the supervisor stopped before "
                         f"it could be staged again: it was not committed"
@@ -514,11 +644,20 @@ class EnginePool:
             except CommitUnsettledError:
                 # Never staged again: its intent is open, and recovery says.
                 self.count("unsettled")
+                self._staged(began, "unsettled")
                 raise
             except Exception:
                 self.count("failed")
+                self._staged(began, "failed")
                 raise
             self.count("committed" if result.committed else "refused")
+            self._staged(began, "committed" if result.committed else "refused")
+            verdict = getattr(result, "verdict", None)
+            if not result.committed and verdict is not None:
+                for violation in verdict.blocking:
+                    window = violation.invariant.removeprefix("rate_window:")
+                    if window != violation.invariant:
+                        self.metrics.inc("interlock_window_refusals_total", window=window)
             return result
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -548,6 +687,7 @@ class EnginePool:
 class _Job:
     plan: EffectPlan
     future: asyncio.Future[StageResult]
+    queued: float = field(default_factory=time.monotonic)
 
 
 # --------------------------------------------------------------------------
@@ -575,10 +715,14 @@ class AgentContext:
         """Whether the supervisor has begun to shut down."""
         return self._stopping.is_set()
 
-    def plan(self, scope_id: str, *, intent: str = "") -> PlanBuilder:
+    def plan(
+        self, scope_id: str, *, intent: str = "", traceparent: str | None = None
+    ) -> PlanBuilder:
+        """A plan for ``scope_id``, continuing ``traceparent``'s trace when
+        given (:mod:`interlock.trace`)."""
         from interlock.builder import PlanBuilder
 
-        return PlanBuilder(scope_id, intent=intent)
+        return PlanBuilder(scope_id, intent=intent, traceparent=traceparent)
 
     async def execute(self, plan: EffectPlan) -> StageResult:
         return await self._supervisor.execute(plan)
@@ -641,6 +785,7 @@ class _Running:
     task: asyncio.Task[None] | None = None
     state: str = STARTING
     opened: bool = False
+    busy: bool = False
     steps: int = 0
     failures: int = 0
     streak: int = 0
@@ -657,6 +802,8 @@ class InterlockSupervisor:
     :param restart_min: A failed service is opened again after this many
         seconds, doubling with each failure in a row...
     :param restart_max: ...up to this many.
+    :param metrics: What every part measures into (:mod:`interlock.telemetry`);
+        a registry of its own by default. :class:`MetricsService` serves it.
     """
 
     def __init__(
@@ -667,6 +814,7 @@ class InterlockSupervisor:
         drain_timeout: float = 30.0,
         restart_min: float = 0.5,
         restart_max: float = 30.0,
+        metrics: Metrics | None = None,
     ) -> None:
         names = [s.name for s in services] + (["engines"] if engines is not None else [])
         twice = sorted({n for n in names if names.count(n) > 1})
@@ -694,6 +842,12 @@ class InterlockSupervisor:
         self._engine_state = STARTING if engines is not None else STOPPED
         self._engine_error: str | None = None
         self._finished = threading.Event()
+        self._busy = 0
+        self.metrics = metrics if metrics is not None else Metrics()
+        """What every part measures into."""
+        self.metrics.collect(self._collect)
+        if engines is not None:
+            engines.metrics = self.metrics
 
     # -- registration -----------------------------------------------------
 
@@ -877,6 +1031,10 @@ class InterlockSupervisor:
                 return
             if job.future.cancelled():
                 continue
+            self.metrics.observe(
+                "interlock_engine_queue_wait_seconds", time.monotonic() - job.queued
+            )
+            self._busy += 1
             try:
                 result = await self._loop.run_in_executor(
                     self._engine_executor, self._engines.execute, index, job.plan
@@ -887,6 +1045,8 @@ class InterlockSupervisor:
                 if isinstance(exc, asyncio.CancelledError):  # pragma: no cover - never cancelled
                     raise
                 continue
+            finally:
+                self._busy -= 1
             if not job.future.done():
                 job.future.set_result(result)
 
@@ -903,7 +1063,17 @@ class InterlockSupervisor:
                     running.opened = True
                     running.opened_once.set()
                 running.state = RUNNING
-                delay = await self._loop.run_in_executor(running.executor, service.step)
+                running.busy = True
+                began = time.monotonic()
+                try:
+                    delay = await self._loop.run_in_executor(running.executor, service.step)
+                finally:
+                    running.busy = False
+                    self.metrics.observe(
+                        "interlock_service_step_seconds",
+                        time.monotonic() - began,
+                        service=service.name,
+                    )
                 running.steps += 1
                 running.streak = 0
             except Exception as exc:
@@ -1144,6 +1314,33 @@ class InterlockSupervisor:
             if isinstance(running.service, InboxService):
                 return running.service.port
         return None
+
+    @property
+    def metrics_port(self) -> int | None:
+        """The port the metrics are served on, once open; ``None`` without them."""
+        for running in self._running.values():
+            if isinstance(running.service, MetricsService):
+                return running.service.port
+        return None
+
+    def _collect(self, metrics: Metrics) -> None:
+        """What a scrape reads of the supervisor itself: each part's state,
+        and the engines' saturation."""
+        import interlock
+
+        metrics.set("interlock_build_info", 1, version=interlock.__version__)
+        for name, running in tuple(self._running.items()):
+            metrics.set("interlock_service_up", int(running.state == RUNNING), service=name)
+            metrics.set("interlock_service_busy", int(running.busy), service=name)
+            metrics.set("interlock_service_steps_total", running.steps, service=name)
+            metrics.set("interlock_service_failures_total", running.failures, service=name)
+        if self._engines is not None:
+            up = self._engine_state == RUNNING
+            metrics.set("interlock_service_up", int(up), service="engines")
+            metrics.set("interlock_engine_workers", self._engines.workers)
+            metrics.set("interlock_engine_workers_busy", self._busy)
+            queue = self._queue
+            metrics.set("interlock_engine_queue_depth", 0 if queue is None else queue.qsize())
 
     def health(self) -> tuple[int, dict[str, Any]]:
         """``GET /healthz``: ``200`` while the engines and every service are

@@ -346,6 +346,13 @@ Requirements:
   authors both fields and is untrusted.
 - **E2-4.** `EffectPlan` MUST be immutable after admission. Amendment is a new
   plan with a new `plan_id`.
+- **E2-5.** A plan MAY carry a W3C trace context (`EffectPlan.traceparent`, version
+  `00`), which MUST be validated at admission and MUST NOT enter `content_hash()`, nor
+  any hash or signed statement derived from the plan: its requests, their outbox genesis
+  and delivery logs, a relay's attestation, a receipt, an inbound event or a fact. Nothing
+  that decides admission, verification or settlement may read it. Trace context is
+  advisory and unsigned, and evidence bound to it would bind to what nobody vouches for;
+  the same plan, traced or not, has one hash (`docs/EPIC7_DESIGN.md` §1.2).
 
 ## 2.3 `ShadowSubstrate`
 
@@ -1186,6 +1193,9 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | Compaction: final, settled history pruned under signed, anchored checkpoints; folds, tombstones and archives prove what went; a vacuum reads one snapshot of a live database | `vacuum`, `compaction` | `test_vacuum`, `test_vacuum_inbox`, `test_vacuum_crash`, `test_upgrade_v5` |
 | The runtime, configured whole, and the daemon: every part in one process, restarted on failure, stopped in order, healthy or not at `/healthz` | `runtime`, `supervisor`, `daemon`, `cli` | `test_runtime`, `test_supervisor`, `test_daemon` |
 | The whole, under load | `scripts/live_stress_test.py` | `test_soak` (PostgreSQL), and the script run for minutes |
+| Trace context (E2-5): from the plan through the outbox, the relay's calls and compensations, back on verified webhooks and the facts bound to them; outside every hash | `trace`, `relay`, `adapters`, `inbox`, `inbox_store`, `outbox_store`, `sqlite_outbox` | `test_trace` (golden vectors for every hash), the soak |
+| Metrics: one catalog of fixed labels, served on a listener of its own; the database sampled in one read-only snapshot | `telemetry`, `sampling`, `supervisor` | `test_metrics`, `test_sampling`, `test_instrumentation`, `test_daemon`, the soak |
+| A stage behind a transaction-mode pooler: its second connection bounded and retried, nothing left in a pooled session | `postgres` | `test_pool` (PgBouncer, in CI) |
 | Checked repair, refusal feedback, budgeted recovery, extension quotes | `repair`, `feedback`, `recovery`, `extension` | `test_repair`, `test_feedback`, `test_recovery`, `test_extension` |
 
 ## Partial

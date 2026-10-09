@@ -292,6 +292,9 @@ def _parser() -> argparse.ArgumentParser:
         help="a callable taking the configuration and returning an interlock.daemon.Application",
     )
     daemon.add_argument("--listen", help="overrides [inbox]'s listen, HOST:PORT")
+    daemon.add_argument(
+        "--metrics", help="serves /metrics on HOST:PORT, overriding [metrics]'s listen"
+    )
     daemon.add_argument("--relay-key", help=f"overrides [relay]'s key, as does {RELAY_KEY_ENV}")
     daemon.add_argument("--inbox-key", help=f"overrides [inbox]'s key, as does {INBOX_KEY_ENV}")
     operator = commands.add_parser("operator", help="operator keys", description="Operator keys.")
@@ -1115,6 +1118,7 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         listen=args.listen,
         relay_key=args.relay_key,
         inbox_key=args.inbox_key,
+        metrics_listen=args.metrics,
     )
 
     async def run() -> None:
@@ -1127,6 +1131,9 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
             port = supervisor.inbox_port
             if port is not None:
                 print(f"receiving webhooks on port {port}", file=out)
+            port = supervisor.metrics_port
+            if port is not None:
+                print(f"serving metrics on port {port}", file=out)
             out.flush()
         else:
             ready.cancel()
