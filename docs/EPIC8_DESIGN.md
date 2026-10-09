@@ -258,13 +258,31 @@ registration record is signed by an operator trusted at its position.
 
 ## 3. Rotation in a running daemon
 
-- **Signers resolved at open.** A relay, the inbox and the vacuum build their signer when
-  they open, not when the daemon starts, so a part that reopens signs with the key its
-  configuration points at now: a new version at the key service, or a new file.
-- **Reload.** `InterlockSupervisor.reload()`, and `SIGHUP` to `interlock daemon`: each part
-  finishes its current step, closes and reopens. Engines and agents are untouched.
-- **Fresh keyrings.** Each part reads revocations from the database once per pass (one
-  short query) and resolves unknown key ids from the operator log (§2.1).
+- **Signers resolved at open.** The daemon opens and checks every key when it is built, so a
+  key that cannot be used stops it before it starts. After that a relay and the inbox open
+  their key again each time they open, and the vacuum at each run: a part reopened signs
+  with the key its configuration points at then (a new version at the key service, or a new
+  file). A key is refused at open when the operator log does not trust it for the role:
+  never registered, or revoked (`interlock.wiring.operator_signer` for the vacuum's).
+- **Reload.** `InterlockSupervisor.reload()`, and `SIGHUP` to `interlock daemon`: each
+  service finishes its step and opens again (`Service.reopen`); its next step stays where
+  its pace put it, so a reload never runs an hourly vacuum early. The inbox opens its new
+  self behind its listener, which never closes: a webhook already taken is answered by the
+  inbox that took it, every later one by the new. A service backing off is opened at once.
+  One that cannot open again fails as at any reopen, backs off and retries, and the reload
+  says why. Engines and agents are untouched.
+- **Fresh keyrings.** A running part's keyrings resolve a key id they do not hold among
+  the keys the operator log registers (`interlock.wiring.live_keyring`), reading the log
+  again only when it changed: a key registered while the part runs is trusted at its first
+  use, an engine's included. The revoked keys are read once a pass, one short query, and
+  each seal once, when its key is first seen revoked: a seal never changes
+  (`interlock.keys.Seals`).
+- **A key revoked under a running part.** A relay asks before it claims, the inbox at each
+  matching pass; each finds its key revoked, fails, and opens again with the key it is
+  given then, which is how a compromise needs no reload (§2.6). Until it does, the database
+  refuses what the old key would write, and the inbox answers webhooks 503, which vendors
+  send again. `interlock relay` and `interlock inbox serve`, which hold one key for their
+  life, stop with exit status 3.
 
 ## 4. The security audit
 

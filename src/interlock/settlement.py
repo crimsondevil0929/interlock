@@ -71,7 +71,7 @@ from interlock.deliveries import (
     settlements,
     verify_delivery_log,
 )
-from interlock.keys import outcome_ref, revocations_of
+from interlock.keys import Seals, outcome_ref, revocations_of
 from interlock.records import Keyring, SignedRecord, read_records
 from interlock.types import EffectId, outbound_key
 
@@ -149,6 +149,7 @@ class Settler:
         "_pass_relays",
         "_receipts",
         "_relays",
+        "_seals",
         "_sinks",
     )
 
@@ -170,6 +171,7 @@ class Settler:
         self._chain = chain
         self._relays = relays
         self._pass_relays = relays
+        self._seals = Seals()
         self._ledger = ledger
         self._operator_log = operator_log
         self._operators = operators
@@ -184,8 +186,9 @@ class Settler:
         if not due:
             return SettlementReport((), 0, 0, ())
         # A revoked relay's deliveries settle only as its revocation sealed
-        # them (docs/EPIC8_DESIGN.md §2.3): read once a pass.
-        self._pass_relays = self._relays.with_revocations(revocations_of(self._outbox))
+        # them (docs/EPIC8_DESIGN.md §2.3): the revoked keys read once a pass,
+        # each seal once.
+        self._pass_relays = self._relays.with_revocations(self._seals.read(self._outbox))
         if self._ledger is not None:
             # A governor's view of a shared ledger is as of its last read or
             # write: the charges other governors booked since are not in it.

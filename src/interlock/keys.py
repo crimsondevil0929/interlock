@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -42,12 +43,14 @@ __all__ = [
     "KeyRegistry",
     "KeyReport",
     "Revocation",
+    "Seals",
     "attestation_key",
     "event_ref",
     "fact_ref",
     "fact_row_hash",
     "outcome_ref",
     "revocations_of",
+    "revoked_ids_of",
     "seal_digest",
     "verify_keys",
 ]
@@ -101,6 +104,43 @@ def revocations_of(source: object) -> dict[str, Revocation]:
 
         read = PostgresReader(source).revocations  # type: ignore[arg-type]
     return dict(read()) if read is not None else {}
+
+
+def revoked_ids_of(source: object) -> frozenset[str]:
+    """The ids of the keys a store, a reader or a PostgreSQL connection holds
+    revoked: one short read, and no seal."""
+    read = getattr(source, "revoked_ids", None)
+    if read is None and hasattr(source, "execute") and not hasattr(source, "snapshot"):
+        from interlock.deliveries import PostgresReader
+
+        read = PostgresReader(source).revoked_ids  # type: ignore[arg-type]
+    return frozenset(read()) if read is not None else frozenset()
+
+
+class Seals:
+    """The revocations a running part holds rows to (``docs/EPIC8_DESIGN.md``
+    §3): which keys are revoked, read at every :meth:`read`, one short query;
+    and each seal, read once, when its key is first seen revoked. A seal never
+    changes (§2.7). Verification reads every seal whole, each time.
+    Thread-safe."""
+
+    __slots__ = ("_known", "_lock")
+
+    def __init__(self) -> None:
+        self._known: dict[str, Revocation] = {}
+        self._lock = threading.Lock()
+
+    def read(self, source: object) -> dict[str, Revocation]:
+        """The revocations ``source`` holds now, with their seals."""
+        revoked = revoked_ids_of(source)
+        with self._lock:
+            missing = revoked - self._known.keys()
+        if missing:
+            found = revocations_of(source)
+            with self._lock:
+                self._known.update({k: v for k, v in found.items() if k in missing})
+        with self._lock:
+            return {k: self._known[k] for k in revoked if k in self._known}
 
 
 def attestation_key(attestation: str | None) -> str | None:

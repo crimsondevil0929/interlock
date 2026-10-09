@@ -374,8 +374,25 @@ class Keyring:
         if key is None and self._resolve is not None:
             found = self._resolve(key_id)
             if found is not None:
-                key = self._add(*found)
+                name, spec = found
+                try:
+                    resolved = parse_key(spec) if isinstance(spec, str) else spec
+                except MalformedReceiptError:
+                    return None
+                if resolved.key_id != key_id:  # the resolver answered for another key
+                    return None
+                # Two threads resolving one key add it once.
+                key = self._by_id.setdefault(key_id, resolved)
+                self._names.setdefault(key_id, name)
         return key
+
+    def resolving(self, resolve: Callable[[str], tuple[str, Verifier | str] | None]) -> Keyring:
+        """This keyring, asking ``resolve`` for a key id it does not hold: the
+        name and key a registration since gives it, or ``None``
+        (:func:`interlock.wiring.live_keyring`)."""
+        copy = self._copy()
+        copy._resolve = resolve
+        return copy
 
     def name(self, key_id: str) -> str | None:
         """Whose key ``key_id`` is."""
@@ -448,7 +465,7 @@ class Keyring:
         )
 
     def __contains__(self, key_id: object) -> bool:
-        return key_id in self._by_id
+        return isinstance(key_id, str) and self.verifier(key_id) is not None
 
     def __len__(self) -> int:
         return len(self._by_id)

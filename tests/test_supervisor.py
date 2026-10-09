@@ -666,3 +666,110 @@ def test_sigterm_stops_and_a_second_skips_the_drains() -> None:
     assert supervisor.wait_finished(0)
     # The handlers are removed with the run.
     assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, cast(Any, None))
+
+
+# -- reload (docs/EPIC8_DESIGN.md §3) ----------------------------------------------
+
+
+def test_a_reload_opens_every_service_again_between_its_steps() -> None:
+    log: list[tuple[str, str]] = []
+    release = threading.Event()
+    busy = Recorder("busy", log, hold=release)
+    idle = Recorder("idle", log, every=10.0)
+    engine = FakeEngine()
+    engines = pool([engine])
+    supervisor = InterlockSupervisor(engines=engines, services=[busy, idle])
+
+    async def body() -> dict[str, str | None]:
+        while ("busy", "step") not in log:
+            await asyncio.sleep(0.005)
+        reloading = asyncio.ensure_future(supervisor.reload())
+        await asyncio.sleep(0.05)
+        # The idle one is woken from its wait; the busy one finishes its step.
+        assert log.count(("idle", "open")) == 2
+        assert log.count(("busy", "open")) == 1 and not reloading.done()
+        release.set()
+        return await reloading
+
+    assert run(supervisor, body) == {"busy": None, "idle": None}
+    busy_log = [event for name, event in log if name == "busy"]
+    assert busy_log[:4] == ["open", "step", "close", "open"]
+    # Opened again, and its next step left where its pace put it.
+    assert log.count(("idle", "step")) == 1
+    assert busy.counters["reloads"] == idle.counters["reloads"] == 1
+    # The engines were not touched.
+    assert engines.closed == [0]  # type: ignore[attr-defined]
+    assert all(s.failures == 0 for s in supervisor.status().values())
+
+
+def test_a_service_that_cannot_open_again_backs_off_and_the_reload_says_why() -> None:
+    log: list[tuple[str, str]] = []
+    fragile = Recorder("fragile", log, every=10.0)
+    supervisor = InterlockSupervisor(services=[fragile], restart_min=0.02, restart_max=0.02)
+
+    async def body() -> dict[str, str | None]:
+        fragile.fail_open = 1
+        outcome = await supervisor.reload()
+        while fragile.counters.get("steps", 0) < 2:
+            await asyncio.sleep(0.005)
+        return outcome
+
+    assert run(supervisor, body) == {"fragile": "RuntimeError: cannot open"}
+    status = supervisor.status()["fragile"]
+    assert status.failures == 1 and status.last_error == "RuntimeError: cannot open"
+    events = [event for name, event in log]
+    # Closed for the reload; the open that failed, closed as any failure is;
+    # opened again after the backoff.
+    assert events[:7] == ["open", "step", "close", "open", "close", "open", "step"]
+
+
+def test_a_reload_opens_a_service_backing_off_at_once() -> None:
+    log: list[tuple[str, str]] = []
+    down = Recorder("down", log, fail_open=1, every=10.0)
+    supervisor = InterlockSupervisor(services=[down], restart_min=30.0, restart_max=30.0)
+    started = time.monotonic()
+
+    async def body() -> dict[str, str | None]:
+        return await supervisor.reload()
+
+    assert run(supervisor, body) == {"down": None}
+    assert time.monotonic() - started < 5.0
+    assert [event for name, event in log][:3] == ["open", "open", "step"]
+
+
+def test_a_reload_is_refused_unless_the_supervisor_runs() -> None:
+    supervisor = InterlockSupervisor(services=[Recorder("a", [])])
+    with pytest.raises(SupervisorStoppedError):
+        asyncio.run(supervisor.reload())
+
+    async def body() -> None:
+        supervisor.stop()
+        await asyncio.sleep(0)
+        with pytest.raises(SupervisorStoppedError):
+            await supervisor.reload()
+
+    run(supervisor, body)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="POSIX signals")
+def test_sighup_reloads_and_says_what_it_did() -> None:
+    log: list[tuple[str, str]] = []
+    relay = Recorder("relay", log, every=10.0)
+    supervisor = InterlockSupervisor(services=[relay])
+    told: list[dict[str, str | None]] = []
+    supervisor.on_reload(lambda outcome: told.append(dict(outcome)))
+
+    async def main() -> None:
+        running = asyncio.create_task(supervisor.run(handle_signals=True))
+        await supervisor.ready()
+        os.kill(os.getpid(), signal.SIGHUP)
+        while not told:
+            await asyncio.sleep(0.005)
+        supervisor.stop()
+        await running
+
+    asyncio.run(main())
+    assert told == [{"relay": None}]
+    assert log.count(("relay", "open")) == 2
+    # The handlers are removed with the run.
+    assert signal.getsignal(signal.SIGHUP) in (signal.SIG_DFL, cast(Any, None))

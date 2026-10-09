@@ -37,12 +37,14 @@ __all__ = [
     "inbox_signer",
     "inbox_store",
     "key_registry",
+    "live_keyring",
     "open_anchor",
     "open_governor",
     "open_ledger",
     "open_receipts",
     "open_signer",
     "open_substrate",
+    "operator_signer",
     "relay_adapter",
     "relay_adapters",
     "relay_signer",
@@ -170,6 +172,69 @@ def trusted_keyring(config: InterlockConfig, role: str) -> Keyring | None:
     return registry.keyring(role)
 
 
+def live_keyring(config: InterlockConfig, role: str) -> Keyring | None:
+    """A role's keys, for a part that runs (``docs/EPIC8_DESIGN.md`` §3): the
+    :func:`trusted_keyring`, and a key id it does not hold looked up among the
+    keys the operator log registers when it is asked for, so a key registered
+    while the part runs is trusted at its first use. The log is read again
+    only when it changed since it was last read."""
+    keyring = trusted_keyring(config, role)
+    if keyring is None:
+        return None
+    return keyring.resolving(_Registered(config, role))
+
+
+class _Registered:
+    """The keys the operator log registers for a role, read again when the
+    log's size or modification time changed."""
+
+    __slots__ = ("_config", "_keys", "_lock", "_role", "_seen")
+
+    def __init__(self, config: InterlockConfig, role: str) -> None:
+        import threading
+
+        self._config = config
+        self._role = role
+        self._lock = threading.Lock()
+        self._seen: tuple[int, int] | None = None
+        self._keys: dict[str, tuple[str, str]] = {}
+
+    def __call__(self, key_id: str) -> tuple[str, str] | None:
+        from agentgov.receipts.signing import parse_key
+
+        operators = self._config.operators
+        if operators is None:
+            return None
+        try:
+            stat = operators.log.stat()
+        except OSError:
+            return None
+        mark = (stat.st_size, stat.st_mtime_ns)
+        with self._lock:
+            if mark != self._seen:
+                keys = key_registry(self._config).keys(self._role)
+                self._keys = {parse_key(spec).key_id: (name, spec) for name, spec in keys.items()}
+                self._seen = mark
+            return self._keys.get(key_id)
+
+
+def _held(config: InterlockConfig, role: str, signer: Any, *, part: str, register: str) -> None:
+    """Refuse a key ``role`` does not trust as the operator log stands
+    (``docs/EPIC8_DESIGN.md`` §2): one never registered (``register`` says
+    where to), or one an operator revoked."""
+    registry = key_registry(config)
+    if signer.key_id not in registry.keyring(role):
+        raise RefusedError(register)
+    revoked = registry.revocation(signer.key_id)
+    # A relay's or an inbox's key is revoked when its revocation applied; an
+    # operator's, by the intent that revokes it (§2.5).
+    if revoked is not None and (role == "operator" or revoked.applied is not None):
+        raise RefusedError(
+            f"the {part}'s key {signer.key_id} was revoked by operator record "
+            f"{revoked.intent.seq}: it signs nothing more. Give the {part} its new key"
+        )
+
+
 def open_signer(config: InterlockConfig, signer: str | None, key: str | Path | None) -> Any:
     """What a part signs with: the key the ``[signers.<name>]`` that
     ``signer`` names holds, its version pinned now (``docs/EPIC8_DESIGN.md``
@@ -205,13 +270,15 @@ def relay_signer(config: InterlockConfig, path: str | Path | None) -> Any:
         signer = open_signer(config, remote, path)
     except (OSError, ValueError, SignerUnavailableError) as exc:
         raise RefusedError(f"cannot open the relay key: {exc}") from exc
-    keyring = trusted_keyring(config, "relay")
-    if keyring is None or signer.key_id not in keyring:
-        raise RefusedError(
-            f"the relay's key {signer.key_id} is not registered, so nothing it signs would "
-            f"verify: register it in [relays.keys] under the relay's name, as "
-            f'"{signer.public_key().spec()}"'
-        )
+    _held(
+        config,
+        "relay",
+        signer,
+        part="relay",
+        register=f"the relay's key {signer.key_id} is not registered, so nothing it signs would "
+        f"verify: register it in [relays.keys] under the relay's name, as "
+        f'"{signer.public_key().spec()}"',
+    )
     return signer
 
 
@@ -302,14 +369,40 @@ def inbox_signer(config: InterlockConfig, path: str | Path | None) -> Any:
         signer = open_signer(config, remote, path)
     except (OSError, ValueError, SignerUnavailableError) as exc:
         raise RefusedError(f"cannot open the inbox key: {exc}") from exc
-    keyring = trusted_keyring(config, "inbox")
-    if keyring is None or signer.key_id not in keyring:
-        raise RefusedError(
-            f"the inbox's key {signer.key_id} is not registered, so nothing it attests would "
-            f"verify: register it in [inbox.keys] under the inbox's name, as "
-            f'"{signer.public_key().spec()}"'
-        )
+    _held(
+        config,
+        "inbox",
+        signer,
+        part="inbox",
+        register=f"the inbox's key {signer.key_id} is not registered, so nothing it attests "
+        f"would verify: register it in [inbox.keys] under the inbox's name, as "
+        f'"{signer.public_key().spec()}"',
+    )
     return signer
+
+
+def operator_signer(
+    config: InterlockConfig, signer: str | None, key: str | Path | None, *, part: str
+) -> Any:
+    """An operator key a part signs operator records with (the vacuum's): the
+    ``[signers.<name>]`` that ``signer`` names, or the file at ``key``; one
+    ``[operators.keys]`` holds or an operator registered, and none revoked; or
+    why the part may not run."""
+    from agentgov.exceptions import SignerUnavailableError
+
+    try:
+        opened = open_signer(config, signer, key)
+    except (OSError, ValueError, SignerUnavailableError) as exc:
+        raise RefusedError(f"cannot open the {part}'s key: {exc}") from exc
+    _held(
+        config,
+        "operator",
+        opened,
+        part=part,
+        register=f"the {part}'s key {opened.key_id} is no registered operator's: register it "
+        f'in [operators.keys], as "{opened.public_key().spec()}"',
+    )
+    return opened
 
 
 def inbox_store(config: InterlockConfig, database: str | None) -> tuple[Any, Callable[[], None]]:

@@ -375,6 +375,11 @@ class OutboxReader(Protocol):
         none before version 7."""
         ...
 
+    def revoked_ids(self) -> frozenset[str]:
+        """The ids of the revoked keys, without their seals: what a running
+        part reads every pass (:class:`interlock.keys.Seals`)."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class Settled:
@@ -785,6 +790,20 @@ class PostgresReader:
         row = self._conn.execute("SELECT pg_catalog.clock_timestamp()").fetchone()
         assert row is not None
         return row[0]  # type: ignore[no-any-return]
+
+    def revoked(self, key_id: str) -> bool:
+        """Whether ``key_id`` was revoked: an inbox asks each matching pass."""
+        return key_id in self.revoked_ids()
+
+    def revoked_ids(self) -> frozenset[str]:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.key_revocations') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return frozenset()
+        return frozenset(
+            str(r[0]) for r in self._conn.execute("SELECT key_id FROM interlock.key_revocations")
+        )
 
     def revocations(self) -> dict[str, Revocation]:
         from interlock.keys import Revocation

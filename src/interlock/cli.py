@@ -61,7 +61,7 @@ import signal
 import sys
 import threading
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, TextIO
@@ -94,7 +94,7 @@ from interlock.reconcile import (
     reconcile_sqlite,
 )
 from interlock.substrate import SqliteSubstrate
-from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV, trusted_keyring
+from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV, live_keyring, trusted_keyring
 from interlock.wiring import RefusedError as _RefusedError
 from interlock.wiring import compactor as _compactor
 from interlock.wiring import inbox_signer as _inbox_signer
@@ -501,6 +501,7 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
 
 
 def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    from interlock.exceptions import KeyRevokedError
     from interlock.relay import LedgerBreaker, NoBreaker, Relay, RelayReport
     from interlock.sqlite_outbox import SqliteOutboxStore
 
@@ -554,13 +555,16 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
         stop = threading.Event()
         _stop_on_signals(stop)
         reports: list[RelayReport] = []
-        threads = [
-            threading.Thread(
-                target=lambda r=relay: reports.append(r.run(stop, poll=settings.poll_seconds)),
-                name=relay.relay_id,
-            )
-            for relay in relays
-        ]
+        revoked: list[KeyRevokedError] = []
+
+        def work(relay: Relay) -> None:
+            try:
+                reports.append(relay.run(stop, poll=settings.poll_seconds))
+            except KeyRevokedError as exc:  # every worker signs with the one key
+                revoked.append(exc)
+                stop.set()
+
+        threads = [threading.Thread(target=work, args=(r,), name=r.relay_id) for r in relays]
         for thread in threads:
             thread.start()
         print(f"relaying with {len(threads)} worker(s); stop with SIGTERM or Ctrl-C", file=out)
@@ -571,6 +575,13 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
         for report in reports:
             total = total + report
         _print_relay(total, out)
+        if revoked:
+            print(
+                f"interlock: {revoked[0]}: start the relay again with its new key "
+                f"(docs/EPIC8_DESIGN.md §2.6)",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIGURATION
         return EXIT_OK
     finally:
         for relay in relays:
@@ -1148,7 +1159,7 @@ def _inbox_command(config: InterlockConfig, args: argparse.Namespace, out: TextI
             return _inbox_verify(config, source, keys, out)
         finally:
             close()
-    relays = trusted_keyring(config, "relay")
+    relays = live_keyring(config, "relay")
     if relays is None:
         print(
             "interlock: an inbox binds an event only to a delivery a registered relay "
@@ -1208,7 +1219,16 @@ def _inbox_serve(inbox: Any, listen: str, every: Any, out: TextIO) -> int:
     def ready(bound: int) -> None:
         print(f"receiving webhooks on {host}:{bound}; stop with SIGTERM or Ctrl-C", file=out)
 
-    serve(inbox, host, int(port), stop=stop, ready=ready, match_every=every)
+    from interlock.exceptions import KeyRevokedError
+
+    try:
+        serve(inbox, host, int(port), stop=stop, ready=ready, match_every=every)
+    except KeyRevokedError as exc:
+        print(
+            f"interlock: {exc}: start the inbox again with its new key (docs/EPIC8_DESIGN.md §2.6)",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIGURATION
     return EXIT_OK
 
 
@@ -1293,13 +1313,27 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         metrics_listen=args.metrics,
     )
 
+    def reloaded(outcome: Mapping[str, str | None]) -> None:
+        opened = sorted(name for name, error in outcome.items() if error is None)
+        print(f"reloaded: {', '.join(opened) or 'nothing'}", file=out)
+        for name, error in sorted(outcome.items()):
+            if error is not None:
+                print(f"reload: {name} could not open again: {error}", file=out)
+        out.flush()
+
+    supervisor.on_reload(reloaded)
+
     async def run() -> None:
         running = asyncio.create_task(supervisor.run(handle_signals=True))
         ready = asyncio.create_task(supervisor.ready())
         await asyncio.wait({running, ready}, return_when=asyncio.FIRST_COMPLETED)
         if ready.done() and not running.done():
             parts = ", ".join(sorted(supervisor.status()))
-            print(f"interlock daemon running: {parts}; stop with SIGTERM or Ctrl-C", file=out)
+            print(
+                f"interlock daemon running: {parts}; reload its keys with SIGHUP; stop with "
+                f"SIGTERM or Ctrl-C",
+                file=out,
+            )
             port = supervisor.inbox_port
             if port is not None:
                 print(f"receiving webhooks on port {port}", file=out)

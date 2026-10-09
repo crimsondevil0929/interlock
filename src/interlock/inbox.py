@@ -49,6 +49,7 @@ from agentgov.receipts.signing import Signer
 
 from interlock.compaction import instant_text
 from interlock.deliveries import _digest
+from interlock.exceptions import KeyRevokedError
 from interlock.records import Keyring
 from interlock.trace import parse_traceparent
 from interlock.types import InboundFact, _frozen, exact_number, field_path, outbound_key, value_at
@@ -833,6 +834,10 @@ class Inbox:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._checkpoint = checkpoint or _no_checkpoint
         self._lock = threading.Lock()
+        from interlock.keys import Seals
+
+        self._seals = Seals()
+        """The revocations deliveries are held to: read once a binding."""
 
     def receive(self, name: str, headers: Mapping[str, str], body: bytes) -> Response:
         """Take one webhook through verification, recording and matching."""
@@ -913,7 +918,18 @@ class Inbox:
 
     def match_pending(self) -> int:
         """Bind the events that matched nothing yet, received within the match
-        window, to deliveries recorded since. Returns how many it bound."""
+        window, to deliveries recorded since. Returns how many it bound.
+
+        :raises KeyRevokedError: If the inbox's key was revoked
+            (``docs/EPIC8_DESIGN.md`` §2.4): it records nothing more, and every
+            webhook is answered 503 until it opens again with its new key. A
+            supervisor reopens it with the key it is given then.
+        """
+        revoked = getattr(self._store, "revoked", None)
+        if revoked is not None and revoked(self._signer.key_id):
+            raise KeyRevokedError(
+                f"inbox: its key {self._signer.key_id} was revoked; it records nothing more"
+            )
         with self._lock:
             since = self._clock() - self._window
             return sum(1 for event in self._store.unmatched(since) if self._match(event))
@@ -950,9 +966,9 @@ class Inbox:
         """Bind ``event`` to the delivery it names, when exactly one message's
         relay-attested delivery created it. Returns whether a fact now binds it."""
         from interlock.attestations import attestation_of
-        from interlock.keys import outcome_ref, revocations_of
+        from interlock.keys import outcome_ref
 
-        relays = self._relays.with_revocations(revocations_of(self._store))
+        relays = self._relays.with_revocations(self._seals.read(self._store))
         for ref in event.refs:
             delivered = self._store.delivered_with(ref)
             if not delivered:
@@ -1328,6 +1344,8 @@ def serve(
         while not stop.wait(match_every.total_seconds()):
             try:
                 inbox.match_pending()
+            except KeyRevokedError:  # it records nothing more: its caller restarts it
+                raise
             except Exception:  # pragma: no cover - logged, retried next round
                 logger.exception("inbox: matching what is pending failed")
     finally:

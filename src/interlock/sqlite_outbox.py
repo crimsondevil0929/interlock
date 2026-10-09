@@ -1111,6 +1111,14 @@ class SqliteOutboxStore:
         """Every revoked key, with its seal."""
         return read_revocations(self._conn)
 
+    def revoked_ids(self) -> frozenset[str]:
+        """The ids of the revoked keys, without their seals."""
+        if not _has_revocations(self._conn):
+            return frozenset()
+        return frozenset(
+            str(row[0]) for row in self._conn.execute(f"SELECT key_id FROM {REVOCATIONS}")
+        )
+
     def revoke_key(self, role: str, key_id: str, *, authority: str) -> tuple[int, str]:
         """An operator's revocation, under ``authority``, the hash of the signed
         intent: the seal of every row the key attested, and the revocation, in
