@@ -10,6 +10,7 @@ or is dropped, so only shutting the socket ends the wait.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import socketserver
 import struct
@@ -76,11 +77,19 @@ class FakePooler:
         )
 
     def close(self) -> None:
+        """Stop listening, and end every session: the client's wait ends with
+        the connection, as when a pooler goes away."""
         self._server.shutdown()
         self._server.server_close()
         with self._lock:
-            for session in self._sessions.values():
-                session.close()
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            # Shut the connection down, then close the descriptor. On Linux,
+            # close() alone leaves a socket that another thread is blocked
+            # reading open, and the client is never told; macOS ends it.
+            with contextlib.suppress(OSError):
+                session.shutdown(socket.SHUT_RDWR)
+            session.close()
 
     def _serve(self, sock: socket.socket) -> None:
         while True:
