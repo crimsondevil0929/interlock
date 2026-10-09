@@ -94,7 +94,7 @@ from interlock.reconcile import (
     reconcile_sqlite,
 )
 from interlock.substrate import SqliteSubstrate
-from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV
+from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV, trusted_keyring
 from interlock.wiring import RefusedError as _RefusedError
 from interlock.wiring import compactor as _compactor
 from interlock.wiring import inbox_signer as _inbox_signer
@@ -146,6 +146,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             return _relay(config, args, stream)
         if args.command == "outbox":
             return _outbox(config, args, stream)
+        if args.command == "keys":
+            return _keys(config, args, stream)
         if args.command == "vacuum":
             return _vacuum(config, args, stream)
         return _check(config, stream)
@@ -300,6 +302,41 @@ def _parser() -> argparse.ArgumentParser:
     )
     daemon.add_argument("--relay-key", help=f"overrides [relay]'s key, as does {RELAY_KEY_ENV}")
     daemon.add_argument("--inbox-key", help=f"overrides [inbox]'s key, as does {INBOX_KEY_ENV}")
+    keys_command = commands.add_parser(
+        "keys",
+        help="list, register and revoke keys (docs/EPIC8_DESIGN.md §2)",
+        description="Every role's keys: the configuration's, the ones operators registered, and "
+        "the revoked. A registration or a revocation is signed into the operator log; a relay's "
+        "or an inbox's key is revoked in the database too, which seals what it signed.",
+    )
+    key_actions = keys_command.add_subparsers(dest="action", required=True)
+    for name, text in (
+        ("list", "every role's keys, and what became of each"),
+        ("register", "register a key for a role, signed into the operator log"),
+        ("revoke", "revoke a key: what it signed still verifies, and nothing new it signs does"),
+    ):
+        key_action = key_actions.add_parser(name, help=text, description=text)
+        _common(key_action, _DATABASE_HELP)
+        if name == "list":
+            continue
+        key_action.add_argument(
+            "--key", help=f"your operator key file (default: ${OPERATOR_KEY_ENV})"
+        )
+        key_action.add_argument("--signer", help=_SIGNER_HELP)
+        key_action.add_argument("--role", required=True, choices=("relay", "inbox", "operator"))
+        if name == "register":
+            key_action.add_argument("--name", required=True, help="whose key it is")
+            public = key_action.add_mutually_exclusive_group(required=True)
+            public.add_argument("--public", help="the key's public half: ed25519:<hex>")
+            public.add_argument(
+                "--public-of",
+                metavar="SIGNER",
+                help="the public half of the key a [signers.<name>] holds, as its service "
+                "serves it now",
+            )
+        else:
+            key_action.add_argument("key_id", help="the key's id: 16 hex characters")
+            key_action.add_argument("--reason", help="recorded in the signed intent")
     operator = commands.add_parser("operator", help="operator keys", description="Operator keys.")
     keys = operator.add_subparsers(dest="action", required=True)
     keygen = keys.add_parser(
@@ -622,7 +659,7 @@ def _outbox_action(
         return EXIT_OK
     if args.action == "show":
         log = message_log(source, args.message)
-        keyring = config.relay_keyring()
+        keyring = trusted_keyring(config, "relay")
         for event in log:
             print(
                 f"{event.seq:>3} {event.at.isoformat()} {event.event:<17} "
@@ -653,6 +690,7 @@ def _attester(attestation: str | None, keyring: Any) -> str:
 
 
 def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
+    from interlock.keys import KeyRegistry, verify_keys
     from interlock.operators import legacy_vouch
     from interlock.records import read_records
 
@@ -660,7 +698,14 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
     settings = config.operators
     records = read_records(settings.log) if settings is not None and settings.log.exists() else ()
     vouch = legacy_vouch(records, settings.keyring()) if settings is not None else None
-    keyring = config.relay_keyring()
+    # The relays' keys: the configured, and those operators registered since
+    # (docs/EPIC8_DESIGN.md §2.1).
+    registry = KeyRegistry.build(config.key_roots(), records)
+    keyring = (
+        None
+        if config.relays is None and not registry.keys("relay")
+        else (registry.keyring("relay"))
+    )
     attestations = None
     if keyring is not None:
         from interlock.attestations import verify_attestations
@@ -681,6 +726,8 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
         report = verify_operators(source, records, settings.keyring(), ledger=entries)
         problems += report.problems
         legacy = report.legacy
+        keys = verify_keys(source, records, config.key_roots())
+        problems += keys.problems
     # The legacy set is both verifiers' to check: say what is wrong with it once.
     problems = list(dict.fromkeys(problems))
     for problem in problems:
@@ -710,6 +757,12 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
             print(
                 f"{len(checkpoints)} checkpoint(s) verify against their signed intents; "
                 f"{pruned} message(s) pruned under them, every tombstone in its fold",
+                file=out,
+            )
+        if keys.registered or keys.revoked:
+            print(
+                f"{keys.registered} key(s) registered by operators; {keys.revoked} revoked, each "
+                f"held to the seal its operator signed",
                 file=out,
             )
         print(
@@ -817,6 +870,112 @@ def _signed(config: InterlockConfig, source: Any, args: argparse.Namespace, out:
     return EXIT_OK if outcome.applied else EXIT_FINDINGS
 
 
+def _keys(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
+    """``interlock keys``: list, register, revoke (``docs/EPIC8_DESIGN.md`` §2)."""
+    if config.operators is None:
+        print(
+            "interlock: keys are registered and revoked in the operator log: configure "
+            "[operators] (docs/EPIC3_DESIGN.md §6)",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    if config.substrate != "postgres":
+        from interlock.sqlite_outbox import OPERATOR, SqliteOutboxStore
+
+        store = SqliteOutboxStore(config.database, writes=OPERATOR)
+        try:
+            return _keys_action(config, store, args, out)
+        finally:
+            store.close()
+    import psycopg
+
+    try:
+        with psycopg.connect(config.database, autocommit=True) as conn:
+            return _keys_action(config, conn, args, out)
+    except psycopg.Error as exc:
+        raise SubstrateUnavailableError(f"keys {args.action} failed: {exc}") from exc
+
+
+def _keys_action(
+    config: InterlockConfig, source: Any, args: argparse.Namespace, out: TextIO
+) -> int:
+    from interlock.deliveries import reader
+    from interlock.keys import ROLES, revocations_of
+    from interlock.operators import OperatorRefusedError
+    from interlock.wiring import key_registry
+
+    if args.action == "list":
+        registry = key_registry(config)
+        revoked = revocations_of(reader(source))
+        registered = {r.key.key_id: r.record.seq for r in registry.registrations}
+        for role in ROLES:
+            keyring = registry.keyring(role)
+            for key_id in keyring.ids():
+                origin = (
+                    f"registered by operator record {registered[key_id]}"
+                    if key_id in registered
+                    else "configured"
+                )
+                logged = registry.revocation(key_id)
+                if key_id in revoked:
+                    sealed = revoked[key_id]
+                    status = f"revoked {sealed.revoked_at.isoformat()}, {sealed.count} rows sealed"
+                elif logged is not None and logged.applied is not None:
+                    status = f"revoked by operator record {logged.intent.seq}"
+                else:
+                    status = "trusted"
+                print(
+                    f"{role:<9} {keyring.name(key_id) or '':<20} {key_id}  {origin}; {status}",
+                    file=out,
+                )
+        return EXIT_OK
+    try:
+        signer = _signer(config, args.key, args.signer)
+        with _session(config, source, signer) as operator:
+            roots = config.key_roots()
+            try:
+                if args.action == "register":
+                    public = args.public or _public_of(config, args.public_of)
+                    record = operator.register_key(args.role, args.name, public, roots=roots)
+                    body = record.body
+                    print(
+                        f"signed by {operator.name}: record {record.seq}, {args.role} key "
+                        f"{body['key_id']} registered as {args.name}",
+                        file=out,
+                    )
+                    return EXIT_OK
+                outcome = operator.revoke_key(
+                    args.role, args.key_id, reason=args.reason, roots=roots
+                )
+            except OperatorRefusedError as exc:
+                print(f"refused, nothing signed: {exc}", file=out)
+                return EXIT_FINDINGS
+    except _RefusedError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    seal = outcome.record.body.get("seal")
+    print(
+        f"signed by {operator.name}: intent {outcome.intent.seq}, {args.role} key "
+        f"{args.key_id} revoked"
+        + (f"; {seal['count']} rows sealed ({seal['digest'][:16]})" if seal else ""),
+        file=out,
+    )
+    return EXIT_OK
+
+
+def _public_of(config: InterlockConfig, name: str) -> str:
+    """The public half of the key the ``[signers.<name>]`` holds, as its
+    service serves it now."""
+    from agentgov.exceptions import SignerUnavailableError
+
+    if name not in config.signers:
+        raise _RefusedError(f"--public-of {name!r} names no [signers.{name}]")
+    try:
+        return config.signers[name].open().public_key().spec()
+    except SignerUnavailableError as exc:
+        raise _RefusedError(f"cannot read the key [signers.{name}] holds: {exc}") from exc
+
+
 def _act(operator: Any, config: InterlockConfig, args: argparse.Namespace) -> Any:
     if args.action == "release":
         if args.scope:
@@ -838,7 +997,7 @@ def _act(operator: Any, config: InterlockConfig, args: argparse.Namespace) -> An
 def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
     from interlock.vacuum import Vacuum
 
-    relays = config.relay_keyring()
+    relays = trusted_keyring(config, "relay")
     settings = config.operators
     if args.verify_archive:
         return _verify_archive(config, Path(args.verify_archive), out)
@@ -884,7 +1043,7 @@ def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
                 retain=config.vacuum.retain,
                 margin=config.vacuum.margin,
                 archive=config.vacuum.archive,
-                inbox=config.inbox_keyring(),
+                inbox=trusted_keyring(config, "inbox"),
             ).run(reason=args.reason, dry_run=args.dry_run)
         finally:
             log.close()
@@ -938,8 +1097,8 @@ def _verify_archive(config: InterlockConfig, path: Path, out: TextIO) -> int:
     problems = verify_archive(
         path,
         Checkpoint.parse(rows[0].body),
-        relays=config.relay_keyring(),
-        inbox=config.inbox_keyring(),
+        relays=trusted_keyring(config, "relay"),
+        inbox=trusted_keyring(config, "inbox"),
     )
     for problem in problems:
         print(problem, file=out)
@@ -973,7 +1132,7 @@ def _database_errors() -> tuple[type[Exception], ...]:
 
 def _inbox_command(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> int:
     settings = config.inbox
-    keys = settings.keyring()
+    keys = trusted_keyring(config, "inbox")
     if keys is None:
         print(
             "interlock: the inbox attests every event and fact, and verifying needs its "
@@ -989,7 +1148,7 @@ def _inbox_command(config: InterlockConfig, args: argparse.Namespace, out: TextI
             return _inbox_verify(config, source, keys, out)
         finally:
             close()
-    relays = config.relay_keyring()
+    relays = trusted_keyring(config, "relay")
     if relays is None:
         print(
             "interlock: an inbox binds an event only to a delivery a registered relay "
@@ -1101,7 +1260,7 @@ def _inbox_list(source: Any, args: argparse.Namespace, out: TextIO) -> int:
 def _inbox_verify(config: InterlockConfig, source: Any, keys: Any, out: TextIO) -> int:
     from interlock.inbox import verify_inbox
 
-    relays = config.relay_keyring()
+    relays = trusted_keyring(config, "relay")
     report = verify_inbox(source, keys, relays=relays)
     for problem in report.problems:
         print(problem, file=out)

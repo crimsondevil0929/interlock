@@ -8,6 +8,7 @@ builds one fresh part and hands its ownership to the caller, which closes it.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from agentgov import BudgetManager
 
     from interlock.config import Endpoint, InterlockConfig, RelayConfig
+    from interlock.keys import KeyRegistry
+    from interlock.records import Keyring
     from interlock.telemetry import Metrics
 
 __all__ = [
@@ -33,6 +36,7 @@ __all__ = [
     "compactor",
     "inbox_signer",
     "inbox_store",
+    "key_registry",
     "open_anchor",
     "open_governor",
     "open_ledger",
@@ -42,7 +46,11 @@ __all__ = [
     "relay_adapter",
     "relay_adapters",
     "relay_signer",
+    "trusted_keyring",
 ]
+
+
+logger = logging.getLogger("interlock.wiring")
 
 
 def open_substrate(
@@ -125,6 +133,43 @@ class RefusedError(Exception):
     or registered nowhere. Usage, not the database."""
 
 
+def key_registry(config: InterlockConfig) -> KeyRegistry:
+    """What the configuration's keyrings and the operator log say about keys
+    (``docs/EPIC8_DESIGN.md`` §2.1). The log is evidence up to its first
+    record that does not hold under ``[operators.keys]``
+    (:meth:`~interlock.keys.KeyRegistry.build` verifies as it reads): a log
+    that does not verify is the verifiers' to report, and never adds a key."""
+    from interlock.exceptions import RecordIntegrityError
+    from interlock.keys import KeyRegistry
+    from interlock.records import read_records
+
+    operators = config.operators
+    records: tuple[Any, ...] = ()
+    if operators is not None and operators.log.exists():
+        try:
+            records = read_records(operators.log)
+        except RecordIntegrityError as exc:  # unreadable: the configured keys alone
+            logger.warning(
+                "operator log %s: %s; trusting the configured keys only", operators.log, exc
+            )
+    return KeyRegistry.build(config.key_roots(), records)
+
+
+def trusted_keyring(config: InterlockConfig, role: str) -> Keyring | None:
+    """A role's keys as verification and the running parts take them: the
+    configured ones, and those operators registered since
+    (``docs/EPIC8_DESIGN.md`` §2.1); ``None`` when the role has neither."""
+    configured = {
+        "relay": config.relays,
+        "inbox": config.inbox.keys,
+        "operator": None if config.operators is None else config.operators.keys,
+    }[role]
+    registry = key_registry(config)
+    if configured is None and not registry.keys(role):
+        return None
+    return registry.keyring(role)
+
+
 def open_signer(config: InterlockConfig, signer: str | None, key: str | Path | None) -> Any:
     """What a part signs with: the key the ``[signers.<name>]`` that
     ``signer`` names holds, its version pinned now (``docs/EPIC8_DESIGN.md``
@@ -160,7 +205,7 @@ def relay_signer(config: InterlockConfig, path: str | Path | None) -> Any:
         signer = open_signer(config, remote, path)
     except (OSError, ValueError, SignerUnavailableError) as exc:
         raise RefusedError(f"cannot open the relay key: {exc}") from exc
-    keyring = config.relay_keyring()
+    keyring = trusted_keyring(config, "relay")
     if keyring is None or signer.key_id not in keyring:
         raise RefusedError(
             f"the relay's key {signer.key_id} is not registered, so nothing it signs would "
@@ -257,7 +302,7 @@ def inbox_signer(config: InterlockConfig, path: str | Path | None) -> Any:
         signer = open_signer(config, remote, path)
     except (OSError, ValueError, SignerUnavailableError) as exc:
         raise RefusedError(f"cannot open the inbox key: {exc}") from exc
-    keyring = config.inbox_keyring()
+    keyring = trusted_keyring(config, "inbox")
     if keyring is None or signer.key_id not in keyring:
         raise RefusedError(
             f"the inbox's key {signer.key_id} is not registered, so nothing it attests would "

@@ -950,7 +950,9 @@ class Inbox:
         """Bind ``event`` to the delivery it names, when exactly one message's
         relay-attested delivery created it. Returns whether a fact now binds it."""
         from interlock.attestations import attestation_of
+        from interlock.keys import outcome_ref, revocations_of
 
+        relays = self._relays.with_revocations(revocations_of(self._store))
         for ref in event.refs:
             delivered = self._store.delivered_with(ref)
             if not delivered:
@@ -977,10 +979,16 @@ class Inbox:
                 try:
                     statement = attestation_of(message, row)
                     assert statement.signature is not None
-                    key = self._relays.verifier(statement.signature.key_id)
+                    key_id = statement.signature.key_id
+                    key = relays.verifier(key_id)
                     if key is None:
                         raise ValueError("no registered relay's key")
                     statement.verify(key)
+                    refused = relays.refusal(
+                        key_id, "outcome", outcome_ref(message_id, row.seq), row.event_hash
+                    )
+                    if refused is not None:
+                        raise ValueError(refused)
                 except Exception as exc:  # an attestation that does not hold binds nothing
                     logger.warning(
                         "inbox: message %s's delivery row %d is not a registered relay's (%s); "
@@ -1070,7 +1078,20 @@ def verify_inbox(source: object, keys: Keyring, *, relays: Keyring | None = None
 
 def _verify_inbox(reader: Any, keys: Keyring, relays: Keyring | None) -> InboxReport:
     from interlock.attestations import attestation_of
+    from interlock.keys import (
+        attestation_key,
+        event_ref,
+        fact_ref,
+        fact_row_hash,
+        outcome_ref,
+        revocations_of,
+    )
 
+    # A revoked key's rows hold only as its revocation sealed them
+    # (docs/EPIC8_DESIGN.md §2.3).
+    revoked = revocations_of(reader)
+    keys = keys.with_revocations(revoked)
+    relays = None if relays is None else relays.with_revocations(revoked)
     problems: list[str] = []
     events = reader.inbound_events()
     by_source: dict[str, list[InboundEvent]] = {}
@@ -1090,6 +1111,13 @@ def _verify_inbox(reader: Any, keys: Keyring, relays: Keyring | None) -> InboxRe
                 problems.append(f"{where} does not hash to what it records")
                 break
             found = verify_event(event, keys)
+            if found is None:
+                found = keys.refusal(
+                    attestation_key(event.attestation) or "",
+                    "event",
+                    event_ref(event.source, event.seq),
+                    event.event_hash,
+                )
             if found is not None:
                 problems.append(f"{where}: {found}")
             expected = event.event_hash
@@ -1110,6 +1138,13 @@ def _verify_inbox(reader: Any, keys: Keyring, relays: Keyring | None) -> InboxRe
     for fact in facts:
         where = f"fact {fact.fact_id}"
         found = verify_fact(fact, keys)
+        if found is None:
+            found = keys.refusal(
+                attestation_key(fact.attestation) or "",
+                "fact",
+                fact_ref(fact.source, fact.event_seq),
+                fact_row_hash(fact.attestation),
+            )
         if found is not None:
             problems.append(f"{where}: {found}")
         event = recorded.get((fact.source, fact.event_seq))
@@ -1138,10 +1173,16 @@ def _verify_inbox(reader: Any, keys: Keyring, relays: Keyring | None) -> InboxRe
             try:
                 statement = attestation_of(message, row)
                 assert statement.signature is not None
-                key = relays.verifier(statement.signature.key_id)
+                key_id = statement.signature.key_id
+                key = relays.verifier(key_id)
                 if key is None:
                     raise ValueError("no registered relay's key")
                 statement.verify(key)
+                refused = relays.refusal(
+                    key_id, "outcome", outcome_ref(message.message_id, row.seq), row.event_hash
+                )
+                if refused is not None:
+                    raise ValueError(refused)
             except Exception as exc:
                 problems.append(f"{where} names a delivery no registered relay attested ({exc})")
     consumed = reader.inbound_consumed()

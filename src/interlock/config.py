@@ -591,6 +591,15 @@ class InterlockConfig:
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
 
+    def key_roots(self) -> dict[str, dict[str, str]]:
+        """Each role's configured keys, by name: the roots the operator log's
+        registrations extend (``docs/EPIC8_DESIGN.md`` §2.1)."""
+        return {
+            "relay": dict(self.relays or {}),
+            "inbox": dict(self.inbox.keys or {}),
+            "operator": dict(self.operators.keys) if self.operators is not None else {},
+        }
+
     def inbox_keyring(self) -> Keyring | None:
         """``[inbox.keys]``, as an engine takes them: ``EscrowEngine(inbox=...)``."""
         return self.inbox.keyring()

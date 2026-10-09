@@ -71,6 +71,7 @@ from interlock.deliveries import (
     settlements,
     verify_delivery_log,
 )
+from interlock.keys import outcome_ref, revocations_of
 from interlock.records import Keyring, SignedRecord, read_records
 from interlock.types import EffectId, outbound_key
 
@@ -145,6 +146,7 @@ class Settler:
         "_operator_log",
         "_operators",
         "_outbox",
+        "_pass_relays",
         "_receipts",
         "_relays",
         "_sinks",
@@ -167,6 +169,7 @@ class Settler:
         self._receipts = receipts
         self._chain = chain
         self._relays = relays
+        self._pass_relays = relays
         self._ledger = ledger
         self._operator_log = operator_log
         self._operators = operators
@@ -180,6 +183,9 @@ class Settler:
         due = [m for m in messages if m.state == "delivered" and m.message_id not in settled_before]
         if not due:
             return SettlementReport((), 0, 0, ())
+        # A revoked relay's deliveries settle only as its revocation sealed
+        # them (docs/EPIC8_DESIGN.md §2.3): read once a pass.
+        self._pass_relays = self._relays.with_revocations(revocations_of(self._outbox))
         if self._ledger is not None:
             # A governor's view of a shared ledger is as of its last read or
             # write: the charges other governors booked since are not in it.
@@ -231,7 +237,9 @@ class Settler:
             return _Outcome(settled, 0, 0)
         statement = attestation_of(message, delivered)
         assert statement.signature is not None
-        key = self._relays.verifier(statement.signature.key_id)
+        relays = self._pass_relays
+        key_id = statement.signature.key_id
+        key = relays.verifier(key_id)
         try:
             if key is None:
                 raise ReceiptSignatureError("no registered relay's key")
@@ -240,6 +248,11 @@ class Settler:
             raise _UnsettledError(
                 f"its delivery is not attested by a registered relay ({exc}): not settled"
             ) from exc
+        refused = relays.refusal(
+            key_id, "outcome", outcome_ref(message.message_id, delivered.seq), delivered.event_hash
+        )
+        if refused is not None:
+            raise _UnsettledError(f"its delivery: {refused}: not settled")
         # The plan a delivery receipt binds to: the one the attested key was
         # derived from, which the row's plan must be.
         if message.idempotency_key != outbound_key(message.plan_id, EffectId(message.effect_id)):
@@ -705,6 +718,7 @@ def verify_settlements(
         rows = dict(source.settlements())
         messages, _ = source.snapshot(None)
         pruned = source.compacted()
+        relays = relays.with_revocations(revocations_of(source))
     by_id = {m.message_id: m for m in messages}
     for message_id, tombstone in pruned.items():
         if tombstone.state == "delivered" and message_id not in rows:
@@ -752,6 +766,17 @@ def verify_settlements(
             receipt.attested().verify(key)
         except ReceiptSignatureError as exc:
             problems.append(f"delivery receipt {row.receipt_id}: its attestation: {exc}")
+        else:
+            # A live row a revoked relay attested is held to the seal; one
+            # pruned before the revocation was verified as it was pruned.
+            refused = relays.refusal(
+                receipt.attestation.key_id,
+                "outcome",
+                outcome_ref(message_id, receipt.delivery.log_seq),
+                receipt.delivery.log_hash,
+            )
+            if refused is not None and message_id in by_id:
+                problems.append(f"delivery receipt {row.receipt_id}: its delivery: {refused}")
         index = log.index_of(receipt.action.receipt_id)
         action = None if index is None else log.receipt(index)
         if not isinstance(action, ActionReceipt) or receipt.action.problem(action) is not None:

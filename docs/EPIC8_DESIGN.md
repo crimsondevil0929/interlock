@@ -159,15 +159,19 @@ Let *K* be a relay or inbox key, and *A(K)* the rows in the database whose attes
 |---|---|---|---|
 | relay | outcome rows of the delivery logs | `message_id, seq` | the row's `event_hash` |
 | inbox | inbound events | `source, seq` | the event's `event_hash` |
-| inbox | facts | `fact_id` | SHA-256 of the fact's attestation |
+| inbox | facts | `source, event_seq` (an event has one fact at most) | SHA-256 of the fact's attestation |
 
 At the revocation, at the instant *t_R* of its transaction, the seal is
 *S(K) = A(K) at t_R*: the references and row hashes of every row *K* had attested that is
 still in the database. It is stored beside the revocation, row by row, and its digest
 
-> *D(K)* = SHA-256( canonical JSON of the sorted list of `[kind, reference, row hash]` )
+> *D(K)* = SHA-256( frame( *k₁*, *r₁*, *h₁*, *k₂*, *r₂*, *h₂*, … ) )
 
-is signed into the applied record with its count, and anchored.
+over the members `(kind, reference, row hash)` in byte order, where `frame` is the
+length-prefixed framing every Interlock hash uses (`interlock.deliveries.frame`: no field can
+run into the next), is signed into the applied record with its count, and anchored. The
+database computes it (`interlock.key_revoke` sorts with `COLLATE "C"`, byte order) and
+`interlock.keys.seal_digest` recomputes it.
 
 **The write side.** Every write of an attested row takes the keys lock shared and, holding
 it, refuses an attestation by a revoked key. The revocation takes it exclusively. So every
@@ -214,8 +218,10 @@ answers with what it already did.
 
 The operator log orders itself. A record signed by operator key *K* holds when *K* is a root,
 or a `key.registered` record before it registered *K*, and no `operator.intent` to revoke
-*K* precedes it. An operator may revoke their own key. A log written on by a revoked key is
-named record by record. `OperatorLog` refuses to open with a revoked or unregistered key.
+*K* precedes it. Another operator revokes *K*: an operator does not revoke their own key,
+so every revocation is signed by a key that still signs, and the last operator key is never
+revoked, so someone always can. A log written on by a revoked key is named record by record.
+`OperatorLog` refuses to open with a revoked or unregistered key.
 
 ### 2.6 Rotation
 

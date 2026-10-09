@@ -41,7 +41,7 @@ import logging
 import os
 import re
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,7 +49,7 @@ from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from agentgov.core import QUANTUM, EntryType, LedgerEntry
 from agentgov.exceptions import MalformedReceiptError
@@ -68,6 +68,7 @@ __all__ = [
     "RecordKind",
     "RecordLog",
     "SignedRecord",
+    "UntrustedSignerError",
     "anchor_memo",
     "check_anchors",
     "money",
@@ -143,6 +144,10 @@ class RecordKind(StrEnum):
     OPERATOR_ABANDONED = "operator.abandoned"
     """The process that signed an intent stopped before acting on it, and no
     row carries its authority: recorded by the next operator to act."""
+
+    KEY_REGISTERED = "key.registered"
+    """An operator registered a key for a role (``docs/EPIC8_DESIGN.md`` §2.1):
+    trusted from the next record on, beside the configuration's."""
 
 
 def money(amount: Decimal | int | str) -> str:
@@ -285,41 +290,162 @@ class SignedRecord:
         )
 
 
+class UntrustedSignerError(ValueError):
+    """A log's signer is not one of its keys as the log stands: never
+    registered, or revoked by the record ``revoked_by``."""
+
+    def __init__(self, message: str, *, revoked_by: int | None = None) -> None:
+        super().__init__(message)
+        self.revoked_by = revoked_by
+
+
+class Sealed(Protocol):
+    """A key's revocation, as a keyring holds it (:class:`interlock.keys.Revocation`)."""
+
+    @property
+    def revoked_at(self) -> datetime: ...
+
+    def holds(self, kind: str, ref: str, row_hash: str) -> bool:
+        """Whether the revocation sealed this row, at this hash."""
+        ...
+
+
 class Keyring:
     """The public keys a log written by several signers is verified under:
     each record under the key it names, and only under a key held here.
 
+    It knows what the operator log does to its keys (``docs/EPIC8_DESIGN.md``
+    §2): :meth:`after` a record that registers an operator key, the key is
+    trusted; after the intent that revokes one, it is not. And it knows the
+    revocations the database sealed, for :meth:`refusal`.
+
     :param keys: Each signer's name, and their key: a :class:`Verifier`, or
         written as ``ed25519:<hex>`` (an Ed25519 public key; verifying needs
         no private half and nothing beyond agentgov).
+    :param revoked: Revoked keys, by id, as the database sealed them.
+    :param resolve: Asked for a key id this keyring does not hold: its name
+        and key, if a key registered since says so, or ``None``.
     :raises ValueError: On a key that does not parse, or one key under two
         names.
     """
 
-    __slots__ = ("_by_id", "_names")
+    __slots__ = ("_by_id", "_names", "_resolve", "_retired", "_revoked")
 
-    def __init__(self, keys: Mapping[str, Verifier | str]) -> None:
+    def __init__(
+        self,
+        keys: Mapping[str, Verifier | str],
+        *,
+        revoked: Mapping[str, Sealed] | None = None,
+        resolve: Callable[[str], tuple[str, Verifier | str] | None] | None = None,
+    ) -> None:
         self._by_id: dict[str, Verifier] = {}
         self._names: dict[str, str] = {}
+        self._retired: dict[str, int] = {}
+        self._revoked: dict[str, Sealed] = dict(revoked or {})
+        self._resolve = resolve
         for name, key in keys.items():
-            try:
-                verifier = parse_key(key) if isinstance(key, str) else key
-            except MalformedReceiptError as exc:
-                raise ValueError(f"the key of {name!r} does not parse: {exc}") from exc
-            if verifier.key_id in self._by_id:
-                raise ValueError(
-                    f"{self._names[verifier.key_id]!r} and {name!r} hold one key; a key "
-                    f"names one signer"
-                )
-            self._by_id[verifier.key_id] = verifier
-            self._names[verifier.key_id] = name
+            self._add(name, key)
+
+    def _add(self, name: str, key: Verifier | str) -> Verifier:
+        try:
+            verifier = parse_key(key) if isinstance(key, str) else key
+        except MalformedReceiptError as exc:
+            raise ValueError(f"the key of {name!r} does not parse: {exc}") from exc
+        if verifier.key_id in self._by_id:
+            raise ValueError(
+                f"{self._names[verifier.key_id]!r} and {name!r} hold one key; a key names "
+                f"one signer"
+            )
+        self._by_id[verifier.key_id] = verifier
+        self._names[verifier.key_id] = name
+        return verifier
+
+    def _copy(self) -> Keyring:
+        copy = Keyring.__new__(Keyring)
+        copy._by_id = dict(self._by_id)
+        copy._names = dict(self._names)
+        copy._retired = dict(self._retired)
+        copy._revoked = dict(self._revoked)
+        copy._resolve = self._resolve
+        return copy
 
     def verifier(self, key_id: str) -> Verifier | None:
-        return self._by_id.get(key_id)
+        key = self._by_id.get(key_id)
+        if key is None and self._resolve is not None:
+            found = self._resolve(key_id)
+            if found is not None:
+                key = self._add(*found)
+        return key
 
     def name(self, key_id: str) -> str | None:
         """Whose key ``key_id`` is."""
         return self._names.get(key_id)
+
+    def ids(self) -> tuple[str, ...]:
+        """Every key id held here, the revoked included."""
+        return tuple(self._by_id)
+
+    def trusts(self, key_id: str) -> bool:
+        """Whether what ``key_id`` signs now holds: it is held here, and no
+        intent before revoked it."""
+        return key_id in self._by_id and key_id not in self._retired
+
+    def retired(self, key_id: str) -> int | None:
+        """The sequence of the operator record that revoked ``key_id``, if one did."""
+        return self._retired.get(key_id)
+
+    def after(self, record: SignedRecord) -> Keyring:
+        """This keyring as the operator log stands after ``record``, when a
+        key trusted here signed it: an operator key it registers is trusted
+        from the next record on, one its ``revoke-key`` intent names is not."""
+        if not self.trusts(record.key_id):
+            return self
+        body = record.body
+        if body.get("role") != "operator":
+            return self
+        if record.kind == RecordKind.KEY_REGISTERED.value:
+            spec, name = body.get("key"), body.get("name")
+            try:
+                key = parse_key(spec) if isinstance(spec, str) else None
+            except MalformedReceiptError:
+                key = None
+            if key is None or not isinstance(name, str) or key.key_id in self._by_id:
+                return self
+            copy = self._copy()
+            copy._add(name, key)
+            return copy
+        if (
+            record.kind == RecordKind.OPERATOR_INTENT.value
+            and body.get("action") == "revoke-key"
+            and body.get("key_id") in self._by_id
+            and body.get("key_id") not in self._retired
+        ):
+            copy = self._copy()
+            copy._retired[str(body["key_id"])] = record.seq
+            return copy
+        return self
+
+    def with_revocations(self, revoked: Mapping[str, Sealed]) -> Keyring:
+        """This keyring, holding ``revoked`` as the database sealed them."""
+        copy = self._copy()
+        copy._revoked = dict(revoked)
+        return copy
+
+    def revocation(self, key_id: str) -> Sealed | None:
+        return self._revoked.get(key_id)
+
+    def refusal(self, key_id: str, kind: str, ref: str, row_hash: str) -> str | None:
+        """Why a row attested by ``key_id`` does not hold for want of a seal:
+        the key was revoked, and its revocation did not seal this row at this
+        hash. ``None`` when the key is not revoked, or sealed the row."""
+        revoked = self._revoked.get(key_id)
+        if revoked is None or revoked.holds(kind, ref, row_hash):
+            return None
+        return (
+            f"it is attested by key {key_id} ({self._names.get(key_id, 'unregistered')}), "
+            f"revoked at {revoked.revoked_at.isoformat()}, and its revocation did not seal "
+            f"it: written after, around the database's refusal"
+        )
 
     def __contains__(self, key_id: object) -> bool:
         return key_id in self._by_id
@@ -341,6 +467,7 @@ def verify_records(records: Sequence[SignedRecord], verifier: Verifier | Keyring
     """
     previous = GENESIS
     log: str | None = None
+    keys = verifier if isinstance(verifier, Keyring) else None
     for index, record in enumerate(records, start=1):
         if record.seq != index:
             raise RecordIntegrityError(
@@ -356,15 +483,23 @@ def verify_records(records: Sequence[SignedRecord], verifier: Verifier | Keyring
                 f"record {index} links to {record.prev[:16]}, expected {previous[:16]}: "
                 f"the log was re-linked"
             )
-        if isinstance(verifier, Keyring):
-            key = verifier.verifier(record.key_id)
+        if keys is not None:
+            key = keys.verifier(record.key_id)
             if key is None:
                 raise RecordIntegrityError(
                     f"record {index} was signed by key {record.key_id}, which is not a "
                     f"registered key"
                 )
+            retired = keys.retired(record.key_id)
+            if retired is not None:
+                raise RecordIntegrityError(
+                    f"record {index} was signed by key {record.key_id} after record {retired} "
+                    f"revoked it"
+                )
             record.verify(key)
+            keys = keys.after(record)
         else:
+            assert not isinstance(verifier, Keyring)
             record.verify(verifier)
         previous = record.record_hash
 
@@ -428,10 +563,12 @@ class RecordLog:
     :param path: Optional JSON Lines file.
     :param keyring: For a log several signers write (the operator log): an
         existing file is verified under it, each record under its own
-        signer's key, and ``signer`` must be one of its keys.
+        signer's key, and ``signer`` must be one of its keys as the log stands:
+        registered (in ``keyring``, or by a record of the log), and not revoked.
     :raises ChainInUseError: If another live log has the file open.
     :raises RecordIntegrityError: If the existing file does not verify.
-    :raises ValueError: If ``signer`` is not in ``keyring``.
+    :raises ValueError: If ``signer`` is not a trusted key of ``keyring`` as
+        the log stands.
     """
 
     __slots__ = (
@@ -444,6 +581,7 @@ class RecordLog:
         "_path",
         "_records",
         "_signer",
+        "_trusted",
     )
 
     def __init__(
@@ -456,9 +594,8 @@ class RecordLog:
     ) -> None:
         if not _LOG_ID.fullmatch(log_id):
             raise ValueError(f"a log id is 1-64 characters of [A-Za-z0-9._:@/-], got {log_id!r}")
-        if keyring is not None and signer.key_id not in keyring:
-            raise ValueError(f"the signer's key {signer.key_id} is not a registered key")
         self._keyring = keyring
+        self._trusted = keyring
         self._signer = signer
         self._log_id = log_id
         self._records: list[SignedRecord] = []
@@ -468,6 +605,7 @@ class RecordLog:
         self._path = Path(path) if path is not None else None
         self._claim: _FileClaim | None = None
         if self._path is None:
+            self._refuse_untrusted()
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         claim = _FileClaim(
@@ -476,10 +614,33 @@ class RecordLog:
         claim.acquire()
         try:
             self._resume(self._path)
+            self._refuse_untrusted()
         except BaseException:
             claim.release()
             raise
         self._claim = claim
+
+    def _refuse_untrusted(self) -> None:
+        trusted = self._trusted
+        if trusted is None or trusted.trusts(self._signer.key_id):
+            return
+        retired = trusted.retired(self._signer.key_id)
+        if retired is not None:
+            raise UntrustedSignerError(
+                f"the signer's key {self._signer.key_id} was revoked by record {retired}: it "
+                f"signs nothing more",
+                revoked_by=retired,
+            )
+        raise UntrustedSignerError(
+            f"the signer's key {self._signer.key_id} is not a registered key"
+        )
+
+    @property
+    def trusted(self) -> Keyring | None:
+        """The keyring as the log stands: the given one, with every key its
+        records registered or revoked."""
+        with self._lock:
+            return self._trusted
 
     @property
     def log_id(self) -> str:
@@ -523,6 +684,7 @@ class RecordLog:
         with self._lock:
             if self._closed:
                 raise AnchorError(f"record log {self._log_id!r} is closed")
+            self._refuse_untrusted()
             unsigned = SignedRecord(
                 log=self._log_id,
                 seq=len(self._records) + 1,
@@ -544,6 +706,8 @@ class RecordLog:
                 self._write(self._path, record)
             self._records.append(record)
             self._head = record.record_hash
+            if self._trusted is not None:
+                self._trusted = self._trusted.after(record)
             return record
 
     def verify(self, verifier: Verifier | Keyring | None = None) -> None:
@@ -627,6 +791,11 @@ class RecordLog:
             raise RecordIntegrityError(f"{path} holds log {records[0].log!r}, not {self._log_id!r}")
         self._records = records
         self._head = records[-1].record_hash if records else GENESIS
+        if self._keyring is not None:
+            trusted = self._keyring
+            for record in records:
+                trusted = trusted.after(record)
+            self._trusted = trusted
 
 
 def read_records(path: str | Path) -> tuple[SignedRecord, ...]:

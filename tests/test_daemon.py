@@ -742,3 +742,63 @@ def test_an_operator_signs_through_a_signing_service(
         assert main(both, out=io.StringIO()) != 0
         assert main(["install", "--config", config, "--signer", "nobody"], out=io.StringIO()) != 0
         assert kms.signed[("ops", 1)] == 1
+
+
+def test_keys_are_listed_registered_and_revoked_from_the_command_line(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``interlock keys`` (docs/EPIC8_DESIGN.md §2): a relay key rotated, its
+    successor's public half read from the key service, and verified after."""
+    from tests.fakekms import FakeKms
+
+    base = site.path.parent
+    config = str(site.path)
+    operator_key = ["--key", str(base / "vacuum.key")]
+    old = load_config(site.path).relay_keyring()
+    assert old is not None
+    (old_id,) = old.ids()
+
+    def run(*argv: str) -> tuple[int, str]:
+        out = io.StringIO()
+        code = main([*argv, "--config", config], out=out)
+        return code, out.getvalue()
+
+    code, listed = run("keys", "list")
+    assert code == 0
+    assert f"relay     relay                {old_id}  configured; trusted" in listed
+    with FakeKms() as kms:
+        new = kms.create("relay-2")
+        site.path.write_text(
+            site.path.read_text().replace(
+                "[daemon]",
+                f'[signers.relay-2]\ntype = "http"\nurl = "{kms.url}"\nkey = "relay-2"\n\n[daemon]',
+            )
+        )
+        register = ["keys", "register", *operator_key, "--role", "relay", "--name", "relay-2"]
+        code, said = run(*register, "--public-of", "relay-2")
+        assert code == 0, said
+        assert f"relay key {new.key_id} registered as relay-2" in said
+        # Once is enough: under any name, for any role.
+        assert run(*register, "--public-of", "relay-2")[0] == 1
+        again = ["keys", "register", *operator_key, "--role", "inbox", "--name", "x"]
+        code, said = run(*again, "--public", new.public_key().spec())
+        assert code == 1 and "is a relay key already" in said
+        assert run(*register, "--public-of", "nobody")[0] == 2
+    revoke = ["keys", "revoke", *operator_key, "--role", "relay", old_id, "--reason", "rotated"]
+    code, said = run(*revoke)
+    assert code == 0, said
+    assert f"relay key {old_id} revoked; 0 rows sealed" in said
+    assert run(*revoke)[0] == 1
+    # The operator's own key, and the last one: nobody could sign again.
+    vacuum = load_config(site.path).operators
+    assert vacuum is not None
+    (operator_id,) = vacuum.keyring().ids()
+    code, said = run("keys", "revoke", *operator_key, "--role", "operator", operator_id)
+    assert code == 1 and "does not revoke their own key" in said
+    code, listed = run("keys", "list")
+    assert code == 0
+    assert f"{old_id}  configured; revoked " in listed and "0 rows sealed" in listed
+    assert f"relay-2              {new.key_id}  registered by operator record" in listed
+    code, verified = run("outbox", "verify")
+    assert code == 0, verified
+    assert "1 key(s) registered by operators; 1 revoked" in verified

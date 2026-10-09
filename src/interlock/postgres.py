@@ -126,7 +126,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "6"
+INSTALL_VERSION: Final = "7"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -589,6 +589,8 @@ _OUTBOX_TABLES: Final = (
     "interlock.checkpoints",
     "interlock.outbox_compacted",
     "interlock.outbox_traces",
+    "interlock.key_revocations",
+    "interlock.key_seals",
 )
 
 _SETTLER_FUNCTIONS: Final = ("interlock.outbox_settle(uuid, text, text, text)",)
@@ -866,8 +868,9 @@ def _install_sources(conn: psycopg.Connection[Any], sources: Sequence[InboundSou
 
 
 def installed_version(conn: psycopg.Connection[Any]) -> int:
-    """Which version installed the outbox in this database: 6 when it keeps
-    trace context, 5 when vacuums compact it under checkpoints, 4 when its
+    """Which version installed the outbox in this database: 7 when it records
+    revoked keys and their seals, 6 when it keeps trace context, 5 when
+    vacuums compact it under checkpoints, 4 when its
     delivery log records relays' attestations and rate windows keep their
     history, 3 when the log records what calls created, 2 before; 0 when there
     is no outbox."""
@@ -881,14 +884,17 @@ def installed_version(conn: psycopg.Connection[Any]) -> int:
         "        AND attname = 'attestation' AND NOT attisdropped), "
         "pg_catalog.to_regclass('interlock.window_ledger') IS NOT NULL, "
         "pg_catalog.to_regclass('interlock.checkpoints') IS NOT NULL, "
-        "pg_catalog.to_regclass('interlock.outbox_traces') IS NOT NULL"
+        "pg_catalog.to_regclass('interlock.outbox_traces') IS NOT NULL, "
+        "pg_catalog.to_regclass('interlock.key_revocations') IS NOT NULL"
     ).fetchone()
     if row is None or not row[0]:
         return 0
     if row[2] and row[3]:
         if not row[4]:
             return 4
-        return 6 if row[5] else 5
+        if not row[5]:
+            return 5
+        return 7 if row[6] else 6
     return 3 if row[1] else 2
 
 

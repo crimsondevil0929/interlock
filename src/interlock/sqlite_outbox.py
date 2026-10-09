@@ -87,6 +87,7 @@ from interlock.types import InboundFact, OutboundDelta, _frozen
 
 if TYPE_CHECKING:
     from interlock.inbox import DeliveredRef, InboundEvent, InboundSource
+    from interlock.keys import Revocation
     from interlock.outbound import SinkSpec
     from interlock.relay import DeliveryResult, Lease
     from interlock.types import Effect
@@ -103,10 +104,11 @@ __all__ = [
 
 logger = logging.getLogger("interlock.sqlite_outbox")
 
-VERSION: Final = 6
-"""The outbox version this module installs: 6 keeps trace context beside the
-outbox and the inbox (``docs/EPIC7_DESIGN.md`` §1); 5 compacts under
-checkpoints (``docs/EPIC5_DESIGN.md`` §1)."""
+VERSION: Final = 7
+"""The outbox version this module installs: 7 records revoked keys and their
+seals (``docs/EPIC8_DESIGN.md`` §2); 6 keeps trace context beside the outbox
+and the inbox (``docs/EPIC7_DESIGN.md`` §1); 5 compacts under checkpoints
+(``docs/EPIC5_DESIGN.md`` §1)."""
 
 SINKS: Final = "_interlock_sinks"
 OUTBOX: Final = "_interlock_outbox"
@@ -120,8 +122,26 @@ COMPACTED: Final = "_interlock_outbox_compacted"
 TRACES: Final = "_interlock_outbox_traces"
 """Each request's trace context, its plan's (version 6, ``docs/EPIC7_DESIGN.md``
 §1.3): in no hash, and gone with the request."""
+REVOCATIONS: Final = "_interlock_key_revocations"
+SEALS: Final = "_interlock_key_seals"
+"""Revoked relay and inbox keys, and the seal of each: every row the key had
+attested when it was revoked (version 7, ``docs/EPIC8_DESIGN.md`` §2). Never
+changed."""
 OUTBOX_TABLES: Final = frozenset(
-    {SINKS, OUTBOX, STATE, LOG, EPOCHS, LEGACY, SETTLEMENTS, CHECKPOINTS, COMPACTED, TRACES}
+    {
+        SINKS,
+        OUTBOX,
+        STATE,
+        LOG,
+        EPOCHS,
+        LEGACY,
+        SETTLEMENTS,
+        CHECKPOINTS,
+        COMPACTED,
+        TRACES,
+        REVOCATIONS,
+        SEALS,
+    }
     | SQLITE_INBOX_TABLES
 )
 
@@ -389,6 +409,30 @@ _SCHEMA_TEMPLATE: Final = (
         PRIMARY KEY (source, seq),
         FOREIGN KEY (source, seq) REFERENCES {SQLITE_EVENTS} (source, seq) ON DELETE CASCADE
     )""",
+    # Version 7 (docs/EPIC8_DESIGN.md §2): revoked keys and their seals, written
+    # by an operator's revocation alone, and never changed.
+    f"""CREATE TABLE IF NOT EXISTS main.{REVOCATIONS} (
+        key_id      TEXT PRIMARY KEY
+                    CHECK (length(key_id) = 16 AND key_id NOT GLOB '*[^0-9a-f]*'),
+        role        TEXT NOT NULL CHECK (role IN ('relay', 'inbox')),
+        revoked_at  INTEGER NOT NULL,
+        authority   TEXT NOT NULL UNIQUE,
+        seal_count  INTEGER NOT NULL CHECK (seal_count >= 0),
+        seal_digest TEXT NOT NULL
+    )""",
+    f"""CREATE TABLE IF NOT EXISTS main.{SEALS} (
+        key_id   TEXT NOT NULL,
+        kind     TEXT NOT NULL CHECK (kind IN ('outcome', 'event', 'fact')),
+        ref      TEXT NOT NULL,
+        row_hash TEXT NOT NULL,
+        PRIMARY KEY (key_id, kind, ref)
+    )""",
+    *(
+        f"CREATE TRIGGER IF NOT EXISTS _interlock_{name}_no_{op.lower()} BEFORE {op} ON "
+        f"{table} BEGIN SELECT RAISE(ABORT, 'interlock: {table} is append-only'); END"
+        for name, table in (("revocations", REVOCATIONS), ("seals", SEALS))
+        for op in ("UPDATE", "DELETE")
+    ),
 )
 _SCHEMA: Final = tuple(
     statement.replace("{compacting}", _COMPACTING) for statement in _SCHEMA_TEMPLATE
@@ -431,6 +475,93 @@ def instant(us: int) -> datetime:
 
 def instant_text(us: int) -> str:
     return instant(us).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+# --------------------------------------------------------------------------
+# Revoked keys (version 7, docs/EPIC8_DESIGN.md §2): what a write checks, what
+# a revocation seals, what verification reads. The file's write lock orders a
+# revocation against every attested write.
+# --------------------------------------------------------------------------
+
+
+def _has_revocations(conn: sqlite3.Connection) -> bool:
+    found = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (REVOCATIONS,)
+    ).fetchone()
+    return found is not None
+
+
+def refuse_revoked(conn: sqlite3.Connection, attestation: str | None) -> None:
+    """Refuse a row attested by a revoked key, inside the transaction that
+    would write it.
+
+    :raises KeyRevokedError: If the attestation names a revoked key.
+    """
+    from interlock.exceptions import KeyRevokedError
+    from interlock.keys import attestation_key
+
+    key_id = attestation_key(attestation)
+    if key_id is None or not _has_revocations(conn):
+        return
+    if conn.execute(f"SELECT 1 FROM {REVOCATIONS} WHERE key_id = ?", (key_id,)).fetchone():
+        raise KeyRevokedError(f"key {key_id} was revoked: it attests nothing new")
+
+
+def sealed_rows(conn: sqlite3.Connection, role: str, key_id: str) -> set[tuple[str, str, str]]:
+    """Every row ``key_id`` attested that the file holds: what its revocation
+    seals, ``(kind, reference, row hash)``."""
+    from interlock.keys import attestation_key, event_ref, fact_ref, fact_row_hash, outcome_ref
+
+    members: set[tuple[str, str, str]] = set()
+    if role == "relay":
+        for message, seq, row_hash, attestation in conn.execute(
+            f"SELECT message_id, seq, event_hash, attestation FROM {LOG} "
+            f"WHERE attestation IS NOT NULL"
+        ):
+            if attestation_key(attestation) == key_id:
+                members.add(("outcome", outcome_ref(message, int(seq)), str(row_hash)))
+        return members
+    for source, seq, row_hash, attestation in conn.execute(
+        f"SELECT source, seq, event_hash, attestation FROM {SQLITE_EVENTS}"
+    ):
+        if attestation_key(attestation) == key_id:
+            members.add(("event", event_ref(str(source), int(seq)), str(row_hash)))
+    for source, seq, attestation in conn.execute(
+        f"SELECT source, event_seq, attestation FROM {SQLITE_FACTS}"
+    ):
+        if attestation_key(attestation) == key_id:
+            members.add(("fact", fact_ref(str(source), int(seq)), fact_row_hash(str(attestation))))
+    return members
+
+
+def read_revocations(conn: sqlite3.Connection) -> dict[str, Revocation]:
+    """Every revoked key, with its seal, as the file holds them."""
+    from interlock.keys import Revocation
+
+    if not _has_revocations(conn):
+        return {}
+    # The revocations first: one committed after this read brings its seal
+    # into the next, never a revocation without its seal.
+    revoked = conn.execute(
+        f"SELECT key_id, role, revoked_at, authority, seal_count, seal_digest FROM {REVOCATIONS}"
+    ).fetchall()
+    members: dict[str, set[tuple[str, str, str]]] = {}
+    for key_id, kind, ref, row_hash in conn.execute(
+        f"SELECT key_id, kind, ref, row_hash FROM {SEALS}"
+    ):
+        members.setdefault(str(key_id), set()).add((str(kind), str(ref), str(row_hash)))
+    return {
+        str(r[0]): Revocation(
+            key_id=str(r[0]),
+            role=str(r[1]),
+            revoked_at=instant(int(r[2])),
+            authority=str(r[3]),
+            count=int(r[4]),
+            digest=str(r[5]),
+            members=frozenset(members.get(str(r[0]), ())),
+        )
+        for r in revoked
+    }
 
 
 def _us(span: timedelta) -> int:
@@ -486,9 +617,10 @@ def _event_hash_sql(
 
 
 def installed_version(conn: sqlite3.Connection) -> int:
-    """Which version installed the outbox in this file: 6 when it keeps trace
-    context, 5 when vacuums compact it under checkpoints, 4 when its delivery
-    log records relays' attestations, 3 before; 0 when there is none."""
+    """Which version installed the outbox in this file: 7 when it records
+    revoked keys and their seals, 6 when it keeps trace context, 5 when
+    vacuums compact it under checkpoints, 4 when its delivery log records
+    relays' attestations, 3 before; 0 when there is none."""
     if not outbox_installed(conn):
         return 0
     columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({LOG})").fetchall()}
@@ -497,13 +629,15 @@ def installed_version(conn: sqlite3.Connection) -> int:
     tables = {
         str(r[0])
         for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
-            (CHECKPOINTS, TRACES),
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
+            (CHECKPOINTS, TRACES, REVOCATIONS),
         ).fetchall()
     }
     if CHECKPOINTS not in tables:
         return 4
-    return 6 if TRACES in tables else 5
+    if TRACES not in tables:
+        return 5
+    return 7 if REVOCATIONS in tables else 6
 
 
 def outbox_installed(conn: sqlite3.Connection) -> bool:
@@ -842,9 +976,9 @@ def stage_requests(
 
 RELAY: Final = frozenset({STATE, LOG})
 """What a relay's connection may write."""
-OPERATOR: Final = frozenset({OUTBOX, STATE, LOG, TRACES})
+OPERATOR: Final = frozenset({OUTBOX, STATE, LOG, TRACES, REVOCATIONS, SEALS})
 """What an operator's connection may write: compensations are new requests,
-in the trace of the request they compensate."""
+in the trace of the request they compensate; and revocations, with their seals."""
 SETTLER: Final = frozenset({SETTLEMENTS})
 """What settlement's connection may write: its record, and nothing else."""
 INBOX: Final = frozenset({SQLITE_SOURCES, SQLITE_EVENTS, SQLITE_FACTS, SQLITE_TRACES})
@@ -960,6 +1094,52 @@ class SqliteOutboxStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    # -- keys (version 7, docs/EPIC8_DESIGN.md §2) ---------------------------------
+
+    def revoked(self, key_id: str) -> bool:
+        """Whether ``key_id`` was revoked: a relay asks before it claims, so
+        one indexed read, and no seal."""
+        if not _has_revocations(self._conn):
+            return False
+        found = self._conn.execute(
+            f"SELECT 1 FROM {REVOCATIONS} WHERE key_id = ?", (key_id,)
+        ).fetchone()
+        return found is not None
+
+    def revocations(self) -> dict[str, Revocation]:
+        """Every revoked key, with its seal."""
+        return read_revocations(self._conn)
+
+    def revoke_key(self, role: str, key_id: str, *, authority: str) -> tuple[int, str]:
+        """An operator's revocation, under ``authority``, the hash of the signed
+        intent: the seal of every row the key attested, and the revocation, in
+        one write transaction, which every attested write waits on.
+
+        :returns: The seal's count and digest.
+        :raises KeyRevokedError: If the key is revoked already.
+        """
+        from interlock.exceptions import KeyRevokedError
+        from interlock.keys import SEALED_ROLES, seal_digest
+
+        if role not in SEALED_ROLES:
+            raise ValueError(f"the database seals a relay's or an inbox's key, not a {role}'s")
+        with self._writing() as conn:
+            if conn.execute(f"SELECT 1 FROM {REVOCATIONS} WHERE key_id = ?", (key_id,)).fetchone():
+                raise KeyRevokedError(f"key {key_id} is revoked already")
+            members = sealed_rows(conn, role, key_id)
+            digest = seal_digest(members)
+            conn.execute(
+                f"INSERT INTO {REVOCATIONS} "
+                f"(key_id, role, revoked_at, authority, seal_count, seal_digest) "
+                f"VALUES (?, ?, ?, ?, ?, ?)",
+                (key_id, role, now_us(), authority, len(members), digest),
+            )
+            conn.executemany(
+                f"INSERT INTO {SEALS} (key_id, kind, ref, row_hash) VALUES (?, ?, ?, ?)",
+                [(key_id, *member) for member in sorted(members)],
+            )
+        return len(members), digest
 
     # -- transactions -----------------------------------------------------------
 
@@ -1277,6 +1457,7 @@ class SqliteOutboxStore:
         for tries in range(3):
             try:
                 with self._writing() as conn:
+                    refuse_revoked(conn, attestation)
                     state = conn.execute(
                         f"SELECT state, lease_owner, fence, attempts, attempt_floor "
                         f"FROM {STATE} WHERE message_id = ?",

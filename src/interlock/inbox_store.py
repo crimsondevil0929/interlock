@@ -19,7 +19,8 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -168,6 +169,24 @@ def inbox_reader(source: object) -> Any:
 # --------------------------------------------------------------------------
 
 
+@contextmanager
+def _refused_if_revoked() -> Iterator[None]:
+    """The database's refusal of a revoked key's attestation (``IL013``), as
+    :class:`~interlock.exceptions.KeyRevokedError`."""
+    import psycopg
+
+    from interlock.exceptions import KeyRevokedError
+
+    try:
+        yield
+    except psycopg.Error as exc:
+        if getattr(exc, "sqlstate", None) == "IL013":
+            raise KeyRevokedError(
+                f"the inbox's key was revoked: the database refused what it attests ({exc})"
+            ) from exc
+        raise
+
+
 class PostgresInboxStore(PostgresReader):
     """The inbox on PostgreSQL: an inbox role's connection (``inbox_roles``),
     or any reader's for verification."""
@@ -198,7 +217,7 @@ class PostgresInboxStore(PostgresReader):
         attestation: str,
         traceparent: str | None = None,
     ) -> tuple[int, bool]:
-        with self._conn.transaction():
+        with _refused_if_revoked(), self._conn.transaction():
             row = self._conn.execute(
                 "SELECT out_seq, out_event_hash, out_fresh FROM interlock.inbox_record("
                 "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
@@ -235,7 +254,7 @@ class PostgresInboxStore(PostgresReader):
         return _event_row(row)
 
     def record_fact(self, fact: InboundFact) -> bool:
-        with self._conn.transaction():
+        with _refused_if_revoked(), self._conn.transaction():
             row = self._conn.execute(
                 "SELECT interlock.inbox_match(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
@@ -419,9 +438,12 @@ def sqlite_record_event(
     traceparent: str | None = None,
 ) -> tuple[int, bool]:
     """Within a ``BEGIN IMMEDIATE`` transaction: append the event once, and
-    its trace context beside it."""
+    its trace context beside it. An inbox whose key was revoked records
+    nothing new (``docs/EPIC8_DESIGN.md`` §2.4)."""
     from interlock.exceptions import InterlockError
+    from interlock.sqlite_outbox import refuse_revoked
 
+    refuse_revoked(conn, attestation)
     head = conn.execute(
         f"SELECT log_seq, log_head FROM {SQLITE_SOURCES} WHERE name = ? AND enabled = 1",
         (source,),
@@ -493,9 +515,11 @@ def sqlite_event(conn: sqlite3.Connection, source: str, seq: int) -> InboundEven
 
 def sqlite_record_fact(conn: sqlite3.Connection, fact: InboundFact, now_us: int) -> bool:
     """Within a ``BEGIN IMMEDIATE`` transaction: the binding, held to what the
-    file can check, once per event."""
+    file can check, once per event; never under a revoked key."""
     from interlock.exceptions import InterlockError
+    from interlock.sqlite_outbox import refuse_revoked
 
+    refuse_revoked(conn, fact.attestation)
     if (
         conn.execute(
             f"SELECT 1 FROM {SQLITE_EVENTS} WHERE source = ? AND seq = ? AND event_hash = ?",

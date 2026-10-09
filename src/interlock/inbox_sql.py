@@ -232,6 +232,8 @@ DECLARE
     found_seq integer;
     found_hash text;
 BEGIN
+    -- An inbox whose key was revoked attests nothing new (docs/EPIC8_DESIGN.md §2.4).
+    PERFORM interlock.key_unrevoked(p_attestation);
     -- One writer per source at a time: the head row is held to the commit.
     PERFORM 1 FROM interlock.inbox_sources AS s
      WHERE s.name = p_source AND s.enabled FOR UPDATE;
@@ -281,6 +283,7 @@ BEGIN
         RAISE EXCEPTION 'interlock: a fact needs the inbox''s attestation'
             USING ERRCODE = 'IL008';
     END IF;
+    PERFORM interlock.key_unrevoked(p_attestation);
     IF NOT EXISTS (
         SELECT 1 FROM interlock.inbox_events AS e
          WHERE e.source = p_source AND e.seq = p_event_seq AND e.event_hash = p_event_hash) THEN

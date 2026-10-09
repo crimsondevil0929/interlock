@@ -23,6 +23,7 @@ __all__ = [
     "ForbiddenStatementError",
     "InboundFactError",
     "InterlockError",
+    "KeyRevokedError",
     "LedgerUnverifiedError",
     "OutboundRequestError",
     "PlanError",
@@ -334,3 +335,10 @@ class SupervisorStoppedError(InterlockError):
     """The supervisor is not accepting plans (``docs/EPIC6_DESIGN.md`` §2.5):
     not started, shutting down, or run without engines. A plan refused with it
     was never staged."""
+
+
+class KeyRevokedError(InterlockError):
+    """The key that would sign was revoked (``docs/EPIC8_DESIGN.md`` §2): it
+    attests nothing new. A relay holding it stops before it claims; the
+    database refuses what it would write. What it attested before its
+    revocation still verifies, under the seal the revocation made."""
