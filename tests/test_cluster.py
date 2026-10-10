@@ -301,10 +301,11 @@ def test_a_vacuum_on_standby_exports_its_families_at_zero() -> None:
     service = VacuumService(never, every=60)
     supervisor = InterlockSupervisor(services=[service])
     service.bind(supervisor)
+    exported = supervisor.metrics.render().splitlines()
     for outcome in ("applied", "nothing", "refused", "rejected", "abandoned", "busy"):
-        assert supervisor.metrics.value("interlock_vacuum_runs_total", outcome=outcome) == 0
+        assert f'interlock_vacuum_runs_total{{outcome="{outcome}"}} 0' in exported
     for kind in ("messages", "window_rows", "inbox_events"):
-        assert supervisor.metrics.value("interlock_vacuum_pruned_total", kind=kind) == 0
+        assert f'interlock_vacuum_pruned_total{{kind="{kind}"}} 0' in exported
 
 
 def test_a_node_that_may_not_end_a_gone_nodes_sessions_says_so_once(

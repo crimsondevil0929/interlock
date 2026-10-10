@@ -264,7 +264,6 @@ class ClusterNode:
         with self._lock:
             before, self._conn = self._conn, conn
             self._joined = True
-            self._held.clear()
             self.counters["joins"] += 1
         if before is not None:
             _close(before)

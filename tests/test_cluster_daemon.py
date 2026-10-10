@@ -28,7 +28,7 @@ from psycopg.conninfo import make_conninfo
 from interlock import BlastRadius, EscrowEngine, PlanBuilder, PostgresSubstrate
 from interlock.attestations import verify_attestations
 from interlock.cli import main
-from interlock.cluster import LEADER_LOCK, NODE_LOCK, lock_key
+from interlock.cluster import LEADER_LOCK, NODE_LOCK, ClusterNode, lock_key
 from interlock.config import load_config
 from interlock.deliveries import message_log, verify_delivery_log
 from interlock.operators import generate_key
@@ -465,6 +465,35 @@ def test_a_second_daemon_as_a_node_that_runs_is_refused(cluster: Cluster) -> Non
         assert "node 'a' runs already" in twin.stderr
     finally:
         assert a.stop() == 0
+
+
+def test_a_daemon_whose_node_another_process_took_while_it_ran_exits_3(
+    cluster: Cluster,
+) -> None:
+    """The server ends a running node's session (a blip of the network), and
+    another process takes the node's name before it can join again: the
+    daemon is the stale one, stops, and says so with status 3."""
+    a = Daemon(cluster.configs["a"])
+    # The thief heartbeats never: its session must outlast the test.
+    thief = ClusterNode(cluster.owner, "a", heartbeat=1, session_timeout=120, join_wait=10)
+    try:
+        a.wait_for("interlock daemon running as node a")
+        a.process.send_signal(signal.SIGSTOP)  # it cannot join again meanwhile
+        with psycopg.connect(cluster.owner, autocommit=True) as conn:
+            conn.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE application_name = 'interlock-cluster@a'"
+            )
+        thief.join()
+        a.process.send_signal(signal.SIGCONT)
+        assert a.process.wait(60) == 3
+    finally:
+        if a.process.poll() is None:
+            a.process.kill()
+            a.process.wait()
+        thief.leave()
+    a.stop()
+    assert any("node 'a' runs already" in line for line in a.errors), a.errors
 
 
 def test_the_command_line_names_the_node_and_a_cluster_needs_one(cluster: Cluster) -> None:
