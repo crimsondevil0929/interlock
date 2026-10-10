@@ -260,3 +260,113 @@ def test_an_operators_ledger_may_be_a_keyword_connection_string(tmp_path: Path) 
     )
     operators = load_config(path).operators
     assert operators is not None and operators.ledger == "host=db dbname=app user=owner"
+
+
+SIGNERS = (
+    GOOD
+    + """
+[signers.relay-kms]
+type = "http"
+url = "https://kms.internal:8443"
+key = "interlock-relay"
+token_env = "INTERLOCK_KMS_TOKEN"
+timeout_seconds = 2.5
+version = 3
+
+[signers.ops]
+type = "http"
+url = "http://127.0.0.1:9000"
+key = "operators"
+
+[relay]
+signer = "relay-kms"
+breaker = "none"
+
+[[relay.endpoints]]
+sink = "mail"
+url = "https://api.mail.example"
+routes = { send = "POST /v3/mail/send" }
+
+[[sinks]]
+name = "mail"
+cost_per_call = "0.002"
+
+[[sinks.operations]]
+name = "send"
+
+[receipts]
+log = "receipts.jsonl"
+signer = "ops"
+
+[vacuum]
+signer = "ops"
+"""
+)
+
+
+def test_keys_at_a_signing_service_load(tmp_path: Path) -> None:
+    from interlock.config import SignerConfig
+
+    config = load_config(write(tmp_path, SIGNERS))
+    assert config.signers["relay-kms"] == SignerConfig(
+        name="relay-kms",
+        type="http",
+        url="https://kms.internal:8443",
+        key="interlock-relay",
+        token_env="INTERLOCK_KMS_TOKEN",
+        timeout=2.5,
+        version=3,
+    )
+    assert config.signers["ops"].token_env is None and config.signers["ops"].version is None
+    assert config.relay is not None and (config.relay.signer, config.relay.key) == (
+        "relay-kms",
+        None,
+    )
+    assert config.receipts is not None and (config.receipts.signer, config.receipts.key) == (
+        "ops",
+        None,
+    )
+    assert config.vacuum.signer == "ops"
+    assert load_config(write(tmp_path, GOOD)).signers == {}
+
+
+@pytest.mark.parametrize(
+    ("replace", "message"),
+    [
+        (('type = "http"\nurl = "https://kms', 'type = "aws"\nurl = "https://kms'), "'http'"),
+        (("https://kms.internal:8443", "ftp://kms.internal"), r"http\(s\)"),
+        (("version = 3", "version = 0"), "positive integer"),
+        (("version = 3", "version = 3\nregion = 'eu'"), r"\[signers.relay-kms\]: unknown key"),
+        (('signer = "relay-kms"', 'signer = "nobody"'), r"names no \[signers.nobody\]"),
+        (('signer = "relay-kms"', 'signer = "relay-kms"\nkey = "relay.key"'), "not both"),
+        (('log = "receipts.jsonl"\nsigner = "ops"', 'log = "receipts.jsonl"'), "missing 'key'"),
+        (("[signers.ops]", "[signers.'no good']"), "letters, digits"),
+    ],
+)
+def test_a_signer_misconfigured_is_refused(
+    tmp_path: Path, replace: tuple[str, str], message: str
+) -> None:
+    assert replace[0] in SIGNERS
+    with pytest.raises(ConfigError, match=message):
+        load_config(write(tmp_path, SIGNERS.replace(replace[0], replace[1], 1)))
+
+
+def test_a_signer_opens_with_its_credential_from_the_environment_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from interlock.signers import HttpRemoteSigner, SignerUnavailableError
+    from tests.fakekms import FakeKms
+
+    with FakeKms(token="the-token") as kms:
+        kms.create("interlock-relay")
+        kms.rotate("interlock-relay")
+        kms.rotate("interlock-relay")
+        text = SIGNERS.replace("https://kms.internal:8443", kms.url)
+        settings = load_config(write(tmp_path, text)).signers["relay-kms"]
+        monkeypatch.delenv("INTERLOCK_KMS_TOKEN", raising=False)
+        with pytest.raises(SignerUnavailableError, match="INTERLOCK_KMS_TOKEN is not set"):
+            settings.open()
+        monkeypatch.setenv("INTERLOCK_KMS_TOKEN", "the-token")
+        signer = settings.open()
+        assert isinstance(signer, HttpRemoteSigner) and signer.version == 3
+        assert signer.key_id == kms.key("interlock-relay", 3).key_id

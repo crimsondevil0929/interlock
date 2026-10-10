@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     import psycopg
 
     from interlock.compaction import CheckpointRow, Tombstone, WindowRow
+    from interlock.keys import Revocation
 
 __all__ = [
     "ACTION_EVENTS",
@@ -369,6 +370,16 @@ class OutboxReader(Protocol):
         """The clock the store's instants are on."""
         ...
 
+    def revocations(self) -> dict[str, Revocation]:
+        """Every revoked key, with its seal (``docs/EPIC8_DESIGN.md`` §2);
+        none before version 7."""
+        ...
+
+    def revoked_ids(self) -> frozenset[str]:
+        """The ids of the revoked keys, without their seals: what a running
+        part reads every pass (:class:`interlock.keys.Seals`)."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class Settled:
@@ -596,6 +607,16 @@ class OutboxOperations(OutboxReader, Protocol):
         idempotency_key: str,
     ) -> bool: ...
 
+    def revoke_key(self, role: str, key_id: str, *, authority: str) -> tuple[int, str]:
+        """An operator's revocation of a relay's or an inbox's key, under
+        ``authority`` (``docs/EPIC8_DESIGN.md`` §2.2): the revocation and the
+        seal of every row the key attested, in one transaction.
+
+        :returns: The seal's count and digest.
+        :raises KeyRevokedError: If the key is revoked already.
+        """
+        ...
+
     def compact(
         self,
         authority: str,
@@ -769,6 +790,52 @@ class PostgresReader:
         row = self._conn.execute("SELECT pg_catalog.clock_timestamp()").fetchone()
         assert row is not None
         return row[0]  # type: ignore[no-any-return]
+
+    def revoked(self, key_id: str) -> bool:
+        """Whether ``key_id`` was revoked: an inbox asks each matching pass."""
+        return key_id in self.revoked_ids()
+
+    def revoked_ids(self) -> frozenset[str]:
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.key_revocations') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return frozenset()
+        return frozenset(
+            str(r[0]) for r in self._conn.execute("SELECT key_id FROM interlock.key_revocations")
+        )
+
+    def revocations(self) -> dict[str, Revocation]:
+        from interlock.keys import Revocation
+
+        row = self._conn.execute(
+            "SELECT pg_catalog.to_regclass('interlock.key_revocations') IS NOT NULL"
+        ).fetchone()
+        if row is None or not row[0]:
+            return {}
+        # The revocations first: one committed after this read brings its
+        # seal into the next, never a revocation without its seal.
+        revoked = self._conn.execute(
+            "SELECT key_id, role, revoked_at, authority, seal_count, seal_digest "
+            "FROM interlock.key_revocations"
+        ).fetchall()
+        members: dict[str, set[tuple[str, str, str]]] = {}
+        for key_id, kind, ref, row_hash in self._conn.execute(
+            "SELECT key_id, kind, ref, row_hash FROM interlock.key_seals"
+        ):
+            members.setdefault(str(key_id), set()).add((str(kind), str(ref), str(row_hash)))
+        return {
+            str(r[0]): Revocation(
+                key_id=str(r[0]),
+                role=str(r[1]),
+                revoked_at=r[2],
+                authority=str(r[3]),
+                count=int(r[4]),
+                digest=str(r[5]),
+                members=frozenset(members.get(str(r[0]), ())),
+            )
+            for r in revoked
+        }
 
     def legacy(self) -> LegacySet | None:
         row = self._conn.execute(
@@ -1206,6 +1273,24 @@ class PostgresOperations(PostgresReader):
     """:class:`OutboxOperations` over a PostgreSQL connection as the installer."""
 
     __slots__ = ()
+
+    def revoke_key(self, role: str, key_id: str, *, authority: str) -> tuple[int, str]:
+        import psycopg
+
+        from interlock.exceptions import KeyRevokedError
+
+        try:
+            with self._conn.transaction():
+                row = self._conn.execute(
+                    "SELECT out_count, out_digest FROM interlock.key_revoke(%s, %s, %s)",
+                    (role, key_id, authority),
+                ).fetchone()
+        except psycopg.Error as exc:
+            if getattr(exc, "sqlstate", None) == "IL013":
+                raise KeyRevokedError(f"key {key_id} is revoked already") from exc
+            raise
+        assert row is not None
+        return int(row[0]), str(row[1])
 
     def release(
         self, message_id: uuid.UUID, *, actor: str, authority: str, expected_head: str

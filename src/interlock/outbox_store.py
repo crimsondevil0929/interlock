@@ -182,6 +182,24 @@ class PostgresOutboxStore:
             for row in rows
         ]
 
+    def revoked(self, key_id: str) -> bool:
+        """Whether ``key_id`` was revoked (``docs/EPIC8_DESIGN.md`` §2.4): a
+        relay asks before it claims."""
+        import psycopg
+
+        try:
+            row = (
+                self.connection()
+                .execute(
+                    "SELECT EXISTS (SELECT 1 FROM interlock.key_revocations WHERE key_id = %s)",
+                    (key_id,),
+                )
+                .fetchone()
+            )
+        except psycopg.OperationalError as exc:
+            raise self._lost(exc) from exc
+        return bool(row and row[0])
+
     def _traces(self, conn: psycopg.Connection[Any], messages: list[Any]) -> dict[Any, str]:
         """Each leased request's trace context, its plan's
         (``docs/EPIC7_DESIGN.md`` §1.3): one read a batch."""
@@ -261,6 +279,13 @@ class PostgresOutboxStore:
                     exc
                 ):
                     return None
+                if getattr(exc, "sqlstate", None) == "IL013":
+                    from interlock.exceptions import KeyRevokedError
+
+                    raise KeyRevokedError(
+                        f"relay {relay_id}: its key was revoked, and the database refused the "
+                        f"outcome of message {lease.message_id}, attempt {attempt}"
+                    ) from exc
                 raise
         return None  # pragma: no cover - the loop returns or raises
 

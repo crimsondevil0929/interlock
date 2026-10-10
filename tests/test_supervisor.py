@@ -666,3 +666,216 @@ def test_sigterm_stops_and_a_second_skips_the_drains() -> None:
     assert supervisor.wait_finished(0)
     # The handlers are removed with the run.
     assert signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, cast(Any, None))
+
+
+# -- reload (docs/EPIC8_DESIGN.md §3) ----------------------------------------------
+
+
+def test_a_reload_opens_every_service_again_between_its_steps() -> None:
+    log: list[tuple[str, str]] = []
+    release = threading.Event()
+    busy = Recorder("busy", log, hold=release)
+    idle = Recorder("idle", log, every=10.0)
+    engine = FakeEngine()
+    engines = pool([engine])
+    supervisor = InterlockSupervisor(engines=engines, services=[busy, idle])
+
+    async def body() -> dict[str, str | None]:
+        while ("busy", "step") not in log:
+            await asyncio.sleep(0.005)
+        reloading = asyncio.ensure_future(supervisor.reload())
+        await asyncio.sleep(0.05)
+        # The idle one is woken from its wait; the busy one finishes its step.
+        assert log.count(("idle", "open")) == 2
+        assert log.count(("busy", "open")) == 1 and not reloading.done()
+        release.set()
+        return await reloading
+
+    assert run(supervisor, body) == {"busy": None, "idle": None}
+    busy_log = [event for name, event in log if name == "busy"]
+    assert busy_log[:4] == ["open", "step", "close", "open"]
+    # Opened again, and its next step left where its pace put it.
+    assert log.count(("idle", "step")) == 1
+    assert busy.counters["reloads"] == idle.counters["reloads"] == 1
+    # The engines were not touched.
+    assert engines.closed == [0]  # type: ignore[attr-defined]
+    assert all(s.failures == 0 for s in supervisor.status().values())
+
+
+def test_a_service_that_cannot_open_again_backs_off_and_the_reload_says_why() -> None:
+    log: list[tuple[str, str]] = []
+    fragile = Recorder("fragile", log, every=10.0)
+    supervisor = InterlockSupervisor(services=[fragile], restart_min=0.02, restart_max=0.02)
+
+    async def body() -> dict[str, str | None]:
+        fragile.fail_open = 1
+        outcome = await supervisor.reload()
+        while fragile.counters.get("steps", 0) < 2:
+            await asyncio.sleep(0.005)
+        return outcome
+
+    assert run(supervisor, body) == {"fragile": "RuntimeError: cannot open"}
+    status = supervisor.status()["fragile"]
+    assert status.failures == 1 and status.last_error == "RuntimeError: cannot open"
+    events = [event for name, event in log]
+    # Closed for the reload; the open that failed, closed as any failure is;
+    # opened again after the backoff.
+    assert events[:7] == ["open", "step", "close", "open", "close", "open", "step"]
+
+
+def test_a_reload_opens_a_service_backing_off_at_once() -> None:
+    log: list[tuple[str, str]] = []
+    down = Recorder("down", log, fail_open=1, every=10.0)
+    supervisor = InterlockSupervisor(services=[down], restart_min=30.0, restart_max=30.0)
+    started = time.monotonic()
+
+    async def body() -> dict[str, str | None]:
+        return await supervisor.reload()
+
+    assert run(supervisor, body) == {"down": None}
+    assert time.monotonic() - started < 5.0
+    assert [event for name, event in log][:3] == ["open", "open", "step"]
+
+
+def test_a_reload_is_refused_unless_the_supervisor_runs() -> None:
+    supervisor = InterlockSupervisor(services=[Recorder("a", [])])
+    with pytest.raises(SupervisorStoppedError):
+        asyncio.run(supervisor.reload())
+
+    async def body() -> None:
+        supervisor.stop()
+        await asyncio.sleep(0)
+        with pytest.raises(SupervisorStoppedError):
+            await supervisor.reload()
+
+    run(supervisor, body)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="POSIX signals")
+def test_sighup_reloads_and_says_what_it_did() -> None:
+    log: list[tuple[str, str]] = []
+    relay = Recorder("relay", log, every=10.0)
+    supervisor = InterlockSupervisor(services=[relay])
+    told: list[dict[str, str | None]] = []
+    supervisor.on_reload(lambda outcome: told.append(dict(outcome)))
+
+    async def main() -> None:
+        running = asyncio.create_task(supervisor.run(handle_signals=True))
+        await supervisor.ready()
+        os.kill(os.getpid(), signal.SIGHUP)
+        deadline = time.monotonic() + 5
+        while not told and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        supervisor.stop()
+        await running
+
+    # Caught here when the supervisor does not: the test fails, and the
+    # process lives.
+    unhandled: list[int] = []
+    previous = signal.signal(signal.SIGHUP, lambda signum, frame: unhandled.append(signum))
+    try:
+        asyncio.run(main())
+        removed = signal.getsignal(signal.SIGHUP)
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert told == [{"relay": None}] and not unhandled
+    assert log.count(("relay", "open")) == 2
+    # The handler is removed with the run.
+    assert removed in (signal.SIG_DFL, cast(Any, None))
+
+
+def test_a_failed_service_is_backing_off_while_it_closes() -> None:
+    log: list[tuple[str, str]] = []
+    slow = Recorder("slow", log, fail=1, close_seconds=0.3)
+    supervisor = InterlockSupervisor(services=[slow], restart_min=0.01, restart_max=0.01)
+    seen: list[tuple[str, int]] = []
+
+    async def body() -> None:
+        while ("slow", "close") not in log:
+            status = supervisor.status()["slow"]
+            seen.append((status.state, status.failures))
+            await asyncio.sleep(0.01)
+
+    run(supervisor, body)
+    # Counted as failed, and never reported running, until it had closed.
+    assert ("running", 1) not in seen and ("backing-off", 1) in seen
+
+
+def test_an_inbox_swapped_answers_what_it_took_and_the_new_one_the_rest() -> None:
+    from interlock.supervisor import _CountingInbox
+
+    class Answer:
+        status = 202
+
+        def __init__(self) -> None:
+            self.body: dict[str, int] = {}
+
+    class Fake:
+        _max_body = 1024
+
+        def __init__(self, gate: threading.Event | None = None) -> None:
+            self.gate = gate
+            self.took: list[bytes] = []
+            self._sources = {"s": object()}
+
+        def receive(self, name: str, headers: dict[str, str], body: bytes) -> Answer:
+            self.took.append(body)
+            if self.gate is not None:
+                self.gate.wait(10)
+            return Answer()
+
+    gate = threading.Event()
+    old, new = Fake(gate), Fake()
+    counting = _CountingInbox(cast(Any, old), Recorder("inbox", []))
+    in_flight = threading.Thread(target=counting.receive, args=("s", {}, b"first"))
+    in_flight.start()
+    while not old.took:
+        time.sleep(0.005)
+    swapped = threading.Thread(target=counting.swap, args=(cast(Any, new),))
+    swapped.start()
+    time.sleep(0.05)
+    # Every later webhook is the new inbox's; the swap waits for the old one's.
+    counting.receive("s", {}, b"second")
+    assert swapped.is_alive() and new.took == [b"second"]
+    gate.set()
+    swapped.join(5)
+    in_flight.join(5)
+    assert not swapped.is_alive() and old.took == [b"first"]
+
+
+def test_a_reload_keeps_the_settlers_and_the_vacuums_governors() -> None:
+    """Neither holds a key a reload rotates, and each holds an AgentGov
+    governor, which opens under the ledger's writer lock while every engine
+    waits: a reload opens neither again (``docs/EPIC8_DESIGN.md`` §3)."""
+    from interlock.supervisor import SettlerService, VacuumService
+
+    opened: list[str] = []
+    closed: list[str] = []
+
+    class Settled:
+        def settle(self) -> Any:
+            class Report:
+                settled: tuple[()] = ()
+                receipts = credits = 0
+                problems: tuple[()] = ()
+                lags: tuple[()] = ()
+
+            return Report()
+
+    def open_settler() -> tuple[Any, Callable[[], None]]:
+        opened.append("settler")
+        return Settled(), lambda: closed.append("settler")
+
+    settler = SettlerService(open_settler, every=10.0)
+    vacuum = VacuumService(
+        lambda: cast(Any, None), every=10.0, close=lambda: closed.append("vacuum")
+    )
+    vacuum.step = lambda: 10.0  # type: ignore[method-assign]
+    supervisor = InterlockSupervisor(services=[settler, vacuum])
+
+    async def body() -> dict[str, str | None]:
+        return await supervisor.reload()
+
+    assert run(supervisor, body) == {"settler": None, "vacuum": None}
+    # Opened once, at the start; closed once, at the stop.
+    assert opened == ["settler"] and sorted(closed) == ["settler", "vacuum"]

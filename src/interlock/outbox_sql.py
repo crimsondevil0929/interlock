@@ -251,6 +251,28 @@ CREATE TABLE IF NOT EXISTS interlock.outbox_traces (
                        AND pg_catalog.substr(traceparent, 37, 16) <> pg_catalog.repeat('0', 16))
 );
 REVOKE ALL ON interlock.outbox_traces FROM PUBLIC;
+
+-- Version 7 (docs/EPIC8_DESIGN.md §2): revoked relay and inbox keys, and the
+-- seal of each: every row the key had attested when it was revoked. Written
+-- only by interlock.key_revoke, under an operator's signed intent; never
+-- changed. What the database still holds of a key's history is held to its seal.
+CREATE TABLE IF NOT EXISTS interlock.key_revocations (
+    key_id      text PRIMARY KEY CHECK (key_id ~ '^[0-9a-f]{16}$'),
+    role        text NOT NULL CHECK (role IN ('relay', 'inbox')),
+    revoked_at  timestamptz NOT NULL,
+    authority   text NOT NULL UNIQUE CHECK (authority ~ '^[0-9a-f]{64}$'),
+    seal_count  integer NOT NULL CHECK (seal_count >= 0),
+    seal_digest text NOT NULL CHECK (seal_digest ~ '^[0-9a-f]{64}$')
+);
+REVOKE ALL ON interlock.key_revocations FROM PUBLIC;
+CREATE TABLE IF NOT EXISTS interlock.key_seals (
+    key_id   text NOT NULL,
+    kind     text NOT NULL CHECK (kind IN ('outcome', 'event', 'fact')),
+    ref      text NOT NULL,
+    row_hash text NOT NULL,
+    PRIMARY KEY (key_id, kind, ref)
+);
+REVOKE ALL ON interlock.key_seals FROM PUBLIC;
 DO $legacy$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
@@ -1000,6 +1022,9 @@ BEGIN
     IF p_outcome NOT IN ('delivered', 'retryable', 'permanent', 'unknown') THEN
         RAISE EXCEPTION 'interlock: % is not an outcome', p_outcome USING ERRCODE = '22023';
     END IF;
+    -- A revoked key attests nothing new; held shared to the commit, so a
+    -- revocation (which takes it exclusively) seals every outcome before it.
+    PERFORM interlock.key_unrevoked(p_attestation);
     SELECT st.state, st.lease_owner, st.fence, st.attempts, st.attempt_floor INTO s
       FROM interlock.outbox_state AS st
      WHERE st.message_id = p_message
@@ -1449,6 +1474,114 @@ END
 $fn$;
 """
 
+KEY_FUNCTIONS: Final = r"""
+-- The key an attestation names, or NULL for one that is no JSON object: a row
+-- written around the database must not stop a revocation.
+CREATE OR REPLACE FUNCTION interlock.attested_key(p_attestation text)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+BEGIN
+    RETURN p_attestation::jsonb ->> 'key_id';
+EXCEPTION WHEN others THEN
+    RETURN NULL;
+END
+$fn$;
+
+-- Every write of an attested row calls this, holding the keys lock shared
+-- to its commit: refused when the attestation names a revoked key
+-- (docs/EPIC8_DESIGN.md §2.4). Internal.
+CREATE OR REPLACE FUNCTION interlock.key_unrevoked(p_attestation text)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    named text;
+BEGIN
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(1229737817, 8);
+    named := interlock.attested_key(p_attestation);
+    IF named IS NULL THEN
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM interlock.key_revocations AS r WHERE r.key_id = named) THEN
+        RAISE EXCEPTION 'interlock: key % was revoked: it attests nothing new', named
+            USING ERRCODE = 'IL013';
+    END IF;
+END
+$fn$;
+
+-- An operator's revocation of a relay's or an inbox's key, under the hash of
+-- the operator's signed revoke-key intent (docs/EPIC8_DESIGN.md §2.2). Holding
+-- the keys lock exclusively, so no attested write is in flight: the seal is
+-- every row the key attested, read in one snapshot, and its digest, which the
+-- operator signs into the log. Called by the installer.
+CREATE OR REPLACE FUNCTION interlock.key_revoke(p_role text, p_key_id text, p_authority text)
+RETURNS TABLE (out_count integer, out_digest text)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    kinds text[];
+    refs text[];
+    hashes text[];
+    fields text[];
+    sealed integer;
+    digest text;
+BEGIN
+    IF p_role NOT IN ('relay', 'inbox') OR p_key_id !~ '^[0-9a-f]{16}$'
+       OR p_authority !~ '^[0-9a-f]{64}$' THEN
+        RAISE EXCEPTION 'interlock: a revocation names a relay or inbox key and its authority'
+            USING ERRCODE = '22023';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock(1229737817, 8);
+    IF EXISTS (SELECT 1 FROM interlock.key_revocations AS r WHERE r.key_id = p_key_id) THEN
+        RAISE EXCEPTION 'interlock: key % is revoked already', p_key_id USING ERRCODE = 'IL013';
+    END IF;
+    SELECT coalesce(pg_catalog.array_agg(m.kind ORDER BY m.kind COLLATE "C", m.ref COLLATE "C"),
+                    '{}'),
+           coalesce(pg_catalog.array_agg(m.ref ORDER BY m.kind COLLATE "C", m.ref COLLATE "C"),
+                    '{}'),
+           coalesce(pg_catalog.array_agg(m.h ORDER BY m.kind COLLATE "C", m.ref COLLATE "C"),
+                    '{}')
+      INTO kinds, refs, hashes
+      FROM (
+        SELECT 'outcome'::text AS kind, a.message_id::text || ':' || a.seq::text AS ref,
+               a.event_hash AS h
+          FROM interlock.outbox_attempts AS a
+         WHERE p_role = 'relay' AND a.attestation IS NOT NULL
+           AND interlock.attested_key(a.attestation) = p_key_id
+        UNION ALL
+        SELECT 'event', e.source || ':' || e.seq::text, e.event_hash
+          FROM interlock.inbox_events AS e
+         WHERE p_role = 'inbox' AND interlock.attested_key(e.attestation) = p_key_id
+        UNION ALL
+        SELECT 'fact', f.source || ':' || f.event_seq::text,
+               pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(f.attestation, 'UTF8')),
+                                 'hex')
+          FROM interlock.inbox_facts AS f
+         WHERE p_role = 'inbox' AND interlock.attested_key(f.attestation) = p_key_id
+      ) AS m;
+    sealed := pg_catalog.cardinality(kinds);
+    SELECT coalesce(pg_catalog.array_agg(f.v ORDER BY m.i, f.j), '{}')
+      INTO fields
+      FROM ROWS FROM (pg_catalog.unnest(kinds), pg_catalog.unnest(refs),
+                      pg_catalog.unnest(hashes)) WITH ORDINALITY AS m (k, r, h, i),
+           LATERAL pg_catalog.unnest(ARRAY[m.k, m.r, m.h]) WITH ORDINALITY AS f (v, j);
+    digest := interlock.outbox_digest(VARIADIC fields);
+    INSERT INTO interlock.key_revocations (
+        key_id, role, revoked_at, authority, seal_count, seal_digest)
+    VALUES (p_key_id, p_role, pg_catalog.clock_timestamp(), p_authority, sealed, digest);
+    INSERT INTO interlock.key_seals (key_id, kind, ref, row_hash)
+    SELECT p_key_id, m.k, m.r, m.h
+      FROM ROWS FROM (pg_catalog.unnest(kinds), pg_catalog.unnest(refs),
+                      pg_catalog.unnest(hashes)) AS m (k, r, h);
+    RETURN QUERY SELECT sealed, digest;
+END
+$fn$;
+"""
+
 COMPACT_FUNCTIONS: Final = r"""
 -- A vacuum's act (docs/EPIC5_DESIGN.md §1.4), under the hash of the
 -- operator's signed intent that carries p_body, the checkpoint: record it,
@@ -1681,7 +1814,7 @@ $fn$;
 """
 
 OUTBOX_FUNCTIONS: Final = (
-    STAGE_OUTBOX_FUNCTIONS + RELAY_FUNCTIONS + SETTLE_FUNCTIONS + COMPACT_FUNCTIONS
+    STAGE_OUTBOX_FUNCTIONS + RELAY_FUNCTIONS + SETTLE_FUNCTIONS + COMPACT_FUNCTIONS + KEY_FUNCTIONS
 )
 
 OUTBOX_TRIGGERS: Final = r"""
@@ -1760,6 +1893,23 @@ CREATE TRIGGER legacy_sealed BEFORE INSERT ON interlock.outbox_legacy
 ALTER TABLE interlock.outbox_legacy ENABLE ALWAYS TRIGGER legacy_append_only,
     ENABLE ALWAYS TRIGGER legacy_append_only_truncate,
     ENABLE ALWAYS TRIGGER legacy_sealed;
+-- Version 7: a revocation and its seal never change.
+DROP TRIGGER IF EXISTS key_revocations_append_only ON interlock.key_revocations;
+CREATE TRIGGER key_revocations_append_only BEFORE UPDATE OR DELETE
+    ON interlock.key_revocations FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS key_revocations_no_truncate ON interlock.key_revocations;
+CREATE TRIGGER key_revocations_no_truncate BEFORE TRUNCATE ON interlock.key_revocations
+    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
+ALTER TABLE interlock.key_revocations ENABLE ALWAYS TRIGGER key_revocations_append_only,
+    ENABLE ALWAYS TRIGGER key_revocations_no_truncate;
+DROP TRIGGER IF EXISTS key_seals_append_only ON interlock.key_seals;
+CREATE TRIGGER key_seals_append_only BEFORE UPDATE OR DELETE ON interlock.key_seals
+    FOR EACH ROW EXECUTE FUNCTION interlock.outbox_append_only();
+DROP TRIGGER IF EXISTS key_seals_no_truncate ON interlock.key_seals;
+CREATE TRIGGER key_seals_no_truncate BEFORE TRUNCATE ON interlock.key_seals
+    FOR EACH STATEMENT EXECUTE FUNCTION interlock.outbox_append_only();
+ALTER TABLE interlock.key_seals ENABLE ALWAYS TRIGGER key_seals_append_only,
+    ENABLE ALWAYS TRIGGER key_seals_no_truncate;
 """
 
 OUTBOX_TRIGGER_NAMES: Final = (

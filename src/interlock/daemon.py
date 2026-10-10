@@ -151,8 +151,10 @@ def build_supervisor(
     metrics_listen: str | None = None,
 ) -> InterlockSupervisor:
     """The supervisor ``config`` describes, running ``application``'s agents
-    (see the module). Keys are read and checked now; nothing else is opened
-    until it runs.
+    (see the module). Keys are read and checked now, and read again by each
+    part each time it opens (``docs/EPIC8_DESIGN.md`` §3): a part reopened, at
+    a reload or after a failure, signs with the key its configuration points
+    at then. Nothing else is opened until it runs.
 
     :param listen: Overrides ``[inbox] listen``, ``HOST:PORT``.
     :param metrics_listen: Overrides ``[metrics] listen``, ``HOST:PORT``: where
@@ -181,7 +183,7 @@ def build_supervisor(
         if engines is not None and config.receipts is not None:
             services.append(_settler(config, engines, receipts, governors))
         vacuum = config.vacuum
-        if vacuum.every is not None and vacuum.key is not None:
+        if vacuum.every is not None and (vacuum.key is not None or vacuum.signer is not None):
             services.append(_vacuum(config, governors))
         where = metrics_listen or config.metrics.listen
         if where:
@@ -239,7 +241,7 @@ def _engines(
 ) -> EnginePool:
     from interlock.chain import EscrowChain
     from interlock.engine import EscrowEngine
-    from interlock.wiring import open_anchor, open_substrate
+    from interlock.wiring import live_keyring, open_anchor, open_substrate
 
     settings = config.engine
 
@@ -267,7 +269,9 @@ def _engines(
                 receipts=shared.get(),
                 sinks=config.sink_registry() if config.sinks else None,
                 windows=config.windows,
-                inbox=config.inbox_keyring(),
+                # An inbox key registered while the engine runs verifies the
+                # facts it attests (docs/EPIC8_DESIGN.md §3).
+                inbox=live_keyring(config, "inbox"),
             )
         except BaseException:
             close()
@@ -328,12 +332,15 @@ def _relays(config: InterlockConfig, key: Any) -> list[Service]:
         raise SubstrateConfigurationError(
             "no database for the relay: set [relay] database, or INTERLOCK_RELAY_DATABASE"
         )
-    signer = relay_signer(config, key)
+    relay_signer(config, key)  # a key that cannot be used stops the daemon now
     relay_adapters(settings)  # the credentials are there, or the daemon does not start
 
     def open_relay() -> tuple[Relay, Callable[[], None]]:
         from interlock.sqlite_outbox import SqliteOutboxStore
 
+        # The key the configuration points at now: a new version at the key
+        # service, or a new file (docs/EPIC8_DESIGN.md §3).
+        signer = relay_signer(config, key)
         breaker: Any = (
             LedgerBreaker.open(settings.ledger, schema=settings.ledger_schema)
             if settings.breaker == "agentgov" and settings.ledger is not None
@@ -371,21 +378,25 @@ def _relays(config: InterlockConfig, key: Any) -> list[Service]:
 
 def _inbox(config: InterlockConfig, key: Any, listen: str | None) -> Service:
     from interlock.inbox import Inbox
-    from interlock.wiring import inbox_signer, inbox_store
+    from interlock.wiring import inbox_signer, inbox_store, live_keyring
 
     settings = config.inbox
-    relays = config.relay_keyring()
-    if relays is None:
+    if live_keyring(config, "relay") is None:
         raise SubstrateConfigurationError(
             "an inbox binds an event only to a delivery a registered relay attested: "
             "register the relays' keys in [relays.keys]"
         )
-    signer = inbox_signer(config, key)
+    inbox_signer(config, key)  # a key that cannot be used stops the daemon now
     host, _, port = (listen or settings.listen).rpartition(":")
     if not host or not port.isdigit():
         raise SubstrateConfigurationError(f"listen is HOST:PORT, not {listen or settings.listen!r}")
 
     def open_inbox() -> tuple[Inbox, Callable[[], None]]:
+        # The key the configuration points at now, and the relays' keys the
+        # operator log registers (docs/EPIC8_DESIGN.md §3).
+        signer = inbox_signer(config, key)
+        relays = live_keyring(config, "relay")
+        assert relays is not None  # the configuration's keys are there still
         store, close = inbox_store(config, None)
         return (
             Inbox(
@@ -415,9 +426,9 @@ def _settler(
     governors: _Governors,
 ) -> Service:
     from interlock.settlement import Settler
+    from interlock.wiring import live_keyring
 
-    relays = config.relay_keyring()
-    if relays is None:
+    if live_keyring(config, "relay") is None:
         raise SubstrateConfigurationError(
             "the settler holds every delivery to a registered relay's attestation: register "
             "the relays' keys in [relays.keys]"
@@ -460,6 +471,8 @@ def _settler(
             operators = config.operators
             receipts = shared.get()
             assert receipts is not None  # [receipts] is configured: the settler is built
+            relays = live_keyring(config, "relay")
+            assert relays is not None  # the configuration's keys are there still
             settler = Settler(
                 outbox,
                 receipts=receipts,
@@ -479,12 +492,13 @@ def _settler(
 
 
 def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
-    from interlock.operators import OperatorLog, load_key
+    from interlock.operators import OperatorLog
     from interlock.vacuum import Vacuum
-    from interlock.wiring import compactor
+    from interlock.wiring import RefusedError, compactor, live_keyring, operator_signer
 
     operators = config.operators
-    relays = config.relay_keyring()
+    relays = live_keyring(config, "relay")
+    inbox = live_keyring(config, "inbox")
     vacuum = config.vacuum
     if operators is None or operators.ledger is None:
         raise SubstrateConfigurationError(
@@ -496,19 +510,20 @@ def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
             "a vacuum prunes only what verifies, relays' attestations included: register "
             "their keys in [relays.keys]"
         )
-    assert vacuum.key is not None and vacuum.every is not None
-    signer = load_key(vacuum.key)
-    if signer.key_id not in operators.keyring():
-        raise SubstrateConfigurationError(
-            f"the vacuum's key {signer.key_id} is no registered operator's: register it in "
-            f'[operators.keys], as "{signer.public_key().spec()}"'
-        )
+    assert vacuum.every is not None
+    try:  # a key that cannot be used stops the daemon now
+        operator_signer(config, vacuum.signer, vacuum.key, part="vacuum")
+    except RefusedError as exc:
+        raise SubstrateConfigurationError(str(exc)) from exc
     # One governor for every run, caught up at the start of each: opening one
     # reads the whole ledger, which grows with every plan.
     kept = _Kept(lambda: governors.open(str(operators.ledger)))
 
     @contextlib.contextmanager
     def open_vacuum() -> Iterator[Vacuum]:
+        # Each run signs with the key the configuration points at then
+        # (docs/EPIC8_DESIGN.md §3).
+        signer = operator_signer(config, vacuum.signer, vacuum.key, part="vacuum")
         governor = kept.get()
         governor.refresh()
         source, close = compactor(config, vacuum.database or None)
@@ -531,7 +546,7 @@ def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
                     retain=vacuum.retain,
                     margin=vacuum.margin,
                     archive=vacuum.archive,
-                    inbox=config.inbox_keyring(),
+                    inbox=inbox,
                 )
             finally:
                 log.close()

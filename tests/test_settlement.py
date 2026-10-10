@@ -833,3 +833,36 @@ def test_a_delivery_waits_for_its_plans_action_receipt(
     report = bench.settler().settle()
     assert (report.settled, report.receipts, report.problems) == ((booked,), 1, ())
     assert settlements(bench)[booked].receipt_id is not None
+
+
+def test_a_delivery_attested_after_its_relays_key_was_revoked_is_never_settled(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``docs/EPIC8_DESIGN.md`` §2.3: a revoked relay key's deliveries settle
+    as its revocation sealed them. One written after, around the database, is
+    never settled; settled around the settler, verification names it."""
+    from tests.outbox_env import relay_signer
+    from tests.test_attestations import signature_json, statement
+
+    relay = relay_signer()
+    roots = {
+        "relay": {"relay": relay.public_key().spec()},
+        "inbox": {},
+        "operator": {"ops": bench.outbox.operator_key("ops").public_key().spec()},
+    }
+    sealed = bench.book(1)
+    bench.deliver()
+    with bench.outbox.signed("ops") as operator:
+        operator.revoke_key("relay", relay.key_id, reason="rotated", roots=roots)
+    forged = bench.book(2)
+    ghost(bench.outbox, forged, signature_json(statement(bench.outbox, forged, attempt=1), relay))
+    report = bench.settler().settle()
+    assert report.settled == (sealed,)
+    (problem,) = report.problems
+    assert f"message {forged}" in problem and "its revocation did not seal it" in problem
+    # Settled anyway, past the settler's own check: verification names it.
+    with monkeypatch.context() as patched:
+        patched.setattr(Keyring, "refusal", lambda self, *args: None)
+        assert bench.settler().settle().settled == (forged,)
+    found = verify_settlements(bench.source(), log=bench.log, relays=RELAYS)
+    assert any("its delivery" in p and "did not seal it" in p for p in found), found

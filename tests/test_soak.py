@@ -1,7 +1,9 @@
 """The soak (``docs/EPIC6_DESIGN.md`` §3), scaled down to half a minute of load:
 ``scripts/live_stress_test.py`` runs the whole daemon against the test
-PostgreSQL, and every claim it proves must hold. Run for minutes, it is the
-same script (``uv run python scripts/live_stress_test.py --docker``)."""
+PostgreSQL, its relays, inbox and vacuum signing through a key service, the
+relays' key rotated halfway (``docs/EPIC8_DESIGN.md`` §5); and every claim it
+proves must hold. Run for minutes, it is the same script
+(``uv run python scripts/live_stress_test.py --docker``)."""
 
 from __future__ import annotations
 
@@ -44,10 +46,12 @@ def test_the_daemon_under_load_holds_every_claim(
             "0.5",
             "--agents",
             "2",
+            # Enough plans in flight on enough engines that some lose a race
+            # for a hot row in half a minute: the claims want one retried.
             "--concurrency",
-            "3",
+            "4",
             "--workers",
-            "3",
+            "4",
             "--relays",
             "2",
             "--tenants",
@@ -76,4 +80,5 @@ def test_the_daemon_under_load_holds_every_claim(
         "shutdown is graceful",
         "trace context survives",
         "metrics agree",
+        "keys rotate",
     }

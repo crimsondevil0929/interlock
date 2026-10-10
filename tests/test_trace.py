@@ -529,11 +529,11 @@ def test_a_sqlite_outbox_of_version_5_is_upgraded_in_place(tmp_path: Path) -> No
         conn.execute("DROP TABLE _interlock_outbox_traces")
         conn.commit()
         assert installed_version(conn) == 5
-    with pytest.raises(SubstrateConfigurationError, match="upgrade it in place to version 6"):
+    with pytest.raises(SubstrateConfigurationError, match="upgrade it in place to version 7"):
         SqliteOutboxStore(path)
     install_sqlite_outbox(path, RELAY_SINKS)
     with closing(sqlite3.connect(path)) as conn:
-        assert installed_version(conn) == 6
+        assert installed_version(conn) == 7
     SqliteOutboxStore(path).close()
 
 
@@ -547,7 +547,7 @@ def test_a_postgresql_install_of_version_5_is_upgraded_in_place(outbox: Outbox) 
         assert pg_version(conn) == 5
     outbox.reinstall(RELAY_SINKS)
     with outbox.admin() as conn:
-        assert pg_version(conn) == 6
+        assert pg_version(conn) == 7
     _, (message,) = outbox.commit(mail(1), traceparent=TP)
     assert traces(outbox) == {message: TP}
 

@@ -39,6 +39,13 @@ them, bounds them and stops them::
   closed. Nothing is cut in half: a stage, a delivery, a webhook being recorded
   and a vacuum each finish or never start. A second signal skips the drains,
   and gives the closes :data:`CLOSE_GRACE` seconds.
+- **Reload** (:meth:`InterlockSupervisor.reload`, or ``SIGHUP``): every service
+  finishes its step and opens again (``docs/EPIC8_DESIGN.md`` §3), so the relays
+  and the inbox sign with the key their configuration points at then. The inbox
+  opens again behind its listener, which never closes. The settler, the vacuum
+  and the metrics endpoint have nothing to open again: the vacuum opens its key
+  at each run, and every part holds rows to keyrings that follow the operator
+  log as it runs. Engines and agents are untouched.
 """
 
 from __future__ import annotations
@@ -174,6 +181,14 @@ class Service:
     def close(self) -> None:
         """Release what :meth:`open` acquired. Idempotent."""
 
+    def reopen(self) -> None:
+        """At a reload (:meth:`InterlockSupervisor.reload`), between two steps:
+        open again, with what the configuration points at now. Closes, then
+        opens, unless overridden. What it raises fails the service as a step
+        that raises does: it is closed, and opened again after the backoff."""
+        self.close()
+        self.open()
+
 
 # --------------------------------------------------------------------------
 # the services
@@ -256,6 +271,7 @@ class InboxService(Service):
         self._inbox: Inbox | None = None
         self._close_store: Callable[[], None] | None = None
         self._server: InboxServer | None = None
+        self._receiver: _CountingInbox | None = None
         self._health: Callable[[], tuple[int, Mapping[str, Any]]] | None = None
         self.port: int | None = None
         """The port bound, once open: the one asked for, or the one chosen
@@ -279,6 +295,23 @@ class InboxService(Service):
         # The port chosen is kept: a restart binds the same one.
         self._port = self.port
         self._inbox, self._close_store, self._server = inbox, close_store, server
+        self._receiver = counting
+
+    def reopen(self) -> None:
+        """A new inbox behind the listener, which never closes: a webhook it
+        took is answered by the inbox that took it, every later one by the
+        new, and the old one's store is closed once the last it took is
+        answered. One that cannot open fails the service, as at any reopen."""
+        counting = self._receiver
+        if self._server is None or counting is None:
+            super().reopen()
+            return
+        inbox, close_store = self._open_inbox()
+        counting.swap(inbox)
+        close, self._close_store = self._close_store, close_store
+        self._inbox = inbox
+        if close is not None:
+            close()
 
     def step(self) -> float:
         assert self._inbox is not None
@@ -297,6 +330,7 @@ class InboxService(Service):
             server.stop()
         close, self._close_store = self._close_store, None
         self._inbox = None
+        self._receiver = None
         if close is not None:
             close()
 
@@ -305,19 +339,40 @@ class _CountingInbox:
     """An inbox that counts what its server answered, and the trace context
     each webhook it took carried: an unverified request's headers are
     anyone's. A source the inbox does not have is counted as ``_unknown``:
-    the path names it, and the path is the sender's."""
+    the path names it, and the path is the sender's.
 
-    __slots__ = ("_inbox", "_max_body", "_service")
+    The inbox behind it can be swapped (:meth:`swap`) while its server runs."""
+
+    __slots__ = ("_flight", "_inbox", "_max_body", "_service", "_turn")
 
     def __init__(self, inbox: Inbox, service: Service) -> None:
         self._inbox = inbox
         self._service = service
         self._max_body = inbox._max_body
+        self._turn = threading.Condition()
+        self._flight: Counter[int] = Counter()
+        """Webhooks being answered, by the inbox answering them."""
+
+    def swap(self, inbox: Inbox) -> None:
+        """Answer every later webhook with ``inbox``; return once every one the
+        inbox before it took is answered."""
+        with self._turn:
+            before, self._inbox = self._inbox, inbox
+            self._turn.wait_for(lambda: not self._flight[id(before)])
+            del self._flight[id(before)]
 
     def receive(self, name: str, headers: Mapping[str, str], body: bytes) -> Any:
-        response = self._inbox.receive(name, headers, body)
+        with self._turn:
+            inbox = self._inbox
+            self._flight[id(inbox)] += 1
+        try:
+            response = inbox.receive(name, headers, body)
+        finally:
+            with self._turn:
+                self._flight[id(inbox)] -= 1
+                self._turn.notify_all()
         self._service.count(f"answered_{response.status}")
-        source = name if name in self._inbox._sources else "_unknown"
+        source = name if name in inbox._sources else "_unknown"
         metrics = self._service.metrics
         metrics.inc("interlock_webhooks_total", source=source, status=str(response.status))
         if response.status == 200:
@@ -382,6 +437,13 @@ class SettlerService(Service):
         if close is not None:
             close()
 
+    def reopen(self) -> None:
+        """Nothing to open again at a reload: the settler signs through the
+        receipt log, which a reload does not rotate, and holds deliveries to a
+        keyring that follows the operator log as it runs. Its governor is
+        kept: one opens under the ledger's writer lock, every engine waiting
+        while it reads the whole ledger."""
+
 
 class VacuumService(Service):
     """A vacuum every ``every`` seconds (``docs/EPIC5_DESIGN.md`` §1). Each run
@@ -435,6 +497,12 @@ class VacuumService(Service):
     def close(self) -> None:
         if self._close is not None:
             self._close()
+
+    def reopen(self) -> None:
+        """Nothing to open again at a reload: each run opens its key, its log
+        and its keyrings as they are then. The governor the runs share is
+        kept: one opens under the ledger's writer lock, every engine waiting
+        while it reads the whole ledger."""
 
 
 class MetricsService(Service):
@@ -522,6 +590,10 @@ class MetricsService(Service):
         server, self._server = self._server, None
         if server is not None:
             server.stop()
+
+    def reopen(self) -> None:
+        """It signs nothing and holds no row to a key: a reload leaves the
+        endpoint as it is, scraped through it."""
 
 
 # --------------------------------------------------------------------------
@@ -781,6 +853,11 @@ class _Running:
     service: Service
     executor: concurrent.futures.ThreadPoolExecutor
     stop: asyncio.Event = field(default_factory=asyncio.Event)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    """Set to end a wait between steps: at a stop, and at a reload."""
+    reloads: list[asyncio.Future[str | None]] = field(default_factory=list)
+    """Reloads asked for and not yet done: each answered with ``None``, or
+    why the service could not open again."""
     opened_once: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
     state: str = STARTING
@@ -790,6 +867,12 @@ class _Running:
     failures: int = 0
     streak: int = 0
     last_error: str | None = None
+
+
+def _signals() -> tuple[signal.Signals, ...]:
+    """The signals :meth:`InterlockSupervisor.run` handles, where they exist."""
+    hangup = (signal.SIGHUP,) if hasattr(signal, "SIGHUP") else ()
+    return (signal.SIGTERM, signal.SIGINT, *hangup)
 
 
 class InterlockSupervisor:
@@ -843,6 +926,8 @@ class InterlockSupervisor:
         self._engine_error: str | None = None
         self._finished = threading.Event()
         self._busy = 0
+        self._reloaded: list[Callable[[Mapping[str, str | None]], None]] = []
+        self._signalled: set[asyncio.Task[None]] = set()
         self.metrics = metrics if metrics is not None else Metrics()
         """What every part measures into."""
         self.metrics.collect(self._collect)
@@ -876,13 +961,19 @@ class InterlockSupervisor:
         what they share, such as the receipt log."""
         self._closers.append(close)
 
+    def on_reload(self, reloaded: Callable[[Mapping[str, str | None]], None]) -> None:
+        """Call ``reloaded`` with what each reload a ``SIGHUP`` asked for did
+        (:meth:`reload`'s answer), on the loop."""
+        self._reloaded.append(reloaded)
+
     # -- running ----------------------------------------------------------
 
     async def run(self, *, handle_signals: bool = False) -> None:
         """Start everything, run until :meth:`stop`, then shut down in order.
 
         :param handle_signals: Stop on ``SIGTERM`` or ``SIGINT``, and skip the
-            remaining drains on a second. Main thread only.
+            remaining drains on a second; reload on ``SIGHUP``, where there is
+            one. Main thread only.
         :raises Exception: What opening the engines raised: nothing else is
             started then.
         """
@@ -902,9 +993,39 @@ class InterlockSupervisor:
                 await self._shutdown()
             finally:
                 if handle_signals:
-                    for signum in (signal.SIGTERM, signal.SIGINT):
+                    for signum in _signals():
                         loop.remove_signal_handler(signum)
                 self._finished.set()
+
+    async def reload(self) -> dict[str, str | None]:
+        """Open every service again (``docs/EPIC8_DESIGN.md`` §3), each between
+        two of its steps: a relay, the inbox and the vacuum sign with the key
+        their configuration points at then, and every part holds rows to the
+        keys the operator log trusts then. A service backing off is opened at
+        once. Engines, agents and a service already stopping are untouched.
+
+        On the supervisor's loop; from another thread, through :meth:`call`.
+
+        :returns: Each service reloaded, by name: ``None`` when it opened
+            again, or why it could not, as ``Type: message``. One that could
+            not is backing off, as after any failure.
+        :raises SupervisorStoppedError: If the supervisor is not running, or
+            is stopping.
+        """
+        if self._loop is None or self._stop is None or self._stop.is_set():
+            raise SupervisorStoppedError("the supervisor is not running")
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("reload() runs on the supervisor's loop: use call()")
+        asked: dict[str, asyncio.Future[str | None]] = {}
+        for name, running in self._running.items():
+            if running.stop.is_set():
+                continue
+            asked[name] = self._loop.create_future()
+            running.reloads.append(asked[name])
+            running.wake.set()
+        if asked:
+            await asyncio.wait(asked.values())
+        return {name: future.result() for name, future in asked.items()}
 
     async def ready(self) -> None:
         """Wait until the engines are open and every service has opened once
@@ -943,8 +1064,32 @@ class InterlockSupervisor:
                 logger.info("signal received: shutting down")
                 self.stop()
 
+        def on_hangup() -> None:
+            logger.info("SIGHUP received: reloading every service")
+            task = loop.create_task(self._reload_signalled())
+            self._signalled.add(task)
+            task.add_done_callback(self._signalled.discard)
+
         for signum in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(signum, on_signal)
+        if hasattr(signal, "SIGHUP"):
+            loop.add_signal_handler(signal.SIGHUP, on_hangup)
+
+    async def _reload_signalled(self) -> None:
+        try:
+            outcome = await self.reload()
+        except SupervisorStoppedError:  # a hangup during the shutdown
+            return
+        for name, error in sorted(outcome.items()):
+            if error is None:
+                logger.info("reload: %s opened again", name)
+            else:
+                logger.warning("reload: %s could not open again: %s", name, error)
+        for reloaded in self._reloaded:
+            try:
+                reloaded(outcome)
+            except Exception:
+                logger.exception("a reload's callback failed")
 
     async def _start(self) -> None:
         assert self._loop is not None and self._ready is not None
@@ -1053,10 +1198,60 @@ class InterlockSupervisor:
     # -- the services ------------------------------------------------------
 
     async def _service_loop(self, running: _Running) -> None:
+        try:
+            await self._serve(running)
+        finally:
+            # A reload asked for as the service stopped: it opens no more.
+            for asked in running.reloads:
+                if not asked.done():
+                    asked.set_result("Stopped: the service stopped before it opened again")
+            running.reloads.clear()
+
+    async def _reopen(self, running: _Running) -> None:
+        """The reloads asked for: the service opened again, between steps."""
+        assert self._loop is not None
+        asked, running.reloads = running.reloads, []
+        service = running.service
+        running.streak = 0
+        try:
+            running.state = STARTING
+            if running.opened:
+                await self._loop.run_in_executor(running.executor, service.reopen)
+            else:
+                await self._loop.run_in_executor(running.executor, service.open)
+                running.opened = True
+                running.opened_once.set()
+        except Exception as exc:
+            for each in asked:
+                if not each.done():
+                    each.set_result(f"{type(exc).__name__}: {exc}")
+            raise
+        service.count("reloads")
+        for each in asked:
+            if not each.done():
+                each.set_result(None)
+
+    async def _serve(self, running: _Running) -> None:
         assert self._loop is not None
         service = running.service
+        # When the next step is due: at the pace the last one asked for, or
+        # after a failure's backoff. A reload does not move it.
+        due = 0.0
         while not running.stop.is_set():
+            rest = due - time.monotonic()
+            if rest > 0 and not running.reloads:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(running.wake.wait(), timeout=rest)
+                running.wake.clear()
+                continue
+            running.wake.clear()
             try:
+                if running.reloads:
+                    opened = running.opened
+                    await self._reopen(running)
+                    if opened and due > time.monotonic():
+                        running.state = RUNNING
+                        continue
                 if not running.opened:
                     running.state = STARTING
                     await self._loop.run_in_executor(running.executor, service.open)
@@ -1077,6 +1272,8 @@ class InterlockSupervisor:
                 running.steps += 1
                 running.streak = 0
             except Exception as exc:
+                # Backing off from the moment it failed: closing is part of it.
+                running.state = BACKING_OFF
                 running.failures += 1
                 running.streak += 1
                 running.last_error = f"{type(exc).__name__}: {exc}"
@@ -1090,11 +1287,8 @@ class InterlockSupervisor:
                     except Exception:
                         logger.exception("%s: closing after a failure failed", service.name)
                 running.opened_once.set()
-                running.state = BACKING_OFF
                 delay = min(self._restart_max, self._restart_min * 2 ** (running.streak - 1))
-            if delay > 0:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(running.stop.wait(), timeout=delay)
+            due = time.monotonic() + delay
 
     # -- agents --------------------------------------------------------------
 
@@ -1198,6 +1392,7 @@ class InterlockSupervisor:
             for running in group:
                 running.state = STOPPING
                 running.stop.set()
+                running.wake.set()
             await self._wait([r.task for r in group if r.task is not None], "the services")
             for running in group:
                 # A service still in its step is not drained: the drain would

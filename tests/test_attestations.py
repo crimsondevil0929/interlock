@@ -411,7 +411,7 @@ def test_the_relay_command_starts_only_with_a_registered_key(
     # A key that cannot be read.
     path.write_text(config + f"\n[relays.keys]\n{line}\n")
     code, _ = cli("relay", "--config", str(path), "--once", "--key", str(tmp_path / "nope.key"))
-    assert code == 2 and "cannot read the relay key" in capsys.readouterr().err
+    assert code == 2 and "cannot open the relay key" in capsys.readouterr().err
 
     # Registered: it delivers, and every outcome is its.
     code, out = cli("relay", "--config", str(path), "--once")

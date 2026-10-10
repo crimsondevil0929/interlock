@@ -232,6 +232,74 @@ def charge(ctx: AgentContext) -> Any:
     )
 
 
+def test_the_daemon_signs_with_every_key_at_a_signing_service(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay, the inbox, the vacuum and the receipt log each sign through a
+    key service (docs/EPIC8_DESIGN.md §1): no key file is left to read."""
+    from tests.fakekms import FakeKms
+
+    base = site.path.parent
+    parts = ("relay", "inbox", "vacuum", "receipts")
+    kms = FakeKms(token="daemon-kms-token")
+    monkeypatch.setenv("DAEMON_KMS_TOKEN", "daemon-kms-token")
+    text = site.path.read_text()
+    for name in parts:
+        key_file = base / f"{name}.key"
+        kms.create(name, bytes.fromhex(key_file.read_text().strip()))
+        key_file.unlink()
+        text = text.replace(f'key = "{name}.key"', f'signer = "{name}"').replace(
+            "[daemon]",
+            f'[signers.{name}]\ntype = "http"\nurl = "{kms.url}"\nkey = "{name}"\n'
+            f'token_env = "DAEMON_KMS_TOKEN"\n\n[daemon]',
+        )
+    site.path.write_text(text)
+    config = site.config
+    assert {config.signers[n].key for n in parts} == set(parts)
+    charged: list[StageResult] = []
+
+    async def agent(ctx: AgentContext) -> None:
+        charged.append(await ctx.execute(charge(ctx)))
+        while not ctx.stopping:
+            await ctx.sleep(0.05)
+
+    supervisor = build_supervisor(config, Application(checkers=[BlastRadius(5)], agents=[agent]))
+
+    async def run() -> None:
+        running = asyncio.create_task(supervisor.run())
+        await asyncio.wait_for(supervisor.ready(), 30)
+        inbox = supervisor.inbox_port
+        assert inbox is not None
+        await until(lambda: supervisor.status()["settler"].counters.get("receipts", 0) == 1)
+        (intent,) = site.stripe.of("payment_intent")
+        event = {
+            "id": "evt_1",
+            "object": "event",
+            "type": "payment_intent.succeeded",
+            "data": {"object": {**intent, "status": "succeeded"}},
+        }
+        # Recorded, so attested. (Its fact may not be: the vacuum, every second
+        # with no retention, may have pruned the payment by now.)
+        status, answer = await asyncio.to_thread(post, inbox, stripe_webhook(event))
+        assert status == 200 and answer["recorded"] == 1
+        await until(lambda: supervisor.status()["vacuum"].counters.get("applied", 0) >= 1)
+        supervisor.stop()
+        await running
+
+    try:
+        asyncio.run(run())
+    finally:
+        kms.close()
+    assert [r.committed for r in charged] == [True]
+    # Every signature came from the service: the outcome, the event, both
+    # receipts, and the vacuum's intent and outcome.
+    assert kms.signed[("relay", 1)] >= 1
+    assert kms.signed[("inbox", 1)] >= 1
+    assert kms.signed[("receipts", 1)] >= 2
+    assert kms.signed[("vacuum", 1)] >= 2
+    assert not [n for n in parts if (base / f"{n}.key").exists()]
+
+
 def test_every_part_runs_as_the_configuration_says(site: Site) -> None:
     results: list[StageResult] = []
 
@@ -645,3 +713,391 @@ def test_interlock_daemon_serves_metrics_where_asked(site: Site) -> None:
         "vacuum",
         "metrics",
     }
+
+
+def test_an_operator_signs_through_a_signing_service(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from interlock.records import read_records
+    from tests.fakekms import FakeKms
+
+    base = site.path.parent
+    with FakeKms(token="ops-token") as kms:
+        key = kms.create("ops", bytes.fromhex((base / "vacuum.key").read_text().strip()))
+        monkeypatch.setenv("OPS_KMS_TOKEN", "ops-token")
+        site.path.write_text(
+            site.path.read_text().replace(
+                "[daemon]",
+                f'[signers.ops]\ntype = "http"\nurl = "{kms.url}"\nkey = "ops"\n'
+                f'token_env = "OPS_KMS_TOKEN"\n\n[daemon]',
+            )
+        )
+        config = str(site.path)
+        before = len(read_records(base / "operators.ilok1"))
+        assert main(["install", "--config", config, "--signer", "ops"], out=io.StringIO()) == 0
+        records = read_records(base / "operators.ilok1")
+        assert len(records) == before + 1 and records[-1].key_id == key.key_id
+        assert kms.signed[("ops", 1)] == 1
+        both = ["install", "--config", config, "--signer", "ops", "--key", str(base / "vacuum.key")]
+        assert main(both, out=io.StringIO()) != 0
+        assert main(["install", "--config", config, "--signer", "nobody"], out=io.StringIO()) != 0
+        assert kms.signed[("ops", 1)] == 1
+
+
+def test_keys_are_listed_registered_and_revoked_from_the_command_line(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``interlock keys`` (docs/EPIC8_DESIGN.md §2): a relay key rotated, its
+    successor's public half read from the key service, and verified after."""
+    from tests.fakekms import FakeKms
+
+    base = site.path.parent
+    config = str(site.path)
+    operator_key = ["--key", str(base / "vacuum.key")]
+    old = load_config(site.path).relay_keyring()
+    assert old is not None
+    (old_id,) = old.ids()
+
+    def run(*argv: str) -> tuple[int, str]:
+        out = io.StringIO()
+        code = main([*argv, "--config", config], out=out)
+        return code, out.getvalue()
+
+    code, listed = run("keys", "list")
+    assert code == 0
+    assert f"relay     relay                {old_id}  configured; trusted" in listed
+    with FakeKms() as kms:
+        new = kms.create("relay-2")
+        site.path.write_text(
+            site.path.read_text().replace(
+                "[daemon]",
+                f'[signers.relay-2]\ntype = "http"\nurl = "{kms.url}"\nkey = "relay-2"\n\n[daemon]',
+            )
+        )
+        register = ["keys", "register", *operator_key, "--role", "relay", "--name", "relay-2"]
+        code, said = run(*register, "--public-of", "relay-2")
+        assert code == 0, said
+        assert f"relay key {new.key_id} registered as relay-2" in said
+        # Once is enough: under any name, for any role.
+        assert run(*register, "--public-of", "relay-2")[0] == 1
+        again = ["keys", "register", *operator_key, "--role", "inbox", "--name", "x"]
+        code, said = run(*again, "--public", new.public_key().spec())
+        assert code == 1 and "is a relay key already" in said
+        assert run(*register, "--public-of", "nobody")[0] == 2
+    revoke = ["keys", "revoke", *operator_key, "--role", "relay", old_id, "--reason", "rotated"]
+    code, said = run(*revoke)
+    assert code == 0, said
+    assert f"relay key {old_id} revoked; 0 rows sealed" in said
+    assert run(*revoke)[0] == 1
+    # The operator's own key, and the last one: nobody could sign again.
+    vacuum = load_config(site.path).operators
+    assert vacuum is not None
+    (operator_id,) = vacuum.keyring().ids()
+    code, said = run("keys", "revoke", *operator_key, "--role", "operator", operator_id)
+    assert code == 1 and "does not revoke their own key" in said
+    code, listed = run("keys", "list")
+    assert code == 0
+    assert f"{old_id}  configured; revoked " in listed and "0 rows sealed" in listed
+    assert f"relay-2              {new.key_id}  registered by operator record" in listed
+    code, verified = run("outbox", "verify")
+    assert code == 0, verified
+    assert "1 key(s) registered by operators; 1 revoked" in verified
+
+
+# --------------------------------------------------------------------------
+# keys rotated while the daemon runs (docs/EPIC8_DESIGN.md §2.6, §3)
+# --------------------------------------------------------------------------
+
+KMS_TOKEN = "daemon-kms-token"
+
+
+def at_key_service(
+    site: Site, kms: Any, parts: tuple[str, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``parts``' keys moved into ``kms``, their files deleted: each part signs
+    through a ``[signers.<part>]`` of its own."""
+    base = site.path.parent
+    monkeypatch.setenv("DAEMON_KMS_TOKEN", KMS_TOKEN)
+    text = site.path.read_text()
+    for name in parts:
+        key_file = base / f"{name}.key"
+        kms.create(name, bytes.fromhex(key_file.read_text().strip()))
+        key_file.unlink()
+        text = text.replace(f'key = "{name}.key"', f'signer = "{name}"').replace(
+            "[daemon]",
+            f'[signers.{name}]\ntype = "http"\nurl = "{kms.url}"\nkey = "{name}"\n'
+            f'token_env = "DAEMON_KMS_TOKEN"\n\n[daemon]',
+        )
+    site.path.write_text(text)
+
+
+def cli(site: Site, *argv: str) -> tuple[int, str]:
+    out = io.StringIO()
+    code = main([*argv, "--config", str(site.path)], out=out)
+    return code, out.getvalue()
+
+
+def as_operator(site: Site, *argv: str) -> tuple[int, str]:
+    """``interlock keys ...`` signed with the vacuum's key: the site's operator."""
+    return cli(site, *argv, "--key", str(site.path.parent / "vacuum.key"))
+
+
+def payment_succeeded(intent: dict[str, Any], n: int) -> tuple[dict[str, str], bytes]:
+    return stripe_webhook(
+        {
+            "id": f"evt_{n}",
+            "object": "event",
+            "type": "payment_intent.succeeded",
+            "data": {"object": {**intent, "status": "succeeded"}},
+        }
+    )
+
+
+def two_charges(charged: list[StageResult], second: threading.Event) -> Any:
+    """An agent charging once, and again once ``second`` is set."""
+
+    async def agent(ctx: AgentContext) -> None:
+        charged.append(await ctx.execute(charge(ctx)))
+        while not second.is_set() and not ctx.stopping:
+            await ctx.sleep(0.02)
+        if not ctx.stopping:
+            charged.append(await ctx.execute(charge(ctx)))
+        while not ctx.stopping:
+            await ctx.sleep(0.05)
+
+    return agent
+
+
+def test_a_reload_rotates_the_relay_and_inbox_keys_while_the_daemon_runs(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planned rotation (docs/EPIC8_DESIGN.md §2.6): new versions at the key
+    service, registered; a reload; the old keys revoked. Nothing is refused,
+    nothing stops, and what the old keys attested still verifies."""
+    from tests.fakekms import FakeKms
+
+    kms = FakeKms(token=KMS_TOKEN)
+    at_key_service(site, kms, ("relay", "inbox"), monkeypatch)
+    # The operator acts between the vacuum's runs: one as it starts, none after.
+    config = site.rewrite("every_seconds = 1\n", "every_seconds = 3600\n")
+    old = {"relay": kms.key("relay").key_id, "inbox": kms.key("inbox").key_id}
+    charged: list[StageResult] = []
+    second = threading.Event()
+    supervisor = build_supervisor(
+        config, Application(checkers=[BlastRadius(5)], agents=[two_charges(charged, second)])
+    )
+    told: dict[str, Any] = {}
+
+    def receipts() -> int:
+        return supervisor.status()["settler"].counters.get("receipts", 0)
+
+    async def run() -> None:
+        running = asyncio.create_task(supervisor.run())
+        await asyncio.wait_for(supervisor.ready(), 30)
+        await until(lambda: receipts() == 1)
+        # 1. A new version of each key at the service, registered: both trusted.
+        for role in ("relay", "inbox"):
+            kms.rotate(role)
+            register = ("keys", "register", "--role", role, "--name", f"{role}-2")
+            code, said = await asyncio.to_thread(as_operator, site, *register, "--public-of", role)
+            assert code == 0, said
+        # 2. Every part opens again, signing with the new keys; the inbox
+        # behind the listener it had, which never closed.
+        listening = supervisor._running["inbox"].service._server  # type: ignore[attr-defined]
+        told["reload"] = await supervisor.reload()
+        assert supervisor._running["inbox"].service._server is listening  # type: ignore[attr-defined]
+        # 3. The old keys revoked: what they attested, sealed.
+        for role, key_id in old.items():
+            revoke = ("keys", "revoke", "--role", role, key_id, "--reason", "rotated")
+            code, told[role] = await asyncio.to_thread(as_operator, site, *revoke)
+            assert code == 0, told[role]
+        second.set()
+        await until(lambda: receipts() == 2)
+        port = supervisor.inbox_port
+        assert port is not None
+        for n, intent in enumerate(site.stripe.of("payment_intent")):
+            # Bound to its delivery, the first's attested by the revoked key.
+            answered = await asyncio.to_thread(post, port, payment_succeeded(intent, n))
+            assert answered == (200, {"recorded": 1, "matched": 1}), answered
+        supervisor.stop()
+        await running
+
+    try:
+        asyncio.run(run())
+    finally:
+        kms.close()
+    assert [r.committed for r in charged] == [True, True]
+    assert told["reload"] == dict.fromkeys(("relay-0", "inbox", "settler", "vacuum"))
+    assert "; 1 rows sealed" in told["relay"] and "; 0 rows sealed" in told["inbox"]
+    # Each key signed only before its rotation, or only after.
+    assert kms.signed[("relay", 1)] == 1 and kms.signed[("relay", 2)] == 1
+    assert kms.signed[("inbox", 1)] == 0 and kms.signed[("inbox", 2)] == 4
+    status = supervisor.status()
+    assert all(s.failures == 0 for s in status.values()), status
+    assert status["relay-0"].counters["reloads"] == 1
+    # Everything verifies: the revoked keys' attestations under their seals.
+    code, verified = cli(site, "outbox", "verify")
+    assert code == 0, verified
+    assert "2 key(s) registered by operators; 2 revoked" in verified
+    code, verified = cli(site, "inbox", "verify")
+    assert code == 0, verified
+
+
+def test_a_part_whose_key_is_revoked_opens_again_with_the_key_it_is_given_now(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a compromise (docs/EPIC8_DESIGN.md §2.6) the old keys are revoked
+    with no reload. The relay's next claim and the inbox's next pass find
+    their keys revoked: each fails, and opens again with the key its service
+    serves then."""
+    from tests.fakekms import FakeKms
+
+    kms = FakeKms(token=KMS_TOKEN)
+    at_key_service(site, kms, ("relay", "inbox"), monkeypatch)
+    config = site.rewrite("every_seconds = 1\n", "every_seconds = 3600\n")
+    old = {"relay": kms.key("relay").key_id, "inbox": kms.key("inbox").key_id}
+    charged: list[StageResult] = []
+    second = threading.Event()
+    supervisor = build_supervisor(
+        config, Application(checkers=[BlastRadius(5)], agents=[two_charges(charged, second)])
+    )
+
+    def failed(name: str) -> bool:
+        status = supervisor.status()[name]
+        return status.failures >= 1 and status.state == "running"
+
+    async def run() -> None:
+        running = asyncio.create_task(supervisor.run())
+        await asyncio.wait_for(supervisor.ready(), 30)
+        await until(lambda: supervisor.status()["settler"].counters.get("receipts", 0) == 1)
+        for role in ("relay", "inbox"):
+            kms.rotate(role)
+            register = ("keys", "register", "--role", role, "--name", f"{role}-2")
+            code, said = await asyncio.to_thread(as_operator, site, *register, "--public-of", role)
+            assert code == 0, said
+            revoke = ("keys", "revoke", "--role", role, old[role], "--reason", "compromised")
+            code, said = await asyncio.to_thread(as_operator, site, *revoke)
+            assert code == 0, said
+        await until(lambda: failed("relay-0") and failed("inbox"))
+        second.set()
+        await until(lambda: supervisor.status()["settler"].counters.get("receipts", 0) == 2)
+        port = supervisor.inbox_port
+        assert port is not None
+        for n, intent in enumerate(site.stripe.of("payment_intent")):
+            answered = await asyncio.to_thread(post, port, payment_succeeded(intent, n))
+            assert answered == (200, {"recorded": 1, "matched": 1}), answered
+        supervisor.stop()
+        await running
+
+    try:
+        asyncio.run(run())
+    finally:
+        kms.close()
+    assert [r.committed for r in charged] == [True, True]
+    status = supervisor.status()
+    for name in ("relay-0", "inbox"):
+        assert (status[name].last_error or "").startswith("KeyRevokedError"), status[name]
+    assert kms.signed[("relay", 2)] == 1 and kms.signed[("inbox", 2)] == 4
+    assert cli(site, "outbox", "verify")[0] == 0
+    assert cli(site, "inbox", "verify")[0] == 0
+
+
+def test_interlock_daemon_reloads_on_sighup(site: Site, tmp_path: Path) -> None:
+    """A key file replaced, its new key registered, and ``SIGHUP``: the relay
+    opens again with it."""
+    site.rewrite("every_seconds = 1\n", "every_seconds = 3600\n")
+    daemon = Daemon(site.path)
+    try:
+        daemon.wait_for("interlock daemon running:")
+        fresh = generate_key(tmp_path / "relay-2.key")
+        os.replace(tmp_path / "relay-2.key", site.path.parent / "relay.key")
+        register = ("keys", "register", "--role", "relay", "--name", "relay-2")
+        code, said = as_operator(site, *register, "--public", fresh.public_key().spec())
+        assert code == 0, said
+        daemon.process.send_signal(signal.SIGHUP)
+        reloaded = daemon.wait_for("reloaded:")
+    finally:
+        code = daemon.stop()
+    assert code == 0, (daemon.lines, daemon.errors)
+    assert reloaded == "reloaded: inbox, relay-0, vacuum"
+    (relay,) = [line for line in daemon.lines if line.startswith("relay-0: stopped")]
+    assert "0 failure(s)" in relay and "reloads 1" in relay
+
+
+def test_a_key_registered_while_a_part_runs_is_trusted_at_its_first_use(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import interlock.wiring
+    from interlock.wiring import key_registry, live_keyring
+
+    reads: list[int] = []
+
+    def counted(config: InterlockConfig) -> Any:
+        reads.append(1)
+        return key_registry(config)
+
+    keyring = live_keyring(site.config, "relay")
+    assert keyring is not None
+    monkeypatch.setattr(interlock.wiring, "key_registry", counted)
+    fresh = generate_key(site.path.parent / "relay-2.key")
+    assert fresh.key_id not in keyring and len(reads) == 1
+    register = ("keys", "register", "--role", "relay", "--name", "relay-2")
+    assert as_operator(site, *register, "--public", fresh.public_key().spec())[0] == 0
+    reads.clear()
+    assert keyring.verifier(fresh.key_id) is not None
+    assert keyring.name(fresh.key_id) == "relay-2"
+    # An id no one registered: the log is read again only once it changed.
+    assert keyring.verifier("0123456789abcdef") is None
+    assert keyring.verifier("fedcba9876543210") is None
+    assert len(reads) == 1
+
+
+def test_a_revoked_key_is_refused_before_anything_starts(site: Site, tmp_path: Path) -> None:
+    from interlock.operators import load_key
+    from interlock.wiring import RefusedError, operator_signer
+
+    config = site.config
+    keyring = config.relay_keyring()
+    assert keyring is not None
+    (relay_id,) = keyring.ids()
+    code, said = as_operator(site, "keys", "revoke", "--role", "relay", relay_id)
+    assert code == 0, said
+    with pytest.raises(SubstrateConfigurationError, match="was revoked by operator record"):
+        build_supervisor(config)
+    assert cli(site, "relay", "--once")[0] == 2
+    # An operator's key, revoked by another operator.
+    ops = generate_key(tmp_path / "ops.key")
+    register = ("keys", "register", "--role", "operator", "--name", "ops")
+    assert as_operator(site, *register, "--public", ops.public_key().spec())[0] == 0
+    vacuum_id = load_key(tmp_path / "vacuum.key").key_id
+    revoke = ("keys", "revoke", "--role", "operator", vacuum_id, "--key", str(tmp_path / "ops.key"))
+    code, said = cli(site, *revoke)
+    assert code == 0, said
+    with pytest.raises(RefusedError, match=r"the vacuum.s key .* was revoked by operator record"):
+        operator_signer(config, None, tmp_path / "vacuum.key", part="vacuum")
+    assert operator_signer(config, None, tmp_path / "ops.key", part="vacuum").key_id == ops.key_id
+
+
+@pytest.mark.parametrize("part", ["relay", "inbox"])
+def test_a_standalone_part_whose_key_is_revoked_stops_and_says_so(
+    site: Site, part: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``interlock relay`` and ``interlock inbox serve``: a key revoked while
+    they run stops every worker, with exit status 3."""
+    site.rewrite("every_seconds = 1\n", "every_seconds = 3600\n")
+    config = site.config
+    keys = config.relay_keyring() if part == "relay" else config.inbox_keyring()
+    assert keys is not None
+    (key_id,) = keys.ids()
+    argv = ("relay",) if part == "relay" else ("inbox", "serve")
+    exited: list[int] = []
+    running = threading.Thread(target=lambda: exited.append(cli(site, *argv)[0]))
+    running.start()
+    try:
+        time.sleep(0.3)  # serving: claiming, or matching
+        assert as_operator(site, "keys", "revoke", "--role", part, key_id)[0] == 0
+        running.join(timeout=30)
+    finally:
+        assert not running.is_alive(), f"interlock {' '.join(argv)} did not stop"
+    assert exited == [3]
+    assert "was revoked" in capsys.readouterr().err

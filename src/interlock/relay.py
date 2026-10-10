@@ -53,7 +53,7 @@ from agentgov.receipts.canonical import canonical_bytes, loads_strict
 from agentgov.receipts.signing import Signer
 
 from interlock.anchor import _halted
-from interlock.exceptions import SubstrateUnavailableError
+from interlock.exceptions import KeyRevokedError, SubstrateUnavailableError
 from interlock.outbox_store import OutboxStore, PostgresOutboxStore
 from interlock.telemetry import Metrics, NullMetrics
 
@@ -513,7 +513,16 @@ class Relay:
         :raises SubstrateUnavailableError: If the database is lost. Leases
             held then run out, and another relay, or this one later, takes
             the messages over.
+        :raises KeyRevokedError: If this relay's key was revoked
+            (``docs/EPIC8_DESIGN.md`` §2.4): it claims nothing it could not
+            attest. A supervisor reopens it with the key it is given now.
         """
+        revoked = getattr(self._store, "revoked", None)
+        if revoked is not None and revoked(self._signer.key_id):
+            raise KeyRevokedError(
+                f"relay {self._relay_id}: its key {self._signer.key_id} was revoked; it claims "
+                f"nothing more"
+            )
         leases = self._claim(limit or self._batch)
         report = RelayReport(claimed=len(leases))
         for lease in leases:

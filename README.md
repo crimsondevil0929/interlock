@@ -1307,6 +1307,58 @@ attestation. They are the legacy set the install that brought version 4 recorded
 and the signed `interlock install` vouches for it: a row forged into an old log later is
 not in it, however early it is dated.
 
+### Keys held by a signing service
+
+A relay, the inbox, the vacuum and the receipt log can sign with a key a KMS, an HSM or
+Vault's transit engine holds: the process keeps the key's name, the version it pinned, the
+public half and a credential, and never the private key (`docs/EPIC8_DESIGN.md` §1).
+
+```toml
+[signers.relay]
+type = "http"                       # interlock.signers.HttpRemoteSigner's protocol
+url = "https://kms.internal:8200"
+key = "interlock-relay"             # the key's name at the service
+token_env = "INTERLOCK_KMS_TOKEN"   # its bearer token, read from the environment
+timeout_seconds = 5
+# version = 3                       # pinned; the service's latest when left out
+
+[relay]
+signer = "relay"                    # in place of key = "relay.key"
+```
+
+Every signature the service hands back is verified under the pinned key before it is
+used: a service that signs with another key or version, or answers with anything but a
+signature, fails the call, and nothing is attested. `sign_async` signs off the event loop.
+Operator commands take `--signer NAME` in place of `--key PATH`. An adapter for another
+service implements `RemoteSigner._remote_key` and `_remote_sign`.
+
+### Registering, revoking and rotating keys
+
+The operator log is the key registry and its revocation list (`docs/EPIC8_DESIGN.md` §2).
+An operator registers a key beside the configuration's; it is trusted from the next record
+on. Revoking one is an operator action in two phases, like every other. For a relay's or an
+inbox's key, the database records the revocation, in the transaction of the signed intent,
+and *seals* every row the key attested: the reference and hash of each. The applied record
+signs the seal's count and digest, anchored in AgentGov, and from then on the database
+refuses every row the key would attest. What the key attested before verifies as it always
+did, exactly as sealed: a row written around the refusal, or one of its rows rewritten, is
+named by `interlock outbox verify`.
+
+```bash
+interlock keys list --config interlock.toml
+interlock keys register --config interlock.toml --key ops.key --role relay --name east-2 \
+    --public-of relay                 # the version [signers.relay]'s service serves now
+interlock keys revoke --config interlock.toml --key ops.key --role relay 03dd37a92a71a9ba \
+    --reason "rotated"
+```
+
+A planned rotation: a new version at the key service; register it; reload the daemon
+(`kill -HUP`, or `await supervisor.reload()`), each part finishing its step and opening
+again with the key it is given now; then revoke the old one. Nothing is refused on the way.
+After a compromise, revoke first: a relay finds its key revoked before its next claim, the
+inbox at its next matching pass, and each opens again with the key its service serves
+then. An operator's key is revoked by another operator, never its own, and never the last.
+
 ### Settlement: delivery receipts, and credits for compensations
 
 The process that holds the receipt log and the ledger (the engine's) settles each
@@ -1531,7 +1583,10 @@ interlock daemon --config interlock.toml --app myapp.agents:build
 ```
 
 A plan that loses a race for a row or a window key is staged again, with jittered backoff.
-A part that fails is reopened after a backoff that doubles. `GET /healthz` on the inbox's
+A part that fails is reopened after a backoff that doubles. `SIGHUP` reloads it: the relays
+and the inbox finish their step and open again, signing with the key their configuration
+points at then, the inbox behind a listener that never closes; the vacuum opens its key at
+each run anyway; engines and agents run on. `GET /healthz` on the inbox's
 port answers `200` while every part runs, `503` otherwise, with each part's counters.
 `SIGTERM` stops it in order, every step bounded: the agents; the engines (queued plans run
 until the deadline, and a running stage always finishes); the inbox, then one last match;
@@ -1630,8 +1685,29 @@ order and one receipt per delivery; no forgery accepted; the vacuum keeping the 
 bounded as it runs; every verifier passing after; a graceful stop, a second daemon
 recovering nothing; every checkout's trace context carried to the payment API, onto its
 refund, back on the facts its webhooks became and on to the plans that consumed them,
-whatever the vendor sent; and the metrics, scraped every second, telling what the run
-counted itself. `tests/test_soak.py` runs it for half a minute in the test suite.
+whatever the vendor sent; the metrics, scraped every second, telling what the run
+counted itself; and keys that rotate under load. The relays, the inbox and the vacuum sign
+through a key service in the soak's process, and halfway through, the operator rotates the
+relays' key: a new version, registered; the daemon reloaded; the old key revoked while a
+stale relay still holding it has a call in flight. The database refuses that relay's
+outcome, another relay delivers its message once under the new key, and everything the old
+key attested before verifies under its seal. `tests/test_soak.py` runs it for half a minute
+in the test suite.
+
+### The security audit
+
+`scripts/security_audit.py` asks whether any sensitive value reaches a hash Interlock
+commits to (`docs/EPIC8_DESIGN.md` §4). On each store it runs one scenario through the
+daemon with canaries planted in a plan's trace context, the relay's API key, a webhook's
+body and headers, and its signing secret, and records the input of every SHA-256 and every
+signature Interlock and AgentGov compute. None may hold a sensitive value or its digest, but
+for the body's SHA-256, which the inbound event commits to; and only the columns made for
+one may hold one. It prints, column by column, what holds a sensitive value and which hash
+reads it:
+
+```bash
+uv run python scripts/security_audit.py --docker
+```
 
 ## Unrecorded writes
 

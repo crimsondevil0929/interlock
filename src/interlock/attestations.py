@@ -44,6 +44,7 @@ from interlock.deliveries import (
     consistent,
     reader,
 )
+from interlock.keys import outcome_ref, revocations_of
 from interlock.records import Keyring
 
 __all__ = ["AttestationReport", "attestation_of", "verify_attestations"]
@@ -128,6 +129,9 @@ def _verify_attestations(
             0,
         )
     messages, events = source_reader.snapshot(None)
+    # A revoked key's outcomes hold only as its revocation sealed them
+    # (docs/EPIC8_DESIGN.md §2.3).
+    relays = relays.with_revocations(revocations_of(source_reader))
     by_id: dict[uuid.UUID, LoggedMessage] = {m.message_id: m for m in messages}
     problems: list[str] = []
     mismatch = legacy.problem(recorded) if legacy is not None else None
@@ -171,6 +175,12 @@ def _verify_attestations(
                 f"{where} says what relay {relays.name(key_id)} never attested: the row or "
                 f"its request was written around Interlock"
             )
+            continue
+        refused = relays.refusal(
+            key_id, "outcome", outcome_ref(event.message_id, event.seq), event.event_hash
+        )
+        if refused is not None:
+            problems.append(f"{where}: {refused}")
             continue
         attested += 1
     if unvouched and legacy is None:

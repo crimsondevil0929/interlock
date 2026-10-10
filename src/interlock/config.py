@@ -183,6 +183,22 @@ vacuum, each part connecting as its own role::
     every_seconds = 15                # how often the database is sampled
     database = "postgresql://interlock_audit@db/app"  # an audit_roles role
 
+Every key a part signs with (``[relay]``, ``[inbox]``, ``[vacuum]``,
+``[receipts]``) may live in a key service instead of a file
+(``docs/EPIC8_DESIGN.md`` §1): name a ``[signers.<name>]`` with ``signer`` in
+place of ``key``::
+
+    [signers.relay-kms]
+    type = "http"                     # interlock.signers.HttpRemoteSigner's protocol
+    url = "https://kms.internal:8443"
+    key = "interlock-relay"           # the key's name at the service
+    token_env = "INTERLOCK_KMS_TOKEN" # the variable holding its credential
+    timeout_seconds = 5
+    # version = 3                     # pin a version; the latest when a part opens
+
+    [relay]
+    signer = "relay-kms"              # in place of key = "relay.key"
+
 ``database`` may be left out and given on the command line or in
 ``INTERLOCK_DATABASE`` instead, which keeps a password out of the file; the
 relay's in ``INTERLOCK_RELAY_DATABASE``, the inbox's in
@@ -197,13 +213,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
 from interlock.outbound import (
@@ -218,6 +235,9 @@ from interlock.outbound import (
 from interlock.records import Keyring
 from interlock.substrate import TableSpec
 from interlock.windows import Measure, Plans, RateWindow, Requests, RequestSum, RowSum
+
+if TYPE_CHECKING:
+    from interlock.signers import RemoteSigner
 
 __all__ = [
     "DATABASE_ENV",
@@ -235,6 +255,7 @@ __all__ = [
     "ReceiptsConfig",
     "RelayConfig",
     "SettlerConfig",
+    "SignerConfig",
     "VacuumConfig",
     "load_config",
 ]
@@ -248,6 +269,9 @@ METRICS_DATABASE_ENV = "INTERLOCK_METRICS_DATABASE"
 
 class ConfigError(ValueError):
     """The configuration file is missing, unreadable or malformed."""
+
+
+_SIGNER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def is_dsn(text: str) -> bool:
@@ -296,6 +320,53 @@ class RelayConfig:
     key: Path | None = None
     """This relay's own Ed25519 key file (``interlock keygen --role relay``),
     or ``INTERLOCK_RELAY_KEY``: it signs every outcome the relay records."""
+    signer: str | None = None
+    """In place of ``key``: the ``[signers.<name>]`` holding the relay's key."""
+
+
+@dataclass(frozen=True, slots=True)
+class SignerConfig:
+    """``[signers.<name>]``: a key a signing service holds, which a part signs
+    with in place of a key file (``docs/EPIC8_DESIGN.md`` §1.3).
+
+    :ivar type: ``http``, :class:`~interlock.signers.HttpRemoteSigner`'s
+        protocol.
+    :ivar url: The service.
+    :ivar key: The key's name at the service.
+    :ivar token_env: The environment variable holding the service's
+        credential, if it takes one. Never the file.
+    :ivar timeout: The most one request may take, in seconds.
+    :ivar version: The version to pin; the service's latest when a part opens
+        by default, so a part that reopens signs with a rotated key.
+    """
+
+    name: str
+    type: str
+    url: str
+    key: str
+    token_env: str | None = None
+    timeout: float = 5.0
+    version: int | None = None
+
+    def open(self) -> RemoteSigner:
+        """A signer for the key, its version pinned now.
+
+        :raises SignerUnavailableError: If the service cannot be reached, or
+            the credential's variable is not set.
+        """
+        from interlock.signers import HttpRemoteSigner, SignerUnavailableError
+
+        token = None
+        if self.token_env is not None:
+            token = os.environ.get(self.token_env)
+            if not token:
+                raise SignerUnavailableError(
+                    f"[signers.{self.name}]: {self.token_env} is not set, and the service's "
+                    f"credential comes from the environment only"
+                )
+        return HttpRemoteSigner(
+            self.url, self.key, token=token, timeout=self.timeout, version=self.version
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +406,7 @@ class VacuumConfig:
         ``""`` for the file's own.
     :ivar key: The operator key the daemon signs its vacuums with: one of
         ``[operators.keys]``, as accountable as any operator's.
+    :ivar signer: In place of ``key``: the ``[signers.<name>]`` holding it.
     """
 
     retain: timedelta = timedelta(days=30)
@@ -343,6 +415,7 @@ class VacuumConfig:
     every: timedelta | None = None
     database: str = ""
     key: Path | None = None
+    signer: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,13 +467,15 @@ class ReceiptsConfig:
 
     :ivar log: Its file.
     :ivar key: Its Ed25519 key's file (``interlock keygen``).
+    :ivar signer: In place of ``key``: the ``[signers.<name>]`` holding it.
     """
 
     log: Path
-    key: Path
+    key: Path | None = None
     log_id: str = "interlock-receipts"
     issuer: str = "interlock"
     policy_epoch: int = 0
+    signer: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +536,7 @@ class InboxConfig:
         configuration's own (SQLite) or ``INTERLOCK_INBOX_DATABASE``.
     :ivar key: The inbox's own key file (``interlock keygen --role inbox``),
         or ``INTERLOCK_INBOX_KEY``.
+    :ivar signer: In place of ``key``: the ``[signers.<name>]`` holding it.
     """
 
     sources: tuple[InboundSource, ...] = ()
@@ -471,6 +547,7 @@ class InboxConfig:
     max_body: int = MAX_BODY
     match_window: timedelta = timedelta(hours=1)
     match_every: timedelta = timedelta(seconds=5)
+    signer: str | None = None
 
     def keyring(self) -> Keyring | None:
         return None if self.keys is None else Keyring(self.keys)
@@ -508,9 +585,20 @@ class InterlockConfig:
     settler: SettlerConfig = SettlerConfig()
     daemon: DaemonConfig = DaemonConfig()
     metrics: MetricsConfig = MetricsConfig()
+    signers: Mapping[str, SignerConfig] = field(default_factory=dict)
+    """``[signers.<name>]``: keys signing services hold, by name."""
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
+
+    def key_roots(self) -> dict[str, dict[str, str]]:
+        """Each role's configured keys, by name: the roots the operator log's
+        registrations extend (``docs/EPIC8_DESIGN.md`` §2.1)."""
+        return {
+            "relay": dict(self.relays or {}),
+            "inbox": dict(self.inbox.keys or {}),
+            "operator": dict(self.operators.keys) if self.operators is not None else {},
+        }
 
     def inbox_keyring(self) -> Keyring | None:
         """``[inbox.keys]``, as an engine takes them: ``EscrowEngine(inbox=...)``."""
@@ -584,6 +672,7 @@ def load_config(
                 f"{label} are PostgreSQL roles; on SQLite the file's permissions bound who "
                 f"writes it instead"
             )
+    signers = _signers(raw.get("signers"))
     relay = _relay(raw.get("relay"), sinks, Path(path).parent)
     operators = _operators(raw.get("operators"), Path(path).parent)
     relays = _relays(raw.get("relays"))
@@ -591,6 +680,22 @@ def load_config(
     vacuum = _vacuum(raw.get("vacuum"), Path(path).parent)
     inbox = _inbox(raw.get("inbox"), Path(path).parent)
     engine = _engine(raw.get("engine"), Path(path).parent, substrate)
+    receipts = _receipts(raw.get("receipts"), Path(path).parent)
+    keyed: list[tuple[str, Path | None, str | None]] = [
+        ("inbox", inbox.key, inbox.signer),
+        ("vacuum", vacuum.key, vacuum.signer),
+    ]
+    if relay is not None:
+        keyed.append(("relay", relay.key, relay.signer))
+    if receipts is not None:
+        keyed.append(("receipts", receipts.key, receipts.signer))
+        if receipts.key is None and receipts.signer is None:
+            raise ConfigError("[receipts]: missing 'key' or 'signer': the log signs its receipts")
+    for section, key, signer in keyed:
+        if key is not None and signer is not None:
+            raise ConfigError(f"[{section}]: key or signer, not both")
+        if signer is not None and signer not in signers:
+            raise ConfigError(f"[{section}]: signer {signer!r} names no [signers.{signer}]")
     return InterlockConfig(
         substrate=substrate,
         database=url,
@@ -610,11 +715,53 @@ def load_config(
         inbox=inbox,
         inbox_roles=inbox_roles,
         engine=engine,
-        receipts=_receipts(raw.get("receipts"), Path(path).parent),
+        receipts=receipts,
         settler=_settler(raw.get("settler")),
         daemon=_daemon(raw.get("daemon")),
         metrics=_metrics(raw.get("metrics")),
+        signers=signers,
     )
+
+
+_SIGNER_KEYS = frozenset({"type", "url", "key", "token_env", "timeout_seconds", "version"})
+
+
+def _signers(raw: object) -> dict[str, SignerConfig]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("'signers' must be tables ([signers.<name>])")
+    signers: dict[str, SignerConfig] = {}
+    for name, entry in raw.items():
+        where = f"[signers.{name}]"
+        if not _SIGNER_NAME.fullmatch(str(name)):
+            raise ConfigError(f"{where}: a signer's name is letters, digits, '.', '_' and '-'")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} must be a table")
+        unknown = sorted(set(entry) - _SIGNER_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        kind = _string(entry, "type")
+        if kind != "http":
+            raise ConfigError(f"{where}: type is 'http', not {kind!r}")
+        url = _string(entry, "url")
+        if not url.startswith(("http://", "https://")):
+            raise ConfigError(f"{where}: url is http(s)://host[:port], not {url!r}")
+        version = None
+        if "version" in entry:
+            version = _integer(entry, "version", 0)
+            if version < 1:
+                raise ConfigError(f"{where}: version is a positive integer")
+        signers[name] = SignerConfig(
+            name=name,
+            type=kind,
+            url=url,
+            key=_string(entry, "key"),
+            token_env=_string(entry, "token_env", default="") or None,
+            timeout=_seconds(entry, "timeout_seconds", 5.0),
+            version=version,
+        )
+    return signers
 
 
 def _vacuum(raw: object, base: Path) -> VacuumConfig:
@@ -630,6 +777,7 @@ def _vacuum(raw: object, base: Path) -> VacuumConfig:
         "every_seconds",
         "database",
         "key",
+        "signer",
     }
     unknown = sorted(set(raw) - known)
     if unknown:
@@ -657,6 +805,7 @@ def _vacuum(raw: object, base: Path) -> VacuumConfig:
         every=timedelta(seconds=every) if every else None,
         database=_string(raw, "database", default=""),
         key=base / key if key else None,
+        signer=_string(raw, "signer", default="") or None,
     )
 
 
@@ -731,7 +880,7 @@ def _receipts(raw: object, base: Path) -> ReceiptsConfig | None:
         return None
     if not isinstance(raw, dict):
         raise ConfigError("'receipts' must be a table ([receipts])")
-    unknown = sorted(set(raw) - {"log", "key", "log_id", "issuer", "policy_epoch"})
+    unknown = sorted(set(raw) - {"log", "key", "signer", "log_id", "issuer", "policy_epoch"})
     if unknown:
         raise ConfigError(f"[receipts]: unknown key(s) {', '.join(unknown)}")
     epoch = _integer(raw, "policy_epoch", 0)
@@ -739,7 +888,8 @@ def _receipts(raw: object, base: Path) -> ReceiptsConfig | None:
         raise ConfigError("[receipts]: policy_epoch is not negative")
     return ReceiptsConfig(
         log=base / _string(raw, "log"),
-        key=base / _string(raw, "key"),
+        key=base / _string(raw, "key") if "key" in raw else None,
+        signer=_string(raw, "signer", default="") or None,
         log_id=_string(raw, "log_id", default="interlock-receipts"),
         issuer=_string(raw, "issuer", default="interlock"),
         policy_epoch=epoch,
@@ -803,6 +953,7 @@ def _daemon(raw: object) -> DaemonConfig:
 _INBOX_KEYS = frozenset(
     {
         "key",
+        "signer",
         "database",
         "listen",
         "max_body_bytes",
@@ -867,6 +1018,7 @@ def _inbox(raw: object, base: Path) -> InboxConfig:
         keys=keys,
         database=_string(raw, "database", default=""),
         key=base / key if key else None,
+        signer=_string(raw, "signer", default="") or None,
         listen=listen,
         max_body=max_body,
         match_window=timedelta(seconds=window),
@@ -1096,6 +1248,7 @@ def _relay(raw: object, sinks: tuple[SinkSpec, ...], base: Path) -> RelayConfig 
             batch=_integer(raw, "batch", 1),
             workers=_integer(raw, "workers", 1),
             key=base / _string(raw, "key") if "key" in raw else None,
+            signer=_string(raw, "signer", default="") or None,
         )
     except ConfigError as exc:
         raise ConfigError(f"[relay]: {exc}") from exc

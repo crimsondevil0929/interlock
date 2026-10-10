@@ -230,8 +230,8 @@ def test_version_5_over_version_4_on_postgres(
     install()
     install()
     with psycopg.connect(pg_back_office, autocommit=True) as conn:
-        # Over version 4, an install brings the current version: 5's, and 6's.
-        assert installer.installed_version(conn) == int(installer.INSTALL_VERSION) == 6
+        # Over version 4, an install brings the current version: 5's, 6's and 7's.
+        assert installer.installed_version(conn) == int(installer.INSTALL_VERSION) == 7
         assert (
             conn.execute(
                 "SELECT message_id, seq, event_hash FROM interlock.outbox_attempts ORDER BY 1, 2"
@@ -301,11 +301,11 @@ def test_version_5_over_version_4_on_sqlite(tmp_path: Path) -> None:
             "SELECT message_id, seq, event_hash FROM _interlock_outbox_attempts ORDER BY 1, 2"
         ).fetchall()
 
-    # Version 5, in place, twice; and with it the current version, 6.
+    # Version 5, in place, twice; and with it the current version, 7.
     install_sqlite_outbox(path, RELAY_SINKS)
     install_sqlite_outbox(path, RELAY_SINKS)
     with closing(sqlite3.connect(path)) as conn:
-        assert installed_version(conn) == VERSION == 6
+        assert installed_version(conn) == VERSION == 7
         assert (
             conn.execute(
                 "SELECT message_id, seq, event_hash FROM _interlock_outbox_attempts ORDER BY 1, 2"

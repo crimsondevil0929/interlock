@@ -43,7 +43,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from agentgov.core import EntryType, LedgerEntry
-from agentgov.receipts.signing import Ed25519Signer, Signer
+from agentgov.exceptions import MalformedReceiptError
+from agentgov.receipts.signing import Ed25519Signer, Signer, Verifier, parse_key
 
 from interlock.deliveries import (
     ACTION_EVENTS,
@@ -58,6 +59,14 @@ from interlock.deliveries import (
     registry_digest,
 )
 from interlock.exceptions import InterlockError, OutboundRequestError, RecordIntegrityError
+from interlock.keys import (
+    REVOKE,
+    ROLES,
+    SEALED_ROLES,
+    KeyRegistry,
+    registered_body,
+    revoked_ids_of,
+)
 from interlock.outbound import SinkRegistry, bind, placeholders
 from interlock.records import (
     GENESIS,
@@ -65,6 +74,7 @@ from interlock.records import (
     RecordKind,
     RecordLog,
     SignedRecord,
+    UntrustedSignerError,
     anchor_memo,
     check_anchors,
 )
@@ -91,12 +101,13 @@ logger = logging.getLogger("interlock.operators")
 OPERATOR_LOG: Final = "interlock-operators"
 """The operator log's id, in its records and its ledger anchors."""
 
-INTENT, APPLIED, REFUSED, ABANDONED, INSTALLED = (
+INTENT, APPLIED, REFUSED, ABANDONED, INSTALLED, KEY_REGISTERED = (
     RecordKind.OPERATOR_INTENT,
     RecordKind.OPERATOR_APPLIED,
     RecordKind.OPERATOR_REFUSED,
     RecordKind.OPERATOR_ABANDONED,
     RecordKind.OPERATOR_INSTALLED,
+    RecordKind.KEY_REGISTERED,
 )
 _OUTCOMES: Final = frozenset({APPLIED.value, REFUSED.value, ABANDONED.value})
 
@@ -163,13 +174,14 @@ class OperatorLog:
 
     :param path: The log's file. One process writes it at a time.
     :param signer: This operator's private key.
-    :param keyring: Every operator's public key, by name. ``signer`` must be
-        one of them: its name is who this operator is.
+    :param keyring: Every operator's public key, by name, as configured.
+        ``signer`` must be one of them, or registered by a record of the log
+        since, and not revoked: its name is who this operator is.
     :param ledger: An AgentGov ledger to anchor every record into, or none.
         When the ledger cannot be written (another process holds it), the
         record stands and is anchored the next time the log is opened.
     :param scope: The ledger scope the anchors are written to.
-    :raises ValueError: If ``signer`` is not a registered key.
+    :raises ValueError: If ``signer`` is not a registered key, or was revoked.
     :raises RecordIntegrityError: If the file does not verify.
     """
 
@@ -185,20 +197,34 @@ class OperatorLog:
         scope: str = "interlock-operators",
         log_id: str = OPERATOR_LOG,
     ) -> None:
-        name = keyring.name(signer.key_id)
-        if name is None:
-            raise ValueError(
+        try:
+            self._log = RecordLog(signer, log_id=log_id, path=path, keyring=keyring)
+        except UntrustedSignerError as exc:
+            if exc.revoked_by is not None:
+                raise
+            raise UntrustedSignerError(
                 f"key {signer.key_id} is no registered operator's: add its public half to "
-                f"[operators.keys]"
-            )
-        self.operator = name
-        self._log = RecordLog(signer, log_id=log_id, path=path, keyring=keyring)
+                f"[operators.keys], or have an operator register it"
+            ) from exc
+        trusted = self._log.trusted
+        assert trusted is not None
+        self.operator = trusted.name(signer.key_id) or signer.key_id
         self._ledger = ledger
         self._scope = scope
         self.anchor_pending()
 
     def records(self) -> tuple[SignedRecord, ...]:
         return self._log.records()
+
+    @property
+    def signer(self) -> Signer:
+        return self._log.signer
+
+    @property
+    def trusted(self) -> Keyring | None:
+        """The operators' keyring as the log stands: the configured keys,
+        with every key its records registered or revoked."""
+        return self._log.trusted
 
     def append(self, kind: RecordKind, body: Mapping[str, Any]) -> SignedRecord:
         """Sign and write a record, as this operator, and anchor it."""
@@ -344,6 +370,9 @@ class Operator:
             if intent.body.get("action") == "compact":
                 resolved.append(self._resolve_compaction(intent))
                 continue
+            if intent.body.get("action") == REVOKE:
+                resolved.append(self._resolve_revocation(intent))
+                continue
             rows = self._outbox.authorized(intent.record_hash)
             if rows:
                 record = self._log.append(
@@ -366,6 +395,134 @@ class Operator:
                 )
             resolved.append(record)
         return resolved
+
+    def _resolve_revocation(self, intent: SignedRecord) -> SignedRecord:
+        """A revocation killed between its phases: applied when the database
+        holds a revocation under its authority, with that seal; abandoned
+        when not, and the key is not revoked. An operator key's revocation
+        took effect at its intent: it touches no database."""
+        if intent.body.get("role") not in SEALED_ROLES:
+            return self._log.append(
+                APPLIED,
+                {
+                    "intent": _ref(intent),
+                    "rows": [],
+                    "skipped": [],
+                    "resolved": "an operator key is revoked in the log, by its intent",
+                },
+            )
+        found = next(
+            (r for r in self._outbox.revocations().values() if r.authority == intent.record_hash),
+            None,
+        )
+        if found is not None:
+            return self._log.append(
+                APPLIED,
+                {
+                    "intent": _ref(intent),
+                    "rows": [],
+                    "skipped": [],
+                    "seal": {"count": found.count, "digest": found.digest},
+                    "resolved": "the process that signed it stopped before recording this",
+                },
+            )
+        return self._log.append(
+            ABANDONED,
+            {
+                "intent": _ref(intent),
+                "why": "the database holds no revocation under its authority: the process that "
+                "signed it stopped before its transaction committed, and the key is not revoked",
+            },
+        )
+
+    # -- keys (docs/EPIC8_DESIGN.md §2) ------------------------------------------
+
+    def register_key(
+        self,
+        role: str,
+        name: str,
+        key: Verifier | str,
+        *,
+        roots: Mapping[str, Mapping[str, str]],
+    ) -> SignedRecord:
+        """Register ``key`` for ``role`` under ``name``: trusted from the next
+        record of the log on, beside the configuration's keys.
+
+        :param roots: Each role's configured keys, by name: the configuration's
+            keyrings (:meth:`interlock.config.InterlockConfig.key_roots`).
+        :raises OperatorRefusedError: On a role that is none, a key that is
+            not an Ed25519 public key, one any role trusts already, or a name
+            the role uses. Nothing is signed.
+        """
+        if role not in ROLES:
+            raise OperatorRefusedError(f"a key's role is one of {', '.join(ROLES)}, not {role!r}")
+        try:
+            verifier = parse_key(key) if isinstance(key, str) else key
+        except MalformedReceiptError as exc:
+            raise OperatorRefusedError(f"the key does not parse: {exc}; nothing signed") from exc
+        if verifier.alg != "ed25519":
+            raise OperatorRefusedError("a registered key is an Ed25519 public key; nothing signed")
+        registry = KeyRegistry.build(roots, self._log.records())
+        trusted_as = registry.role_of(verifier.key_id)
+        if trusted_as is not None:
+            raise OperatorRefusedError(
+                f"key {verifier.key_id} is a {trusted_as} key already; nothing signed"
+            )
+        if name in registry.keys(role):
+            raise OperatorRefusedError(f"a {role} key is named {name!r} already; nothing signed")
+        self.resolve()
+        return self._log.append(KEY_REGISTERED, registered_body(role, name, verifier))
+
+    def revoke_key(
+        self,
+        role: str,
+        key_id: str,
+        *,
+        reason: str | None = None,
+        roots: Mapping[str, Mapping[str, str]],
+    ) -> Outcome:
+        """Revoke a key (``docs/EPIC8_DESIGN.md`` §2.2): it attests nothing new.
+        A relay's or an inbox's key is revoked in the database too, which
+        seals every row it attested, under the signed intent; the applied
+        record signs the seal's count and digest. An operator key is revoked
+        by its intent, and only by another operator.
+
+        :raises OperatorRefusedError: If the key is no trusted key of the role,
+            is revoked already, or is this operator's own (so it is never the
+            last operator key: the one revoking it still signs). Nothing is
+            signed.
+        """
+        if role not in ROLES:
+            raise OperatorRefusedError(f"a key's role is one of {', '.join(ROLES)}, not {role!r}")
+        self.resolve()
+        registry = KeyRegistry.build(roots, self._log.records())
+        if key_id not in registry.keyring(role):
+            raise OperatorRefusedError(f"key {key_id} is no {role} key; nothing signed")
+        logged = registry.revocation(key_id)
+        if logged is not None and logged.applied is not None:
+            raise OperatorRefusedError(f"key {key_id} is revoked already; nothing signed")
+        if role in SEALED_ROLES and key_id in revoked_ids_of(self._outbox):
+            raise OperatorRefusedError(f"key {key_id} is revoked already; nothing signed")
+        if role == "operator":
+            # Never the last operator key, then: the one revoking it still signs.
+            if key_id == self._log.signer.key_id:
+                raise OperatorRefusedError(
+                    "an operator does not revoke their own key: another operator does, so the "
+                    "revocation is recorded by a key that still signs; nothing signed"
+                )
+        intent = self._log.append(
+            INTENT,
+            {"action": REVOKE, "role": role, "key_id": key_id, "reason": reason, "targets": []},
+        )
+        self._checkpoint("intent")
+        body: dict[str, Any] = {"intent": _ref(intent), "rows": [], "skipped": []}
+        if role in SEALED_ROLES:
+            count, digest = self._outbox.revoke_key(role, key_id, authority=intent.record_hash)
+            body["seal"] = {"count": count, "digest": digest}
+        self._checkpoint("acted")
+        record = self._log.append(APPLIED, body)
+        self._checkpoint("recorded")
+        return Outcome(intent, record, (), ())
 
     def _resolve_compaction(self, intent: SignedRecord) -> SignedRecord:
         """A vacuum killed between its phases: its checkpoint is in the
@@ -1069,10 +1226,17 @@ def _verified_prefix(
                 raise RecordIntegrityError(
                     f"record {index} was signed by key {record.key_id}, no registered operator's"
                 )
+            retired = keyring.retired(record.key_id)
+            if retired is not None:
+                raise RecordIntegrityError(
+                    f"record {index} was signed by key {record.key_id} after record {retired} "
+                    f"revoked it"
+                )
             record.verify(key)
         except RecordIntegrityError as exc:
             problems.append(f"operator log: {exc}")
             break
         trusted.append(record)
+        keyring = keyring.after(record)
         previous = record.record_hash
     return trusted

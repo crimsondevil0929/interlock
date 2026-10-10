@@ -701,3 +701,38 @@ def test_sqlites_log_trigger_refuses_an_event_that_does_not_hash(site: InboxSite
     )
     store._conn.execute(insert, row)
     assert site.reader().inbound_heads()["stripe"] == (1, row["event_hash"])
+
+
+def test_the_inbox_uses_its_store_only_under_its_lock(site: InboxSite) -> None:
+    """The store's one connection is shared by every webhook's thread and the
+    matching pass: a read from one between another's ``BEGIN`` and its first
+    statement would land in that transaction (the soak saw it: ``SET
+    TRANSACTION ISOLATION`` refused, and a webhook answered 503). So the
+    inbox touches its store only while it holds its lock."""
+    seen: list[str] = []
+
+    class Guarded:
+        def __init__(self, store: Any) -> None:
+            self._store = store
+
+        def __getattr__(self, name: str) -> Any:
+            found = getattr(self._store, name)
+            if not callable(found):
+                return found
+
+            def call(*args: Any, **kwargs: Any) -> Any:
+                if not inbox._lock.locked():
+                    seen.append(name)
+                return found(*args, **kwargs)
+
+            return call
+
+    site.deliver("re_1")
+    inbox = site.inbox(store=Guarded(site.store()))
+    assert site.receive(inbox, "stripe", stripe_webhook(refund_event("re_1"))).status == 200
+    # An event before its delivery, bound by the matching pass.
+    early = stripe_webhook(refund_event("re_2", event_id="evt_2"))
+    assert site.receive(inbox, "stripe", early) == Response(200, {"recorded": 1, "matched": 0})
+    site.deliver("re_2")
+    assert inbox.match_pending() == 1
+    assert seen == []
