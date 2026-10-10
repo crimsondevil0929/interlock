@@ -269,6 +269,11 @@ CATALOG: Final = (
         ("role",),
     ),
     Metric(
+        "interlock_cluster_fenced_total",
+        COUNTER,
+        "Sessions this node ended of nodes the database counted gone (fencing).",
+    ),
+    Metric(
         "interlock_lease_takeovers_total",
         COUNTER,
         "Leases a relay took over from a node that was gone, before they ran out.",

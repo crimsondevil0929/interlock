@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,28 @@ def released(dsn: str, kind: int, key: int, within: float = 5.0) -> bool:
             return False
         time.sleep(0.02)
     return True
+
+
+def session(dsn: str, name: str) -> Any:
+    """A connection called ``name``, as a part of a node opens one."""
+    import psycopg
+
+    return psycopg.connect(dsn, autocommit=True, application_name=name)
+
+
+def ended(dsn: str, pid: int, within: float = 5.0) -> bool:
+    """Whether the server process ``pid`` is soon gone."""
+    import psycopg
+
+    deadline = time.monotonic() + within
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        while True:
+            row = conn.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s", (pid,))
+            if not row.fetchone()[0]:  # type: ignore[index]
+                return True
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.02)
 
 
 def terminate(dsn: str, application: str) -> None:
@@ -197,11 +220,127 @@ def test_a_node_whose_name_another_process_took_meanwhile_is_refused(
     assert not a.joined
 
 
+def test_a_gone_nodes_sessions_are_ended_at_a_survivors_heartbeat(
+    pg_database: str, nodes: Any
+) -> None:
+    """Fencing (§1.5): a node gone, its lock free and its sessions still on the
+    server, one inside a transaction holding a lock the cluster would wait
+    for. The next heartbeat of a node that survives ends each of them. A live
+    node's sessions, the survivor's own, what no node opened, and the gone
+    node's next incarnation's are left alone."""
+    import psycopg
+
+    a, b, c = nodes("a"), nodes("b"), nodes("c")
+    for node in (a, b, c):
+        node.join()
+    stage = session(pg_database, "interlock-stage@a")
+    stage.execute("BEGIN")
+    stage.execute("SELECT pg_advisory_xact_lock(1, 1)")  # as a frozen stage holds a lock
+    ledger = session(pg_database, "interlock-ledger@a")
+    kept = [
+        session(pg_database, "interlock-relay@c"),  # a node alive
+        session(pg_database, "interlock-relay@b"),  # the survivor's own
+        session(pg_database, "psql@a"),  # no node's
+        session(pg_database, "interlock-relay@" + "a" * 41),  # no node is named so
+    ]
+    gone = [stage.info.backend_pid, ledger.info.backend_pid]
+    b.heartbeat()
+    assert b.counters["fenced"] == 0  # a is alive: nothing is ended
+    terminate(pg_database, "interlock-cluster@a")
+    b.heartbeat()
+    assert b.counters["fenced"] == 2
+    assert all(ended(pg_database, pid) for pid in gone)
+    with psycopg.connect(pg_database, autocommit=True) as other:
+        assert other.execute("SELECT pg_try_advisory_lock(1, 1)").fetchone() == (True,)
+    for conn in kept:
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+    # Its next incarnation holds the node's lock: its sessions are its own.
+    nodes("a").join()
+    fresh = session(pg_database, "interlock-stage@a")
+    b.heartbeat()
+    assert b.counters["fenced"] == 2
+    assert fresh.execute("SELECT 1").fetchone() == (1,)
+    metrics = Metrics()
+    b.collect(metrics)
+    assert metrics.value("interlock_cluster_fenced_total") == 2
+    for conn in [stage, ledger, fresh, *kept]:
+        conn.close()
+
+
+def test_a_node_that_may_not_end_a_gone_nodes_sessions_says_so_once(
+    pg_admin_dsn: str, pg_database: str, nodes: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ending another role's session takes pg_signal_backend, and a
+    superuser's a superuser: a node without it says so once, and keeps
+    heartbeating. The sessions end at their own bounds."""
+    from psycopg.conninfo import make_conninfo
+
+    from tests.conftest import PASSWORD, create_role, drop_role
+
+    role = f"fenceless_{uuid.uuid4().hex[:8]}"
+    create_role(pg_admin_dsn, role)
+    try:
+        a = nodes("a")
+        a.join()
+        held = session(pg_database, "interlock-ledger@a")  # a superuser's session
+        b = ClusterNode(
+            make_conninfo(pg_database, user=role, password=PASSWORD),
+            "b",
+            heartbeat=FAST["heartbeat"],
+            session_timeout=FAST["session_timeout"],
+        )
+        try:
+            b.join()
+            terminate(pg_database, "interlock-cluster@a")
+            with caplog.at_level("WARNING", logger="interlock.cluster"):
+                b.heartbeat()
+                b.heartbeat()
+            assert b.joined and b.counters["fenced"] == 0
+            assert caplog.text.count("cannot end a gone node's sessions") == 1
+            assert held.execute("SELECT 1").fetchone() == (1,)
+        finally:
+            b.leave()
+            held.close()
+    finally:
+        drop_role(pg_admin_dsn, pg_database, role)
+
+
+def test_a_daemons_node_joins_only_the_database_interlock_is_installed_in(
+    pg_database: str,
+) -> None:
+    """A node's lock is its database's own, and the relays look for it in
+    theirs: a daemon's node refuses a database without Interlock's storage."""
+    import psycopg
+
+    from interlock.exceptions import SubstrateConfigurationError
+    from interlock.postgres import install
+
+    node = ClusterNode(
+        pg_database,
+        "a",
+        heartbeat=FAST["heartbeat"],
+        session_timeout=FAST["session_timeout"],
+        storage=True,
+    )
+    with pytest.raises(SubstrateConfigurationError, match="holds no Interlock storage"):
+        node.join()
+    assert not node.joined
+    with psycopg.connect(pg_database, autocommit=True) as conn:
+        install(conn, [])
+    try:
+        node.join()
+        assert node.joined
+    finally:
+        node.leave()
+
+
 def test_names_and_timings_that_cannot_work_are_refused(pg_database: str) -> None:
     with pytest.raises(ValueError, match="named by letters"):
         ClusterNode(pg_database, "-a")
+    # 40 characters at most: every connection's name holds the node's whole.
+    assert ClusterNode(pg_database, "a" * 40).node == "a" * 40
     with pytest.raises(ValueError, match="named by letters"):
-        ClusterNode(pg_database, "a" * 64)
+        ClusterNode(pg_database, "a" * 41)
     with pytest.raises(ValueError, match="three heartbeats"):
         ClusterNode(pg_database, "a", heartbeat=1, session_timeout=2.9)
 

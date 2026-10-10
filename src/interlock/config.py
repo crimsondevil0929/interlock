@@ -1041,7 +1041,7 @@ def _node_name(node: str, where: str) -> str:
 
     if not NODE_NAME.fullmatch(node):
         raise ConfigError(
-            f"{where}: a node is named by letters, digits, '.', '_' and '-', 63 at most, "
+            f"{where}: a node is named by letters, digits, '.', '_' and '-', 40 at most, "
             f"not {node!r}"
         )
     return node

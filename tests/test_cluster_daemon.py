@@ -278,6 +278,41 @@ def test_a_node_killed_mid_call_loses_its_lease_and_its_role_at_once(cluster: Cl
     assert sum(c.acted for c in calls) == 1
 
 
+def test_a_frozen_node_is_fenced_once_its_session_times_out(cluster: Cluster) -> None:
+    """A node frozen (``SIGSTOP``) keeps every connection open, as a host lost
+    to the network leaves them: its idle sessions would stay for as long as it
+    does. Once the server ends its cluster session, at the session timeout,
+    the other node's next heartbeat ends every one of them (§1.5)."""
+    a = Daemon(cluster.configs["a"])
+    b = Daemon(cluster.configs["b"])
+    try:
+        a.wait_for("interlock daemon running as node a")
+        b.wait_for("interlock daemon running as node b")
+
+        def sessions() -> set[str]:
+            return {
+                str(row[0])
+                for row in cluster.fetch(
+                    "SELECT application_name FROM pg_stat_activity WHERE application_name LIKE %s",
+                    "interlock-%@a",
+                )
+            }
+
+        until(lambda: "interlock-relay@a" in sessions(), "a's relays to connect")
+        a.process.send_signal(signal.SIGSTOP)
+        frozen = time.monotonic()
+        until(lambda: cluster.holder(NODE_LOCK, "a") is None, "a's session to time out")
+        until(lambda: not sessions(), "b to end a's sessions")
+        fenced = time.monotonic() - frozen
+        # Its session timeout (2 s) and a heartbeat of b's, never a bound per session.
+        assert fenced < 6, fenced
+    finally:
+        a.process.kill()
+        a.process.wait()
+        assert b.stop() == 0, (b.lines, b.errors)
+    assert any("node a is gone; its sessions ended" in line for line in b.lines + b.errors)
+
+
 def test_a_second_daemon_as_a_node_that_runs_is_refused(cluster: Cluster) -> None:
     a = Daemon(cluster.configs["a"])
     try:

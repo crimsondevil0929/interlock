@@ -290,6 +290,7 @@ def _cluster(config: InterlockConfig) -> ClusterNode | None:
         settings.node,
         heartbeat=settings.heartbeat.total_seconds(),
         session_timeout=settings.session_timeout.total_seconds(),
+        storage=True,
     )
 
 

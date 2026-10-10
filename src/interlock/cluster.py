@@ -21,6 +21,14 @@ leader that pauses past its session's bound loses the role while its step
 still runs, and for that step another node may lead too: what a part that
 follows a role does is safe under concurrency on its own (§1.2).
 
+A node gone is *fenced* (§1.5): at each heartbeat a node ends every session of
+a node whose lock no session holds, as its connections' names tell them
+(``interlock-<part>@<node>``). A frozen process's transactions, and its waits
+for a lock it would take and then sit on, end then, not one bound after
+another. It takes ``pg_signal_backend``, or a superuser for a superuser's
+sessions; a node that may not end them says so once, and they end at their
+own bounds.
+
 A transaction-mode pooler cannot carry the session: it hands a session's locks
 to whoever runs on it next. The session reaches the server directly, or
 through a pooler in session mode. Every other connection may go through one.
@@ -37,7 +45,11 @@ import time
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Final
 
-from interlock.exceptions import NodeTakenError, SubstrateUnavailableError
+from interlock.exceptions import (
+    NodeTakenError,
+    SubstrateConfigurationError,
+    SubstrateUnavailableError,
+)
 
 if TYPE_CHECKING:
     import psycopg
@@ -62,13 +74,39 @@ LEADER_LOCK: Final = 1229737819
 """The advisory lock class of the roles: ``(LEADER_LOCK, lock_key("role", role))``.
 Interlock's keys lock (``docs/EPIC8_DESIGN.md`` §2.3) is ``(1229737817, 8)``."""
 
-NODE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}")
-"""What a node may be called: a Kubernetes pod's name fits."""
+NODE_NAME: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+"""What a node may be called, 40 characters at most: every connection's name,
+``interlock-<part>@<node>``, then holds it whole (PostgreSQL keeps 63 bytes of
+a name), which is how a node's sessions are told from another's, and fenced."""
+
+_NAMED: Final = re.compile(r"interlock-[a-z]+@(?P<node>.+)")
+"""A connection a node of a cluster opened, by its name."""
+_KEPT: Final = 63
+"""The bytes of ``application_name`` PostgreSQL keeps: a name this long may
+have been cut, and is never taken for a node's."""
 
 _HELD: Final = (
     "SELECT classid::bigint, objid::bigint FROM pg_catalog.pg_locks "
     "WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() "
     "AND objsubid = 2 AND granted"
+)
+_SESSIONS: Final = (
+    "SELECT pid, application_name FROM pg_catalog.pg_stat_activity "
+    "WHERE datname = pg_catalog.current_database() AND pid <> pg_catalog.pg_backend_pid() "
+    "AND application_name LIKE 'interlock-%@%'"
+)
+_FENCE: Final = (
+    "SELECT pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity AS a "
+    "WHERE a.pid = %s AND a.application_name = %s "
+    "AND pg_catalog.pg_try_advisory_xact_lock_shared(%s, %s)"
+)
+"""End one session of a node, only if no session holds the node's lock: the
+shared try fails while one does, and holds the lock to the statement's end,
+so the node cannot join again in between."""
+_STORAGE: Final = (
+    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS p "
+    "JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace "
+    "WHERE n.nspname = 'interlock' AND p.proname = 'node_key')"
 )
 _HOLDER: Final = (
     "SELECT a.pid, a.application_name, a.backend_start FROM pg_catalog.pg_locks AS l "
@@ -114,6 +152,9 @@ class ClusterNode:
         another session holds it: the node's previous incarnation, whose
         session the server has not ended yet. Twice the session timeout by
         default.
+    :param storage: Whether the database must hold Interlock's storage, at
+        version 8 or later, as a daemon's must: a node's lock is the
+        database's own, and the relays look for it in theirs (§2).
     :raises ValueError: On a name or a timing that cannot work.
     """
 
@@ -125,10 +166,11 @@ class ClusterNode:
         heartbeat: float = 1.0,
         session_timeout: float = 10.0,
         join_wait: float | None = None,
+        storage: bool = False,
     ) -> None:
         if not NODE_NAME.fullmatch(node):
             raise ValueError(
-                f"a node is named by letters, digits, '.', '_' and '-', 63 at most, not {node!r}"
+                f"a node is named by letters, digits, '.', '_' and '-', 40 at most, not {node!r}"
             )
         if heartbeat <= 0 or session_timeout < 3 * heartbeat:
             raise ValueError(
@@ -140,6 +182,8 @@ class ClusterNode:
         self.heartbeat_seconds = heartbeat
         self.session_timeout = session_timeout
         self._dsn = dsn
+        self._storage = storage
+        self._unfenced = False
         self._join_wait = 2 * session_timeout if join_wait is None else join_wait
         self._key = lock_key("node", node)
         self._lock = threading.RLock()
@@ -149,7 +193,8 @@ class ClusterNode:
         self._roles: set[str] = set()
         self._taken: Counter[str] = Counter()
         self.counters: Counter[str] = Counter()
-        """``joins``, ``heartbeats``, ``lost`` sessions: what the node did."""
+        """``joins``, ``heartbeats``, ``lost`` sessions, sessions ``fenced``:
+        what the node did."""
 
     @property
     def joined(self) -> bool:
@@ -179,12 +224,23 @@ class ClusterNode:
 
         :raises NodeTakenError: If another session still holds it then:
             another process is this node.
+        :raises SubstrateConfigurationError: If the database must hold
+            Interlock's storage and does not.
         :raises SubstrateUnavailableError: If the server cannot be reached.
         """
         import psycopg
 
         conn = self._connect()
         try:
+            if self._storage:
+                row = conn.execute(_STORAGE).fetchone()
+                if row is None or not row[0]:
+                    raise SubstrateConfigurationError(
+                        f"node {self.node!r}: the cluster's database holds no Interlock storage "
+                        f"of version 8 or later: a node's lock is the database's own, and the "
+                        f"relays look for it in theirs. Point [cluster] database at the "
+                        f"database Interlock is installed in"
+                    )
             deadline = time.monotonic() + self._join_wait
             while True:
                 row = conn.execute(
@@ -249,6 +305,7 @@ class ClusterNode:
                 else:
                     if (NODE_LOCK, self._key) in {(int(c), _signed(int(o))) for c, o in rows}:
                         self.counters["heartbeats"] += 1
+                        self._fence(conn)
                         return
                     self._lose("its session no longer holds the node's lock")
         self.join()
@@ -312,12 +369,61 @@ class ClusterNode:
             joined = self._joined
             roles = {role: joined and role in self._held for role in self._roles}
             taken = dict(self._taken)
+            fenced = self.counters["fenced"]
         metrics.set("interlock_cluster_node", int(joined), node=self.node)
+        metrics.set("interlock_cluster_fenced_total", fenced)
         for role, held in sorted(roles.items()):
             metrics.set("interlock_cluster_leader", int(held), role=role)
             metrics.set("interlock_cluster_leaderships_total", taken.get(role, 0), role=role)
 
     # -- internals ---------------------------------------------------------------
+
+    def _fence(self, conn: psycopg.Connection[Any]) -> None:
+        """End every session of every other node the database counts gone:
+        one whose lock no session holds (§1.5). Its cluster session holds
+        nothing else, and its next incarnation's waits there to join: both
+        are left alone. Under the lock; never raises."""
+        import psycopg
+
+        nodes: dict[str, list[tuple[int, str]]] = {}
+        try:
+            for pid, name in conn.execute(_SESSIONS).fetchall():
+                named = _NAMED.fullmatch(str(name))
+                if named is None or len(str(name)) >= _KEPT:
+                    continue
+                node = named.group("node")
+                if node == self.node or not NODE_NAME.fullmatch(node):
+                    continue
+                if str(name) == connection_name("cluster", node, ""):
+                    continue
+                nodes.setdefault(node, []).append((int(pid), str(name)))
+            for node, sessions in sorted(nodes.items()):
+                ended = []
+                for pid, name in sessions:
+                    row = conn.execute(
+                        _FENCE, (pid, name, NODE_LOCK, lock_key("node", node))
+                    ).fetchone()
+                    if row is not None and row[0]:
+                        ended.append(f"{name} ({pid})")
+                if ended:
+                    self.counters["fenced"] += len(ended)
+                    logger.warning(
+                        "node %s: node %s is gone; its sessions ended: %s",
+                        self.node,
+                        node,
+                        ", ".join(ended),
+                    )
+        except psycopg.errors.InsufficientPrivilege as exc:
+            if not self._unfenced:
+                self._unfenced = True
+                logger.warning(
+                    "node %s cannot end a gone node's sessions (%s): they end at their own "
+                    "bounds. Grant the cluster's role pg_signal_backend",
+                    self.node,
+                    str(exc).strip(),
+                )
+        except psycopg.Error as exc:
+            logger.warning("node %s could not fence: %s", self.node, str(exc).strip())
 
     def _lose(self, why: str) -> None:
         """The session is gone, or no longer the node's: every role with it.
