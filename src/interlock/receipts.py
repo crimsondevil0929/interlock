@@ -12,6 +12,13 @@ before the stage's terminal record is written, and the record's note carries
 it; the receipt's ``anchors.escrow`` names that record's sequence and hash.
 Deleting either leaves the other pointing at nothing.
 
+A receipt is *owed* while the engine call that chose its id runs
+(:meth:`ReceiptIssuer.owe`): between a plan's commit record and its receipt a
+relay can deliver, and a settler sharing the issuer run, and it waits for a
+receipt that is owed. One the chain names that the log does not hold and
+nothing owes was never issued and never will be: the process that committed
+the plan stopped first (``docs/EPIC9_DESIGN.md`` §9).
+
 What each field is built from:
 
 - ``authority``: the AgentGov scope path when an anchor is attached (the
@@ -34,6 +41,7 @@ What each field is built from:
 from __future__ import annotations
 
 import secrets
+import threading
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
@@ -96,7 +104,7 @@ class ReceiptIssuer:
         decision. Bump it when the checkers change.
     """
 
-    __slots__ = ("_epoch", "_issuer", "_log", "_row_secret")
+    __slots__ = ("_epoch", "_issuer", "_log", "_owed", "_owed_lock", "_row_secret")
 
     def __init__(
         self,
@@ -112,6 +120,8 @@ class ReceiptIssuer:
         self._issuer = issuer
         self._row_secret = row_secret if row_secret is not None else secrets.token_bytes(32)
         self._epoch = policy_epoch
+        self._owed: set[str] = set()
+        self._owed_lock = threading.Lock()
 
     @property
     def log(self) -> ReceiptLog:
@@ -121,6 +131,23 @@ class ReceiptIssuer:
     def new_id() -> str:
         """A fresh receipt id, chosen before the record that will name it."""
         return str(uuid.uuid4())
+
+    def owe(self, receipt_id: str) -> None:
+        """Count ``receipt_id`` as one this process may still issue, until
+        :meth:`forgo`: the engine owes it from the moment it chooses the id
+        until the call that may issue it returns."""
+        with self._owed_lock:
+            self._owed.add(receipt_id)
+
+    def owes(self, receipt_id: str) -> bool:
+        """Whether this process may still issue ``receipt_id``."""
+        with self._owed_lock:
+            return receipt_id in self._owed
+
+    def forgo(self, receipt_id: str) -> None:
+        """``receipt_id`` is issued, or never will be by this process."""
+        with self._owed_lock:
+            self._owed.discard(receipt_id)
 
     def issue(
         self,

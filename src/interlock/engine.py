@@ -506,18 +506,33 @@ class EscrowEngine:
             retry the plan: its intent stays open, and :meth:`recover`
             settles it.
         """
+        # The plan's receipt is owed while this call runs: a settler that
+        # finds its commit recorded and the receipt not yet logged waits for
+        # it. Once the call returns, the receipt is in the log or never will be.
+        receipt_id = self._receipts.new_id() if self._receipts is not None else None
+        if self._receipts is not None and receipt_id is not None:
+            self._receipts.owe(receipt_id)
         try:
             with self._repair_claim(plan) as repairs:
-                return self._execute(plan, settle_cost=settle_cost, repairs=repairs)
+                return self._execute(
+                    plan, settle_cost=settle_cost, repairs=repairs, receipt_id=receipt_id
+                )
         except InterlockError as exc:
             if exc.feedback is None:
                 exc.feedback = feedback_for_error(plan, exc)
             raise
         finally:
             self._reserving.discard(plan.plan_id)
+            if self._receipts is not None and receipt_id is not None:
+                self._receipts.forgo(receipt_id)
 
     def _execute(
-        self, plan: EffectPlan, *, settle_cost: Decimal | str | None, repairs: str | None
+        self,
+        plan: EffectPlan,
+        *,
+        settle_cost: Decimal | str | None,
+        repairs: str | None,
+        receipt_id: str | None,
     ) -> StageResult:
         cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
         if cost < 0:
@@ -533,7 +548,6 @@ class EscrowEngine:
             plan.content_hash(),
             note=(f"repair of {plan.repair_of}: " if plan.repair_of else "") + plan.intent[:80],
         )
-        receipt_id = self._receipts.new_id() if self._receipts is not None else None
         stamp = f"; receipt {receipt_id}" if receipt_id else ""
         terminal: EscrowRecord | None = None
         txid: str | None = None

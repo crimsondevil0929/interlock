@@ -99,6 +99,10 @@ _RECEIPT: Final = re.compile(r"; receipt ([0-9a-f-]{36})")
 _PRUNED_AT: Final = datetime(1970, 1, 1, tzinfo=UTC)
 """A pruned settlement's time, which its tombstone does not keep."""
 _COMMITTED: Final = frozenset({OutcomeStatus.COMMITTED, OutcomeStatus.RECOVERED_COMMITTED})
+_OUTCOMES: Final = frozenset(
+    {RecordType.COMMITTED, RecordType.ABORTED, RecordType.ORPHANED, RecordType.COMPENSATED}
+)
+"""The records that end a stage's commit intent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +223,7 @@ class Settler:
             events,
             chain=chain,
             log=self._receipts.log,
+            owes=self._receipts.owes,
             ledger=self._ledger,
             operators=self._operator_records(),
             legacy=self._outbox.legacy(),
@@ -285,9 +290,18 @@ class Settler:
                 f"was not derived from: not settled"
             )
 
-        # A plan's commit is recorded before its action receipt is issued: in
-        # one process a relay can deliver, and this run, in between. A receipt
-        # the commit names is coming; until the log holds it, nothing is settled.
+        # A stage commits before the chain records it, and its plan's action
+        # receipt is issued after that: in one process a relay can deliver,
+        # and this run, in either window. A commit not recorded yet, or a
+        # receipt the commit names that its engine still owes, is coming; until
+        # it is here, nothing is settled.
+        if message.stage_id in context.open_stages and str(message.message_id) not in (
+            context.receipts
+        ):
+            raise _UnsettledError(
+                "its stage's commit is not recorded on the chain yet (its intent is open): "
+                "not settled until it is"
+            )
         pending = context.receipt_pending(message.plan_id)
         if pending is not None and str(message.message_id) not in context.receipts:
             raise _UnsettledError(
@@ -310,7 +324,14 @@ class Settler:
         receipt = context.receipts.get(str(message.message_id))
         if receipt is None:
             action = context.action_receipt(message.plan_id)
-            if action is None:
+            named = context.plan_receipts.get(message.plan_id)
+            if action is None and named is not None and context.log.index_of(named) is None:
+                notes.append(
+                    f"no action receipt for plan {message.plan_id} to bind a delivery receipt "
+                    f"to: its commit names receipt {named}, which was never issued (the "
+                    f"process that committed it stopped first)"
+                )
+            elif action is None:
                 notes.append(
                     f"no action receipt for plan {message.plan_id} to bind a delivery receipt "
                     f"to (receipts were off, or its commit was recovered after a crash)"
@@ -510,6 +531,11 @@ class _Context:
     plan_credits: dict[str, Decimal]
     plan_receipts: dict[str, str]
     """Each committed plan's action receipt id, from the chain."""
+    open_stages: frozenset[uuid.UUID]
+    """The stages whose commit intent the chain holds with no outcome after it:
+    committing now, or left open by a process that stopped."""
+    owes: Callable[[str], bool]
+    """Whether an engine of this process may still issue a receipt."""
     plan_records: dict[str, list[str]]
     """The hashes of each plan's commit records, which its charge's memo names."""
     spends: dict[str, LedgerEntry]
@@ -530,6 +556,7 @@ class _Context:
         *,
         chain: Sequence[EscrowRecord],
         log: ReceiptLog,
+        owes: Callable[[str], bool],
         ledger: BudgetManager | None,
         operators: _Operators | None,
         legacy: Any,
@@ -540,6 +567,8 @@ class _Context:
         by_id = {m.message_id: m for m in messages}
         plan_receipts: dict[str, str] = {}
         plan_records: dict[str, list[str]] = {}
+        intents: set[uuid.UUID] = set()
+        ended: set[uuid.UUID] = set()
         for record in chain:
             if record.record_type in (RecordType.COMMIT_INTENT, RecordType.COMMITTED):
                 plan_records.setdefault(str(record.plan_id), []).append(record.record_hash)
@@ -547,6 +576,11 @@ class _Context:
                 found = _RECEIPT.search(record.note)
                 if found is not None:
                     plan_receipts[str(record.plan_id)] = found.group(1)
+            if record.stage_id is not None:
+                if record.record_type is RecordType.COMMIT_INTENT:
+                    intents.add(record.stage_id)
+                elif record.record_type in _OUTCOMES:
+                    ended.add(record.stage_id)
         credits: dict[uuid.UUID, LedgerEntry] = {}
         plan_credits: dict[str, Decimal] = {}
         spends: dict[str, LedgerEntry] = {}
@@ -578,6 +612,8 @@ class _Context:
             credits=credits,
             plan_credits=plan_credits,
             plan_receipts=plan_receipts,
+            open_stages=frozenset(intents - ended),
+            owes=owes,
             plan_records=plan_records,
             spends=spends,
             claims=claims,
@@ -588,11 +624,13 @@ class _Context:
 
     def receipt_pending(self, plan_id: str) -> str | None:
         """The action receipt the plan's commit record names, while the log
-        does not hold it yet."""
+        does not hold it yet and an engine of this process still owes it. One
+        nothing owes was never issued, and never will be: the log is asked
+        again after, since the engine logs a receipt before it stops owing it."""
         receipt_id = self.plan_receipts.get(plan_id)
         if receipt_id is None or self.log.index_of(receipt_id) is not None:
             return None
-        return receipt_id
+        return receipt_id if self.owes(receipt_id) else None
 
     def action_receipt(self, plan_id: str) -> ActionReceipt | None:
         """The action receipt the plan that committed was issued, if the log holds it."""

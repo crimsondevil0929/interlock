@@ -810,29 +810,88 @@ def test_a_delivery_waits_for_its_plans_action_receipt(
 ) -> None:
     """In one process (the daemon's) a relay can deliver, and the settler run,
     between a plan's commit and its action receipt: the commit's record names
-    the receipt, and the log does not hold it yet. The delivery waits for it;
-    it is never settled for good without one."""
+    the receipt, which the log does not hold yet and the engine still owes.
+    The delivery waits for it; it is never settled for good without one."""
     from interlock import EscrowEngine
 
     issue = EscrowEngine._issue_receipt
-    deferred: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+    early: list[Any] = []
 
-    def later(self: Any, *args: Any, **kwargs: Any) -> None:
-        deferred.append((self, args, kwargs))
+    def late(self: Any, *args: Any, **kwargs: Any) -> Any:
+        bench.deliver()
+        early.append(bench.settler().settle())
+        return issue(self, *args, **kwargs)
 
-    monkeypatch.setattr(EscrowEngine, "_issue_receipt", later)
+    monkeypatch.setattr(EscrowEngine, "_issue_receipt", late)
     booked = bench.book(1)
     monkeypatch.undo()
-    bench.deliver()
-    report = bench.settler().settle()
+    (report,) = early
     assert booked not in report.settled
     assert any("is not in the receipt log yet" in p for p in report.problems), report
-    assert booked not in settlements(bench)
-    ((engine, args, kwargs),) = deferred
-    issue(engine, *args, **kwargs)  # the engine gets to it
     report = bench.settler().settle()
     assert (report.settled, report.receipts, report.problems) == ((booked,), 1, ())
     assert settlements(bench)[booked].receipt_id is not None
+
+
+def test_a_delivery_waits_for_its_stages_commit_to_be_recorded(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stage commits before the chain records it, and the record names the
+    plan's receipt: a relay can deliver, and the settler run, in between. The
+    commit's intent is open on the chain then; the delivery waits for its
+    outcome, and is never settled for good without the receipt it names."""
+    from interlock import EscrowEngine
+    from interlock.chain import RecordType
+
+    record = EscrowEngine._record
+    early: list[Any] = []
+
+    def late(self: Any, record_type: RecordType, *args: Any, **kwargs: Any) -> Any:
+        if record_type is RecordType.COMMITTED:
+            bench.deliver()
+            early.append(bench.settler().settle())
+        return record(self, record_type, *args, **kwargs)
+
+    monkeypatch.setattr(EscrowEngine, "_record", late)
+    booked = bench.book(1)
+    monkeypatch.undo()
+    (report,) = early
+    assert booked not in report.settled
+    assert any("its intent is open" in p for p in report.problems), report
+    report = bench.settler().settle()
+    assert (report.settled, report.receipts, report.problems) == ((booked,), 1, ())
+    assert settlements(bench)[booked].receipt_id is not None
+
+
+def test_a_delivery_whose_action_receipt_was_never_issued_is_settled_without_one(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that stops between a plan's commit and its action receipt
+    leaves the commit naming a receipt nothing will issue: no engine owes it
+    once the call that chose it is over, and the process's next incarnation
+    never does. The delivery is settled without a delivery receipt, its
+    settlement saying why, and everything verifies."""
+    from interlock import EscrowEngine
+    from interlock.chain import RecordType
+
+    monkeypatch.setattr(EscrowEngine, "_issue_receipt", lambda self, *args, **kwargs: None)
+    booked = bench.book(1)
+    monkeypatch.undo()
+    bench.deliver()
+    (committed,) = [r for r in bench.chain.records() if r.record_type is RecordType.COMMITTED]
+    named = committed.note.rsplit("; receipt ", 1)[1]
+    assert bench.log.index_of(named) is None and not bench.issuer.owes(named)
+    report = bench.settler().settle()
+    assert (report.settled, report.receipts, report.problems) == ((booked,), 0, ())
+    settled = settlements(bench)[booked]
+    assert settled.receipt_id is None
+    assert f"its commit names receipt {named}, which was never issued" in settled.note
+    assert verify_settlements(bench.source(), log=bench.log, relays=RELAYS) == ()
+    # Owed while the engine runs it: a receipt is pending only then.
+    bench.issuer.owe(named)
+    assert bench.issuer.owes(named)
+    bench.issuer.forgo(named)
+    assert not bench.issuer.owes(named)
 
 
 def test_a_delivery_attested_after_its_relays_key_was_revoked_is_never_settled(
