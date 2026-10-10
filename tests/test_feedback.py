@@ -221,6 +221,36 @@ def test_tenant_isolation_never_names_or_counts_other_tenants() -> None:
     assert (c.tenants, c.withheld_tenants, c.limit) == (("acme",), True, "1")
 
 
+def test_a_plan_that_touched_only_other_tenants_is_told_its_own() -> None:
+    plan = plan_of(("orders", "acme"))
+    rows = [
+        row("orders", 2, "globex", D("5"), D("6")),
+        row("orders", 3, "initech", D("5"), D("6")),
+    ]
+    fb = feedback(plan, rows, [TenantIsolation(1)])
+    assert "its declared tenants are acme." in fb.render()
+    assert "globex" not in text_of(fb) and "initech" not in text_of(fb)
+
+
+def test_an_undeclared_tenant_is_never_named_or_counted() -> None:
+    plan = plan_of(("orders", "acme"))
+    rows = [
+        row("orders", 2, "globex", D("5"), D("6")),
+        row("orders", 3, "initech", D("5"), D("6")),
+    ]
+    fb = feedback(plan, rows, [TenantIsolation(5, declared=True)])
+    rendered = text_of(fb)
+    (c,) = fb.constraints
+    assert (c.guidance, c.constraint, c.tenants, c.withheld_tenants) == (
+        Guidance.UNDECLARED_TENANT,
+        "tenant_isolation",
+        ("acme",),
+        True,
+    )
+    assert "globex" not in rendered and "initech" not in rendered
+    assert not re.search(r"\b[0-9]+\b", rendered)
+
+
 def test_a_plan_that_declares_no_tenant_is_told_none() -> None:
     plan = plan_of(("orders", None))
     rows = [row("orders", 1, "acme", D("1"), D("2")), row("orders", 2, "globex", D("1"), D("2"))]
@@ -542,6 +572,8 @@ class CheckerSpec:
             return BlastRadius(int(self.number))
         if self.kind == "tenants":
             return TenantIsolation(int(self.number))
+        if self.kind == "declared":
+            return TenantIsolation(int(self.number), declared=True)
         if self.kind == "allow":
             return TableAllowlist(ts)
         if self.kind == "nodelete":
@@ -648,6 +680,7 @@ def scenarios(draw: st.DrawFn) -> Scenario:
                 (
                     "blast",
                     "tenants",
+                    "declared",
                     "allow",
                     "nodelete",
                     "value",
@@ -667,6 +700,7 @@ def scenarios(draw: st.DrawFn) -> Scenario:
         number = {
             "blast": float(draw(st.integers(1, 25))),
             "tenants": float(draw(st.integers(1, 3))),
+            "declared": float(draw(st.integers(1, 3))),
             "value": draw(st.sampled_from(FRACTIONS)),
             "drawdown": draw(st.sampled_from(FRACTIONS)),
             "stated": draw(st.sampled_from((1.5, 2.0, 3.0))),

@@ -260,7 +260,7 @@ blocking violation: fail closed.
 | Checker | Bounds |
 |---|---|
 | `BlastRadius` | captured mutations in one plan |
-| `TenantIsolation` | distinct tenants one plan may span |
+| `TenantIsolation` | distinct tenants one plan may span; with `declared=True`, the tenants its effects declare |
 | `ColumnValueGuard` | fall in a column total, table-wide |
 | `TenantDrawdownGuard` | fall in a column total, **per tenant** |
 | `NoDelete` | deletions outside granted tables |
@@ -274,6 +274,13 @@ blocking violation: fail closed.
 | `RecipientAllowlist` | where a request may send: email domains and addresses, https hosts, per tenant |
 | `OutboundTenantIsolation` | the tenants one plan's requests may span |
 | `FactAgreement` | a write against the inbound fact it must follow ([inbox](#inbound-facts-the-zero-trust-inbox)) |
+
+`TenantIsolation(1)` counts tenants: a plan declared for `acme` that changes one row of
+`globex`, and none of its own, spans one tenant and passes. When an agent acts for one
+tenant and the operator stamps every effect with it (`tenant_id=`, never the model's
+choice), pass `declared=True`: a row of any tenant the plan's effects do not declare is
+refused, one row as much as many, and the agent is told its own tenants and nothing of the
+other.
 
 `TenantDrawdownGuard` exists because `ColumnValueGuard` sums the column across
 the whole diff, and a sum is the wrong denominator on a multi-tenant

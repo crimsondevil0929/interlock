@@ -105,6 +105,7 @@ class Guidance(StrEnum):
     # Raised by a checker over the measured diff.
     ROW_LIMIT = "row_limit"
     TENANT_SCOPE = "tenant_scope"
+    UNDECLARED_TENANT = "undeclared_tenant"
     TABLE_SCOPE = "table_scope"
     NO_DELETE = "no_delete"
     VALUE_DROP = "value_drop"
@@ -145,6 +146,7 @@ class Guidance(StrEnum):
 _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.ROW_LIMIT: "blast_radius",
     Guidance.TENANT_SCOPE: "tenant_isolation",
+    Guidance.UNDECLARED_TENANT: "tenant_isolation",
     Guidance.TABLE_SCOPE: "table_allowlist",
     Guidance.NO_DELETE: "no_delete",
     Guidance.VALUE_DROP: "column_value_guard",
@@ -355,6 +357,10 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"the plan changed rows of more tenants than one plan may "
         f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. "
         f"Confine every statement to its declared tenants."
+    ),
+    Guidance.UNDECLARED_TENANT: lambda c: (
+        f"the plan changed rows of a tenant it does not declare; its declared tenants are "
+        f"{_tenants(c)}. Confine every statement to its declared tenants."
     ),
     Guidance.TABLE_SCOPE: lambda c: (
         f"the plan changed rows in {_tables(c)}, which it may not write."

@@ -9,6 +9,22 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (the customer acceptance matrix; `docs/CUSTOMER_ACCEPTANCE_MATRIX.md`)
+
+- **`TenantIsolation(declared=True)`** holds a plan's rows to the tenants its effects declare
+  (`Effect.tenant_id`), not only to a count. `TenantIsolation(1)` alone admits a plan
+  declared for one tenant that changes only another tenant's rows, since that spans one
+  tenant; building the acceptance suite found it. With `declared=True` such a plan is
+  refused, and a plan that declares no tenant may change no tenant's rows. Its own guidance, `undeclared_tenant`, under the
+  `tenant_isolation` name, tells the agent its declared tenants and never names or counts
+  the other. Off by default: a plan that never declares a tenant is judged as before.
+
+### Fixed (the customer acceptance matrix)
+
+- A `tenant_isolation` refusal of a plan that touched only other tenants' rows told the agent
+  its declared tenants were "none": the hint named only the tenants touched, and the
+  sanitizer keeps only the plan's own. It names the plan's own too now.
+
 ### Added (Epic 9: several daemons on one database; `docs/EPIC9_DESIGN.md`)
 
 - **Nodes of a cluster** (`interlock.cluster`, `[cluster]`). A daemon in a cluster is a
