@@ -1159,8 +1159,10 @@ class PostgresSubstrate:
         # row keeps its hash, which the stage role cannot read.
         token = secrets.token_bytes(32)
         try:
-            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-            conn.execute(self._timeouts())
+            # One message: a client that stops right after BEGIN (frozen, or
+            # lost to the network) leaves a transaction the server ends at the
+            # stage bound, never one with no bound at all.
+            conn.execute(f"BEGIN ISOLATION LEVEL REPEATABLE READ; {self._timeouts()}")
             targets = ", ".join(f"{self._schema}.{t.name}" for t in self._tables)
             if targets:
                 conn.execute(f"LOCK TABLE {targets} IN ROW EXCLUSIVE MODE")
