@@ -1,77 +1,99 @@
 #!/usr/bin/env python3
-"""The soak: the whole Interlock daemon under sustained concurrent load, on a live PostgreSQL.
+"""The soak: a cluster of Interlock daemons under sustained load and chaos, on a live PostgreSQL.
 
-(``docs/EPIC6_DESIGN.md`` §3.) One :class:`~interlock.supervisor.InterlockSupervisor`
-runs every part of Interlock in this process (the engines, the relays, the
-inbox, the settler and the vacuum), built by :func:`interlock.daemon.build_supervisor`
-from an ``interlock.toml`` the soak writes, each part connecting as its own
-role. Around it:
+(``docs/EPIC6_DESIGN.md`` §3, ``docs/EPIC9_DESIGN.md`` §5.) ``--nodes`` daemons,
+three by default, each ``interlock daemon --node`` in a process of its own, as
+the pods of a StatefulSet run: every node runs the engines that execute the
+agents' plans, the relays, the inbox, the settler of its own plans and the
+metrics endpoint, over one database and one AgentGov ledger; the vacuum and the
+inbox's matcher run on the node that leads their role. Each node has a
+directory of its own, as a pod has a volume, for its escrow chains and its
+receipt log; the operator log is in one every node shares. Around them, in the
+harness:
 
 - **A payment API** on localhost, in Stripe's shape. It honours
   ``Idempotency-Key``, replaying a key's first result, and injects faults: a
   500 after it acted, a 429, a reply slower than the relay waits, latency.
 - **The vendor's webhooks**, signed as Stripe signs them, for every payment
-  and every refund: some duplicated, some sent before the relay has recorded
-  the delivery they are about, some about objects Interlock never created,
-  and some forged (another secret, a stale timestamp, a rewritten body, no
-  signature at all). Each carries the trace context of the call that made
-  its object, continued, as a propagating vendor would; or a trace of the
+  and every refund, through a balancer in front of the nodes' inboxes, as a
+  Kubernetes Service is: some duplicated, some sent before the relay has
+  recorded the delivery they are about, some about objects Interlock never
+  created, and some forged (another secret, a stale timestamp, a rewritten
+  body, no signature at all). Each carries the trace context of the call that
+  made its object, continued, as a propagating vendor would; or a trace of the
   vendor's own; or a malformed one; or none, as Stripe sends.
-- **Agents**, each its own AgentGov scope with several plans in flight:
-  checkouts (an order row, and the charge for it carrying the refund that
-  undoes it), each the start of a trace; reconciliations (a fact consumed,
-  and the order updated to say what the fact says), each continuing the
-  fact's trace; notes on a few hot rows every agent contends for; and, now
-  and then, a plan that must be refused.
-- **A key service** in the soak's process, holding the relays', the inbox's
-  and the vacuum's Ed25519 keys as a KMS does: the daemon signs through
-  ``HttpRemoteSigner`` and never holds one (``docs/EPIC8_DESIGN.md`` §5).
-- **An operator** compensating paid orders, every action signed; and, halfway
-  through the load, rotating the relays' key: a new version at the service,
-  registered in the operator log; the daemon reloaded; and the old key
-  revoked while a stale relay, still holding it, has a call in flight.
+- **Agents**, inside every node: each AgentGov scope with several plans in
+  flight on each node, checkouts, reconciliations, notes on a few hot rows
+  every node contends for, and, now and then, a plan that must be refused. A
+  node's agents share no memory with another's: an order is found from its
+  checkout's plan id, and each node writes what its agents did to a journal of
+  its own, a line at a time, which outlives the node.
+- **A key service**, holding the relays', the inbox's and the vacuum's Ed25519
+  keys as a KMS does: every node signs through ``HttpRemoteSigner``
+  (``docs/EPIC8_DESIGN.md`` §5).
+- **An operator** compensating paid orders, every action signed; and, a
+  quarter of the way through the load, rotating the relays' key: a new version,
+  registered; every node reloaded (``SIGHUP``); the old key revoked while a
+  stale relay, still holding it, has a call in flight.
+- **The chaos.** At 45% of the load the node leading the vacuum is killed
+  (``SIGKILL``) at a moment it has a call in flight; at 70% the node leading
+  it then is frozen (``SIGSTOP``) with a call in flight and a stage open, its
+  connections left open as a host lost to the network leaves them, and killed
+  once the server and the cluster have ended everything it held: its session
+  at its timeout, the rest when a survivor fenced it. The moment is found by
+  stopping the node and looking, and letting it go on if it is not there yet.
+  Each comes back, as a pod is rescheduled, and recovers.
 - **An auditor** sampling the database throughout: lock waits, the rate
-  windows' history, the outbox's size, what the vacuum has yet to prune.
-- **A scraper** reading the daemon's ``/metrics`` every second, as Prometheus
-  would, while the daemon samples the database for them as an audit role.
+  windows' history, the outbox's size, what the vacuum has yet to prune, and
+  who holds each node's lock and each role.
+- **A scraper** reading each node's ``/metrics`` every second, as Prometheus
+  would.
 
 The load runs for ``--minutes``. Then no new work starts, everything in
-flight is delivered, settled and consumed, the daemon is stopped, and a
-second one is started to find nothing to recover. Then each claim is proven
-from the database, the ledger and the logs:
+flight is delivered, settled and consumed, every node is stopped, and a second
+start of every node finds nothing to recover. Then each claim is proven from
+the database, the ledger, the logs and the nodes' journals:
 
 ==========================  ====================================================================
 Claim                       Measured by
 ==========================  ====================================================================
-no deadlocks                ``pg_stat_database.deadlocks`` unchanged; no error says one happened
+no deadlocks                ``pg_stat_database.deadlocks`` unchanged; no node logged one
 lock waits resolve          sampled waits within the stage lock timeout; every lost race retried
-                            to an outcome; every plan answered
+                            to an outcome; every plan a node lived to answer, answered
 rate windows hold exactly   every key's history, at every row's commit instant, within the limit
                             over its span: rows the vacuum pruned included
 the ledger balances         AgentGov's integrity and conservation; each plan charged once, exactly
                             its price; each refund credited once; no hold left open
 exactly once                one object per idempotency key and per order; one receipt per
-                            delivery; every event recorded once, every fact consumed once
+                            delivery, but one whose plan's action receipt its node died before
+                            issuing; every event recorded once, every fact consumed once
 no forgery accepted         every forged webhook answered 400 or 401, and recorded nowhere
 the vacuum compacts         checkpoints throughout; messages, window rows and events pruned;
                             nothing prunable outlives its retention by more than a few runs
-everything verifies         delivery logs, attestations, operators, settlements, the inbox, every
-                            escrow chain and its anchors, the receipt log
-shutdown is graceful        stopped within the drain bound, nothing cut; a second daemon
-                            recovers nothing
+everything verifies         delivery logs, attestations, operators, keys, settlements against
+                            every node's receipt log, the inbox, every node's escrow chains
+shutdown is graceful        every node stopped within the drain bound, nothing cut; a second
+                            start of each recovers nothing
 trace context survives      every call the payment API saw carried its plan's context, every
-                            refund its charge's; every fact the trace of the delivery it binds
-                            (the webhook's context, when it continued ours); every reconcile plan
-                            the trace of the checkout it reconciles; every trace row still kept
-                            its plan's
-metrics agree               every scrape well formed and every family exported; no counter ever
-                            fell, no window above its limit; the plans, webhooks, deliveries,
-                            receipts and outbox they report are what the run counted itself
-keys rotate                 mid-load, every part reopened with the new key; every outcome the old
+                            refund its charge's; every fact the trace of the delivery it binds;
+                            every reconcile plan the trace of the checkout it reconciles
+metrics agree               every scrape well formed; no counter fell; each node's plans and
+                            webhooks what it counted itself; the settled outbox as sampled
+keys rotate                 mid-load, every node reloaded with the new key; every outcome the old
                             key attested sealed, but the stale relay's, which the database
-                            refused, and its message delivered once under the new key; every
-                            outcome after the revocation the new key's; the seal the one its
-                            operator signed
+                            refused, and its message delivered once under the new key
+nodes share the work        every node committed plans, delivered messages, answered webhooks
+                            and settled its own deliveries
+one leader at a time        no role ever held by two sessions; every vacuum run by the node
+                            leading then; each receipt log settled by its own node; each dead
+                            leader's role taken by another
+a node killed is survived   its leases taken within a second, its call in flight made again
+                            under its key and acted on once; its sessions gone at once; it came
+                            back and recovered what it left
+a node frozen is survived   its node's lock released at its session timeout, its leases taken
+                            only then; every session it had ended by a survivor's fencing a
+                            heartbeat later, every lock with it, no survivor waiting on one
+                            longer; it was killed, came back and recovered
 ==========================  ====================================================================
 
 Run::
@@ -112,6 +134,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -122,7 +145,7 @@ from datetime import datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, LiteralString, TypeVar
 
 import psycopg
 from agentgov import BudgetManager
@@ -136,11 +159,13 @@ from interlock import (
     EscrowChain,
     FactAgreement,
     OutboundCount,
+    PlanBuilder,
     SinkAllowlist,
     TenantIsolation,
 )
+from interlock.cluster import LEADER_LOCK, NODE_LOCK, lock_key
 from interlock.config import InterlockConfig, load_config
-from interlock.daemon import Application, build_supervisor
+from interlock.daemon import Application
 from interlock.exceptions import (
     ChainInUseError,
     InboundFactError,
@@ -152,10 +177,10 @@ from interlock.operators import Operator, OperatorLog, OperatorRefusedError, gen
 from interlock.relay import Delivery, DeliveryResult, NoBreaker, Relay
 from interlock.signers import HttpRemoteSigner
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE
-from interlock.supervisor import AgentContext, InterlockSupervisor, ServiceStatus
+from interlock.supervisor import AgentContext
 from interlock.telemetry import CATALOG
 from interlock.trace import child_traceparent, new_traceparent, parse_traceparent, trace_id
-from interlock.types import InboundFact, OutboundRequest
+from interlock.types import InboundFact, OutboundRequest, PlanId
 
 T = TypeVar("T")
 logger = logging.getLogger("soak")
@@ -169,6 +194,9 @@ SOURCE = "stripe"
 API_KEY_ENV = "SOAK_STRIPE_KEY"
 WEBHOOK_SECRET_ENV = "SOAK_WEBHOOK_SECRET"  # noqa: S105 - the name of a variable
 KMS_TOKEN_ENV = "SOAK_KMS_TOKEN"  # noqa: S105 - the name of a variable
+NODE_SPEC_ENV = "SOAK_NODE_SPEC"
+"""The variable naming a node process's spec: its name, its incarnation, its
+journal, and the run's settings."""
 REMOTE = ("relay", "inbox", "vacuum")
 """The parts whose keys the key service holds: each signs as
 ``[signers.<part>]``, the key named ``soak-<part>``."""
@@ -187,6 +215,8 @@ INITIAL = "awaiting_payment"
 """An order's status before any fact: the one value written without one."""
 
 TENANTS = ("acme", "globex", "initech", "umbrella", "hooli", "stark", "wayne", "tyrell")
+HOT = 3
+"""Rows each tenant has before the load, that every node's agents write."""
 LOCK_TIMEOUT = 2.0
 """The stages' ``lock_timeout``: no stage waits on a lock longer."""
 LEDGER_LOCK_TIMEOUT = 30.0
@@ -200,6 +230,9 @@ OUTCOMES = ("applied", "nothing", "refused", "rejected", "abandoned")
 """What a vacuum run can come to: only the first two are a vacuum keeping up."""
 
 MISBEHAVIOURS = ("overcharge", "unfounded_status", "cross_tenant", "self_refund", "fact_replay")
+"""Plans that must never commit: a charge for ten times the order, a status
+no fact says, a write across two tenants, a refund the agent issues itself,
+and a fact consumed twice."""
 TRACE_MODES = ("echo", "foreign", "invalid", "none")
 """What a webhook carries as ``traceparent``: the context of the call that
 made its object, continued, as a propagating vendor would; a trace of the
@@ -209,11 +242,16 @@ MALFORMED_TRACES = (
     "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",  # version ff, forbidden
     "00-4bf92f3577b34da6a3ce929d0e0e4736-01",  # no span
 )
+SHARE_AFTER = 2.0
+"""Seconds a pending fact is left to the node it falls to before any node's
+agents take it: fewer races for one fact, and none left behind by a node
+that died."""
 METRICS_EVERY = 1.0
-"""How often the daemon samples the database for its metrics, and the soak scrapes them."""
-"""Plans that must never commit: a charge for ten times the order, a status
-no fact says, a write across two tenants, a refund the agent issues itself,
-and a fact consumed twice."""
+"""How often each node samples the database for its metrics, and the soak
+scrapes them."""
+ROTATE_AT, KILL_AT, FREEZE_AT = 0.25, 0.45, 0.70
+"""Where in the load the relays' key is rotated, the vacuum's leader killed,
+and the vacuum's leader then frozen."""
 
 EXIT_OK, EXIT_FAILED, EXIT_ERROR = 0, 1, 2
 
@@ -224,13 +262,15 @@ class SoakError(Exception):
 
 @dataclass(frozen=True)
 class Settings:
-    """How hard and how long (``--help``)."""
+    """How hard and how long (``--help``). Agents, lanes, engines and relays
+    are each node's."""
 
     minutes: float = 5.0
+    nodes: int = 3
     agents: int = 4
-    concurrency: int = 6
-    workers: int = 8
-    relays: int = 3
+    concurrency: int = 3
+    workers: int = 4
+    relays: int = 2
     tenants: int = 6
     seed: int = 2026
     retain: int = 15
@@ -243,6 +283,11 @@ class Settings:
     desk_every: float = 1.5
     quiesce: float = 180.0
     faults: float = 1.0
+    heartbeat: float = 0.5
+    session_timeout: float = 4.0
+    max_stage: float = 6.0
+    restart_after: float = 10.0
+    chaos: bool = True
     quiet: bool = False
 
     @property
@@ -254,10 +299,22 @@ class Settings:
         return TENANTS[: self.tenants]
 
     @property
+    def node_names(self) -> tuple[str, ...]:
+        return tuple(f"node-{n}" for n in range(self.nodes))
+
+    @property
+    def hot(self) -> dict[str, list[int]]:
+        """Each tenant's hot rows: there before the load, written by every node."""
+        return {
+            tenant: [index * HOT + n + 1 for n in range(HOT)]
+            for index, tenant in enumerate(self.tenant_names)
+        }
+
+    @property
     def slack(self) -> float:
         """How long past its retention a prunable row may stay: three vacuum
-        runs, and the time one takes."""
-        return 3 * self.vacuum_every + 10
+        runs, the time one takes, and a failover's."""
+        return 3 * self.vacuum_every + 10 + self.session_timeout
 
 
 # --------------------------------------------------------------------------
@@ -266,7 +323,7 @@ class Settings:
 
 
 @dataclass
-class Cluster:
+class Server:
     """A PostgreSQL server, and a role on it that may create databases and roles."""
 
     admin: str
@@ -296,7 +353,7 @@ class Cluster:
             self.container = None
 
 
-def start_docker(image: str) -> Cluster:
+def start_docker(image: str) -> Server:
     """A fresh ``image`` container, listening on a free port of localhost."""
     if shutil.which("docker") is None:
         raise SoakError("--docker needs docker on the PATH")
@@ -315,14 +372,14 @@ def start_docker(image: str) -> Cluster:
         "127.0.0.1::5432",
         image,
         "-c",
-        "max_connections=200",
+        "max_connections=300",
         "-c",
         "log_lock_waits=on",
     ]
     started = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
     if started.returncode != 0:
         raise SoakError(f"docker run failed: {started.stderr.strip()}")
-    cluster = Cluster("", name)
+    server = Server("", name)
     try:
         mapped = subprocess.run(
             ["docker", "port", name, "5432/tcp"],
@@ -332,11 +389,11 @@ def start_docker(image: str) -> Cluster:
             timeout=60,
         ).stdout.split()[0]
         port = int(mapped.rsplit(":", 1)[1])
-        cluster.admin = f"postgresql://postgres:{password}@127.0.0.1:{port}/postgres"
+        server.admin = f"postgresql://postgres:{password}@127.0.0.1:{port}/postgres"
         deadline = time.monotonic() + 120
         while True:
             try:
-                with psycopg.connect(cluster.admin, connect_timeout=3) as conn:
+                with psycopg.connect(server.admin, connect_timeout=3) as conn:
                     conn.execute("SELECT 1")
                 break
             except psycopg.Error:
@@ -344,9 +401,9 @@ def start_docker(image: str) -> Cluster:
                     raise SoakError("the PostgreSQL container did not come up") from None
                 time.sleep(0.5)
     except BaseException:
-        cluster.close()
+        server.close()
         raise
-    return cluster
+    return server
 
 
 PARTS = ("stage", "relay", "inbox", "settle", "audit")
@@ -360,17 +417,28 @@ CREATE TABLE orders (
     status         text NOT NULL,
     refund_status  text,
     payment_intent text,
-    note           text
+    note           text,
+    plan           text
 )
 """
-COLUMNS = ("id", "tenant", "amount_cents", "status", "refund_status", "payment_intent", "note")
+COLUMNS = (
+    "id",
+    "tenant",
+    "amount_cents",
+    "status",
+    "refund_status",
+    "payment_intent",
+    "note",
+    "plan",
+)
 
 
 @dataclass
 class Site:
-    """The soak's database on a cluster, its roles, and its files."""
+    """The soak's database on a server, its roles, and its files: a directory
+    every node shares, and one of each node's own."""
 
-    cluster: Cluster
+    server: Server
     name: str
     directory: Path
     roles: dict[str, str]
@@ -379,16 +447,26 @@ class Site:
 
     @property
     def owner(self) -> str:
-        """The database as the cluster's admin: it owns the tables, installs
+        """The database as the server's admin: it owns the tables, installs
         Interlock, owns the AgentGov ledger, and runs the vacuum."""
-        return make_conninfo(self.cluster.admin, dbname=self.name)
+        return make_conninfo(self.server.admin, dbname=self.name)
+
+    @property
+    def shared(self) -> Path:
+        """What every node reads: the operator log, and the files of keys."""
+        return self.directory / "shared"
+
+    def home(self, node: str) -> Path:
+        """A node's own, as a pod's volume: its configuration, its chains,
+        its receipt log, its journals."""
+        return self.directory / node
 
     def dsn(self, part: str) -> str:
         return make_conninfo(self.owner, user=self.roles[part], password=self.password)
 
     def drop(self) -> None:
         """The database and the roles, whatever was created of them."""
-        with psycopg.connect(self.cluster.admin, autocommit=True) as admin:
+        with psycopg.connect(self.server.admin, autocommit=True) as admin:
             admin.execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(self.name))
             )
@@ -396,10 +474,10 @@ class Site:
                 admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
 
 
-def new_site(cluster: Cluster, directory: Path) -> Site:
+def new_site(server: Server, directory: Path) -> Site:
     tag = secrets.token_hex(4)
     return Site(
-        cluster,
+        server,
         f"interlock_soak_{tag}",
         directory,
         {part: f"soak_{tag}_{part}" for part in PARTS},
@@ -408,10 +486,11 @@ def new_site(cluster: Cluster, directory: Path) -> Site:
 
 
 def create_site(site: Site, settings: Settings) -> None:
-    """A fresh database with the orders table, a role for each part, and the
-    AgentGov ledger: a root scope for each agent and one for the operators."""
-    cluster = site.cluster
-    with psycopg.connect(cluster.admin, autocommit=True) as admin:
+    """A fresh database with the orders table and its hot rows, a role for
+    each part, and the AgentGov ledger: a root scope for each agent and one
+    for the operators."""
+    server = site.server
+    with psycopg.connect(server.admin, autocommit=True) as admin:
         admin.execute(
             sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(site.name))
         )
@@ -425,6 +504,14 @@ def create_site(site: Site, settings: Settings) -> None:
     roles = site.roles
     with psycopg.connect(site.owner, autocommit=True) as conn:
         conn.execute(ORDERS_DDL)
+        # The rows every node's agents contend for: written before Interlock
+        # observes the table, as rows that were there before it.
+        for tenant, ids in settings.hot.items():
+            for order_id in ids:
+                conn.execute(
+                    "INSERT INTO orders (id, tenant, amount_cents, status) VALUES (%s, %s, %s, %s)",
+                    (order_id, tenant, 1000, INITIAL),
+                )
         conn.execute(
             sql.SQL("GRANT SELECT, INSERT, UPDATE ON orders TO {}").format(
                 sql.Identifier(roles["stage"])
@@ -591,10 +678,14 @@ def _q(text: str) -> str:
     return json.dumps(text)
 
 
-def write_config(site: Site, settings: Settings, keys: Keys, api_port: int) -> Path:
-    """The ``interlock.toml`` of the run: every part, configured as in production,
-    with its times scaled down to seconds."""
+def write_config(site: Site, settings: Settings, keys: Keys, api_port: int, node: str) -> Path:
+    """Node ``node``'s ``interlock.toml``: every part, configured as in
+    production, with its times scaled down to seconds. The nodes' files differ
+    only in the node and its receipt log's id; each lives in the node's own
+    directory, where its chains and receipt log are written; the operator log
+    and the keys are in the one every node shares."""
     roles = site.roles
+    shared = site.shared
     text = (
         f"""
 substrate = "postgres"
@@ -664,7 +755,7 @@ url = {_q(f"http://127.0.0.1:{api_port}")}
 secret_env = {_q(API_KEY_ENV)}
 
 [operators]
-log = "operators.ilok1"
+log = {_q(str(shared / "operators.ilok1"))}
 ledger = {_q(site.owner)}
 scope = {_q(OPERATORS_SCOPE)}
 
@@ -696,13 +787,13 @@ settle_cost = {_q(str(SETTLE_COST))}
 ledger = {_q(site.owner)}
 same_transaction = true
 conflict_retries = 32
-max_stage_seconds = 10
+max_stage_seconds = {settings.max_stage}
 lock_timeout_seconds = {LOCK_TIMEOUT}
 
 [receipts]
 log = "receipts.jsonl"
-key = "receipts.key"
-log_id = "soak-receipts"
+key = {_q(str(keys.receipts))}
+log_id = {_q(receipts_log_id(node))}
 
 [settler]
 database = {_q(site.dsn("settle"))}
@@ -719,6 +810,13 @@ signer = "vacuum"
 drain_timeout_seconds = 30
 restart_min_seconds = 0.2
 restart_max_seconds = 5
+
+[cluster]
+node = {_q(node)}
+# The owner: a node fences a gone node's sessions, the ledger's (a superuser's) among them.
+database = {_q(site.owner)}
+heartbeat_seconds = {settings.heartbeat}
+session_timeout_seconds = {settings.session_timeout}
 """
         + "".join(
             f"""
@@ -738,9 +836,16 @@ every_seconds = {METRICS_EVERY}
 database = {_q(site.dsn("audit"))}
 """
     )
-    path = site.directory / "interlock.toml"
+    home = site.home(node)
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "interlock.toml"
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def receipts_log_id(node: str) -> str:
+    """Each node's receipt log's id: a log has one writer, its node's."""
+    return f"soak-receipts-{node}"
 
 
 def install(path: Path, keys: Keys) -> None:
@@ -1056,6 +1161,10 @@ class Sent:
     trace: str = "none"
     """What the webhook carried as ``traceparent``: ``echo`` (ours, continued),
     ``foreign`` (the vendor's own), ``invalid``, or ``none``."""
+    node: str = ""
+    """The node whose inbox the balancer sent it to."""
+    incarnation: int = -1
+    """Which process of that node it was."""
 
 
 FORGERIES = ("wrong_secret", "stale", "tampered", "unsigned")
@@ -1063,16 +1172,20 @@ FORGERIES = ("wrong_secret", "stale", "tampered", "unsigned")
 
 class Vendor:
     """The payment provider's webhooks: each object's event, signed when it is
-    sent, retried while the inbox does not answer 2xx, as Stripe retries.
+    sent, through the balancer to one node's inbox, and sent again while no
+    inbox answers 2xx, as Stripe retries. A node that does not answer, a
+    killed one or a frozen one, is tried no more until its health check says
+    it is back, and the webhook goes to the next.
 
     Some are sent at once, before the relay can have recorded the delivery
     they are about; some twice; and beside them, events about objects nobody
     created, and forgeries of the real ones.
     """
 
-    def __init__(self, secret: str, seed: int, *, senders: int = 4) -> None:
+    def __init__(self, secret: str, seed: int, balancer: Balancer, *, senders: int = 4) -> None:
         self._secret = secret
         self._rng = random.Random(seed)
+        self._balancer = balancer
         self._lock = threading.Condition()
         self._heap: list[tuple[float, int, Webhook]] = []
         self._order = itertools.count()
@@ -1080,7 +1193,6 @@ class Vendor:
         self._tag = secrets.token_hex(3)
         self._busy = 0
         self._stop = False
-        self.url: tuple[str, int, str] | None = None
         self.sent: list[Sent] = []
         self.failures: Counter[str] = Counter()
         self.forged: set[str] = set()
@@ -1095,12 +1207,6 @@ class Vendor:
     def start(self) -> None:
         for thread in self._threads:
             thread.start()
-
-    def target(self, port: int) -> None:
-        """Send to the inbox listening on ``port``."""
-        with self._lock:
-            self.url = ("127.0.0.1", port, f"/inbox/{SOURCE}")
-            self._lock.notify_all()
 
     def close(self) -> None:
         with self._lock:
@@ -1177,20 +1283,19 @@ class Vendor:
                     if self._stop:
                         return
                     now = time.monotonic()
-                    if self.url is not None and self._heap and self._heap[0][0] <= now:
+                    if self._heap and self._heap[0][0] <= now:
                         _, _, webhook = heapq.heappop(self._heap)
                         self._busy += 1
-                        url = self.url
                         break
-                    wait = 0.5 if not self._heap or self.url is None else self._heap[0][0] - now
+                    wait = 0.5 if not self._heap else self._heap[0][0] - now
                     self._lock.wait(timeout=max(0.001, min(wait, 0.5)))
             try:
-                self._send(url, webhook)
+                self._send(webhook)
             finally:
                 with self._lock:
                     self._busy -= 1
 
-    def _send(self, url: tuple[str, int, str], webhook: Webhook) -> None:
+    def _send(self, webhook: Webhook) -> None:
         body = json.dumps(webhook.event, separators=(",", ":")).encode()
         at = int(time.time())
         headers = {"Content-Type": "application/json; charset=utf-8", "User-Agent": "Stripe/1.0"}
@@ -1207,24 +1312,52 @@ class Vendor:
         trace, traceparent = self.traces.get(webhook.event["id"], ("none", None))
         if traceparent is not None:
             headers["traceparent"] = traceparent
-        host, port, path = url
-        status, answer = 0, {}
-        try:
-            conn = http.client.HTTPConnection(host, port, timeout=15)
+        status, answer, node, incarnation = 0, {}, "", -1
+        # Through the balancer: a node that does not answer is taken out, and
+        # the next one tried at once, as a Service's next endpoint is.
+        for _ in range(3):
+            picked = self._balancer.pick()
+            if picked is None:
+                self.failures["no node up"] += 1
+                break
+            target, port, incarnation = picked
+            node = target.name
             try:
-                conn.request("POST", path, body=body, headers=headers)
-                response = conn.getresponse()
-                status = response.status
-                with contextlib.suppress(ValueError):
-                    answer = json.loads(response.read() or b"{}")
-            finally:
-                conn.close()
-        except OSError as exc:
-            self.failures[type(exc).__name__] += 1
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request("POST", f"/inbox/{SOURCE}", body=body, headers=headers)
+                    response = conn.getresponse()
+                    status = response.status
+                    with contextlib.suppress(ValueError):
+                        answer = json.loads(response.read() or b"{}")
+                finally:
+                    conn.close()
+            except OSError as exc:
+                self.failures[type(exc).__name__] += 1
+                self._balancer.failed(target)
+                with self._lock:
+                    self.sent.append(
+                        Sent(webhook.event["id"], purpose, 0, 0, 0, trace, node, incarnation)
+                    )
+                status = 0
+                continue
+            break
         recorded = int(answer.get("recorded", 0)) if isinstance(answer, dict) else 0
         matched = int(answer.get("matched", 0)) if isinstance(answer, dict) else 0
         with self._lock:
-            self.sent.append(Sent(webhook.event["id"], purpose, status, recorded, matched, trace))
+            if status:
+                self.sent.append(
+                    Sent(
+                        webhook.event["id"],
+                        purpose,
+                        status,
+                        recorded,
+                        matched,
+                        trace,
+                        node,
+                        incarnation,
+                    )
+                )
             if not 200 <= status < 300 and not purpose.startswith("forged:"):
                 # As Stripe does: again, later, until the endpoint answers 2xx.
                 webhook.attempts += 1
@@ -1236,8 +1369,69 @@ class Vendor:
 
 
 # --------------------------------------------------------------------------
-# The agents
+# The agents, inside every node
 # --------------------------------------------------------------------------
+
+INSERT_ORDER = (
+    "INSERT INTO orders (id, tenant, amount_cents, status, plan) "
+    "VALUES (%(id)s, %(tenant)s, %(amount)s, %(status)s, %(plan)s)"
+)
+
+
+@dataclass(frozen=True)
+class NodeSpec:
+    """What one daemon process of the cluster needs to know of the run,
+    written by the harness as JSON beside the node's configuration."""
+
+    name: str
+    index: int
+    incarnation: int
+    settings: Settings
+    journal: str
+    wind_down: str
+    t0: float
+    """When the load began, in seconds since the epoch: the bursts' clock."""
+    hot: dict[str, list[int]]
+    """Each tenant's few rows every node's agents contend for."""
+
+    @property
+    def order_base(self) -> int:
+        """Where this incarnation's order ids begin: unique across the cluster
+        and every incarnation of every node."""
+        return (self.index + 1) * 10**12 + self.incarnation * 10**9
+
+    def write(self, path: Path) -> None:
+        document = {**self.__dict__, "settings": self.settings.__dict__}
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    @classmethod
+    def read(cls, path: str | Path) -> NodeSpec:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+        document["settings"] = Settings(**document["settings"])
+        return cls(**document)
+
+
+class Journal:
+    """What a node's agents did, a line of JSON each, written to the OS as it
+    happens: what a killed process wrote, the harness reads."""
+
+    def __init__(self, path: str | Path) -> None:
+        self._file = open(path, "a", encoding="utf-8", buffering=1)
+        self._lock = threading.Lock()
+
+    def write(self, record: str, **fields: Any) -> None:
+        line = json.dumps({"r": record, "at": time.time(), **fields}, default=str)
+        with self._lock:
+            self._file.write(line + "\n")
+
+    def close(self) -> None:
+        with self._lock:
+            self._file.close()
+
+
+CHECKOUT = re.compile(r"\Acheckout-(\d+)-[0-9a-f]+\Z")
+"""A checkout's plan id names its order: any node's agent finds the order a
+fact is about from the fact's plan alone."""
 
 
 @dataclass
@@ -1248,105 +1442,86 @@ class Order:
     amount: int
     plan_id: str
     committed: bool = False
-    status: str = INITIAL
     payment_intent: str | None = None
-    refund_status: str | None = None
-    reconciled_at: float = 0.0
-    compensated: bool = False
     traceparent: str | None = None
-    """The checkout plan's: the trace its charge, its refund and their facts continue."""
-
-
-@dataclass
-class PlanRecord:
-    """What became of one plan an agent submitted."""
-
-    kind: str
-    scope: str
-    committed: bool | None
-    """``None``: no verdict, the plan raised."""
-    blocked_by: tuple[str, ...] = ()
-    error: str | None = None
-    checkout: bool = False
-
-
-INSERT_ORDER = (
-    "INSERT INTO orders (id, tenant, amount_cents, status) "
-    "VALUES (%(id)s, %(tenant)s, %(amount)s, %(status)s)"
-)
 
 
 class Workload:
-    """The agents' shared memory, and the record of everything they did."""
+    """One node's agents: what they remember between plans, and the journal
+    of everything they did. Nothing is shared between nodes but the
+    database: an order is found from its checkout's plan id, and the hot rows
+    every node writes exist before the load."""
 
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
+    def __init__(self, spec: NodeSpec) -> None:
+        self.spec = spec
+        self.settings = spec.settings
+        self.journal = Journal(spec.journal)
         self.lock = threading.Lock()
         self.winding_down = threading.Event()
         self.orders: dict[int, Order] = {}
-        self.by_plan: dict[str, int] = {}
-        self.plans: dict[str, PlanRecord] = {}
-        self.hot: dict[str, list[int]] = {t: [] for t in settings.tenant_names}
-        self.by_tenant: dict[str, list[int]] = {t: [] for t in settings.tenant_names}
-        self.burst: tuple[str, float] | None = None
-        """A tenant every lane writes for, until a moment or its window refuses:
-        whatever the machine's speed, the tenant window is pushed to its limit."""
-        self.bursts: Counter[str] = Counter()
+        self.by_tenant: dict[str, list[int]] = {t: [] for t in self.settings.tenant_names}
+        self.hot = {t: list(ids) for t, ids in spec.hot.items()}
         self.consumed: dict[str, list[InboundFact]] = defaultdict(list)
-        self.reconciled: list[tuple[InboundFact, str | None]] = []
-        """Each fact consumed, and the ``traceparent`` of the plan that consumed it."""
-        self.kinds: Counter[str] = Counter()
-        self.errors: Counter[str] = Counter()
-        self.orphans = 0
-        self.submitted = 0
-        self.answered = 0
+        self.bursts_filled: set[int] = set()
+        self._ids = itertools.count(spec.order_base + 1)
         self.inflight = 0
-        self._ids = itertools.count(1)
+        self.journal.write("start", node=spec.name, incarnation=spec.incarnation, pid=os.getpid())
+
+    def watch(self) -> None:
+        """Wind down when the harness says so: a file appears."""
+
+        def watching() -> None:
+            while not Path(self.spec.wind_down).exists():
+                time.sleep(0.1)
+            self.winding_down.set()
+            self.journal.write("winding_down")
+
+        threading.Thread(target=watching, name="soak-wind-down", daemon=True).start()
 
     # -- submitting ---------------------------------------------------------
 
     async def submit(self, ctx: AgentContext, plan: Any, kind: str, scope: str) -> Any:
-        """Execute ``plan``; record what became of it. ``None`` when it raised."""
-        self.submitted += 1
+        """Execute ``plan``; journal it, and what became of it. ``None`` when
+        it raised."""
+        checkout = kind in ("checkout", "misbehave:overcharge")
+        self.journal.write(
+            "plan", plan=str(plan.plan_id), kind=kind, scope=scope, checkout=checkout
+        )
         self.inflight += 1
         try:
             result = await ctx.execute(plan)
         except SupervisorStoppedError as exc:
-            self._record(plan, kind, scope, None, error=f"stopped: {exc}")
+            self._answer(plan, None, error=f"stopped: {exc}")
             return None
         except StageConflictError as exc:
-            self._record(plan, kind, scope, None, error=f"conflict: {exc}")
+            self._answer(plan, None, error=f"conflict: {exc}")
             return None
         except InboundFactError as exc:
-            self._record(plan, kind, scope, None, error=f"fact: {exc}")
+            self._answer(plan, None, error=f"fact: {exc}")
             return None
-        except Exception as exc:  # recorded: the claims say whether it was expected
-            self._record(plan, kind, scope, None, error=f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # journaled: the claims say whether it was expected
+            self._answer(plan, None, error=f"{type(exc).__name__}: {exc}")
             return None
         finally:
             self.inflight -= 1
-            self.answered += 1
-        self._record(plan, kind, scope, result.committed, blocked=result.blocked_by)
+        self._answer(plan, result.committed, blocked=result.blocked_by)
         return result
 
-    def _record(
+    def _answer(
         self,
         plan: Any,
-        kind: str,
-        scope: str,
         committed: bool | None,
         *,
         blocked: tuple[str, ...] = (),
         error: str | None = None,
     ) -> None:
-        checkout = kind in ("checkout", "misbehave:overcharge")
-        self.plans[str(plan.plan_id)] = PlanRecord(
-            kind, scope, committed, tuple(blocked), error, checkout
+        self.journal.write(
+            "answer",
+            plan=str(plan.plan_id),
+            committed=committed,
+            blocked=list(blocked),
+            error=error,
         )
-        outcome = "error" if committed is None else "committed" if committed else "refused"
-        self.kinds[f"{kind}:{outcome}"] += 1
-        if error is not None:
-            self.errors[f"{kind}: {error.split(':', 1)[0]}"] += 1
 
     # -- what agents do -------------------------------------------------------
 
@@ -1357,12 +1532,24 @@ class Workload:
         order_id = next(self._ids)
         amount = rng.randrange(500, 4501)
         traceparent = new_traceparent()
+        plan_id = PlanId(f"checkout-{order_id}-{uuid.uuid4().hex[:8]}")
         plan = (
-            ctx.plan(scope, intent=f"check out order {order_id}", traceparent=traceparent)
+            PlanBuilder(
+                scope,
+                intent=f"check out order {order_id}",
+                traceparent=traceparent,
+                plan_id=plan_id,
+            )
             .insert(
                 table="orders",
                 statement=INSERT_ORDER,
-                parameters={"id": order_id, "tenant": tenant, "amount": amount, "status": INITIAL},
+                parameters={
+                    "id": order_id,
+                    "tenant": tenant,
+                    "amount": amount,
+                    "status": INITIAL,
+                    "plan": plan_id,
+                },
                 tenant_id=tenant,
                 stated_rows=1,
             )
@@ -1381,10 +1568,18 @@ class Workload:
             )
             .build()
         )
-        order = Order(order_id, scope, tenant, amount, str(plan.plan_id), traceparent=traceparent)
+        order = Order(order_id, scope, tenant, amount, plan_id, traceparent=traceparent)
+        self.journal.write(
+            "order",
+            order=order_id,
+            plan=plan_id,
+            scope=scope,
+            tenant=tenant,
+            amount=amount,
+            traceparent=traceparent,
+        )
         with self.lock:
             self.orders[order_id] = order
-            self.by_plan[order.plan_id] = order_id
         result = await self.submit(
             ctx, plan, "misbehave:overcharge" if overcharge else "checkout", scope
         )
@@ -1392,24 +1587,20 @@ class Workload:
             with self.lock:
                 order.committed = True
                 self.by_tenant[tenant].append(order_id)
-                hot = self.hot[tenant]
-                if len(hot) < 3:
-                    hot.append(order_id)
         return result
 
     async def annotate(
         self, ctx: AgentContext, scope: str, rng: random.Random, *, tenant: str | None = None
     ) -> Any:
-        """A note on one of a few hot rows every agent writes: contention. For
-        a burst's ``tenant``, on any of its recent orders instead."""
-        pool = self.by_tenant
+        """A note on one of the few hot rows every node's agents write:
+        contention, across processes. For a burst's ``tenant``, on any of this
+        node's recent orders of it, or a hot one."""
         if tenant is None:
             tenant = rng.choice(self.settings.tenant_names)
-            pool = self.hot
-        with self.lock:
-            rows = pool[tenant][-64:]
-        if not rows:
-            return await self.checkout(ctx, scope, rng)
+            rows = self.hot[tenant]
+        else:
+            with self.lock:
+                rows = self.by_tenant[tenant][-64:] or self.hot[tenant]
         order_id = rng.choice(rows)
         plan = (
             ctx.plan(scope, intent=f"annotate order {order_id}")
@@ -1424,16 +1615,16 @@ class Workload:
         )
         return await self.submit(ctx, plan, "annotate", scope)
 
-    async def reconcile(self, ctx: AgentContext, scope: str, fact: InboundFact) -> bool:
-        """Consume ``fact`` and write what it says. Returns whether it is done
-        with: consumed, or never to be."""
-        with self.lock:
-            order_id = self.by_plan.get(fact.plan_id)
-            order = None if order_id is None else self.orders[order_id]
-        if order is None:
-            self.orphans += 1
-            logger.warning("fact %s names plan %s, which no agent made", fact.fact_id, fact.plan_id)
-            return True
+    async def reconcile(self, ctx: AgentContext, scope: str, fact: InboundFact) -> str:
+        """Consume ``fact`` and write what it says to its order, found from the
+        fact's plan: ``done``; ``again`` when a window refused or a race was
+        lost; ``gone`` when another node consumed it first, or it names no
+        checkout."""
+        named = CHECKOUT.match(fact.plan_id)
+        if named is None or fact.tenant_id is None:
+            self.journal.write("orphan", fact=str(fact.fact_id), plan=fact.plan_id)
+            return "gone"
+        order_id = int(named.group(1))
         status = str(fact.fields.get("status", ""))
         if fact.kind in STATUS_KINDS:
             statement = (
@@ -1442,18 +1633,18 @@ class Workload:
             parameters: dict[str, Any] = {
                 "status": status,
                 "pi": str(fact.fields.get("id", "")),
-                "id": order.order_id,
+                "id": order_id,
             }
         else:
             statement = "UPDATE orders SET refund_status = %(status)s WHERE id = %(id)s"
-            parameters = {"status": status, "id": order.order_id}
+            parameters = {"status": status, "id": order_id}
         # The fact's trace, continued: agent, outbox, relay, vendor, webhook,
-        # fact, and the agent again.
+        # fact, and the agent again, on whichever node.
         parent = fact.traceparent
         plan = (
             ctx.plan(
                 scope,
-                intent=f"record {fact.kind} for order {order.order_id}",
+                intent=f"record {fact.kind} for order {order_id}",
                 traceparent=None if parent is None else child_traceparent(parent),
             )
             .consume(fact)
@@ -1461,31 +1652,37 @@ class Workload:
                 table="orders",
                 statement=statement,
                 parameters=parameters,
-                tenant_id=order.tenant,
+                tenant_id=fact.tenant_id,
                 stated_rows=1,
             )
             .build()
         )
         result = await self.submit(ctx, plan, "reconcile", scope)
         if result is None or not result.committed:
-            return False
+            pending = {f.fact_id for f in await ctx.facts(scope)}
+            return "again" if fact.fact_id in pending else "gone"
+        self.journal.write(
+            "reconciled",
+            fact=str(fact.fact_id),
+            event=fact.event_id,
+            kind=fact.kind,
+            remote_ref=fact.remote_ref,
+            plan=fact.plan_id,
+            traceparent=fact.traceparent,
+            planned=plan.traceparent,
+        )
         with self.lock:
-            if fact.kind in STATUS_KINDS:
-                order.status = status
-                order.payment_intent = str(parameters["pi"])
-                order.reconciled_at = time.monotonic()
-            else:
-                order.refund_status = status
             self.consumed[scope].append(fact)
-            self.reconciled.append((fact, plan.traceparent))
-        return True
+            order = self.orders.get(order_id)
+            if order is not None and fact.kind in STATUS_KINDS:
+                order.payment_intent = str(parameters["pi"])
+        return "done"
 
     async def misbehave(self, ctx: AgentContext, scope: str, rng: random.Random) -> None:
         """A plan that must be refused."""
         how = rng.choice(MISBEHAVIOURS)
         with self.lock:
             mine = [o for o in self.orders.values() if o.committed and o.scope == scope]
-            others = [o for o in self.orders.values() if o.committed]
             replayable = list(self.consumed[scope])
         if how == "overcharge" or not mine:
             await self.checkout(ctx, scope, rng, overcharge=True)
@@ -1502,14 +1699,11 @@ class Workload:
             )
         elif how == "cross_tenant":
             first = rng.choice(mine)
-            second = next((o for o in others if o.tenant != first.tenant), None)
-            if second is None:
-                await self.checkout(ctx, scope, rng, overcharge=True)
-                return
+            other = next(t for t in self.settings.tenant_names if t != first.tenant)
             builder.update(
                 table="orders",
                 statement="UPDATE orders SET note = %(note)s WHERE id IN (%(a)s, %(b)s)",
-                parameters={"note": "merged", "a": first.order_id, "b": second.order_id},
+                parameters={"note": "merged", "a": first.order_id, "b": self.hot[other][0]},
                 tenant_id=first.tenant,
                 stated_rows=2,
             )
@@ -1526,48 +1720,43 @@ class Workload:
                 await self.checkout(ctx, scope, rng, overcharge=True)
                 return
             fact = rng.choice(replayable)
-            with self.lock:
-                order_id = self.by_plan[fact.plan_id]
-                order = self.orders[order_id]
+            named = CHECKOUT.match(fact.plan_id)
+            assert named is not None and fact.tenant_id is not None
             builder.consume(fact).update(
                 table="orders",
                 statement="UPDATE orders SET note = %(note)s WHERE id = %(id)s",
-                parameters={"note": "again", "id": order.order_id},
-                tenant_id=order.tenant,
+                parameters={"note": "again", "id": int(named.group(1))},
+                tenant_id=fact.tenant_id,
                 stated_rows=1,
             )
         await self.submit(ctx, builder.build(), f"misbehave:{how}", scope)
 
-    def bursting(self) -> str | None:
-        """The tenant of the burst under way, if one is."""
-        burst = self.burst
-        if burst is None or time.monotonic() > burst[1]:
+    def bursting(self) -> tuple[int, str] | None:
+        """The burst under way, if one is, and this node has not seen its
+        window fill yet: every node writes for one tenant for a few seconds,
+        on one clock, the run's."""
+        elapsed = time.time() - self.spec.t0
+        number = int(elapsed // BURST_EVERY)
+        if number < 1 or elapsed - number * BURST_EVERY > BURST_SECONDS:
             return None
-        return burst[0]
-
-    def refund_candidate(self, rng: random.Random, within: float) -> Order | None:
-        """A paid order, reconciled within the last ``within`` seconds, not
-        compensated yet: what the operator refunds."""
-        now = time.monotonic()
-        with self.lock:
-            found = [
-                o
-                for o in self.orders.values()
-                if o.status == "succeeded" and not o.compensated and now - o.reconciled_at < within
-            ]
-        return rng.choice(found) if found else None
+        if number in self.bursts_filled:
+            return None
+        names = self.settings.tenant_names
+        return number, names[(number - 1) % len(names)]
 
 
 def make_agent(workload: Workload, index: int) -> Callable[[AgentContext], Any]:
-    """Agent ``index``: its scope, ``concurrency`` lanes, and a fact poller."""
+    """Agent ``index``: its scope, ``concurrency`` lanes, and a fact poller.
+    Every node runs every agent: each scope's plans come from every node."""
     settings = workload.settings
     scope = settings.scopes[index]
-    rng = random.Random(settings.seed * 1000 + index)
+    spec = workload.spec
+    rng = random.Random(f"{settings.seed}:{spec.name}:{spec.incarnation}:{index}")
 
     async def agent(ctx: AgentContext) -> None:
         pending: asyncio.Queue[InboundFact] = asyncio.Queue()
-        seen: set[uuid.UUID] = set()
-        consumed: set[uuid.UUID] = set()
+        queued: set[uuid.UUID] = set()
+        seen: dict[uuid.UUID, float] = {}
 
         async def poll() -> None:
             while not ctx.stopping:
@@ -1578,10 +1767,19 @@ def make_agent(workload: Workload, index: int) -> Callable[[AgentContext], Any]:
                 except Exception as exc:  # the next poll tries again
                     logger.warning("%s: reading facts failed: %s", scope, exc)
                     facts = ()
+                now = time.monotonic()
                 for fact in facts:
-                    if fact.fact_id not in seen and fact.fact_id not in consumed:
-                        seen.add(fact.fact_id)
+                    if fact.fact_id in queued:
+                        continue
+                    # Each fact is one node's first, then anyone's: a node
+                    # that died leaves its facts to the rest of the cluster.
+                    first = seen.setdefault(fact.fact_id, now)
+                    if fact.fact_id.int % settings.nodes == spec.index or now - first > SHARE_AFTER:
+                        queued.add(fact.fact_id)
                         pending.put_nowait(fact)
+                current = {fact.fact_id for fact in facts}
+                for fact_id in [f for f in seen if f not in current]:
+                    del seen[fact_id]
                 await ctx.sleep(0.2)
 
         async def lane() -> None:
@@ -1591,22 +1789,24 @@ def make_agent(workload: Workload, index: int) -> Callable[[AgentContext], Any]:
                 except asyncio.QueueEmpty:
                     fact = None
                 if fact is not None:
-                    if await workload.reconcile(ctx, scope, fact):
-                        consumed.add(fact.fact_id)
-                        seen.discard(fact.fact_id)
-                    else:  # refused by a window, or lost a race: again shortly
+                    outcome = await workload.reconcile(ctx, scope, fact)
+                    if outcome == "again":  # a window refused, or a race lost
                         await ctx.sleep(0.25)
                         pending.put_nowait(fact)
+                    else:  # done, here or by another node: polled again if not
+                        queued.discard(fact.fact_id)
                     continue
                 if workload.winding_down.is_set():
                     await ctx.sleep(0.1)
                     continue
-                tenant = workload.bursting()
-                if tenant is not None:
+                burst = workload.bursting()
+                if burst is not None:
+                    number, tenant = burst
                     result = await workload.annotate(ctx, scope, rng, tenant=tenant)
                     if result is not None and TENANT_WINDOW in result.blocked_by:
-                        workload.bursts[tenant] += 1
-                        workload.burst = None  # the window is full: the burst made its point
+                        if number not in workload.bursts_filled:
+                            workload.bursts_filled.add(number)
+                            workload.journal.write("burst", number=number, tenant=tenant)
                     continue
                 roll = rng.random()
                 if roll < 0.04:
@@ -1628,24 +1828,427 @@ def make_agent(workload: Workload, index: int) -> Callable[[AgentContext], Any]:
     return agent
 
 
+def node_application(config: InterlockConfig) -> Application:
+    """``interlock daemon --app live_stress_test:node_application``: one node's
+    agents, as the harness specified them (:data:`NODE_SPEC_ENV`)."""
+    spec = NodeSpec.read(os.environ[NODE_SPEC_ENV])
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s {spec.name}.{spec.incarnation} %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+    )
+    workload = Workload(spec)
+    workload.watch()
+    return Application(
+        checkers=checkers(),
+        agents=[make_agent(workload, n) for n in range(spec.settings.agents)],
+    )
+
+
+# --------------------------------------------------------------------------
+# What the nodes did, as their journals say
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PlanRecord:
+    """What became of one plan an agent submitted, on whichever node."""
+
+    kind: str
+    scope: str
+    node: str
+    incarnation: int
+    checkout: bool
+    answered: bool = False
+    """``False``: its node died before it was answered."""
+    committed: bool | None = None
+    """``None``: no verdict, the plan raised, or no answer at all."""
+    blocked_by: tuple[str, ...] = ()
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class Reconciled:
+    """A fact a plan consumed, as the journal of the node that consumed it says."""
+
+    fact_id: str
+    event_id: str
+    kind: str
+    remote_ref: str
+    plan_id: str
+    traceparent: str | None
+    planned: str | None
+
+
+@dataclass
+class Incarnation:
+    """One process of one node: from its start to its stop, or its death."""
+
+    node: str
+    number: int
+    pid: int = 0
+    submitted: int = 0
+    answered: int = 0
+    plans: list[str] = field(default_factory=list)
+    """Every plan it submitted, in order."""
+
+
+@dataclass
+class Journals:
+    """Every node's journals, read together: the cluster's workload, as the
+    claims read it."""
+
+    plans: dict[str, PlanRecord] = field(default_factory=dict)
+    orders: dict[int, Order] = field(default_factory=dict)
+    reconciled: list[Reconciled] = field(default_factory=list)
+    bursts: Counter[str] = field(default_factory=Counter)
+    kinds: Counter[str] = field(default_factory=Counter)
+    errors: Counter[str] = field(default_factory=Counter)
+    orphans: int = 0
+    incarnations: dict[tuple[str, int], Incarnation] = field(default_factory=dict)
+
+    @classmethod
+    def read(cls, paths: Mapping[tuple[str, int], Path]) -> Journals:
+        found = cls()
+        for (node, number), path in sorted(paths.items()):
+            life = found.incarnations.setdefault((node, number), Incarnation(node, number))
+            if not path.exists():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:  # a line torn by the death of its writer
+                    continue
+                found._take(entry, node, number, life)
+        for record in found.plans.values():
+            outcome = (
+                "unanswered"
+                if not record.answered
+                else "error"
+                if record.committed is None
+                else "committed"
+                if record.committed
+                else "refused"
+            )
+            found.kinds[f"{record.kind}:{outcome}"] += 1
+            if record.error is not None:
+                found.errors[f"{record.kind}: {record.error.split(':', 1)[0]}"] += 1
+        return found
+
+    def _take(self, entry: dict[str, Any], node: str, number: int, life: Incarnation) -> None:
+        kind = entry.get("r")
+        if kind == "start":
+            life.pid = int(entry["pid"])
+        elif kind == "plan":
+            self.plans[entry["plan"]] = PlanRecord(
+                entry["kind"], entry["scope"], node, number, bool(entry["checkout"])
+            )
+            life.submitted += 1
+            life.plans.append(entry["plan"])
+        elif kind == "answer":
+            record = self.plans[entry["plan"]]
+            record.answered = True
+            record.committed = entry["committed"]
+            record.blocked_by = tuple(entry["blocked"])
+            record.error = entry["error"]
+            life.answered += 1
+        elif kind == "order":
+            self.orders[int(entry["order"])] = Order(
+                int(entry["order"]),
+                entry["scope"],
+                entry["tenant"],
+                int(entry["amount"]),
+                entry["plan"],
+                traceparent=entry["traceparent"],
+            )
+        elif kind == "reconciled":
+            self.reconciled.append(
+                Reconciled(
+                    entry["fact"],
+                    entry["event"],
+                    entry["kind"],
+                    entry["remote_ref"],
+                    entry["plan"],
+                    entry["traceparent"],
+                    entry["planned"],
+                )
+            )
+        elif kind == "burst":
+            self.bursts[entry["tenant"]] += 1
+        elif kind == "orphan":
+            self.orphans += 1
+
+    @property
+    def submitted(self) -> int:
+        return sum(life.submitted for life in self.incarnations.values())
+
+    @property
+    def answered(self) -> int:
+        return sum(life.answered for life in self.incarnations.values())
+
+
+# --------------------------------------------------------------------------
+# The nodes: each `interlock daemon` in a process of its own
+# --------------------------------------------------------------------------
+
+ENTRY = (
+    "import faulthandler, signal, sys; faulthandler.register(signal.SIGUSR1); "
+    "from interlock.cli import main; sys.exit(main(sys.argv[1:]))"
+)
+"""``interlock daemon``, as the console script runs it, with its stacks on
+SIGUSR1."""
+
+
+class Node:
+    """One node of the cluster, as the harness runs it: its configuration,
+    and the process of its current incarnation."""
+
+    def __init__(self, index: int, name: str, home: Path, config: Path) -> None:
+        self.index = index
+        self.name = name
+        self.home = home
+        self.config = config
+        self.incarnation = -1
+        self.process: subprocess.Popen[str] | None = None
+        self.lines: list[str] = []
+        self.inbox_port: int | None = None
+        self.metrics_port: int | None = None
+        self.started_at: dict[int, float] = {}
+        self.ended_at: dict[int, float] = {}
+        self.exits: dict[int, int] = {}
+        self.statuses: dict[int, dict[str, str]] = {}
+        """Each stopped incarnation's last word: every part's state line."""
+        self.reloads: list[str] = []
+        self._stderr: Any = None
+        self._reader: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def journal(self, incarnation: int) -> Path:
+        return self.home / f"journal-{incarnation}.jsonl"
+
+    def log(self, incarnation: int) -> Path:
+        return self.home / f"daemon-{incarnation}.log"
+
+    @property
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def start(self, spec: NodeSpec, environment: Mapping[str, str]) -> None:
+        """Its next incarnation: ``interlock daemon --node``, its agents the
+        soak's."""
+        self.incarnation = spec.incarnation
+        path = self.home / f"spec-{spec.incarnation}.json"
+        spec.write(path)
+        self.lines = []
+        self.inbox_port = self.metrics_port = None
+        self._stderr = self.log(spec.incarnation).open("w", encoding="utf-8")
+        env = {**environment, NODE_SPEC_ENV: str(path)}
+        self.process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                ENTRY,
+                "daemon",
+                "--config",
+                str(self.config),
+                "--node",
+                self.name,
+                "--app",
+                "live_stress_test:node_application",
+            ],
+            cwd=self.home,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=self._stderr,
+            text=True,
+        )
+        self.started_at[spec.incarnation] = time.time()
+        self._reader = threading.Thread(
+            target=self._read, args=(self.process, spec.incarnation), daemon=True
+        )
+        self._reader.start()
+
+    def _read(self, process: subprocess.Popen[str], incarnation: int) -> None:
+        assert process.stdout is not None
+        status: dict[str, str] = {}
+        for raw in process.stdout:
+            line = raw.rstrip("\n")
+            with self._lock:
+                self.lines.append(line)
+            if line.startswith("receiving webhooks on port "):
+                self.inbox_port = int(line.rsplit(" ", 1)[1])
+            elif line.startswith("serving metrics on port "):
+                self.metrics_port = int(line.rsplit(" ", 1)[1])
+            elif line.startswith(("reloaded:", "reload:")):
+                with self._lock:
+                    self.reloads.append(line)
+            elif ": " in line and " step(s), " in line:
+                name, _, rest = line.partition(": ")
+                status[name] = rest
+        self.statuses[incarnation] = status
+
+    def wait_ready(self, timeout: float = 180.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.process is not None and self.process.poll() is not None:
+                raise SoakError(
+                    f"node {self.name} exited ({self.process.returncode}) before it was ready; "
+                    f"see {self.log(self.incarnation)}"
+                )
+            with self._lock:
+                running = any(line.startswith("interlock daemon running") for line in self.lines)
+            if running and self.inbox_port is not None and self.metrics_port is not None:
+                return
+            time.sleep(0.05)
+        raise SoakError(f"node {self.name} was not ready within {timeout:g}s")
+
+    def signal(self, signum: signal.Signals) -> None:
+        assert self.process is not None
+        self.process.send_signal(signum)
+
+    def kill(self) -> float:
+        """SIGKILL: no drain, no close, its sockets closed by the kernel."""
+        assert self.process is not None
+        self.process.send_signal(signal.SIGKILL)
+        at = time.time()
+        self.process.wait(30)
+        self._ended(at)
+        return at
+
+    def freeze(self) -> float:
+        """SIGSTOP: it stops where it stands, every connection left open."""
+        self.signal(signal.SIGSTOP)
+        return time.time()
+
+    def thaw(self) -> None:
+        """SIGCONT: a frozen process carries on, as if it had been descheduled."""
+        self.signal(signal.SIGCONT)
+
+    def stop(self, timeout: float = 90.0) -> tuple[int, float]:
+        """SIGTERM, as Kubernetes asks; its exit status and how long it took."""
+        assert self.process is not None
+        began = time.monotonic()
+        self.process.send_signal(signal.SIGTERM)
+        try:
+            code = self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+            code = -signal.SIGKILL
+        took = time.monotonic() - began
+        if self._reader is not None:
+            self._reader.join(10)
+        self._ended(time.time(), code)
+        return code, took
+
+    def _ended(self, at: float, code: int | None = None) -> None:
+        assert self.process is not None
+        self.ended_at[self.incarnation] = at
+        self.exits[self.incarnation] = self.process.returncode if code is None else code
+        if self._stderr is not None:
+            self._stderr.close()
+            self._stderr = None
+
+
+class Balancer:
+    """What stands in front of the nodes' inboxes, as a Kubernetes Service
+    does: each webhook to the next node that answers its health check; a node
+    that does not, or fails a send, taken out until it answers again."""
+
+    def __init__(self) -> None:
+        self._nodes: list[Node] = []
+        self._lock = threading.Lock()
+        self._turn = itertools.count()
+        self._down: dict[str, float] = {}
+        """Nodes out, until when, on the monotonic clock."""
+        self._halt = threading.Event()
+        self._thread = threading.Thread(target=self._probe, name="soak-balancer", daemon=True)
+
+    def serve(self, nodes: Sequence[Node]) -> None:
+        """Stand in front of ``nodes``."""
+        with self._lock:
+            self._nodes = list(nodes)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def pick(self) -> tuple[Node, int, int] | None:
+        """The next node up: it, its inbox's port, its incarnation."""
+        now = time.monotonic()
+        with self._lock:
+            up = [
+                n
+                for n in self._nodes
+                if n.alive and n.inbox_port is not None and self._down.get(n.name, 0.0) <= now
+            ]
+            if not up:
+                return None
+            node = up[next(self._turn) % len(up)]
+            port = node.inbox_port
+            assert port is not None
+            return node, port, node.incarnation
+
+    def failed(self, node: Node) -> None:
+        """A send to ``node`` found nothing answering: out, until its health
+        check says otherwise."""
+        with self._lock:
+            self._down[node.name] = time.monotonic() + 30.0
+
+    def _probe(self) -> None:
+        while not self._halt.wait(0.5):
+            for node in self._nodes:
+                port = node.inbox_port
+                healthy = False
+                if node.alive and port is not None:
+                    try:
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/healthz", timeout=1.0
+                        ) as answer:
+                            healthy = answer.status == 200
+                    except urllib.error.HTTPError as exc:
+                        healthy = exc.code == 503  # degraded, and answering
+                    except OSError:
+                        healthy = False
+                with self._lock:
+                    if healthy:
+                        self._down.pop(node.name, None)
+                    else:
+                        self._down[node.name] = time.monotonic() + 30.0
+
+
 # --------------------------------------------------------------------------
 # The operator's desk
 # --------------------------------------------------------------------------
 
+PAID = """
+SELECT id, plan FROM orders
+ WHERE status = 'succeeded' AND refund_status IS NULL AND plan IS NOT NULL
+"""
+"""The orders whose payment a fact said succeeded, on any node, and that no
+refund has been recorded for."""
+
 
 class Desk(threading.Thread):
-    """An operator refunding paid orders, one signed action at a time. The
-    operator log has one writer: the desk opens it for each action, as the
-    daemon's vacuum does for each run, and waits its turn."""
+    """An operator refunding paid orders, one signed action at a time, found
+    in the database, whichever node's agents made them. The operator log has
+    one writer: the desk opens it for each action, as the vacuum's leader does
+    for each run, and waits its turn."""
 
-    def __init__(self, config: InterlockConfig, site: Site, keys: Keys, workload: Workload) -> None:
+    def __init__(self, config: InterlockConfig, site: Site, keys: Keys, settings: Settings) -> None:
         super().__init__(name="soak-desk", daemon=True)
         self._config = config
         self._site = site
+        self._settings = settings
         self._signer = load_key(keys.desk)
-        self._workload = workload
-        self._rng = random.Random(workload.settings.seed + 7)
+        self._rng = random.Random(settings.seed + 7)
         self._halt = threading.Event()
+        self._seen: dict[int, tuple[float, str]] = {}
+        """Each paid order, when the desk first saw it paid, and its plan."""
+        self.compensated: set[str] = set()
         self.applied = 0
         self.busy = 0
         self.refused: Counter[str] = Counter()
@@ -1680,10 +2283,25 @@ class Desk(threading.Thread):
         finally:
             conn.close()
 
+    def candidate(self, conn: psycopg.Connection[Any]) -> str | None:
+        """A paid order's checkout plan, the order seen paid within the last
+        half retention (its charge still in the outbox: a vacuum prunes it
+        once settled and past retention), and not refunded yet."""
+        now = time.monotonic()
+        for order_id, plan in conn.execute(PAID).fetchall():
+            self._seen.setdefault(int(order_id), (now, str(plan)))
+        within = self._settings.retain / 2
+        found = [
+            plan
+            for seen, plan in self._seen.values()
+            if plan not in self.compensated and now - seen < within
+        ]
+        return self._rng.choice(found) if found else None
+
     def run(self) -> None:
         from interlock.deliveries import operations
 
-        settings = self._workload.settings
+        settings = self._settings
         operators = self._config.operators
         assert operators is not None
         registry = self._config.sink_registry()
@@ -1692,12 +2310,8 @@ class Desk(threading.Thread):
         try:
             outbox = operations(conn)
             while not self._halt.wait(settings.desk_every):
-                if self._workload.winding_down.is_set():
-                    return
-                # Refunded while the charge is still in the outbox: a vacuum
-                # prunes it once settled and past its retention.
-                order = self._workload.refund_candidate(self._rng, settings.retain / 2)
-                if order is None:
+                plan = self.candidate(conn)
+                if plan is None:
                     continue
                 for _ in range(50):
                     try:
@@ -1709,7 +2323,7 @@ class Desk(threading.Thread):
                             scope=operators.scope,
                         ) as log:
                             outcome = Operator(log, outbox).compensate(
-                                plan_id=order.plan_id,
+                                plan_id=plan,
                                 reason="the customer asked for a refund",
                                 registry=registry,
                             )
@@ -1724,8 +2338,7 @@ class Desk(threading.Thread):
                         logger.exception("the desk's compensation failed")
                     else:
                         if outcome.applied:
-                            with self._workload.lock:
-                                order.compensated = True
+                            self.compensated.add(plan)
                             self.applied += 1
                         else:
                             self.refused["not applied"] += 1
@@ -1738,8 +2351,6 @@ class Desk(threading.Thread):
 # --------------------------------------------------------------------------
 # The rotation: the relays' key, mid-load (docs/EPIC8_DESIGN.md §2.6, §5)
 # --------------------------------------------------------------------------
-
-
 class _Held:
     """The payment API's adapter, holding what each call answered until the
     gate opens: its relay records the outcome only then."""
@@ -1815,7 +2426,8 @@ class Rotation:
     new: str = ""
     registered: int = 0
     """The ``key.registered`` record's sequence."""
-    reload: dict[str, str | None] = field(default_factory=dict)
+    reload: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    """Each node reloaded: each part, and why it did not open again, if not."""
     called_first: bool = False
     """The stale relay called the payment API before the revocation."""
     revoked: int = 0
@@ -1834,11 +2446,37 @@ class Rotation:
     error: str | None = None
 
 
-async def rotate(run: Run, supervisor: InterlockSupervisor) -> None:
-    """Halfway through the load, the operator rotates the relays' key: a new
-    version at the key service, registered; every part reloaded; then, while
-    a stale relay still holding the old key has a call in flight, the old key
-    revoked. Never raises: what went wrong is the claim's to report."""
+def reload_all(run: Run) -> dict[str, dict[str, str | None]]:
+    """``SIGHUP`` to every node up, as an operator's rollout of a new key
+    does: what each said it opened again, and what it could not."""
+    outcome: dict[str, dict[str, str | None]] = {}
+    for node in run.nodes:
+        if not node.alive:
+            continue
+        before = len(node.reloads)
+        node.signal(signal.SIGHUP)
+        deadline = time.monotonic() + 60
+        while len(node.reloads) == before and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.2)  # what could not open again is said right after
+        said: dict[str, str | None] = {}
+        for line in node.reloads[before:]:
+            if line.startswith("reloaded: "):
+                for name in line.removeprefix("reloaded: ").split(", "):
+                    if name and name != "nothing":
+                        said[name] = None
+            elif line.startswith("reload: "):
+                name, _, why = line.removeprefix("reload: ").partition(" could not open again: ")
+                said[name] = why
+        outcome[node.name] = said
+    return outcome
+
+
+def rotate(run: Run) -> None:
+    """A quarter of the way through the load, the operator rotates the relays'
+    key: a new version at the key service, registered; every node reloaded;
+    then, while a stale relay still holding the old key has a call in flight,
+    the old key revoked. Never raises: what went wrong is the claim's to report."""
     rotation = run.rotation
     service = run.keys.service
     roots = run.config.key_roots()
@@ -1848,36 +2486,35 @@ async def rotate(run: Run, supervisor: InterlockSupervisor) -> None:
         rotation.old = old.key_id
         new = service.rotate("soak-relay")
         rotation.new = new.key_id
-        record = await asyncio.to_thread(
-            run.desk.act,
-            lambda op: op.register_key("relay", "soak-relay-2", new.public_key(), roots=roots),
+        record = run.desk.act(
+            lambda op: op.register_key("relay", "soak-relay-2", new.public_key(), roots=roots)
         )
         rotation.registered = record.seq
-        rotation.reload = await supervisor.reload()
-        stale = StaleRelay(run, await asyncio.to_thread(service.signer, "soak-relay", 1))
+        rotation.reload = reload_all(run)
+        stale = StaleRelay(run, service.signer("soak-relay", 1))
         stale.start()
-        rotation.called_first = await asyncio.to_thread(stale.called.wait, 30)
-        outcome = await asyncio.to_thread(
-            run.desk.act,
-            lambda op: op.revoke_key("relay", old.key_id, reason="rotated mid-soak", roots=roots),
+        rotation.called_first = stale.called.wait(30)
+        outcome = run.desk.act(
+            lambda op: op.revoke_key("relay", old.key_id, reason="rotated mid-soak", roots=roots)
         )
         before = service.signed[("soak-relay", 1)]
         rotation.revoked = outcome.intent.seq
         rotation.seal = dict(outcome.record.body.get("seal") or {})
         stale.gate.set()
-        await asyncio.to_thread(stale.join, 60)
+        stale.join(60)
         rotation.stale = stale.result
         rotation.held = stale.held.message
         rotation.old_signed_after = service.signed[("soak-relay", 1)] - before
-        await asyncio.to_thread(_after_revocation, run)
+        _after_revocation(run)
     except Exception as exc:
         rotation.error = f"{type(exc).__name__}: {exc}"
         logger.exception("the rotation failed")
     rotation.ended = time.monotonic() - run.started
     say(
         run.settings,
-        f"  {rotation.ended:6.0f}s  the relays' key rotated: {rotation.old} -> {rotation.new}; "
-        f"the stale relay {rotation.stale.split(':')[0] or 'did nothing'}",
+        f"  {rotation.ended:6.0f}s  the relays' key rotated: {rotation.old} -> {rotation.new}, "
+        f"{len(rotation.reload)} node(s) reloaded; the stale relay "
+        f"{rotation.stale.split(':')[0] or 'did nothing'}",
     )
 
 
@@ -1886,7 +2523,9 @@ async def rotate(run: Run, supervisor: InterlockSupervisor) -> None:
 # --------------------------------------------------------------------------
 
 WAITS = """
-SELECT a.usename::text, EXTRACT(EPOCH FROM clock_timestamp() - l.waitstart)::float8, l.locktype
+SELECT a.usename::text, EXTRACT(EPOCH FROM clock_timestamp() - l.waitstart)::float8, l.locktype,
+       ARRAY(SELECT b.application_name FROM pg_stat_activity AS b
+              WHERE b.pid = ANY (pg_blocking_pids(l.pid)))
   FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
  WHERE NOT l.granted AND l.waitstart IS NOT NULL AND a.datname = current_database()
 """
@@ -1924,7 +2563,8 @@ class Sample:
 class Auditor(threading.Thread):
     """Samples the database as the owner: every lock wait, every row of the
     rate windows' history before a vacuum can prune it, the outbox's size,
-    and what a vacuum should have pruned by now and has not."""
+    what a vacuum should have pruned by now and has not, and which relay
+    delivered each message, before the vacuum prunes its log."""
 
     def __init__(self, site: Site, settings: Settings, started: float) -> None:
         super().__init__(name="soak-auditor", daemon=True)
@@ -1943,6 +2583,11 @@ class Auditor(threading.Thread):
         """Every message seen in the outbox: its plan, and the context kept beside it."""
         self.event_traces: dict[str, str | None] = {}
         """Every inbound event seen: the context kept beside it, by event id."""
+        self.delivered_by: dict[str, str] = {}
+        """Every message seen delivered: the relay that recorded it."""
+        self.longest: list[tuple[float, float, str, tuple[str, ...]]] = []
+        """Every lock wait seen: when, how long so far, whose, and the sessions
+        it waited on (holding the lock, or ahead in its queue), by name."""
         self.samples: list[Sample] = []
         self.errors: Counter[str] = Counter()
 
@@ -1969,10 +2614,18 @@ class Auditor(threading.Thread):
 
     def _tick(self, conn: psycopg.Connection[Any], *, heavy: bool) -> None:
         self.ticks += 1
-        for user, waited, _ in conn.execute(WAITS).fetchall():
+        for user, waited, _, blockers in conn.execute(WAITS).fetchall():
             part = self.roles.get(str(user), "owner")
             self.waits += 1
             self.max_wait[part] = max(self.max_wait[part], float(waited))
+            self.longest.append(
+                (time.time(), float(waited), part, tuple(str(b) for b in blockers or ()))
+            )
+        for message, actor in conn.execute(
+            "SELECT message_id::text, actor FROM interlock.outbox_attempts "
+            "WHERE event = 'delivered' AND at > clock_timestamp() - interval '60 seconds'"
+        ).fetchall():
+            self.delivered_by[str(message)] = str(actor)
         for stage, window, key, amount, at in conn.execute(
             "SELECT stage_id::text, window_name, key, amount, at FROM interlock.window_ledger"
         ).fetchall():
@@ -1998,20 +2651,22 @@ class Auditor(threading.Thread):
         if not heavy:
             return
         settings = self._settings
-        live, pruned, checkpoints, events, connections = conn.execute(
+        live, pruned, checkpoints, events, connections = one(
+            conn,
             "SELECT (SELECT count(*) FROM interlock.outbox),"
             " (SELECT count(*) FROM interlock.outbox_compacted),"
             " (SELECT count(*) FROM interlock.checkpoints),"
             " (SELECT count(*) FROM interlock.inbox_events),"
-            " (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database())"
-        ).fetchone()
-        (stages,) = conn.execute(LINGERING_STAGES, (settings.retain + settings.slack,)).fetchone()
+            " (SELECT count(*) FROM pg_stat_activity WHERE datname = current_database())",
+        )
+        (stages,) = one(conn, LINGERING_STAGES, (settings.retain + settings.slack,))
         horizon = max(settings.charge_span, settings.tenant_span) + settings.margin + settings.slack
-        (windows,) = conn.execute(
+        (windows,) = one(
+            conn,
             "SELECT count(*) FROM interlock.window_ledger "
             "WHERE at < clock_timestamp() - make_interval(secs => %s)",
             (horizon,),
-        ).fetchone()
+        )
         self.samples.append(
             Sample(
                 time.monotonic() - self._t0,
@@ -2067,14 +2722,16 @@ def parse_scrape(text: str) -> tuple[set[str], Scrape]:
 
 
 class Scraper(threading.Thread):
-    """Scrapes the daemon's ``/metrics`` every :data:`METRICS_EVERY` seconds,
-    as Prometheus would, and checks each scrape as it comes: well formed;
-    every counter and histogram at least what it was; no window above its
-    limit; no more engines busy than there are."""
+    """Scrapes one node's ``/metrics`` every :data:`METRICS_EVERY` seconds, as
+    Prometheus would, for as long as that process lives, and checks each
+    scrape as it comes: well formed; every counter and histogram at least what
+    it was; no window above its limit; no more engines busy than there are."""
 
-    def __init__(self, port: int) -> None:
-        super().__init__(name="soak-scraper", daemon=True)
+    def __init__(self, port: int, node: str = "", incarnation: int = 0) -> None:
+        super().__init__(name=f"soak-scraper-{node}-{incarnation}", daemon=True)
         self.port = port
+        self.node = node
+        self.incarnation = incarnation
         self._halt = threading.Event()
         self._serial = threading.Lock()
         self.scrapes = 0
@@ -2085,6 +2742,8 @@ class Scraper(threading.Thread):
         self.workers = 0.0
         self.families: set[str] = set()
         self._last: Scrape = {}
+        self.last: Scrape = {}
+        """The last scrape that came: what a process killed last said."""
 
     def stop(self) -> None:
         self._halt.set()
@@ -2122,6 +2781,7 @@ class Scraper(threading.Thread):
                 if value < before.get(labels, 0.0):
                     self.fell.append(f"{name}{dict(labels)}: {before[labels]} to {value}")
         self._last = samples
+        self.last = samples
         for labels, value in samples.get("interlock_window_saturation", {}).items():
             window = dict(labels)["window"]
             self.saturation[window] = max(self.saturation[window], value)
@@ -2146,12 +2806,10 @@ def outbox_states(conn: psycopg.Connection[Any]) -> dict[str, int]:
     return {str(state): int(n) for state, n in rows.fetchall()}
 
 
-def read_settled(run: Run, conn: psycopg.Connection[Any]) -> Settled | None:
-    """The settled daemon's metrics, against the database. The sampler takes
-    one sample after another, so the second sampled after ``before`` was read
+def read_settled(scraper: Scraper, conn: psycopg.Connection[Any]) -> Settled | None:
+    """A settled node's metrics, against the database. Its sampler takes one
+    sample after another, so the second sampled after ``before`` was read
     began after it; any scrape after that one shows it, or a later one."""
-    scraper = run.scraper
-    assert scraper is not None
     before = outbox_states(conn)
     asked = time.time()
     seen: set[float] = set()
@@ -2170,7 +2828,7 @@ def read_settled(run: Run, conn: psycopg.Connection[Any]) -> Settled | None:
 
 
 # --------------------------------------------------------------------------
-# Running it
+# What the harness itself logs
 # --------------------------------------------------------------------------
 
 
@@ -2207,20 +2865,364 @@ def _shape(text: str) -> str:
     return " ".join(words)[:140]
 
 
+# --------------------------------------------------------------------------
+# The cluster, as the database sees it
+# --------------------------------------------------------------------------
+
+HOLDERS = """
+SELECT l.objid::bigint, a.application_name
+  FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid = l.pid
+ WHERE l.locktype = 'advisory' AND l.classid = %s::bigint::oid AND l.objsubid = 2 AND l.granted
+   AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+"""
+"""Who holds the locks of one class: each lock's key, and its session's name."""
+
+
+class Watch(threading.Thread):
+    """Samples who holds each role every 0.2 seconds, from ``pg_locks``: the
+    claims of who led what read it, and the chaos picks its victim from it."""
+
+    def __init__(self, site: Site, roles: Sequence[str]) -> None:
+        super().__init__(name="soak-watch", daemon=True)
+        self._site = site
+        self._halt = threading.Event()
+        self.role_keys = {lock_key("role", r) & 0xFFFFFFFF: r for r in roles}
+        self.leaders: list[tuple[float, dict[str, str]]] = []
+        """Each change of who leads what: when (wall clock), and every role's holder then."""
+        self.doubled: list[str] = []
+        """Any sample in which two sessions held one role: never, by PostgreSQL."""
+        self.samples = 0
+        self.errors: Counter[str] = Counter()
+
+    def stop(self) -> None:
+        self._halt.set()
+
+    def leader(self, role: str, at: float | None = None) -> str | None:
+        """Who held ``role`` at wall-clock ``at`` (now, by default), as sampled."""
+        holder = None
+        for when, holders in list(self.leaders):
+            if at is not None and when > at:
+                break
+            holder = holders.get(role)
+        return holder
+
+    def run(self) -> None:
+        conn = psycopg.connect(self._site.owner, autocommit=True)
+        try:
+            while not self._halt.wait(0.2):
+                try:
+                    self._tick(conn)
+                except psycopg.Error as exc:
+                    self.errors[type(exc).__name__] += 1
+                    with contextlib.suppress(psycopg.Error):
+                        conn.close()
+                    conn = psycopg.connect(self._site.owner, autocommit=True)
+        finally:
+            conn.close()
+
+    def _tick(self, conn: psycopg.Connection[Any]) -> None:
+        self.samples += 1
+        holders: dict[str, str] = {}
+        for objid, name in conn.execute(HOLDERS, (LEADER_LOCK,)).fetchall():
+            role = self.role_keys.get(int(objid))
+            if role is None:
+                continue
+            node = str(name).removeprefix("interlock-cluster@")
+            if role in holders and holders[role] != node:
+                self.doubled.append(f"{role}: {holders[role]} and {node} at {time.time():.3f}")
+            holders[role] = node
+        if not self.leaders or self.leaders[-1][1] != holders:
+            self.leaders.append((time.time(), holders))
+
+
+# --------------------------------------------------------------------------
+# The chaos: a node killed, a node frozen
+# --------------------------------------------------------------------------
+
+IN_FLIGHT = """
+SELECT s.message_id::text,
+       (SELECT a.event FROM interlock.outbox_attempts AS a
+         WHERE a.message_id = s.message_id ORDER BY a.seq DESC LIMIT 1)
+  FROM interlock.outbox_state AS s
+ WHERE s.state = 'leased' AND s.lease_node = %s
+"""
+"""The leases a node holds, and the last thing each message's log says:
+``sending`` is a call made and not answered yet."""
+
+SESSIONS = """
+SELECT a.pid, a.application_name, a.state, a.xact_start IS NOT NULL,
+       EXISTS (SELECT 1 FROM pg_locks AS l
+                WHERE l.pid = a.pid AND l.granted AND l.locktype <> 'virtualxid'
+                  AND NOT (l.locktype = 'relation' AND l.mode = 'AccessShareLock'))
+  FROM pg_stat_activity AS a
+ WHERE a.datname = current_database() AND a.application_name LIKE %s
+"""
+"""A node's sessions: each one's name and state, whether it is inside a
+transaction, and whether it holds a lock another session could wait for: a
+row's, an advisory lock, a writer's; a read snapshot's ``AccessShareLock``
+holds no writer up."""
+
+
+@dataclass
+class DeathReport:
+    """One death, and what the cluster and the database did about it."""
+
+    how: str
+    """``killed``: SIGKILL, its sockets closed at once by the kernel.
+    ``frozen``: SIGSTOP, its connections left open as a host lost to the
+    network leaves them; then SIGKILL, once the server had let go of it."""
+    node: str
+    incarnation: int
+    at: float = 0.0
+    """Wall clock: the SIGKILL, or the SIGSTOP."""
+    led: list[str] = field(default_factory=list)
+    """The roles the node led as it died."""
+    leases: dict[str, str] = field(default_factory=dict)
+    """Each message it held leased then, and its log's last event."""
+    keys: dict[str, str] = field(default_factory=dict)
+    """Each of those messages' idempotency key: a tombstone keeps none, and
+    the vacuum may prune the message before the claims are read."""
+    sessions: dict[int, tuple[str, str, bool, bool]] = field(default_factory=dict)
+    """Each session it had then: its name, its state, whether inside a
+    transaction, whether holding a lock another could wait for."""
+    gone: dict[int, float] = field(default_factory=dict)
+    """Seconds after the death until each of its sessions was gone."""
+    released: dict[int, float] = field(default_factory=dict)
+    """Seconds after the death until each session that held a lock another
+    could wait for held none: gone, or its transaction over. A statement past
+    its bound aborts the transaction and its locks with it; the session may
+    stay, idle in the aborted transaction, holding nothing."""
+    fenced: float | None = None
+    """Seconds after the death until every session it had was gone: at once
+    for a process killed; for one frozen, once a survivor fenced it."""
+    fencers: list[str] = field(default_factory=list)
+    """The nodes whose heartbeat ended its sessions, as their logs say."""
+    node_lock: float | None = None
+    """Seconds after the death until no session held its node's lock."""
+    taken: dict[str, float] = field(default_factory=dict)
+    """Seconds after the death until each of its leases was another's, or done."""
+    took: dict[str, tuple[str, float]] = field(default_factory=dict)
+    """Each role it led: the node that took it, and seconds after the death."""
+    killed_after: float = 0.0
+    """For a freeze: seconds after it froze until it was killed."""
+    back_after: float = 0.0
+    """Seconds after the death until its next incarnation was up."""
+    waited: float = 0.0
+    """The longest a survivor waited on any lock, from the death until every
+    session the dead node had was gone."""
+    blocked: float = 0.0
+    """The longest a survivor waited on one of the dead node's sessions
+    (holding the lock, or ahead in its queue) over the same span."""
+    error: str | None = None
+
+
+def victim(run: Run) -> Node | None:
+    """The node leading the vacuum now, alive: the costliest to lose, since
+    it holds the cluster's one singleton every node waits on."""
+    holder = run.watch.leader("vacuum")
+    return next((n for n in run.nodes if n.name == holder and n.alive), None)
+
+
+def _poised(conn: psycopg.Connection[Any], node: Node, how: str) -> bool:
+    """Whether ``node`` is in the middle of things: a call made and not
+    answered; and, for a freeze, a stage open too."""
+    calls = [m for m, last in conn.execute(IN_FLIGHT, (node.name,)).fetchall() if last == "sending"]
+    if not calls:
+        return False
+    if how == "killed":
+        return True
+    row = conn.execute(
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name = %s "
+        "AND xact_start IS NOT NULL",
+        (f"interlock-stage@{node.name}",),
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def die(run: Run, how: str) -> DeathReport | None:
+    """Kill, or freeze then kill, the node leading the vacuum, at a moment its
+    relays have a call in flight (and, to freeze it, a stage open); watch
+    what the database and the cluster do about it; and bring it back, as a
+    pod is rescheduled. Never raises: what went wrong is the claims' to report.
+
+    The moment is found by stopping the node (``SIGSTOP``) and looking: a
+    stopped process changes nothing, so what is read then is what it dies
+    holding. Not poised, it is let go on (``SIGCONT``), as if descheduled for a
+    few milliseconds, and looked at again shortly. Poised, it is killed
+    (``SIGKILL``), or left frozen."""
+    node = victim(run)
+    if node is None:
+        return None
+    report = DeathReport(how, node.name, node.incarnation)
+    try:
+        conn = psycopg.connect(run.site.owner, autocommit=True)
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                stopped = node.freeze()
+                if _poised(conn, node, how) or time.monotonic() > deadline:
+                    break
+                node.thaw()
+                time.sleep(random.uniform(0.005, 0.03))
+            holders = run.watch.leaders[-1][1] if run.watch.leaders else {}
+            report.led = sorted(role for role, holder in holders.items() if holder == node.name)
+            scraper = run.scraper(node)
+            if scraper is not None:
+                scraper.stop()
+            # What it holds as it dies, read while it is stopped.
+            report.sessions = {
+                int(pid): (str(name), str(state), bool(open_), bool(holding))
+                for pid, name, state, open_, holding in conn.execute(
+                    SESSIONS, (f"%@{node.name}",)
+                ).fetchall()
+            }
+            report.leases = dict(conn.execute(IN_FLIGHT, (node.name,)).fetchall())
+            report.keys = dict(
+                conn.execute(
+                    "SELECT message_id::text, idempotency_key FROM interlock.outbox "
+                    "WHERE message_id::text = ANY (%s)",
+                    (list(report.leases),),
+                ).fetchall()
+            )
+            report.at = node.kill() if how == "killed" else stopped
+            say(
+                run.settings,
+                f"  {time.monotonic() - run.started:6.0f}s  node {node.name} {how}, leading "
+                f"{', '.join(report.led) or 'nothing'}, with {len(report.leases)} lease(s) and "
+                f"{sum(1 for *_, h in report.sessions.values() if h)} session(s) holding locks",
+            )
+            _watch_death(run, conn, node, report)
+            if how == "frozen":
+                node.kill()
+                report.killed_after = time.time() - report.at
+        finally:
+            conn.close()
+        report.fencers = fencers(run, node)
+        rest = run.settings.restart_after - (time.time() - report.at - report.killed_after)
+        time.sleep(max(0.0, rest))
+        start(run, node)
+        node.wait_ready()
+        scrape(run, node)
+        report.back_after = time.time() - report.at
+        say(
+            run.settings,
+            f"  {time.monotonic() - run.started:6.0f}s  node {node.name} back as incarnation "
+            f"{node.incarnation}",
+        )
+    except Exception as exc:
+        report.error = f"{type(exc).__name__}: {exc}"
+        logger.exception("the %s node could not be watched or brought back", how)
+        if node.alive and node.incarnation == report.incarnation:
+            with contextlib.suppress(Exception):
+                node.kill()
+    # The waits from the death until every session it had was gone: any
+    # survivor's, and those on one of its sessions.
+    until = report.at + (report.fenced if report.fenced is not None else report.back_after)
+    mine = f"@{node.name}"
+    spans = [w for w in run.auditor.longest if report.at <= w[0] <= until]
+    report.waited = max((w[1] for w in spans), default=0.0)
+    report.blocked = max((w[1] for w in spans if any(b.endswith(mine) for b in w[3])), default=0.0)
+    return report
+
+
+FENCED = re.compile(r"node (?P<fencer>\S+): node (?P<gone>\S+) is gone; its sessions ended")
+"""What a node logs when it fences another (``interlock.cluster``)."""
+
+
+def fencers(run: Run, dead: Node) -> list[str]:
+    """The nodes whose logs say they ended a session of ``dead``'s."""
+    found: set[str] = set()
+    for node in run.nodes:
+        if node is dead or node.incarnation < 0:
+            continue
+        with contextlib.suppress(OSError):
+            for line in node.log(node.incarnation).read_text(encoding="utf-8").splitlines():
+                match = FENCED.search(line)
+                if match is not None and match.group("gone") == dead.name:
+                    found.add(match.group("fencer"))
+    return sorted(found)
+
+
+def _watch_death(run: Run, conn: psycopg.Connection[Any], node: Node, report: DeathReport) -> None:
+    """Until the database and the cluster have let go of all the dead node
+    held: its node's lock, every lock its sessions held, every session it had
+    (fenced, for one frozen), its leases, the roles it led; or until every
+    bound has passed, with margin."""
+    settings = run.settings
+    bound = 2 * settings.max_stage + LOCK_TIMEOUT + settings.session_timeout + 10
+    deadline = report.at + bound
+    key = lock_key("node", node.name) & 0xFFFFFFFF
+    leases = set(report.leases)
+    holding = {pid for pid, (*_, held) in report.sessions.items() if held}
+    while time.time() < deadline:
+        now = time.time() - report.at
+        current = {
+            int(row[0]): bool(row[4])
+            for row in conn.execute(SESSIONS, (f"%@{node.name}",)).fetchall()
+        }
+        for pid in report.sessions:
+            if pid not in current and pid not in report.gone:
+                report.gone[pid] = now
+            if pid in holding and pid not in report.released and not current.get(pid):
+                report.released[pid] = now
+        if report.fenced is None and not set(report.sessions) & set(current):
+            report.fenced = now
+        held = {int(o) for o, _ in conn.execute(HOLDERS, (NODE_LOCK,)).fetchall()}
+        if report.node_lock is None and key not in held:
+            report.node_lock = now
+        for message in leases - set(report.taken):
+            row = conn.execute(
+                "SELECT state, lease_node FROM interlock.outbox_state WHERE message_id = %s",
+                (message,),
+            ).fetchone()
+            if row is None or row[0] != "leased" or row[1] != node.name:
+                report.taken[message] = now
+        holders = run.watch.leaders[-1][1] if run.watch.leaders else {}
+        for role in report.led:
+            holder = holders.get(role)
+            if role not in report.took and holder is not None and holder != node.name:
+                report.took[role] = (holder, now)
+        others = [r for r in report.led if r != f"settler:{receipts_log_id(node.name)}"]
+        if (
+            report.node_lock is not None
+            and report.fenced is not None
+            and holding <= set(report.released)
+            and leases <= set(report.taken)
+            and all(r in report.took for r in others)
+        ):
+            return
+        time.sleep(0.05)
+
+
+# --------------------------------------------------------------------------
+# Running it
+# --------------------------------------------------------------------------
+
+SCRIPTS = Path(__file__).resolve().parent
+ROOT = SCRIPTS.parent
+
+
 @dataclass
 class Run:
     """Everything the run measured, for the claims."""
 
     settings: Settings
     config: InterlockConfig
+    """The first node's configuration: what every node's but its node and
+    receipt log, as the harness's operator and verifiers read it."""
     site: Site
     keys: Keys
-    workload: Workload
+    nodes: list[Node]
+    environment: dict[str, str]
     api: PaymentAPI
     vendor: Vendor
+    balancer: Balancer
     desk: Desk
     auditor: Auditor
+    watch: Watch
     captured: Captured
+    t0: float = 0.0
+    """When the run began, wall clock: the bursts' clock, every node's."""
     deadlocks_before: int = 0
     deadlocks_after: int = 0
     started: float = 0.0
@@ -2228,17 +3230,59 @@ class Run:
     quiesced: bool = False
     quiesce_seconds: float = 0.0
     outstanding: dict[str, int] = field(default_factory=dict)
-    stop_seconds: float = 0.0
-    status: dict[str, ServiceStatus] = field(default_factory=dict)
-    second_status: dict[str, ServiceStatus] = field(default_factory=dict)
-    second_ready: bool = False
-    second_stop_seconds: float = 0.0
-    live_at_end: int = 0
-    total_at_end: int = 0
-    scraper: Scraper | None = None
+    stops: dict[str, tuple[int, float]] = field(default_factory=dict)
+    """Each node's last stop: its exit status, and how long it took."""
+    second: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Each node started again after the run: ready, what it recovered, its
+    stop, its failures."""
+    scrapers: dict[tuple[str, int], Scraper] = field(default_factory=dict)
     settled: Settled | None = None
     rotation: Rotation = field(default_factory=Rotation)
+    deaths: list[DeathReport] = field(default_factory=list)
+    journals: Journals = field(default_factory=Journals)
+    live_at_end: int = 0
+    total_at_end: int = 0
     failure: str | None = None
+
+    def scraper(self, node: Node) -> Scraper | None:
+        return self.scrapers.get((node.name, node.incarnation))
+
+
+def node_environment(api_key: str, webhook_secret: str, token: str) -> dict[str, str]:
+    """What a node's process runs with: the harness's environment, without
+    anything of Interlock's own, and the secrets the parts read from it."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("INTERLOCK_")}
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(SCRIPTS), str(ROOT / "src"), *filter(None, [os.environ.get("PYTHONPATH")])]
+    )
+    env.update({API_KEY_ENV: api_key, WEBHOOK_SECRET_ENV: webhook_secret, KMS_TOKEN_ENV: token})
+    return env
+
+
+def start(run: Run, node: Node) -> None:
+    """``node``'s next incarnation, as a pod is started: its spec written
+    beside its configuration, its process started."""
+    settings = run.settings
+    incarnation = node.incarnation + 1
+    spec = NodeSpec(
+        name=node.name,
+        index=node.index,
+        incarnation=incarnation,
+        settings=settings,
+        journal=str(node.journal(incarnation)),
+        wind_down=str(run.site.directory / "wind-down"),
+        t0=run.t0,
+        hot=settings.hot,
+    )
+    node.start(spec, run.environment)
+
+
+def scrape(run: Run, node: Node) -> None:
+    """A scraper for ``node``'s incarnation that is up."""
+    assert node.metrics_port is not None
+    scraper = Scraper(node.metrics_port, node.name, node.incarnation)
+    run.scrapers[(node.name, node.incarnation)] = scraper
+    scraper.start()
 
 
 def deadlocks(dsn: str) -> int:
@@ -2249,9 +3293,21 @@ def deadlocks(dsn: str) -> int:
     return int(row[0]) if row else 0
 
 
+def journals(run: Run) -> Journals:
+    """Every node's journals, as they stand."""
+    return Journals.read(
+        {
+            (node.name, number): node.journal(number)
+            for node in run.nodes
+            for number in range(node.incarnation + 1)
+        }
+    )
+
+
 def outstanding(conn: psycopg.Connection[Any], run: Run) -> dict[str, int]:
     """What is still to happen before the run is settled."""
-    (unfinished, dead, unsettled, unbound, pending) = conn.execute(
+    (unfinished, dead, unsettled, unbound, pending) = one(
+        conn,
         """
         SELECT
           (SELECT count(*) FROM interlock.outbox_state
@@ -2267,8 +3323,14 @@ def outstanding(conn: psycopg.Connection[Any], run: Run) -> dict[str, int]:
           (SELECT count(*) FROM interlock.inbox_facts f
             WHERE NOT EXISTS (SELECT 1 FROM interlock.inbox_consumed c
                                WHERE c.fact_id = f.fact_id))
-        """
-    ).fetchone()
+        """,
+    )
+    lives = journals(run).incarnations
+    inflight = sum(
+        life.submitted - life.answered
+        for (name, number), life in lives.items()
+        if any(n.name == name and n.incarnation == number and n.alive for n in run.nodes)
+    )
     return {
         "undelivered messages": int(unfinished),
         "dead messages": int(dead),
@@ -2276,8 +3338,18 @@ def outstanding(conn: psycopg.Connection[Any], run: Run) -> dict[str, int]:
         "unbound events": int(unbound),
         "unconsumed facts": int(pending),
         "webhooks to send": run.vendor.backlog(),
-        "plans in flight": run.workload.inflight,
+        "plans in flight": inflight,
     }
+
+
+def one(
+    conn: psycopg.Connection[Any], query: LiteralString, args: Sequence[Any] = ()
+) -> tuple[Any, ...]:
+    """The one row a query of counts answers with. Without arguments, a
+    ``%`` in the query is the query's own."""
+    row = conn.execute(query, args or None).fetchone()
+    assert row is not None
+    return tuple(row)
 
 
 def say(settings: Settings, text: str) -> None:
@@ -2285,150 +3357,142 @@ def say(settings: Settings, text: str) -> None:
         print(text, flush=True)
 
 
-def progress(run: Run, supervisor: InterlockSupervisor) -> str:
-    status = supervisor.status()
-    engines = status["engines"].counters if "engines" in status else {}
-    delivered = sum(
-        s.counters.get("delivered", 0) for name, s in status.items() if name.startswith("relay")
-    )
-    inbox = status["inbox"].counters if "inbox" in status else {}
-    settler = status["settler"].counters if "settler" in status else {}
-    vacuum = status["vacuum"].counters if "vacuum" in status else {}
+def progress(run: Run) -> str:
+    """What every node up has done, as its metrics say."""
+
+    def total(name: str, **labels: str) -> float:
+        summed = 0.0
+        for node in run.nodes:
+            scraper = run.scraper(node)
+            if scraper is None or not node.alive:
+                continue
+            summed += scraper.last.get(name, {}).get(tuple(labels.items()), 0.0)
+        return summed
+
     sample = run.auditor.samples[-1] if run.auditor.samples else None
+    up = [n.name for n in run.nodes if n.alive]
+    leading = run.watch.leader("vacuum") or "-"
     return (
-        f"  {time.monotonic() - run.started:6.0f}s  plans {engines.get('committed', 0)} committed"
-        f" / {engines.get('refused', 0)} refused / {engines.get('conflicts', 0)} conflicts"
-        f"  delivered {delivered}  webhooks {inbox.get('answered_200', 0)}"
-        f" (+{inbox.get('answered_401', 0) + inbox.get('answered_400', 0)} refused)"
-        f"  matched {inbox.get('matched', 0)}  settled {settler.get('settled', 0)}"
-        f"  credits {settler.get('credits', 0)}  vacuums {vacuum.get('applied', 0)}"
+        f"  {time.monotonic() - run.started:6.0f}s  {len(up)} node(s) up, vacuum led by "
+        f"{leading}  plans {total('interlock_plans_total', outcome='committed'):.0f} committed"
+        f" / {total('interlock_plans_total', outcome='refused'):.0f} refused"
+        f"  delivered {total('interlock_deliveries_total', sink=SINK, outcome='delivered'):.0f}"
+        f"  webhooks {sum(1 for s in run.vendor.sent if s.status == 200)}"
+        f"  receipts {total('interlock_receipts_issued_total'):.0f}"
         + (f"  outbox {sample.live} live / {sample.pruned} pruned" if sample else "")
     )
 
 
-async def drive(run: Run, supervisor: InterlockSupervisor) -> None:
-    """Start the daemon, load it, wind it down, let it settle, and stop it:
-    stopped whatever happens in between."""
+def drive(run: Run) -> None:
+    """Start every node, load the cluster, kill two of its nodes, wind it
+    down, let it settle, and stop it."""
     settings = run.settings
-    runner = asyncio.create_task(supervisor.run(), name="soak-daemon")
-    try:
-        await started(run, supervisor, runner)
-        await load(run, supervisor, runner)
-        await settle(run, supervisor)
-    finally:
-        run.workload.winding_down.set()
-        run.desk.stop()
-        if run.scraper is not None:  # first: its endpoint closes with the daemon
-            run.scraper.stop()
-            await asyncio.to_thread(run.scraper.join, 30)
-        stopping = time.monotonic()
-        supervisor.stop()
-        with contextlib.suppress(Exception):
-            await runner
-        run.stop_seconds = time.monotonic() - stopping
-        run.status = supervisor.status()
-        run.auditor.stop()
-        if run.auditor.is_alive():
-            await asyncio.to_thread(run.auditor.join, 30)
-        if run.desk.is_alive():
-            await asyncio.to_thread(run.desk.join, 60)
-    if not runner.cancelled() and runner.exception() is not None:
-        raise SoakError(f"the daemon failed: {runner.exception()}")
-    say(settings, f"daemon stopped in {run.stop_seconds:.2f}s")
-
-
-async def started(run: Run, supervisor: InterlockSupervisor, runner: asyncio.Task[None]) -> None:
-    """Until the daemon is ready; then the vendor, the auditor and the desk start."""
-    ready = asyncio.create_task(supervisor.ready())
-    await asyncio.wait({runner, ready}, timeout=180, return_when=asyncio.FIRST_COMPLETED)
-    if not ready.done():
-        ready.cancel()
-        raise SoakError("the daemon was not ready within 180 seconds")
-    if runner.done():
-        raise SoakError("the daemon stopped before it was ready")
-    port = supervisor.inbox_port
-    if port is None:
-        raise SoakError("the daemon runs no inbox")
-    metrics = supervisor.metrics_port
-    if metrics is None:
-        raise SoakError("the daemon serves no metrics")
-    run.vendor.target(port)
+    run.t0 = time.time()
+    for node in run.nodes:
+        start(run, node)
+    for node in run.nodes:
+        node.wait_ready()
+        scrape(run, node)
     run.started = time.monotonic()
-    run.auditor = Auditor(run.site, run.settings, run.started)
+    run.balancer.start()
+    run.auditor = Auditor(run.site, settings, run.started)
     run.auditor.start()
-    run.scraper = Scraper(metrics)
-    run.scraper.start()
+    run.watch.start()
     run.desk.start()
     say(
-        run.settings,
-        f"daemon ready: inbox on 127.0.0.1:{port}, metrics on 127.0.0.1:{metrics}; "
-        f"load for {run.settings.minutes:g} min",
+        settings,
+        f"cluster ready: {len(run.nodes)} nodes, inboxes on "
+        + ", ".join(f"{n.name} 127.0.0.1:{n.inbox_port}" for n in run.nodes)
+        + f"; load for {settings.minutes:g} min",
     )
+    load(run)
+    settle(run)
+    stop_all(run)
 
 
-async def load(run: Run, supervisor: InterlockSupervisor, runner: asyncio.Task[None]) -> None:
+def load(run: Run) -> None:
     settings = run.settings
     end = run.started + settings.minutes * 60
-    halfway = run.started + settings.minutes * 30
-    rotating: asyncio.Task[None] | None = None
+    events: list[tuple[float, str]] = [(ROTATE_AT, "rotate")]
+    if settings.chaos and settings.nodes >= 2:
+        events += [(KILL_AT, "killed"), (FREEZE_AT, "frozen")]
+    threads: list[threading.Thread] = []
     next_report = run.started + 10
-    next_burst = run.started + BURST_EVERY
-    tenants = itertools.cycle(settings.tenant_names)
-    while (now := time.monotonic()) < end and not runner.done():
-        await asyncio.sleep(min(1.0, end - now))
-        if rotating is None and time.monotonic() >= halfway:
-            rotating = asyncio.create_task(rotate(run, supervisor), name="soak-rotation")
-        if time.monotonic() >= next_burst:
-            run.workload.burst = (next(tenants), time.monotonic() + BURST_SECONDS)
-            next_burst += BURST_EVERY
+    while (now := time.monotonic()) < end:
+        time.sleep(min(1.0, end - now))
+        elapsed = (time.monotonic() - run.started) / (settings.minutes * 60)
+        while events and elapsed >= events[0][0]:
+            _, what = events.pop(0)
+            if what == "rotate":
+                target: Callable[[], Any] = lambda: rotate(run)  # noqa: E731
+            else:
+                target = _death(run, what)
+            thread = threading.Thread(target=target, name=f"soak-{what}", daemon=True)
+            thread.start()
+            threads.append(thread)
         if time.monotonic() >= next_report:
-            say(settings, progress(run, supervisor))
+            say(settings, progress(run))
             next_report += 10
-    if rotating is not None:
-        await rotating
     run.load_seconds = time.monotonic() - run.started
-    if runner.done():
-        raise SoakError("the daemon stopped during the load")
+    # A death late in the load is still being watched, and its node brought
+    # back: everything it left is settled by its next incarnation.
+    for thread in threads:
+        thread.join(240)
+    if not all(node.alive for node in run.nodes):
+        raise SoakError(
+            "a node is not up after the load: "
+            + ", ".join(
+                f"{n.name} exited {n.exits.get(n.incarnation)}" for n in run.nodes if not n.alive
+            )
+        )
 
 
-async def settle(run: Run, supervisor: InterlockSupervisor) -> None:
+def _death(run: Run, how: str) -> Callable[[], None]:
+    def dying() -> None:
+        report = die(run, how)
+        if report is not None:
+            run.deaths.append(report)
+
+    return dying
+
+
+def settle(run: Run) -> None:
     """No new work: until everything in flight is delivered, settled and
     consumed, or the quiesce bound passes."""
     settings = run.settings
     say(settings, "winding down: no new work; everything in flight settles")
-    run.workload.winding_down.set()
+    (run.site.directory / "wind-down").touch()
     run.desk.stop()
-    await asyncio.to_thread(run.desk.join, 60)
+    run.desk.join(60)
     begun = time.monotonic()
-    conn = await asyncio.to_thread(psycopg.connect, run.site.owner, autocommit=True)
+    conn = psycopg.connect(run.site.owner, autocommit=True)
     try:
         calm = 0
         while time.monotonic() - begun < settings.quiesce:
-            left = await asyncio.to_thread(outstanding, conn, run)
+            left = outstanding(conn, run)
             run.outstanding = left
             busy = {k: v for k, v in left.items() if v and k != "dead messages"}
             calm = calm + 1 if not busy else 0
             if calm >= 3:
                 run.quiesced = True
                 break
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
         if run.quiesced:
-            run.settled = await asyncio.to_thread(read_settled, run, conn)
-        live, total = await asyncio.to_thread(
-            lambda: (
-                conn.execute(
-                    "SELECT (SELECT count(*) FROM interlock.outbox),"
-                    " (SELECT count(*) FROM interlock.outbox)"
-                    " + (SELECT count(*) FROM interlock.outbox_compacted)"
-                ).fetchone()
-                or (0, 0)
+            scraper = next(
+                (run.scraper(n) for n in run.nodes if n.alive and run.scraper(n) is not None), None
             )
-        )
-        run.live_at_end, run.total_at_end = int(live), int(total)
+            if scraper is not None:
+                run.settled = read_settled(scraper, conn)
+        row = conn.execute(
+            "SELECT (SELECT count(*) FROM interlock.outbox),"
+            " (SELECT count(*) FROM interlock.outbox)"
+            " + (SELECT count(*) FROM interlock.outbox_compacted)"
+        ).fetchone()
+        run.live_at_end, run.total_at_end = (int(row[0]), int(row[1])) if row else (0, 0)
     finally:
         conn.close()
     run.quiesce_seconds = time.monotonic() - begun
-    say(settings, progress(run, supervisor))
+    say(settings, progress(run))
     say(
         settings,
         f"{'settled' if run.quiesced else 'NOT settled'} in {run.quiesce_seconds:.1f}s"
@@ -2436,26 +3500,101 @@ async def settle(run: Run, supervisor: InterlockSupervisor) -> None:
     )
 
 
-async def restart(run: Run) -> None:
-    """A second daemon over the same files and database: it recovers nothing,
-    and stops as cleanly."""
-    supervisor = build_supervisor(run.config, Application(checkers=checkers()))
-    runner = asyncio.create_task(supervisor.run(), name="soak-daemon-2")
-    ready = asyncio.create_task(supervisor.ready())
-    await asyncio.wait({runner, ready}, timeout=120, return_when=asyncio.FIRST_COMPLETED)
-    run.second_ready = ready.done() and not runner.done()
-    if not ready.done():
-        ready.cancel()
-    await asyncio.sleep(1.0)
-    stopping = time.monotonic()
-    supervisor.stop()
-    await runner
-    run.second_stop_seconds = time.monotonic() - stopping
-    run.second_status = supervisor.status()
+def stop_all(run: Run) -> None:
+    """``SIGTERM`` to every node, together, as a rollout's end does; each
+    must stop within its drain bound."""
+    for scraper in run.scrapers.values():
+        scraper.stop()
+    stops: dict[str, tuple[int, float]] = {}
+
+    def stopping(node: Node) -> None:
+        stops[node.name] = node.stop()
+
+    threads = [
+        threading.Thread(target=stopping, args=(n,), daemon=True) for n in run.nodes if n.alive
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(120)
+    run.stops = stops
+    say(
+        run.settings,
+        "every node stopped: "
+        + ", ".join(
+            f"{name} {code} in {took:.2f}s" for name, (code, took) in sorted(stops.items())
+        ),
+    )
 
 
-def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | None) -> int:
-    """Run the soak on ``cluster``; returns the exit status."""
+def second(run: Run) -> None:
+    """Every node started again over its files and the database: it
+    recovers nothing, and stops as cleanly."""
+    for node in run.nodes:
+        start(run, node)
+    for node in run.nodes:
+        try:
+            node.wait_ready(120)
+            ready = True
+        except SoakError:
+            ready = False
+        run.second[node.name] = {"ready": ready, "incarnation": node.incarnation}
+    time.sleep(1.0)
+    for node in run.nodes:
+        if node.alive:
+            code, took = node.stop()
+        else:
+            code, took = node.exits.get(node.incarnation, -1), 0.0
+        status = node.statuses.get(node.incarnation, {})
+        engines = parse_status(status.get("engines", ""))
+        run.second[node.name].update(
+            {
+                "exit": code,
+                "seconds": took,
+                "recovered": engines[3].get("recovered", 0) if engines else -1,
+                "failed": {
+                    name: rest for name, rest in status.items() if " 0 failure(s)" not in rest
+                },
+            }
+        )
+
+
+def parse_status(rest: str) -> tuple[str, int, int, dict[str, int]] | None:
+    """A part's line as a stopped daemon prints it: ``stopped, 3 step(s), 0
+    failure(s); committed 12, refused 2``."""
+    head, _, tail = rest.partition("; ")
+    parts = head.split(", ")
+    if len(parts) != 3:
+        return None
+    counters: dict[str, int] = {}
+    for item in filter(None, tail.split(", ")):
+        name, _, value = item.rpartition(" ")
+        with contextlib.suppress(ValueError):
+            counters[name] = int(value)
+    return parts[0], int(parts[1].split()[0]), int(parts[2].split()[0]), counters
+
+
+def halt(run: Run) -> None:
+    """Whatever is left: every thread stopped, every node's process gone."""
+    for scraper in run.scrapers.values():
+        scraper.stop()
+    for node in run.nodes:
+        if node.process is not None and node.process.poll() is None:
+            with contextlib.suppress(Exception):
+                node.process.send_signal(signal.SIGCONT)
+                node.process.kill()
+                node.process.wait(30)
+    run.desk.stop()
+    run.auditor.stop()
+    run.watch.stop()
+    run.balancer.stop()
+    for thread in (run.auditor, run.watch, run.desk):
+        if thread.is_alive():
+            thread.join(30)
+
+
+def soak(settings: Settings, server: Server, *, keep: bool, directory: Path | None) -> int:
+    """Run the soak on ``server``; returns the exit status."""
     workdir = directory or Path(tempfile.mkdtemp(prefix="interlock-soak-"))
     workdir.mkdir(parents=True, exist_ok=True)
     captured = Captured()
@@ -2466,53 +3605,70 @@ def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | 
     file_log.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root.addHandler(file_log)
     root.setLevel(logging.INFO)
-    site = new_site(cluster, workdir)
+    site = new_site(server, workdir)
     vendor: Vendor | None = None
     api: PaymentAPI | None = None
     service: KeyService | None = None
+    balancer: Balancer | None = None
     try:
         create_site(site, settings)
+        site.shared.mkdir(parents=True, exist_ok=True)
         token = secrets.token_hex(16)
         os.environ[KMS_TOKEN_ENV] = token
         service = KeyService(token)
-        keys = Keys.generate(workdir, service)
+        keys = Keys.generate(site.shared, service)
         api_key = "sk_test_" + secrets.token_hex(12)
         webhook_secret = "whsec_" + secrets.token_hex(16)
+        # The harness's stale relay reads the API key as every relay does.
         os.environ[API_KEY_ENV] = api_key
         os.environ[WEBHOOK_SECRET_ENV] = webhook_secret
-        vendor = Vendor(webhook_secret, settings.seed + 1)
+        balancer = Balancer()
+        vendor = Vendor(webhook_secret, settings.seed + 1, balancer)
         api = PaymentAPI(api_key, vendor, Faults().scaled(settings.faults), settings.seed + 2)
-        path = write_config(site, settings, keys, api.port)
-        install(path, keys)
-        config = load_config(path)
-        say(settings, f"soak database {site.name}: Interlock installed, files in {workdir}")
-        workload = Workload(settings)
-        application = Application(
-            checkers=checkers(),
-            agents=[make_agent(workload, n) for n in range(settings.agents)],
+        nodes = [
+            Node(index, name, site.home(name), write_config(site, settings, keys, api.port, name))
+            for index, name in enumerate(settings.node_names)
+        ]
+        balancer.serve(nodes)
+        install(nodes[0].config, keys)
+        os.environ.pop("INTERLOCK_NODE", None)
+        config = load_config(nodes[0].config)
+        say(
+            settings,
+            f"soak database {site.name}: Interlock installed, {len(nodes)} nodes' files in "
+            f"{workdir}",
         )
-        supervisor = build_supervisor(config, application)
         api.start()
         vendor.start()
+        roles = ["vacuum", "inbox-matcher", *(f"settler:{receipts_log_id(n.name)}" for n in nodes)]
         run = Run(
             settings,
             config,
             site,
             keys,
-            workload,
+            nodes,
+            node_environment(api_key, webhook_secret, token),
             api,
             vendor,
-            Desk(config, site, keys, workload),
+            balancer,
+            Desk(config, site, keys, settings),
             Auditor(site, settings, time.monotonic()),
+            Watch(site, roles),
             captured,
         )
         run.deadlocks_before = deadlocks(site.owner)
         try:
-            asyncio.run(drive(run, supervisor))
-            asyncio.run(restart(run))
+            drive(run)
+            second(run)
         except SoakError as exc:
             run.failure = str(exc)
+        except Exception as exc:
+            logger.exception("the soak failed")
+            run.failure = f"{type(exc).__name__}: {exc}"
+        finally:
+            halt(run)
         run.deadlocks_after = deadlocks(site.owner)
+        run.journals = journals(run)
         claims = prove(run)
         report(run, claims)
         write_report(run, claims, workdir / "report.json")
@@ -2525,6 +3681,8 @@ def soak(settings: Settings, cluster: Cluster, *, keep: bool, directory: Path | 
             api.close()
         if service is not None:
             service.close()
+        if balancer is not None:
+            balancer.stop()
         root.removeHandler(captured)
         root.removeHandler(file_log)
         root.setLevel(level)
@@ -2549,78 +3707,261 @@ class Claim:
     evidence: list[str]
 
 
+@dataclass
+class Evidence:
+    """What the claims read once, after the run: every node's chains and
+    receipt logs, the operator log, and each node's incarnations."""
+
+    chains: dict[str, list[Any]]
+    """Each node's escrow chains' records."""
+    committed: set[str]
+    """Every plan a chain records committed, recovered commits included."""
+    terminal: dict[str, str]
+    """Each plan's last record in the chains: committed, aborted..."""
+    recovered: set[str]
+    """Every plan whose commit intent a recovery resolved."""
+    receipts: dict[str, list[Any]]
+    """Each node's receipt log's delivery receipts."""
+    actions: dict[str, int]
+    """Each node's receipt log's action receipts."""
+    records: tuple[Any, ...]
+    """The operator log."""
+    stopped: dict[tuple[str, int], dict[str, tuple[str, int, int, dict[str, int]]]]
+    """Each incarnation of the run proper that stopped (not one killed, not the
+    second start): its parts' last lines."""
+    killed: list[tuple[str, int]]
+    unissued: dict[str, set[str]] = field(default_factory=dict)
+    """Each node's plans whose commit names an action receipt its log does not
+    hold: committed by an incarnation that died before it issued it."""
+
+
+def chain_paths(run: Run, node: Node) -> list[Path]:
+    engine = run.config.engine
+    assert engine.chain is not None
+    return [
+        node.home / path.name
+        for index in range(engine.workers)
+        if (path := engine.chain_for(index, engine.workers)) is not None
+    ]
+
+
+def gather(run: Run) -> Evidence:
+    from agentgov.receipts import ReceiptLog
+
+    from interlock.chain import RecordType
+    from interlock.records import read_records
+
+    chains: dict[str, list[Any]] = {}
+    committed: set[str] = set()
+    terminal: dict[str, str] = {}
+    recovered: set[str] = set()
+    for node in run.nodes:
+        chains[node.name] = []
+        for path in chain_paths(run, node):
+            if path.exists():
+                chains[node.name] += EscrowChain.load(path).records()
+        for record in chains[node.name]:
+            if record.record_type in (RecordType.COMMITTED, RecordType.ABORTED):
+                terminal[str(record.plan_id)] = record.record_type.value
+                if record.note.startswith("recovered:"):
+                    recovered.add(str(record.plan_id))
+            if record.record_type is RecordType.COMMITTED:
+                committed.add(str(record.plan_id))
+    receipts: dict[str, list[Any]] = {}
+    actions: dict[str, int] = {}
+    settings = run.config.receipts
+    assert settings is not None and settings.key is not None
+    unissued: dict[str, set[str]] = {}
+    for node in run.nodes:
+        path = node.home / settings.log.name
+        named = {
+            str(record.plan_id): record.note.rsplit("; receipt ", 1)[1]
+            for record in chains[node.name]
+            if record.record_type is RecordType.COMMITTED and "; receipt " in record.note
+        }
+        if not path.exists():
+            receipts[node.name], actions[node.name] = [], 0
+            unissued[node.name] = set(named)
+            continue
+        log = ReceiptLog(receipts_log_id(node.name), load_key(settings.key), path=path)
+        try:
+            receipts[node.name] = list(log.deliveries())
+            actions[node.name] = len(log) - len(receipts[node.name])
+            unissued[node.name] = {p for p, r in named.items() if log.index_of(r) is None}
+        finally:
+            log.close()
+    operators = run.config.operators
+    assert operators is not None
+    records = read_records(operators.log) if operators.log.exists() else ()
+    second = {(name, int(found["incarnation"])) for name, found in run.second.items()}
+    stopped = {}
+    killed = []
+    for node in run.nodes:
+        for number, lines in node.statuses.items():
+            if (node.name, number) in second:
+                continue
+            if node.exits.get(number) == -signal.SIGKILL:
+                killed.append((node.name, number))
+                continue
+            stopped[(node.name, number)] = {
+                part: parsed for part, rest in lines.items() if (parsed := parse_status(rest))
+            }
+        for number in range(node.incarnation + 1):
+            if node.exits.get(number) == -signal.SIGKILL and (node.name, number) not in killed:
+                killed.append((node.name, number))
+    return Evidence(
+        chains,
+        committed,
+        terminal,
+        recovered,
+        receipts,
+        actions,
+        records,
+        stopped,
+        killed,
+        unissued=unissued,
+    )
+
+
 def prove(run: Run) -> list[Claim]:
-    """Each claim, from the database, the ledger and the logs."""
+    """Each claim, from the database, the ledger, the logs and the journals."""
     if run.failure is not None:
         return [Claim("the soak ran", False, [run.failure])]
+    evidence = gather(run)
     with psycopg.connect(run.site.owner, autocommit=True) as conn:
         governor = BudgetManager.open_postgres(run.site.owner, read_only=True)
         try:
             entries = tuple(governor.audit_trail())
-            return [
-                no_deadlocks(run),
-                lock_waits_resolve(run),
-                windows_hold(run),
-                ledger_balances(run, conn, governor, entries),
-                exactly_once(run, conn),
-                no_forgery(run),
-                vacuum_compacts(run, conn),
-                everything_verifies(run, conn, entries),
-                graceful(run),
-                trace_survives(run),
-                metrics_agree(run, conn),
-                keys_rotate(run, conn),
+            proofs: list[tuple[str, Callable[[], Claim]]] = [
+                ("no deadlocks", lambda: no_deadlocks(run)),
+                ("lock waits resolve", lambda: lock_waits_resolve(run, evidence)),
+                ("rate windows hold exactly", lambda: windows_hold(run, evidence)),
+                (
+                    "the ledger balances",
+                    lambda: ledger_balances(run, evidence, conn, governor, entries),
+                ),
+                ("exactly once", lambda: exactly_once(run, evidence, conn)),
+                ("no forgery accepted", lambda: no_forgery(run)),
+                ("the vacuum compacts as it goes", lambda: vacuum_compacts(run, evidence, conn)),
+                (
+                    "everything verifies after",
+                    lambda: everything_verifies(run, evidence, conn, entries),
+                ),
+                ("shutdown is graceful", lambda: graceful(run, evidence)),
+                ("trace context survives", lambda: trace_survives(run)),
+                ("metrics agree", lambda: metrics_agree(run, evidence, conn)),
+                ("keys rotate", lambda: keys_rotate(run, conn)),
+                ("nodes share the work", lambda: nodes_share_the_work(run, evidence)),
+                ("one leader at a time", lambda: one_leader_at_a_time(run, evidence)),
+                ("a node killed is survived", lambda: survived(run, evidence, "killed")),
+                ("a node frozen is survived", lambda: survived(run, evidence, "frozen")),
             ]
+            return [_proven(name, proof) for name, proof in proofs]
         finally:
             governor.close()
 
 
+def _proven(name: str, proof: Callable[[], Claim]) -> Claim:
+    """A claim, or why it could not be read: one that raises fails, and the
+    rest are still read."""
+    try:
+        return proof()
+    except Exception as exc:
+        logger.exception("the claim %r could not be read", name)
+        return Claim(name, False, [f"could not be read: {type(exc).__name__}: {exc}"])
+
+
+def counters(evidence: Evidence, part: str) -> Counter[str]:
+    """A part's counters, summed over every incarnation that stopped."""
+    total: Counter[str] = Counter()
+    for parts in evidence.stopped.values():
+        for name, parsed in parts.items():
+            if name == part or (part == "relay" and name.startswith("relay-")):
+                total.update(parsed[3])
+    return total
+
+
 def no_deadlocks(run: Run) -> Claim:
     moved = run.deadlocks_after - run.deadlocks_before
-    logged = _cluster_log_deadlocks(run)
+    logged = _server_log_deadlocks(run)
+    in_nodes = [
+        f"{node.name}.{number}"
+        for node in run.nodes
+        for number in range(node.incarnation + 1)
+        if node.log(number).exists()
+        and "deadlock detected" in node.log(number).read_text(encoding="utf-8", errors="replace")
+    ]
     evidence = [
         f"pg_stat_database.deadlocks: {run.deadlocks_before} before, {run.deadlocks_after} after",
-        f"'deadlock detected' in what the daemon logged: {len(run.captured.deadlocks)}",
+        f"'deadlock detected' in what the nodes logged: {len(in_nodes)} "
+        f"of {sum(n.incarnation + 1 for n in run.nodes)} processes; in the harness's: "
+        f"{len(run.captured.deadlocks)}",
     ]
     if logged is not None:
         evidence.append(f"'deadlock detected' in the server's log: {logged}")
-    held = moved == 0 and not run.captured.deadlocks and not logged
-    evidence += run.captured.deadlocks[:3]
+    held = moved == 0 and not run.captured.deadlocks and not logged and not in_nodes
+    evidence += run.captured.deadlocks[:3] + in_nodes[:3]
     return Claim("no deadlocks", held, evidence)
 
 
-def _cluster_log_deadlocks(run: Run) -> int | None:
-    text = run.site.cluster.logs()
-    if not text and run.site.cluster.container is None:
+def _server_log_deadlocks(run: Run) -> int | None:
+    text = run.site.server.logs()
+    if not text and run.site.server.container is None:
         return None
     return text.count("deadlock detected")
 
 
-def lock_waits_resolve(run: Run) -> Claim:
+def _expected_error(key: str) -> bool:
+    """An error the cluster expects: a fact replayed, refused at admission;
+    and a fact another node's agent consumed first, a race lost across nodes."""
+    return key.startswith("misbehave:fact_replay") or key == "reconcile: fact"
+
+
+def lock_waits_resolve(run: Run, evidence: Evidence) -> Claim:
     auditor = run.auditor
-    engines = run.status["engines"].counters if "engines" in run.status else {}
+    journals = run.journals
+    engines = counters(evidence, "engines")
     stage_wait = auditor.max_wait.get("stage", 0.0)
     worst = max(auditor.max_wait.values(), default=0.0)
-    expected_errors = sum(
-        1 for p in run.workload.plans.values() if p.kind == "misbehave:fact_replay" and p.error
-    )
-    unexpected = {
-        k: v for k, v in run.workload.errors.items() if not k.startswith("misbehave:fact_replay")
+    unexpected = {k: v for k, v in journals.errors.items() if not _expected_error(k)}
+    killed = set(evidence.killed)
+    lives = journals.incarnations
+    unanswered = {
+        f"{name}.{number}": life.submitted - life.answered
+        for (name, number), life in lives.items()
+        if life.submitted != life.answered
     }
-    answered = run.workload.submitted == run.workload.answered and run.workload.inflight == 0
-    counted = engines.get("committed", 0) + engines.get("refused", 0) + engines.get("failed", 0)
+    unanswered_alive = {
+        k: v
+        for k, v in unanswered.items()
+        if tuple(k.rsplit(".", 1)) not in {(n, str(i)) for n, i in killed}
+    }
+    mismatched = []
+    for key, parts in evidence.stopped.items():
+        life = lives.get(key)
+        staged = parts.get("engines")
+        if life is None or staged is None:
+            continue
+        counted = sum(staged[3].get(k, 0) for k in ("committed", "refused", "failed"))
+        if counted != life.submitted:
+            mismatched.append(f"{key[0]}.{key[1]}: staged {counted}, submitted {life.submitted}")
+    conflicts = engines.get("conflicts", 0) + sum(
+        scraper.last.get("interlock_plan_conflicts_total", {}).get((("cause", "lock"),), 0.0)
+        for (name, number), scraper in run.scrapers.items()
+        if (name, number) in killed
+    )
     held = (
         stage_wait <= LOCK_TIMEOUT + 0.5
         and worst <= LEDGER_LOCK_TIMEOUT + 1
-        and engines.get("conflicts", 0) > 0
+        and conflicts > 0
         and engines.get("conflicts_exhausted", 0) == 0
         and engines.get("unsettled", 0) == 0
         and engines.get("cancelled", 0) == 0
-        and answered
-        and counted == run.workload.submitted
-        and engines.get("failed", 0) == expected_errors
+        and not unanswered_alive
+        and not mismatched
         and not unexpected
     )
+    races = sum(v for k, v in journals.errors.items() if k == "reconcile: fact")
     return Claim(
         "lock waits resolve",
         held,
@@ -2628,18 +3969,27 @@ def lock_waits_resolve(run: Run) -> Claim:
             f"{auditor.ticks} samples of pg_locks: {auditor.waits} waits seen; longest by role: "
             + ", ".join(f"{k} {v:.2f}s" for k, v in sorted(auditor.max_wait.items()))
             + f" (stages bounded at {LOCK_TIMEOUT}s, the ledger at {LEDGER_LOCK_TIMEOUT}s)",
-            f"lost races retried: {engines.get('conflicts', 0)}; given up: "
-            f"{engines.get('conflicts_exhausted', 0)}",
-            f"plans submitted {run.workload.submitted}, answered {run.workload.answered}, "
-            f"staged to a verdict or error {counted}; cancelled {engines.get('cancelled', 0)}, "
-            f"unsettled {engines.get('unsettled', 0)}",
-            f"errors: {engines.get('failed', 0)} (fact replays refused at admission: "
-            f"{expected_errors})" + (f"; unexpected: {dict(unexpected)}" if unexpected else ""),
+            f"lost races retried: {conflicts:.0f}; given up: "
+            f"{engines.get('conflicts_exhausted', 0)}; facts another node consumed first: {races}",
+            f"plans submitted {journals.submitted}, answered {journals.answered}; in flight when "
+            f"their node was killed: "
+            + (", ".join(f"{k} {v}" for k, v in sorted(unanswered.items())) or "none")
+            + f"; every process that stopped staged what it was given ({len(evidence.stopped)})",
+            f"errors: {sum(journals.errors.values())}, all of them expected: fact replays refused "
+            f"at admission, facts consumed first elsewhere"
+            + (f"; unexpected: {dict(unexpected)}" if unexpected else ""),
+            *(
+                [f"answered fewer than submitted in a process that lived: {unanswered_alive}"]
+                if unanswered_alive
+                else []
+            ),
+            *mismatched[:3],
         ],
     )
 
 
-def windows_hold(run: Run) -> Claim:
+def windows_hold(run: Run, evidence: Evidence) -> Claim:
+    journals = run.journals
     limits = {w.name: (w.limit, w.span) for w in run.config.windows}
     history: dict[tuple[str, str], list[tuple[datetime, Decimal, str]]] = defaultdict(list)
     for (stage, window, key), (amount, at) in run.auditor.window_rows.items():
@@ -2660,14 +4010,16 @@ def windows_hold(run: Run) -> Claim:
             if total > limit:
                 breaches.append(f"{window} {key}: {total} within {span} ending {at.isoformat()}")
     refusals = Counter(
-        b for p in run.workload.plans.values() for b in p.blocked_by if b.startswith("rate_window")
+        b for p in journals.plans.values() for b in p.blocked_by if b.startswith("rate_window")
     )
-    committed = sum(1 for p in run.workload.plans.values() if p.committed)
-    checkouts = sum(1 for p in run.workload.plans.values() if p.committed and p.checkout)
+    # Committed: what the chains say, recovered commits of a killed node's
+    # plans in flight included.
+    committed = {p for p in evidence.committed if p in journals.plans}
+    checkouts = {p for p in committed if journals.plans[p].checkout}
     stages = {w: len({s for (s, n, _) in run.auditor.window_rows if n == w}) for w in limits}
-    complete = (
-        stages.get("plans_per_tenant") == committed and stages.get("charged_per_agent") == checkouts
-    )
+    complete = stages.get("plans_per_tenant") == len(committed) and stages.get(
+        "charged_per_agent"
+    ) == len(checkouts)
     exercised = all(refusals.get(f"rate_window:{w}", 0) > 0 for w in limits)
     held = not breaches and complete and exercised
     return Claim(
@@ -2679,18 +4031,24 @@ def windows_hold(run: Run) -> Claim:
                 f"{w}: {stages[w]} plans, fullest at {worst[w]:.0%} of its limit"
                 for w in sorted(limits)
             ),
-            "refused by each window: "
+            "refused by each window, across the nodes: "
             + ", ".join(f"{w} {refusals.get(f'rate_window:{w}', 0)}" for w in sorted(limits))
-            + f" ({sum(run.workload.bursts.values())} bursts for one tenant filled its window)",
-            f"every committed plan's rows seen: {committed} committed, {checkouts} of them charges",
+            + f" ({sum(journals.bursts.values())} bursts for one tenant filled its window)",
+            f"every committed plan's rows seen: {len(committed)} committed, {len(checkouts)} of "
+            f"them charges",
             *(breaches[:5] or ["no key ever held more than its limit within its span"]),
         ],
     )
 
 
 def ledger_balances(
-    run: Run, conn: psycopg.Connection[Any], governor: BudgetManager, entries: Sequence[Any]
+    run: Run,
+    evidence: Evidence,
+    conn: psycopg.Connection[Any],
+    governor: BudgetManager,
+    entries: Sequence[Any],
 ) -> Claim:
+    journals = run.journals
     problems: list[str] = []
     try:
         governor.verify_integrity()
@@ -2703,8 +4061,8 @@ def ledger_balances(
     if holds:
         problems.append(f"{len(holds)} hold(s) left open")
     memo_plan: dict[str, str] = {}
-    for path in chain_paths(run):
-        for record in EscrowChain.load(path).records():
+    for records in evidence.chains.values():
+        for record in records:
             memo_plan[f"interlock:{record.record_hash[:16]}"] = str(record.plan_id)
     scopes = set(run.settings.scopes)
     charged: dict[str, list[Decimal]] = defaultdict(list)
@@ -2721,22 +4079,37 @@ def ledger_balances(
         elif entry.entry_type is EntryType.REVERSAL:
             credits[entry.scope_id].append(entry.amount)
     spent: dict[str, Decimal] = defaultdict(Decimal)
-    for plan_id, record in run.workload.plans.items():
+    in_flight = 0
+    for plan_id, record in journals.plans.items():
         got = charged.pop(plan_id, [])
-        if record.committed is None:
+        price = SETTLE_COST + (CALL_COST if record.checkout else Decimal(0))
+        if not record.answered:
+            # In flight when its node was killed: committed, its whole price;
+            # or not, at most what producing it cost.
+            in_flight += 1
+            if plan_id in evidence.committed:
+                if got != [price]:
+                    problems.append(f"plan {plan_id}, committed as its node died, charged {got}")
+            elif got not in ([], [SETTLE_COST]):
+                problems.append(f"plan {plan_id}, not committed as its node died, charged {got}")
+        elif record.committed is None:
             if got:
                 problems.append(f"plan {plan_id} raised, and was charged {got}")
             continue
-        price = SETTLE_COST + (CALL_COST if record.committed and record.checkout else Decimal(0))
-        if got != [price]:
-            problems.append(f"plan {plan_id} ({record.kind}) was charged {got}, not [{price}]")
+        else:
+            expected = price if record.committed else SETTLE_COST
+            if got != [expected]:
+                problems.append(
+                    f"plan {plan_id} ({record.kind}) was charged {got}, not [{expected}]"
+                )
         spent[record.scope] += sum(got, Decimal(0))
     for plan_id, got in charged.items():
         problems.append(f"plan {plan_id}, which no agent submitted, was charged {got}")
-    credited = conn.execute(
+    (credited,) = one(
+        conn,
         "SELECT (SELECT count(*) FROM interlock.outbox_settlements WHERE credit IS NOT NULL)"
-        " + (SELECT count(*) FROM interlock.outbox_compacted WHERE credit IS NOT NULL)"
-    ).fetchone()[0]
+        " + (SELECT count(*) FROM interlock.outbox_compacted WHERE credit IS NOT NULL)",
+    )
     all_credits = [a for amounts in credits.values() for a in amounts]
     if len(all_credits) != int(credited) or any(a != CALL_COST for a in all_credits):
         problems.append(
@@ -2744,42 +4117,37 @@ def ledger_balances(
             f"{sorted(set(all_credits))}"
         )
     if int(credited) != run.desk.applied:
-        # Every refund the desk made was delivered and settled: each earns
-        # back what its payment was charged.
         problems.append(f"{run.desk.applied} refunds made, {credited} credited")
     for scope in sorted(scopes):
-        expected = ENVELOPE - spent[scope] + sum(credits[scope], Decimal(0))
+        expected_total = ENVELOPE - spent[scope] + sum(credits[scope], Decimal(0))
         available = governor.available(scope)
-        if available != expected:
-            problems.append(f"{scope}: {available} available, {expected} expected")
+        if available != expected_total:
+            problems.append(f"{scope}: {available} available, {expected_total} expected")
     total = sum(spent.values(), Decimal(0))
+    charged_plans = sum(
+        1 for r in journals.plans.values() if r.committed is not None or not r.answered
+    )
     return Claim(
         "the ledger balances",
         not problems,
         [
-            f"AgentGov: {len(entries)} entries; integrity and conservation verified"
+            f"AgentGov: {len(entries)} entries, written by every node's governors; integrity and "
+            f"conservation verified"
             if not any(p.startswith("verify_integrity") for p in problems)
             else "AgentGov's integrity check FAILED",
-            f"{sum(1 for r in run.workload.plans.values() if r.committed is not None)} plans "
-            f"charged once each, exactly their price: {total} in all",
+            f"{charged_plans} plans charged once each, exactly their price: {total} in all "
+            f"({in_flight} in "
+            f"flight when their node was killed, each charged as its chain says it ended)",
             f"{len(all_credits)} of {run.desk.applied} refunds credited back at {CALL_COST}, "
-            f"each once",
-            f"no hold left open ({len(holds)}), no claim unredeemed ({len(claims)})",
+            f"each once, by the node that committed its charge",
+            f"no hold left open ({len(holds)}), no claim unredeemed ({len(claims)}): every "
+            f"killed node's next incarnation recovered what it left",
             *problems[:8],
         ],
     )
 
 
-def chain_paths(run: Run) -> list[Path]:
-    engine = run.config.engine
-    return [
-        path
-        for index in range(engine.workers)
-        if (path := engine.chain_for(index, engine.workers)) is not None
-    ]
-
-
-def exactly_once(run: Run, conn: psycopg.Connection[Any]) -> Claim:
+def exactly_once(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -> Claim:
     problems: list[str] = []
     api = run.api
     twice = [k for k, n in api.executions.items() if n > 1]
@@ -2791,7 +4159,10 @@ def exactly_once(run: Run, conn: psycopg.Connection[Any]) -> Claim:
     charged_twice = [o for o, n in per_order.items() if n > 1]
     if charged_twice:
         problems.append(f"orders charged twice: {charged_twice[:5]}")
-    committed = {str(o.order_id) for o in run.workload.orders.values() if o.committed}
+    hot = {str(i) for ids in run.settings.hot.values() for i in ids}
+    committed = {
+        str(r[0]) for r in conn.execute("SELECT id FROM orders").fetchall() if str(r[0]) not in hot
+    }
     if set(per_order) != committed:
         problems.append(
             f"{len(committed - set(per_order))} committed order(s) never charged, "
@@ -2816,60 +4187,78 @@ def exactly_once(run: Run, conn: psycopg.Connection[Any]) -> Claim:
         problems.append(f"messages not delivered: {others}")
     if delivered != len(intents) + len(refunds):
         problems.append(f"{delivered} delivered, {len(intents) + len(refunds)} objects created")
-    (twice_delivered,) = conn.execute(
+    (twice_delivered,) = one(
+        conn,
         "SELECT count(*) FROM (SELECT message_id FROM interlock.outbox_attempts"
-        " WHERE event = 'delivered' GROUP BY message_id HAVING count(*) > 1) AS d"
-    ).fetchone()
+        " WHERE event = 'delivered' GROUP BY message_id HAVING count(*) > 1) AS d",
+    )
     if twice_delivered:
         problems.append(f"{twice_delivered} message(s) recorded delivered twice")
-    (unreceipted,) = conn.execute(
-        "SELECT (SELECT count(*) FROM interlock.outbox_settlements WHERE receipt_id IS NULL)"
-        " + (SELECT count(*) FROM interlock.outbox_compacted"
-        "     WHERE state = 'delivered' AND receipt_id IS NULL)"
-    ).fetchone()
-    from agentgov.receipts import ReceiptLog
+    # A delivery settled without a receipt only when its plan's never could
+    # be: the plan in flight on a node that died between its commit and its
+    # action receipt, which its commit names and its log does not hold.
+    plans = {
+        str(message): str(plan)
+        for message, plan in conn.execute(
+            "SELECT s.message_id, o.plan_id FROM interlock.outbox_settlements AS s"
+            " JOIN interlock.outbox AS o USING (message_id) WHERE s.receipt_id IS NULL"
+            " UNION ALL SELECT message_id, plan_id FROM interlock.outbox_compacted"
+            " WHERE state = 'delivered' AND receipt_id IS NULL"
+        ).fetchall()
+    }
+    died = {(d.node, d.incarnation) for d in run.deaths}
+    unissued = set().union(*evidence.unissued.values()) if evidence.unissued else set()
 
-    receipts = run.config.receipts
-    assert receipts is not None
-    log = ReceiptLog(receipts.log_id, load_key(receipts.key), path=receipts.log)
-    try:
-        per_message = Counter(str(d.request.message_id) for d in log.deliveries())
-        actions = len(log) - sum(per_message.values())
-    finally:
-        log.close()
-    if unreceipted or len(per_message) != delivered or any(n > 1 for n in per_message.values()):
+    def never_issued(plan: str) -> bool:
+        record = run.journals.plans.get(plan)
+        return (
+            plan in unissued
+            and record is not None
+            and (record.node, record.incarnation) in died
+            and not record.answered
+        )
+
+    justified = sorted(m for m, plan in plans.items() if never_issued(plan))
+    unreceipted = len(plans) - len(justified)
+    per_message = Counter(
+        str(d.request.message_id) for receipts in evidence.receipts.values() for d in receipts
+    )
+    actions = sum(evidence.actions.values())
+    if (
+        unreceipted
+        or len(per_message) + len(justified) != delivered
+        or any(n > 1 for n in per_message.values())
+    ):
         problems.append(
             f"{len(per_message)} message(s) receipted for {delivered} delivered; "
-            f"{unreceipted} settled without one"
+            f"{unreceipted} settled without one, {len(justified)} of a plan whose action "
+            f"receipt its node died before issuing"
         )
-    events, distinct, facts, consumed_twice, unconsumed = conn.execute(
+    events, distinct, facts, consumed_twice, unconsumed = one(
+        conn,
         "SELECT (SELECT count(*) FROM interlock.inbox_events),"
         " (SELECT count(DISTINCT (source, event_id)) FROM interlock.inbox_events),"
         " (SELECT count(*) FROM interlock.inbox_facts),"
         " (SELECT count(*) - count(DISTINCT fact_id) FROM interlock.inbox_consumed),"
         " (SELECT count(*) FROM interlock.inbox_facts f WHERE NOT EXISTS"
-        "   (SELECT 1 FROM interlock.inbox_consumed c WHERE c.fact_id = f.fact_id))"
-    ).fetchone()
+        "   (SELECT 1 FROM interlock.inbox_consumed c WHERE c.fact_id = f.fact_id))",
+    )
     if events != distinct or consumed_twice or unconsumed:
         problems.append(
             f"{events} events for {distinct} ids; facts consumed twice {consumed_twice}, "
             f"never {unconsumed}"
         )
-    genuine = [s for s in run.vendor.sent if s.purpose == "genuine" and s.status == 200]
-    duplicates = [s for s in run.vendor.sent if s.purpose == "duplicate" and s.status == 200]
-    # Recordings by event, whichever of its sends came first: under load a
-    # duplicate overtakes its genuine send now and then, and is the one that
-    # records it.
+    answered = [s for s in run.vendor.sent if s.status == 200]
+    duplicates = [s for s in answered if s.purpose == "duplicate"]
+    # Recordings by event, whichever of its sends, to whichever node, made them.
     recordings = Counter(
-        s.event_id
-        for s in run.vendor.sent
-        if s.status == 200 and s.recorded and not s.purpose.startswith("forged:")
+        s.event_id for s in answered if s.recorded and not s.purpose.startswith("forged:")
     )
     recorded_twice = sorted(e for e, n in recordings.items() if n > 1)
     if recorded_twice:
         problems.append(f"{len(recorded_twice)} event(s) recorded more than once")
-    overtaken = sum(1 for s in duplicates if s.recorded)
-    early = sum(1 for s in genuine if s.recorded and not s.matched)
+    spread = Counter(s.node for s in answered if s.recorded)
+    lost = sum(1 for s in run.vendor.sent if s.status == 0)
     return Claim(
         "exactly once",
         not problems,
@@ -2879,19 +4268,26 @@ def exactly_once(run: Run, conn: psycopg.Connection[Any]) -> Claim:
             f"{api.answers.get('in_use', 0)} answered 409 while its first was running",
             f"{len(intents)} payments for {len(committed)} committed orders, none twice; "
             f"{len(refunds)} refunds for {run.desk.applied} compensations",
-            f"{delivered} messages delivered once each, {delivered} delivery receipts "
-            f"({actions} action receipts beside them)",
-            f"{events} events recorded, one per id; each event the vendor sent recorded by one "
-            f"send ({len(duplicates)} duplicates answered, {overtaken} of them ahead of their "
-            f"genuine send; {early} arrived before their delivery was recorded and were bound "
-            f"later); {facts} facts, each consumed once",
+            f"{delivered} messages delivered once each, {len(per_message)} delivery receipts "
+            f"across {len(evidence.receipts)} nodes' logs ({actions} action receipts beside them)"
+            + (
+                f"; {len(justified)} settled without one, its plan committed by a node that "
+                f"died before issuing the action receipt its commit names"
+                if justified
+                else ""
+            ),
+            f"{len(recordings)} events recorded over the run, each by one send, by inbox: "
+            + ", ".join(f"{n} {c}" for n, c in sorted(spread.items()))
+            + f" ({events} still held, the rest pruned)"
+            + f"; {len(duplicates)} duplicates answered; {lost} sends found no node answering "
+            f"and went to another; {facts} facts, each consumed once",
             *problems[:8],
         ],
     )
 
 
 def no_forgery(run: Run) -> Claim:
-    forged = [s for s in run.vendor.sent if s.purpose.startswith("forged:")]
+    forged = [s for s in run.vendor.sent if s.purpose.startswith("forged:") and s.status]
     by_how = Counter((s.purpose.split(":", 1)[1], s.status) for s in forged)
     accepted = [s for s in forged if s.status not in (400, 401)]
     recorded = run.vendor.forged & run.auditor.event_ids
@@ -2900,16 +4296,66 @@ def no_forgery(run: Run) -> Claim:
         "no forgery accepted",
         held,
         [
-            f"{len(forged)} forged webhooks sent: "
+            f"{len(forged)} forged webhooks answered: "
             + ", ".join(f"{how} -> {status} x{n}" for (how, status), n in sorted(by_how.items())),
             f"answered otherwise: {len(accepted)}; recorded: {len(recorded)}",
         ],
     )
 
 
-def vacuum_compacts(run: Run, conn: psycopg.Connection[Any]) -> Claim:
-    vacuum = run.status.get("vacuum")
-    counters = dict(vacuum.counters) if vacuum is not None else {}
+@dataclass(order=True)
+class VacuumRun:
+    """One vacuum run, as the operator log records it."""
+
+    at: float
+    """When its intent was signed, wall clock."""
+    node: str
+    """The node that ran it, as its reason names it."""
+    outcome: str = "open"
+    pruned: dict[str, int] = field(default_factory=dict, compare=False)
+
+
+def vacuum_runs(evidence: Evidence) -> list[VacuumRun]:
+    """Every vacuum run the operator log records: when its intent was signed,
+    the node that ran it, what became of it, and what it pruned."""
+    from interlock.operators import ABANDONED, APPLIED, INTENT, REFUSED
+
+    runs: dict[str, VacuumRun] = {}
+    for record in evidence.records:
+        if record.kind == INTENT.value and record.body.get("action") == "compact":
+            reason = str(record.body.get("reason") or "")
+            node = reason.rsplit(" on ", 1)[1] if " on " in reason else "?"
+            when = datetime.fromisoformat(record.issued_at.replace("Z", "+00:00")).timestamp()
+            runs[record.record_hash] = VacuumRun(when, node)
+    for record in evidence.records:
+        found = runs.get(str(record.body.get("intent", {}).get("hash", "")))
+        if found is None:
+            continue
+        if record.kind == APPLIED.value:
+            found.outcome = "applied"
+            found.pruned = {k: int(v) for k, v in dict(record.body.get("pruned") or {}).items()}
+        elif record.kind == REFUSED.value:
+            found.outcome = "rejected"
+        elif record.kind == ABANDONED.value:
+            found.outcome = "abandoned"
+    return sorted(runs.values())
+
+
+def vacuum_compacts(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -> Claim:
+    runs = vacuum_runs(evidence)
+    outcomes = Counter(r.outcome for r in runs)
+    pruned: Counter[str] = Counter()
+    for r in runs:
+        pruned.update(r.pruned)
+    # A run abandoned by its node's death: its intent signed as it died.
+    deaths = [(d.node, d.at) for d in run.deaths]
+    unexplained = [
+        (r.at, r.node, r.outcome)
+        for r in runs
+        if r.outcome != "applied"
+        and not any(r.node == n and r.at <= died + 1.0 for n, died in deaths)
+    ]
+    vacuum = counters(evidence, "vacuum")
     checkpoints = conn.execute("SELECT seq, at FROM interlock.checkpoints ORDER BY seq").fetchall()
     samples = run.auditor.samples
     warm = run.settings.retain + run.settings.slack + 5
@@ -2919,11 +4365,12 @@ def vacuum_compacts(run: Run, conn: psycopg.Connection[Any]) -> Claim:
     live_max = max((s.live for s in samples), default=0)
     spread = len({int(s.checkpoints) for s in samples})
     held = (
-        counters.get("applied", 0) >= 2
-        and not any(counters.get(k, 0) for k in ("refused", "rejected", "abandoned"))
-        and counters.get("messages", 0) > 0
-        and counters.get("window_rows", 0) > 0
-        and counters.get("inbox_events", 0) > 0
+        outcomes.get("applied", 0) >= 2
+        and not unexplained
+        and vacuum.get("refused", 0) == 0
+        and pruned.get("messages", 0) > 0
+        and pruned.get("windows", 0) > 0
+        and pruned.get("inbox_events", 0) > 0
         and len(checkpoints) >= 2
         and spread >= 3
         and lingering == 0
@@ -2933,22 +4380,29 @@ def vacuum_compacts(run: Run, conn: psycopg.Connection[Any]) -> Claim:
         "the vacuum compacts as it goes",
         held,
         [
-            f"{len(checkpoints)} checkpoints signed, anchored and applied over the run; "
-            f"the daemon's vacuum runs: "
-            + ", ".join(f"{k} {counters.get(k, 0)}" for k in OUTCOMES)
-            + f"; {counters.get('busy', 0)} put off while the desk held the operator log",
-            f"pruned: {counters.get('messages', 0)} messages, "
-            f"{counters.get('window_rows', 0)} window rows, "
-            f"{counters.get('inbox_events', 0)} inbound events",
+            f"{len(checkpoints)} checkpoints signed, anchored and applied over the run, by "
+            f"whichever node led the vacuum: "
+            + ", ".join(f"{o} {n}" for o, n in sorted(outcomes.items()))
+            + f"; surveys refused {vacuum.get('refused', 0)}; {vacuum.get('busy', 0)} runs put off "
+            f"while another writer held the operator log",
+            f"pruned: {pruned.get('messages', 0)} messages, {pruned.get('windows', 0)} window "
+            f"rows, {pruned.get('inbox_events', 0)} inbound events",
             f"the live outbox peaked at {live_max} messages; {run.live_at_end} of "
             f"{run.total_at_end} ever enqueued were still live at the end",
-            f"prunable and still there past retention plus {run.settings.slack}s: at most "
+            f"prunable and still there past retention plus {run.settings.slack:g}s: at most "
             f"{lingering} stages and {stale} window rows in {len(late)} samples",
+            *(
+                [f"runs not applied, and no death to explain them: {unexplained[:3]}"]
+                if unexplained
+                else []
+            ),
         ],
     )
 
 
-def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequence[Any]) -> Claim:
+def everything_verifies(
+    run: Run, evidence: Evidence, conn: psycopg.Connection[Any], entries: Sequence[Any]
+) -> Claim:
     from agentgov.receipts import ReceiptLog
 
     from interlock.attestations import verify_attestations
@@ -2956,21 +4410,18 @@ def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequen
     from interlock.inbox import verify_inbox
     from interlock.keys import verify_keys
     from interlock.operators import legacy_vouch, verify_operators
-    from interlock.records import read_records
     from interlock.settlement import verify_settlements
     from interlock.wiring import trusted_keyring
 
     config = run.config
     operators = config.operators
-    # The configuration's keys, and those the operator log registered since:
-    # the relays' new key among them (docs/EPIC8_DESIGN.md §2.1).
     relays = trusted_keyring(config, "relay")
     inbox = trusted_keyring(config, "inbox")
     receipts = config.receipts
     assert operators is not None and relays is not None and inbox is not None
-    assert receipts is not None
+    assert receipts is not None and receipts.key is not None
+    records = evidence.records
     found: dict[str, list[str]] = {}
-    records = read_records(operators.log)
     found["delivery logs"] = list(verify_delivery_log(conn))
     found["attestations"] = list(
         verify_attestations(
@@ -2982,25 +4433,37 @@ def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequen
     )
     keys = verify_keys(conn, records, config.key_roots())
     found["keys"] = list(keys.problems)
-    log = ReceiptLog(receipts.log_id, load_key(receipts.key), path=receipts.log)
+    logs = [
+        ReceiptLog(
+            receipts_log_id(node.name), load_key(receipts.key), path=node.home / receipts.log.name
+        )
+        for node in run.nodes
+        if (node.home / receipts.log.name).exists()
+    ]
     try:
         found["settlements"] = list(
-            verify_settlements(conn, log=log, relays=relays, ledger=entries)
+            verify_settlements(conn, log=logs, relays=relays, ledger=entries)
         )
-        receipt_count = len(log)
+        receipt_count = sum(len(log) for log in logs)
     finally:
-        log.close()
+        for log in logs:
+            log.close()
     report = verify_inbox(conn, inbox, relays=relays)
     found["inbox"] = list(report.problems)
     chains = 0
     found["escrow chains"] = []
-    for path in chain_paths(run):
-        try:
-            chain = EscrowChain.load(path)
-            chain.verify_anchors()
-            chains += len(chain.records())
-        except Exception as exc:
-            found["escrow chains"].append(f"{path.name}: {exc}")
+    for node in run.nodes:
+        for path in chain_paths(run, node):
+            try:
+                chain = EscrowChain.load(path)
+                chain.verify_anchors()
+                chains += len(chain.records())
+                if chain.unresolved_intents():
+                    found["escrow chains"].append(
+                        f"{node.name}/{path.name}: {len(chain.unresolved_intents())} intent(s) open"
+                    )
+            except Exception as exc:
+                found["escrow chains"].append(f"{node.name}/{path.name}: {exc}")
     problems = [f"{what}: {p}" for what, items in found.items() for p in items]
     return Claim(
         "everything verifies after",
@@ -3008,52 +4471,61 @@ def everything_verifies(run: Run, conn: psycopg.Connection[Any], entries: Sequen
         [
             f"delivery logs, relays' attestations, {len(records)} operator records with their "
             f"AgentGov anchors, {keys.registered} key(s) registered and {keys.revoked} revoked "
-            f"with the seal its operator signed, settlements against {receipt_count} receipts, "
-            f"{report.events} inbound events and {report.facts} facts, "
-            f"{len(chain_paths(run))} escrow chains ({chains} records) with their anchors",
+            f"with the seal its operator signed, settlements against {receipt_count} receipts in "
+            f"{len(logs)} nodes' logs, {report.events} inbound events and {report.facts} facts, "
+            f"{sum(len(chain_paths(run, n)) for n in run.nodes)} escrow chains ({chains} records) "
+            f"with their anchors, no intent left open",
             *(problems[:8] or ["no problem found"]),
         ],
     )
 
 
-def graceful(run: Run) -> Claim:
-    states = {name: s.state for name, s in run.status.items()}
-    engines = run.status["engines"].counters if "engines" in run.status else {}
-    second = run.second_status
-    recovered = second["engines"].counters.get("recovered", 0) if "engines" in second else -1
-    failed = {n: s.last_error for n, s in second.items() if s.failures}
-    stopped = all(state == "stopped" for state in states.values())
-    held = (
-        run.quiesced
-        and stopped
-        and run.stop_seconds <= 30
-        and engines.get("cancelled", 0) == 0
-        and run.second_ready
-        and recovered == 0
-        and not failed
-        and all(s.state == "stopped" for s in second.values())
-    )
+def graceful(run: Run, evidence: Evidence) -> Claim:
+    problems: list[str] = []
+    for name, (code, took) in sorted(run.stops.items()):
+        if code != 0 or took > 30:
+            problems.append(f"{name} stopped with {code} in {took:.2f}s")
+    if len(run.stops) != len(run.nodes):
+        problems.append(f"{len(run.stops)} of {len(run.nodes)} nodes stopped at the end")
+    engines = counters(evidence, "engines")
+    not_stopped = [
+        f"{node}.{number} {part}: {parsed[0]}"
+        for (node, number), parts in evidence.stopped.items()
+        for part, parsed in parts.items()
+        if parsed[0] != "stopped"
+    ]
+    second = run.second
+    for name, found in sorted(second.items()):
+        if not found.get("ready") or found.get("recovered") != 0 or found.get("exit") != 0:
+            problems.append(f"{name} started again: {found}")
+    held = run.quiesced and not problems and not not_stopped and engines.get("cancelled", 0) == 0
     return Claim(
         "shutdown is graceful",
         held,
         [
             f"settled after the load in {run.quiesce_seconds:.1f}s"
             + ("" if run.quiesced else f" -- NOT: {run.outstanding}"),
-            f"stopped in {run.stop_seconds:.2f}s (bound 30s); every part stopped: {stopped}; "
-            f"plans cancelled: {engines.get('cancelled', 0)}",
-            f"a second daemon: ready {run.second_ready}, recovered {recovered} intents, "
-            f"stopped in {run.second_stop_seconds:.2f}s"
-            + (f"; failures {failed}" if failed else ""),
+            "every node stopped on SIGTERM: "
+            + ", ".join(f"{n} in {t:.2f}s" for n, (_, t) in sorted(run.stops.items()))
+            + f" (bound 30s); every part of every process stopped; plans cancelled: "
+            f"{engines.get('cancelled', 0)}",
+            "each node started again: "
+            + ", ".join(
+                f"{n} ready {f.get('ready')}, recovered {f.get('recovered')}, stopped in "
+                f"{f.get('seconds', 0.0):.2f}s"
+                for n, f in sorted(second.items())
+            ),
+            *(problems + not_stopped)[:6],
         ],
     )
 
 
 def trace_survives(run: Run) -> Claim:
     """Agent, outbox, relay, vendor, webhook, fact and agent again: one trace
-    for each checkout (``docs/EPIC7_DESIGN.md`` §5)."""
-    api, vendor, workload = run.api, run.vendor, run.workload
+    for each checkout (``docs/EPIC7_DESIGN.md`` §5), whichever nodes the
+    plans, the call, the webhook and the reconciliation ran on."""
+    api, vendor, journals = run.api, run.vendor, run.journals
     problems: list[str] = []
-    # Every call, retries and replays included, carried one context.
     untraced = [k for k, seen in api.traces.items() if None in seen]
     varied = [k for k, seen in api.traces.items() if len(seen) > 1]
     if untraced or varied:
@@ -3061,8 +4533,7 @@ def trace_survives(run: Run) -> Claim:
             f"idempotency keys called with no traceparent: {len(untraced)}; "
             f"with more than one: {len(varied)}"
         )
-    # Each charge, its plan's context, exactly; each refund, its charge's.
-    orders = {str(o.order_id): o for o in workload.orders.values()}
+    orders = {str(o.order_id): o for o in journals.orders.values()}
     intents = api.of("payment_intent")
     for intent in intents:
         order = orders.get(str(intent["metadata"].get("order")))
@@ -3075,11 +4546,8 @@ def trace_survives(run: Run) -> Claim:
         sent = api.trace_of.get(str(refund["id"]))
         if charged is None or sent != charged:
             problems.append(f"refund {refund['id']} carried {sent}, its charge {charged}")
-    # Each fact consumed: the trace of the delivery it is bound to, under
-    # the webhook's context when that continued ours; and each plan that
-    # consumed one, a span of its own in that trace.
     modes: Counter[str] = Counter()
-    for fact, planned in workload.reconciled:
+    for fact in journals.reconciled:
         mode, header = vendor.traces.get(fact.event_id, ("none", None))
         delivered = api.trace_of.get(fact.remote_ref)
         expected = header if mode == "echo" else delivered
@@ -3087,16 +4555,17 @@ def trace_survives(run: Run) -> Claim:
             problems.append(
                 f"fact {fact.fact_id} ({mode}) continues {fact.traceparent}, not {expected}"
             )
-        elif planned is None or trace_id(planned) != trace_id(delivered) or planned == expected:
-            problems.append(f"the plan consuming fact {fact.fact_id} is traced {planned}")
+        elif (
+            fact.planned is None
+            or trace_id(fact.planned) != trace_id(delivered)
+            or fact.planned == expected
+        ):
+            problems.append(f"the plan consuming fact {fact.fact_id} is traced {fact.planned}")
         else:
             modes[mode] += 1
     if any(parse_traceparent(t) is not None for t in MALFORMED_TRACES):
         problems.append("a malformed traceparent the soak sends is valid")
-    # What the database kept, as the auditor saw it throughout, before the
-    # vacuum pruned it with its messages and events: every message's context,
-    # its plan's; every webhook's, as sent, when it was one; none when not.
-    by_plan = {o.plan_id: o.traceparent for o in workload.orders.values()}
+    by_plan = {o.plan_id: o.traceparent for o in journals.orders.values()}
     messages = run.auditor.message_traces
     for message, (plan_id, traceparent) in messages.items():
         if traceparent is None or traceparent != by_plan.get(plan_id):
@@ -3109,17 +4578,20 @@ def trace_survives(run: Run) -> Claim:
         if traceparent != valid:
             problems.append(f"event {event_id} ({mode}) keeps {traceparent}")
         kept += traceparent is not None
-    sent = Counter(s.trace for s in vendor.sent if s.purpose in ("genuine", "duplicate"))
+    carried = Counter(
+        s.trace for s in vendor.sent if s.purpose in ("genuine", "duplicate") and s.status
+    )
     return Claim(
         "trace context survives",
-        not problems and bool(workload.reconciled) and all(modes[m] for m in TRACE_MODES[:2]),
+        not problems and bool(journals.reconciled) and all(modes[m] for m in TRACE_MODES[:2]),
         [
             f"payment API: {sum(len(s) for s in api.traces.values())} contexts on "
             f"{len(api.traces)} idempotency keys, one each; {len(intents)} charges carried "
             f"their checkout's, {len(refunds)} refunds their charge's",
-            "webhooks sent, by trace context: "
-            + ", ".join(f"{m} {sent.get(m, 0)}" for m in TRACE_MODES),
-            f"{len(workload.reconciled)} facts consumed, each continuing its delivery's trace: "
+            "webhooks answered, by trace context: "
+            + ", ".join(f"{m} {carried.get(m, 0)}" for m in TRACE_MODES),
+            f"{len(journals.reconciled)} facts consumed, on every node, each continuing its "
+            f"delivery's trace: "
             + ", ".join(f"{m} {modes.get(m, 0)}" for m in TRACE_MODES)
             + "; each consuming plan a new span of it",
             f"seen in the database over the run: {len(messages)} messages, each beside its "
@@ -3129,70 +4601,72 @@ def trace_survives(run: Run) -> Claim:
     )
 
 
-def metrics_agree(run: Run, conn: psycopg.Connection[Any]) -> Claim:
-    """What the daemon exported, against what the run counted itself
-    (``docs/EPIC7_DESIGN.md`` §5)."""
-    scraper, settled = run.scraper, run.settled
-    if scraper is None or settled is None:
-        return Claim("metrics agree", False, ["the settled daemon was never scraped"])
+def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -> Claim:
+    """What each node exported, against what it did, as the run counted it
+    (``docs/EPIC7_DESIGN.md`` §5): every process that lived to its stop, its
+    own figures; the settled outbox, as a node sampled it."""
+    settled = run.settled
+    if settled is None:
+        return Claim("metrics agree", False, ["no settled node was scraped"])
     problems: list[str] = []
-    final = settled.scrape
-
-    def value(name: str, **labels: str) -> float:
-        return final.get(name, {}).get(tuple(labels.items()), 0.0)
-
     catalog = {m.name for m in CATALOG}
-    if scraper.errors or scraper.fell:
-        problems.append(f"scrape errors {dict(scraper.errors)}; counters fell {scraper.fell[:3]}")
-    silent = sorted(n for n in catalog if n not in final and f"{n}_count" not in final)
-    if scraper.families != catalog or silent:
-        problems.append(f"families missing: {sorted(catalog - scraper.families)}; silent {silent}")
-    over = {w: s for w, s in scraper.saturation.items() if s > 1}
-    if over or set(scraper.saturation) != {w.name for w in run.config.windows}:
-        problems.append(f"window saturation: {dict(scraper.saturation)}")
-    if not 0 < scraper.busy <= scraper.workers:
-        problems.append(f"{scraper.busy} engines busy of {scraper.workers}")
-    # The plans: each submitted, by its outcome.
-    plans = run.workload.plans.values()
-    counted = {
-        "committed": sum(1 for p in plans if p.committed),
-        "refused": sum(1 for p in plans if p.committed is False),
-        "failed": sum(1 for p in plans if p.committed is None),
-    }
-    exported = {o: value("interlock_plans_total", outcome=o) for o in counted}
-    if exported != counted:
-        problems.append(f"plans exported {exported}, counted {counted}")
-    # The webhooks, by the inbox's answer and by the trace context they carried.
-    answered = Counter(str(s.status) for s in run.vendor.sent if s.status)
-    webhooks = {
-        dict(k)["status"]: v
-        for k, v in final.get("interlock_webhooks_total", {}).items()
-        if dict(k)["source"] == SOURCE
-    }
-    if webhooks != dict(answered):
-        problems.append(f"webhooks exported {webhooks}, answered {dict(answered)}")
-    result = {"echo": "valid", "foreign": "valid", "invalid": "invalid", "none": "absent"}
-    carried = Counter(result[s.trace] for s in run.vendor.sent if s.status == 200)
-    traced = {
-        dict(k)["result"]: v
-        for k, v in final.get("interlock_webhook_traceparent_total", {}).items()
-        if dict(k)["source"] == SOURCE
-    }
-    if traced != dict(carried):
-        problems.append(f"webhooks' trace context exported {traced}, sent {dict(carried)}")
-    # The deliveries and their receipts: one lag observed per receipt.
-    (delivered,) = conn.execute(
-        "SELECT (SELECT count(*) FROM interlock.outbox_state WHERE state = 'delivered')"
-        " + (SELECT count(*) FROM interlock.outbox_compacted WHERE state = 'delivered')"
-    ).fetchone()
-    calls = value("interlock_deliveries_total", sink=SINK, outcome="delivered")
-    if calls < delivered:
-        problems.append(f"{calls} delivering calls exported for {delivered} messages delivered")
-    receipts = value("interlock_receipts_issued_total")
-    lags = value("interlock_settlement_lag_seconds_count")
-    if not receipts == lags == delivered:
-        problems.append(f"{receipts} receipts and {lags} lags exported, {delivered} delivered")
-    # The outbox, settled: the sample's count of each state between two reads.
+    journals = run.journals
+    final = settled.scrape
+    checked = 0
+    for (name, number), scraper in sorted(run.scrapers.items()):
+        if (name, number) not in evidence.stopped:
+            # Killed: what it exported until then was well formed, and only rose.
+            if scraper.errors.get("malformed") or scraper.fell:
+                problems.append(f"{name}.{number}: malformed scrapes or counters that fell")
+            continue
+        checked += 1
+        last = scraper.last
+        where = f"{name}.{number}"
+        if scraper.errors or scraper.fell:
+            problems.append(
+                f"{where}: scrape errors {dict(scraper.errors)}; fell {scraper.fell[:2]}"
+            )
+        silent = sorted(n for n in catalog if n not in last and f"{n}_count" not in last)
+        if scraper.families != catalog or silent:
+            problems.append(
+                f"{where}: families missing {sorted(catalog - scraper.families)}; silent {silent}"
+            )
+        over = {w: s for w, s in scraper.saturation.items() if s > 1}
+        if over:
+            problems.append(f"{where}: window saturation {over}")
+        if not scraper.busy <= scraper.workers:
+            problems.append(f"{where}: {scraper.busy} engines busy of {scraper.workers}")
+
+        def value(metric: str, _last: Scrape = last, **labels: str) -> float:
+            return _last.get(metric, {}).get(tuple(labels.items()), 0.0)
+
+        plans = [p for p in journals.plans.values() if (p.node, p.incarnation) == (name, number)]
+        counted = {
+            "committed": sum(1 for p in plans if p.committed),
+            "refused": sum(1 for p in plans if p.committed is False),
+            "failed": sum(1 for p in plans if p.answered and p.committed is None),
+        }
+        exported = {o: value("interlock_plans_total", outcome=o) for o in counted}
+        if exported != counted:
+            problems.append(f"{where}: plans exported {exported}, counted {counted}")
+        sends = [
+            s for s in run.vendor.sent if (s.node, s.incarnation) == (name, number) and s.status
+        ]
+        answered = dict(Counter(str(s.status) for s in sends))
+        webhooks = {
+            dict(k)["status"]: v
+            for k, v in last.get("interlock_webhooks_total", {}).items()
+            if dict(k)["source"] == SOURCE
+        }
+        if webhooks != answered:
+            problems.append(f"{where}: webhooks exported {webhooks}, answered {answered}")
+        receipts = value("interlock_receipts_issued_total")
+        lags = value("interlock_settlement_lag_seconds_count")
+        if receipts != lags:
+            problems.append(f"{where}: {receipts} receipts and {lags} settlement lags exported")
+        node_label = value("interlock_cluster_node", node=name)
+        if node_label != 1:
+            problems.append(f"{where}: interlock_cluster_node {node_label} while it ran")
     sampled = {
         dict(k)["state"]: int(v) for k, v in final.get("interlock_outbox_messages", {}).items()
     }
@@ -3201,7 +4675,7 @@ def metrics_agree(run: Run, conn: psycopg.Connection[Any]) -> Claim:
         if not low <= sampled.get(state, 0) <= high:
             problems.append(f"{state}: sampled {sampled.get(state, 0)}, read {high} then {low}")
     idle = {
-        name: value(name)
+        name: final.get(name, {}).get((), 0.0)
         for name in (
             "interlock_settlement_backlog",
             "interlock_inbox_facts_pending",
@@ -3211,30 +4685,26 @@ def metrics_agree(run: Run, conn: psycopg.Connection[Any]) -> Claim:
     }
     if any(idle.values()):
         problems.append(f"settled, and yet: {idle}")
+    takeovers = sum(
+        scraper.last.get("interlock_lease_takeovers_total", {}).get((), 0.0)
+        for scraper in run.scrapers.values()
+    )
     return Claim(
         "metrics agree",
-        not problems,
+        not problems and checked >= len(run.nodes),
         [
-            f"{scraper.scrapes} scrapes, every one well formed, {len(catalog)} families "
-            f"exported, each with data; no counter fell; sampled as the audit role every "
-            f"{METRICS_EVERY:g}s, without an error",
-            "fullest window seen: "
-            + ", ".join(f"{w} {s:.0%}" for w, s in sorted(scraper.saturation.items()))
-            + f"; at most {scraper.busy:g} of {scraper.workers:g} engines busy",
-            f"plans by outcome {exported}, as counted; webhooks by answer {webhooks} and by "
-            f"trace context {traced}, as sent",
-            f"{calls:g} delivering calls for {delivered} messages delivered, {receipts:g} "
-            f"receipts, {lags:g} settlement lags observed",
+            f"{sum(s.scrapes for s in run.scrapers.values())} scrapes of "
+            f"{len(run.scrapers)} processes, every one well formed; {len(catalog)} families "
+            f"exported by each process that lived to its stop ({checked}), each with data; no "
+            f"counter fell",
+            f"each such process's plans by outcome and webhooks by answer what its journal and "
+            f"the vendor counted; its receipts and settlement lags one for one; "
+            f"{takeovers:.0f} leases taken over from nodes gone, as the relays exported them",
             f"the settled outbox, sampled: {sampled}; read before {settled.before} and after "
             f"{settled.after}",
             *(problems[:8] or ["every figure what the run counted itself"]),
         ],
     )
-
-
-# --------------------------------------------------------------------------
-# The report
-# --------------------------------------------------------------------------
 
 
 ATTESTED_AFTER = """
@@ -3289,9 +4759,18 @@ def keys_rotate(run: Run, conn: psycopg.Connection[Any]) -> Claim:
             f"it ran from {rotation.began:.0f}s to {rotation.ended:.0f}s, not within the "
             f"load's {run.load_seconds:.0f}s"
         )
-    failed = {name: error for name, error in rotation.reload.items() if error is not None}
-    if not rotation.reload or failed:
-        problems.append(f"the reload did not open every part again: {failed or 'none ran'}")
+    failed = {
+        f"{node}/{part}": error
+        for node, said in rotation.reload.items()
+        for part, error in said.items()
+        if error is not None
+    }
+    silent = sorted(node for node, said in rotation.reload.items() if not said)
+    if len(rotation.reload) != len(run.nodes) or failed or silent:
+        problems.append(
+            f"the reload did not open every part of every node again: {len(rotation.reload)} of "
+            f"{len(run.nodes)} nodes, failed {failed}, said nothing {silent}"
+        )
     if not rotation.called_first:
         problems.append("the stale relay had no call in flight when the key was revoked")
     if "the database refused" not in rotation.stale:
@@ -3357,8 +4836,10 @@ def keys_rotate(run: Run, conn: psycopg.Connection[Any]) -> Claim:
             f"relay key {rotation.old} -> {rotation.new}, registered by operator record "
             f"{rotation.registered}, revoked by {rotation.revoked}; the seal "
             f"{rotation.seal.get('count')} rows ({str(rotation.seal.get('digest'))[:16]})",
-            f"the reload opened {len(rotation.reload)} parts again: "
-            + ", ".join(sorted(rotation.reload)),
+            f"SIGHUP reloaded {len(rotation.reload)} nodes, every part of each opened again: "
+            + "; ".join(
+                f"{node} {len(said)} parts" for node, said in sorted(rotation.reload.items())
+            ),
             f"the stale relay {rotation.stale[:160]}; its message {held}",
             f"the key service signed {old_signed} times with the old version "
             f"({rotation.old_signed_after} after the revocation: the stale relay's), "
@@ -3369,22 +4850,267 @@ def keys_rotate(run: Run, conn: psycopg.Connection[Any]) -> Claim:
     )
 
 
+# --------------------------------------------------------------------------
+# The claims of a cluster (docs/EPIC9_DESIGN.md §5)
+# --------------------------------------------------------------------------
+
+
+def _relay_node(actor: str) -> str:
+    """The node a relay's id names: ``relay:<node>:<pid>:<tag>``."""
+    parts = actor.split(":")
+    return parts[1] if len(parts) >= 4 and parts[0] == "relay" else "?"
+
+
+def nodes_share_the_work(run: Run, evidence: Evidence) -> Claim:
+    """Every node committed plans, delivered messages, answered webhooks and
+    settled the deliveries of its own plans, into its own receipt log."""
+    journals = run.journals
+    names = [n.name for n in run.nodes]
+    committed = Counter(r.node for p, r in journals.plans.items() if p in evidence.committed)
+    delivered = Counter(_relay_node(actor) for actor in run.auditor.delivered_by.values())
+    answered = Counter(s.node for s in run.vendor.sent if s.status == 200)
+    settled = {name: len(evidence.receipts.get(name, ())) for name in names}
+    idle = [
+        f"{name}: no {what}"
+        for name in names
+        for what, counts in (
+            ("plan committed", committed),
+            ("message delivered", delivered),
+            ("webhook answered", answered),
+            ("delivery settled", settled),
+        )
+        if not counts.get(name)
+    ]
+    return Claim(
+        "nodes share the work",
+        not idle,
+        [
+            "plans committed, by node: " + ", ".join(f"{n} {committed.get(n, 0)}" for n in names),
+            "messages delivered by each node's relays: "
+            + ", ".join(f"{n} {delivered.get(n, 0)}" for n in names),
+            "webhooks each node's inbox answered 200: "
+            + ", ".join(f"{n} {answered.get(n, 0)}" for n in names),
+            "deliveries each node settled, receipted into its own log: "
+            + ", ".join(f"{n} {settled[n]}" for n in names),
+            *(idle[:4] or ["every node did every kind of work"]),
+        ],
+    )
+
+
+def one_leader_at_a_time(run: Run, evidence: Evidence) -> Claim:
+    """Who led what, as ``pg_locks`` said every 0.2 seconds: no role held by
+    two sessions; every vacuum run by the node that led then, as its operator
+    record names it; each receipt log's settler role held by its own node
+    only; each dead leader's role taken by another."""
+    watch = run.watch
+    problems = list(watch.doubled)
+    for _, holders in watch.leaders:
+        for role, node in holders.items():
+            if role.startswith("settler:") and role != f"settler:{receipts_log_id(node)}":
+                problems.append(f"{role} held by node {node}")
+    changes: Counter[str] = Counter()
+    for (_, before), (_, after) in itertools.pairwise(watch.leaders):
+        for role in set(before) | set(after):
+            if before.get(role) != after.get(role) and after.get(role) is not None:
+                changes[role] += 1
+    runs = vacuum_runs(evidence)
+    misled = [
+        f"{r.node} at {r.at:.1f}"
+        for r in runs
+        if r.node not in {watch.leader("vacuum", r.at), watch.leader("vacuum", r.at - 1.0)}
+    ]
+    if misled:
+        problems.append(f"{len(misled)} vacuum run(s) by a node not leading then: {misled[:3]}")
+    by_node = Counter(r.node for r in runs)
+    for death in run.deaths:
+        if "vacuum" in death.led and "vacuum" not in death.took:
+            problems.append(f"the {death.how} node {death.node}'s vacuum was never taken")
+    if run.deaths and len(by_node) < 2:
+        problems.append(f"vacuums by node {dict(by_node)}: none after a failover")
+    roles = sorted({role for _, holders in watch.leaders for role in holders})
+    return Claim(
+        "one leader at a time",
+        not problems and bool(runs) and watch.samples > 0,
+        [
+            f"{watch.samples} samples of pg_locks, {len(roles)} roles: never one held by two "
+            f"sessions; leadership changed hands: "
+            + ", ".join(f"{role} {n}" for role, n in sorted(changes.items())),
+            f"{len(runs)} vacuum runs recorded, by node: "
+            + ", ".join(f"{n} {c}" for n, c in sorted(by_node.items()))
+            + "; each by the node leading the vacuum as it ran",
+            "each receipt log's settler role held by its own node, and by no other",
+            *[
+                f"the {d.how} node {d.node} led "
+                + (", ".join(d.led) or "nothing")
+                + "; taken: "
+                + (
+                    ", ".join(f"{r} by {n} {s:.2f}s after" for r, (n, s) in sorted(d.took.items()))
+                    or "-"
+                )
+                for d in run.deaths
+            ],
+            *(problems[:6] or ["no role ever led by two nodes, or by the wrong one"]),
+        ],
+    )
+
+
+def survived(run: Run, evidence: Evidence, how: str) -> Claim:
+    """A node killed (``SIGKILL``: its sockets closed at once), or frozen
+    (``SIGSTOP``: its connections left open, then killed), mid-load, and what
+    the database and the rest of the cluster did about it."""
+    name = "a node killed is survived" if how == "killed" else "a node frozen is survived"
+    if not run.settings.chaos or run.settings.nodes < 2:
+        return Claim(name, True, ["no chaos asked for (--no-chaos, or one node)"])
+    death = next((d for d in run.deaths if d.how == how), None)
+    if death is None:
+        return Claim(name, False, [f"no node was {how}: none led the vacuum when it was time"])
+    settings = run.settings
+    problems: list[str] = [] if death.error is None else [death.error]
+    calls = [m for m, last in death.leases.items() if last == "sending"]
+    if not calls:
+        problems.append("it had no call in flight as it died")
+    # Its leases: taken over once its node was gone, and only then.
+    lock = death.node_lock
+    if lock is None:
+        problems.append("its node's lock was never released")
+    else:
+        late = {m[:8]: round(s, 2) for m, s in death.taken.items() if s > lock + 2.0}
+        early = {m[:8]: round(s, 2) for m, s in death.taken.items() if s < lock - 0.5}
+        if late:
+            problems.append(f"leases taken late, past its node's lock: {late}")
+        if early:
+            problems.append(f"leases taken while its node still held its lock: {early}")
+    untaken = sorted(set(death.leases) - set(death.taken))
+    if untaken:
+        problems.append(f"leases never taken: {[m[:8] for m in untaken]}")
+    # Each call it had in flight: made again under the same key, acted once.
+    acted = {m: run.api.executions.get(death.keys.get(m, ""), 0) for m in calls}
+    if any(n != 1 for n in acted.values()):
+        problems.append(f"calls in flight acted on other than once: {acted}")
+    # Every lock it held, let go by the server within its bound: at once for
+    # a process killed; for one frozen, at its own bound or when a survivor
+    # fenced it, whichever came first.
+    fencing = settings.session_timeout + settings.heartbeat + 1.5
+    holding = {p: s for p, s in death.sessions.items() if s[3]}
+    slow: list[str] = []
+    for pid, (application, state, _, _) in sorted(holding.items()):
+        released = death.released.get(pid)
+        if how == "killed":
+            bound = 1.5 + (LOCK_TIMEOUT if state == "active" else 0.0)
+        elif application.startswith("interlock-stage@"):
+            bound = min(settings.max_stage + LOCK_TIMEOUT, fencing) + 1.5
+        else:
+            bound = fencing
+        if released is None or released > bound:
+            slow.append(
+                f"{application} ({state}): {released if released is None else round(released, 2)}s"
+            )
+    if slow:
+        problems.append(f"locks held past their bound: {slow[:4]}")
+    # Every session it had, gone: at once for a process killed; for one
+    # frozen, fenced once its node's session timed out, by a survivor.
+    if death.fenced is None:
+        problems.append("some of its sessions were never ended")
+    elif how == "killed" and death.fenced > 1.5:
+        problems.append(f"its sessions outlived it by {death.fenced:.2f}s")
+    elif how == "frozen" and death.fenced > fencing:
+        problems.append(
+            f"its sessions ended {death.fenced:.2f}s after it froze, past its session timeout "
+            f"and a heartbeat ({fencing:g}s)"
+        )
+    if how == "frozen" and not death.fencers:
+        problems.append("no survivor's log says it fenced the frozen node")
+    if lock is not None:
+        if how == "killed" and lock > 1.5:
+            problems.append(f"its node's lock outlived it by {lock:.2f}s")
+        if how == "frozen" and not settings.session_timeout - settings.heartbeat - 1.0 <= lock <= (
+            settings.session_timeout + 2.0
+        ):
+            problems.append(
+                f"its node's lock released {lock:.2f}s after it froze, not at its session "
+                f"timeout ({settings.session_timeout:g}s)"
+            )
+    # No survivor waited on anything of its past the moment it was fenced.
+    if death.blocked > (1.5 if how == "killed" else fencing):
+        problems.append(f"a survivor waited {death.blocked:.2f}s on one of its sessions")
+    if death.waited > LEDGER_LOCK_TIMEOUT:
+        problems.append(f"a survivor waited {death.waited:.2f}s on a lock")
+    # It came back, and its next incarnation recovered what it left: its
+    # chains have no intent open, and the ledger no hold of it (claimed by
+    # "the ledger balances" and "everything verifies after").
+    successor = evidence.stopped.get((death.node, death.incarnation + 1), {}).get("engines")
+    recovered = successor[3].get("recovered", 0) if successor else None
+    if not death.back_after or successor is None:
+        problems.append("it never came back, or its next incarnation did not stop cleanly")
+    plans = [
+        p
+        for p, r in run.journals.plans.items()
+        if (r.node, r.incarnation) == (death.node, death.incarnation) and not r.answered
+    ]
+    committed = [p for p in plans if p in evidence.committed]
+    recovered_plans = [p for p in committed if p in evidence.recovered]
+    transactions = sum(1 for *_, held in death.sessions.values() if held)
+    return Claim(
+        name,
+        not problems,
+        [
+            f"node {death.node} (incarnation {death.incarnation}), leading "
+            + (", ".join(death.led) or "nothing")
+            + f", {how} with {len(death.leases)} lease(s) in hand, {len(calls)} of them mid-call, "
+            f"{len(death.sessions)} session(s), {transactions} of them holding locks, "
+            f"{len(plans)} plan(s) in flight",
+            (
+                f"its node's lock released {lock:.2f}s after it died; its leases taken over "
+                f"{max(death.taken.values(), default=0.0):.2f}s after at most, each call in "
+                f"flight made again under its key, and acted on once: {sorted(acted.values())}"
+            )
+            if lock is not None
+            else "its node's lock: never released",
+            "what it held, let go by the server: "
+            + ", ".join(
+                f"{app.removeprefix('interlock-').split('@')[0]} {death.released.get(p, -1):.2f}s"
+                for p, (app, _, _, _) in sorted(holding.items())
+            )
+            + (
+                f"; every session it had ended {death.fenced:.2f}s after it died"
+                if death.fenced is not None
+                else "; some of its sessions never ended"
+            )
+            + (
+                f", fenced by {', '.join(death.fencers)}; killed {death.killed_after:.1f}s "
+                f"after it froze"
+                if how == "frozen"
+                else ""
+            ),
+            f"its plans in flight: {len(committed)} committed ({len(recovered_plans)} of them "
+            f"by its next incarnation's recovery), {len(plans) - len(committed)} left nothing; it "
+            f"came back {death.back_after:.1f}s after it died and recovered {recovered} intent(s)",
+            f"the longest any survivor waited on one of its sessions: {death.blocked:.2f}s; on "
+            f"any lock meanwhile: {death.waited:.2f}s",
+            *(problems[:6] or ["nothing it held outlived its bound; nothing was done twice"]),
+        ],
+    )
+
+
+# --------------------------------------------------------------------------
+# The report
+# --------------------------------------------------------------------------
+
+
 def report(run: Run, claims: Sequence[Claim]) -> None:
-    workload = run.workload
+    journals = run.journals
+    settings = run.settings
     print()
     print("=" * 100)
     print(
-        f"Interlock soak: {run.settings.agents} agents x {run.settings.concurrency} plans in "
-        f"flight, {run.settings.workers} engines, {run.settings.relays} relays, "
-        f"{run.load_seconds / 60:.1f} min of load, seed {run.settings.seed}"
+        f"Interlock soak: {settings.nodes} nodes, each with {settings.agents} agents x "
+        f"{settings.concurrency} plans in flight, {settings.workers} engines and "
+        f"{settings.relays} relays; {run.load_seconds / 60:.1f} min of load, seed {settings.seed}"
     )
     print("-" * 100)
-    kinds = Counter[str]()
-    for key, count in workload.kinds.items():
-        kinds[key] += count
-    print("plans: " + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items())))
+    print("plans: " + ", ".join(f"{k} {v}" for k, v in sorted(journals.kinds.items())))
     refused = Counter(
-        b for p in workload.plans.values() for b in p.blocked_by if p.committed is False
+        b for p in journals.plans.values() for b in p.blocked_by if p.committed is False
     )
     print("refused by: " + ", ".join(f"{k} {v}" for k, v in refused.most_common()))
     print(
@@ -3392,12 +5118,19 @@ def report(run: Run, claims: Sequence[Claim]) -> None:
         f"refunds, {run.desk.busy} waits for the operator log, refused {dict(run.desk.refused)}"
         + (f", errors {dict(run.desk.errors)}" if run.desk.errors else "")
     )
-    sent = Counter(s.purpose for s in run.vendor.sent)
-    failures = dict(run.vendor.failures)
-    print(f"webhooks sent: {dict(sorted(sent.items()))}; transport failures {failures}")
+    sent = Counter(s.purpose for s in run.vendor.sent if s.status)
+    print(
+        f"webhooks answered: {dict(sorted(sent.items()))}; transport failures "
+        f"{dict(run.vendor.failures)}"
+    )
+    for death in run.deaths:
+        print(
+            f"{death.how}: {death.node}.{death.incarnation}, back after {death.back_after:.1f}s"
+            + (f" ({death.error})" if death.error else "")
+        )
     if run.captured.counts:
-        print("logged warnings (most frequent):")
-        for text, count in run.captured.counts.most_common(8):
+        print("the harness's warnings (most frequent):")
+        for text, count in run.captured.counts.most_common(5):
             print(f"  {count:6d}  {text}")
     print("-" * 100)
     for claim in claims:
@@ -3414,11 +5147,11 @@ def write_report(run: Run, claims: Sequence[Claim], path: Path) -> None:
         "settings": {k: getattr(run.settings, k) for k in run.settings.__dataclass_fields__},
         "load_seconds": run.load_seconds,
         "claims": [{"name": c.name, "held": c.held, "evidence": c.evidence} for c in claims],
-        "plans": dict(run.workload.kinds),
-        "status": {
-            name: {"state": s.state, "counters": dict(s.counters), "failures": s.failures}
-            for name, s in run.status.items()
-        },
+        "plans": dict(run.journals.kinds),
+        "stops": run.stops,
+        "second": run.second,
+        "deaths": [d.__dict__ for d in run.deaths],
+        "leaders": run.watch.leaders,
         "samples": [s.__dict__ for s in run.auditor.samples],
     }
     path.write_text(json.dumps(document, indent=2, default=str), encoding="utf-8")
@@ -3432,7 +5165,8 @@ def write_report(run: Run, claims: Sequence[Claim], path: Path) -> None:
 def parse(argv: Sequence[str] | None) -> tuple[Settings, argparse.Namespace]:
     parser = argparse.ArgumentParser(
         prog="live_stress_test.py",
-        description="Soak the whole Interlock daemon against a live PostgreSQL.",
+        description="Soak a cluster of Interlock daemons, under load and chaos, against a live "
+        "PostgreSQL.",
     )
     where = parser.add_mutually_exclusive_group()
     where.add_argument("--docker", action="store_true", help="start postgres:16 for the run")
@@ -3444,24 +5178,47 @@ def parse(argv: Sequence[str] | None) -> tuple[Settings, argparse.Namespace]:
     parser.add_argument("--image", default="postgres:16")
     defaults = Settings()
     parser.add_argument("--minutes", type=float, default=defaults.minutes)
+    parser.add_argument("--nodes", type=int, default=defaults.nodes, help="daemons in the cluster")
     parser.add_argument("--agents", type=int, default=defaults.agents)
-    parser.add_argument("--concurrency", type=int, default=defaults.concurrency)
-    parser.add_argument("--workers", type=int, default=defaults.workers)
-    parser.add_argument("--relays", type=int, default=defaults.relays)
+    parser.add_argument(
+        "--concurrency", type=int, default=defaults.concurrency, help="lanes per agent per node"
+    )
+    parser.add_argument("--workers", type=int, default=defaults.workers, help="engines per node")
+    parser.add_argument("--relays", type=int, default=defaults.relays, help="relays per node")
     parser.add_argument("--tenants", type=int, default=defaults.tenants)
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--retain", type=int, default=defaults.retain, help="seconds")
     parser.add_argument("--vacuum-every", type=int, default=defaults.vacuum_every)
     parser.add_argument("--faults", type=float, default=defaults.faults, help="fault scale")
     parser.add_argument("--quiesce", type=float, default=defaults.quiesce)
+    parser.add_argument("--heartbeat", type=float, default=defaults.heartbeat)
+    parser.add_argument(
+        "--session-timeout",
+        type=float,
+        default=defaults.session_timeout,
+        help="seconds a silent node keeps what it holds",
+    )
+    parser.add_argument(
+        "--max-stage", type=float, default=defaults.max_stage, help="each stage's bound, seconds"
+    )
+    parser.add_argument(
+        "--restart-after",
+        type=float,
+        default=defaults.restart_after,
+        help="seconds before a dead node comes back",
+    )
+    parser.add_argument("--no-chaos", action="store_true", help="no node is killed or frozen")
     parser.add_argument("--keep", action="store_true", help="keep the database and the files")
     parser.add_argument("--dir", type=Path, help="where the run's files go")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     if not 1 <= args.tenants <= len(TENANTS):
         parser.error(f"--tenants is 1 to {len(TENANTS)}")
+    if args.nodes < 1:
+        parser.error("--nodes is at least 1")
     settings = Settings(
         minutes=args.minutes,
+        nodes=args.nodes,
         agents=args.agents,
         concurrency=args.concurrency,
         workers=args.workers,
@@ -3472,6 +5229,11 @@ def parse(argv: Sequence[str] | None) -> tuple[Settings, argparse.Namespace]:
         vacuum_every=args.vacuum_every,
         faults=args.faults,
         quiesce=args.quiesce,
+        heartbeat=args.heartbeat,
+        session_timeout=args.session_timeout,
+        max_stage=args.max_stage,
+        restart_after=args.restart_after,
+        chaos=not args.no_chaos,
         quiet=args.quiet,
     )
     return settings, args
@@ -3483,7 +5245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     try:
         if args.docker:
-            cluster = start_docker(args.image)
+            server = start_docker(args.image)
         else:
             dsn = (
                 args.dsn
@@ -3493,18 +5255,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not dsn:
                 print("live_stress_test: give --docker or --dsn", file=sys.stderr)
                 return EXIT_ERROR
-            cluster = Cluster(dsn)
+            server = Server(dsn)
     except (SoakError, subprocess.SubprocessError, OSError) as exc:
         print(f"live_stress_test: {exc}", file=sys.stderr)
         return EXIT_ERROR
     try:
-        return soak(settings, cluster, keep=args.keep, directory=args.dir)
+        return soak(settings, server, keep=args.keep, directory=args.dir)
     except (SoakError, psycopg.Error) as exc:
         print(f"live_stress_test: the soak could not run: {exc}", file=sys.stderr)
         return EXIT_ERROR
     finally:
         if not args.keep:
-            cluster.close()
+            server.close()
 
 
 if __name__ == "__main__":
