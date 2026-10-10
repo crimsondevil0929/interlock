@@ -859,6 +859,7 @@ SET search_path = pg_catalog, pg_temp
 AS $fn$
 DECLARE
     m record;
+    candidates refcursor;
     now_ts timestamptz := pg_catalog.clock_timestamp();
     lease_until timestamptz;
     last_event text;
@@ -881,31 +882,62 @@ BEGIN
                    AND st.next_attempt_at > now_ts) AS n
          WHERE pg_catalog.pg_try_advisory_xact_lock_shared(
                    1229737818, interlock.node_key(n.node)));
-    FOR m IN
-        SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner,
-               s.lease_node, s.next_attempt_at > now_ts AS early,
-               o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id,
-               o.payload::text AS payload, o.payload_hash, o.idempotency_key, o.not_after,
-               k.idempotency, k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms,
-               k.unknown_outcome
-          FROM interlock.outbox_state AS s
-          JOIN interlock.outbox AS o ON o.message_id = s.message_id
-          JOIN interlock.sinks AS k ON k.name = o.sink
-         WHERE s.state IN ('pending', 'leased')
-           AND (s.next_attempt_at <= now_ts
-                OR (s.state = 'leased' AND s.lease_node = ANY (gone)))
-           AND (p_sinks IS NULL OR o.sink = ANY (p_sinks))
-           AND NOT EXISTS (
-                 SELECT 1
-                   FROM interlock.outbox AS dep
-                   JOIN interlock.outbox_state AS ds ON ds.message_id = dep.message_id
-                  WHERE dep.stage_id = o.stage_id
-                    AND dep.effect_id = ANY (o.depends_on)
-                    AND ds.state <> 'delivered')
-         ORDER BY s.next_attempt_at, o.enqueued_at, o.seq
-         LIMIT p_limit
-           FOR UPDATE OF s SKIP LOCKED
+    IF pg_catalog.cardinality(gone) = 0 THEN
+        OPEN candidates FOR
+            SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner,
+                   s.lease_node, false AS early,
+                   o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id,
+                   o.payload::text AS payload, o.payload_hash, o.idempotency_key, o.not_after,
+                   k.idempotency, k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms,
+                   k.unknown_outcome
+              FROM interlock.outbox_state AS s
+              JOIN interlock.outbox AS o ON o.message_id = s.message_id
+              JOIN interlock.sinks AS k ON k.name = o.sink
+             WHERE s.state IN ('pending', 'leased')
+               AND s.next_attempt_at <= now_ts
+               AND (p_sinks IS NULL OR o.sink = ANY (p_sinks))
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM interlock.outbox AS dep
+                       JOIN interlock.outbox_state AS ds ON ds.message_id = dep.message_id
+                      WHERE dep.stage_id = o.stage_id
+                        AND dep.effect_id = ANY (o.depends_on)
+                        AND ds.state <> 'delivered')
+             ORDER BY s.next_attempt_at, o.enqueued_at, o.seq
+             LIMIT p_limit
+               FOR UPDATE OF s SKIP LOCKED;
+    ELSE
+        -- A gone node's leases first: theirs is the oldest work, due since
+        -- their node went, whatever their lease still says.
+        OPEN candidates FOR
+            SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner,
+                   s.lease_node, s.next_attempt_at > now_ts AS early,
+                   o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id,
+                   o.payload::text AS payload, o.payload_hash, o.idempotency_key, o.not_after,
+                   k.idempotency, k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms,
+                   k.unknown_outcome
+              FROM interlock.outbox_state AS s
+              JOIN interlock.outbox AS o ON o.message_id = s.message_id
+              JOIN interlock.sinks AS k ON k.name = o.sink
+             WHERE s.state IN ('pending', 'leased')
+               AND (s.next_attempt_at <= now_ts
+                    OR (s.state = 'leased' AND s.lease_node = ANY (gone)))
+               AND (p_sinks IS NULL OR o.sink = ANY (p_sinks))
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM interlock.outbox AS dep
+                       JOIN interlock.outbox_state AS ds ON ds.message_id = dep.message_id
+                      WHERE dep.stage_id = o.stage_id
+                        AND dep.effect_id = ANY (o.depends_on)
+                        AND ds.state <> 'delivered')
+             ORDER BY (s.state = 'leased' AND s.lease_node = ANY (gone)) DESC,
+                      s.next_attempt_at, o.enqueued_at, o.seq
+             LIMIT p_limit
+               FOR UPDATE OF s SKIP LOCKED;
+    END IF;
     LOOP
+        FETCH candidates INTO m;
+        EXIT WHEN NOT FOUND;
         IF m.state = 'leased' THEN
             last_event := NULL;
             SELECT a.event, a.attempt INTO last_event, last_attempt
@@ -975,6 +1007,7 @@ BEGIN
         out_taken_from := CASE WHEN m.state = 'leased' AND m.early THEN m.lease_node END;
         RETURN NEXT;
     END LOOP;
+    CLOSE candidates;
 END
 $fn$;
 

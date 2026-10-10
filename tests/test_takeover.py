@@ -93,6 +93,24 @@ def test_a_lease_of_a_node_that_is_gone_is_taken_over_at_once(
     outbox.verify()
 
 
+def test_a_gone_nodes_lease_is_claimed_before_the_messages_due(
+    outbox: PostgresOutbox, node: ClusterNode
+) -> None:
+    """Its lease still says it runs for a minute, and every due message sorts
+    before it by that: a node gone puts its leases first, as the oldest work,
+    due since the node went."""
+    _, (held,) = outbox.commit(mail(0))
+    with outbox.relay(relay_id="slow", node="a", lease=LONG) as slow:
+        assert len(slow._claim(1)) == 1
+    _, waiting = outbox.commit(*(mail(n) for n in range(1, 6)))
+    node.leave()
+    # A relay naming no node: what it takes is not taken from it again.
+    with outbox.relay(relay_id="fast", lease=LONG) as fast:
+        (first,) = fast._claim(1)
+        assert (first.message_id, first.taken_from) == (held, "a")
+        assert {lease.message_id for lease in fast._claim(10)} == set(waiting)
+
+
 def test_a_lease_of_a_node_that_is_alive_waits_to_run_out(
     outbox: PostgresOutbox, node: ClusterNode
 ) -> None:
