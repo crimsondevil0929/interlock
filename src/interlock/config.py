@@ -183,6 +183,18 @@ vacuum, each part connecting as its own role::
     every_seconds = 15                # how often the database is sampled
     database = "postgresql://interlock_audit@db/app"  # an audit_roles role
 
+Several daemons over one database are a cluster (``docs/EPIC9_DESIGN.md``):
+each a node, holding its node's lock in PostgreSQL for its life; the vacuum
+and the inbox's matcher run on one node at a time, and each node settles its
+own plans::
+
+    [cluster]                         # PostgreSQL only
+    node = "interlock-0"              # or INTERLOCK_NODE, or interlock daemon --node
+    database = "postgresql://interlock_audit@db/app"  # the node's session: direct,
+                                      # or a pooler in session mode; or INTERLOCK_CLUSTER_DATABASE
+    heartbeat_seconds = 1
+    session_timeout_seconds = 10      # a node silent this long holds nothing more
+
 Every key a part signs with (``[relay]``, ``[inbox]``, ``[vacuum]``,
 ``[receipts]``) may live in a key service instead of a file
 (``docs/EPIC8_DESIGN.md`` §1): name a ``[signers.<name>]`` with ``signer`` in
@@ -240,11 +252,14 @@ if TYPE_CHECKING:
     from interlock.signers import RemoteSigner
 
 __all__ = [
+    "CLUSTER_DATABASE_ENV",
     "DATABASE_ENV",
     "INBOX_DATABASE_ENV",
     "METRICS_DATABASE_ENV",
+    "NODE_ENV",
     "RELAY_DATABASE_ENV",
     "SETTLER_DATABASE_ENV",
+    "ClusterConfig",
     "DaemonConfig",
     "Endpoint",
     "EngineConfig",
@@ -265,6 +280,8 @@ RELAY_DATABASE_ENV = "INTERLOCK_RELAY_DATABASE"
 INBOX_DATABASE_ENV = "INTERLOCK_INBOX_DATABASE"
 SETTLER_DATABASE_ENV = "INTERLOCK_SETTLER_DATABASE"
 METRICS_DATABASE_ENV = "INTERLOCK_METRICS_DATABASE"
+NODE_ENV = "INTERLOCK_NODE"
+CLUSTER_DATABASE_ENV = "INTERLOCK_CLUSTER_DATABASE"
 
 
 class ConfigError(ValueError):
@@ -506,6 +523,27 @@ class DaemonConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ClusterConfig:
+    """``[cluster]``: this daemon as a node of a cluster (``docs/EPIC9_DESIGN.md`` §1).
+
+    :ivar node: The node's name, unique in the cluster: ``INTERLOCK_NODE``, or
+        the file's; ``""`` until ``interlock daemon --node`` names it.
+    :ivar database: The node's session: any role, reaching the server directly
+        or through a pooler in session mode; ``""`` for
+        ``INTERLOCK_CLUSTER_DATABASE``.
+    :ivar heartbeat: How often the node shows the server it is alive.
+    :ivar session_timeout: How long a silent node keeps what it holds: its
+        session's ``idle_session_timeout``, and in a cluster the bound on every
+        transaction any of its parts leaves idle.
+    """
+
+    node: str = ""
+    database: str = ""
+    heartbeat: timedelta = timedelta(seconds=1)
+    session_timeout: timedelta = timedelta(seconds=10)
+
+
+@dataclass(frozen=True, slots=True)
 class MetricsConfig:
     """``[metrics]``: the Prometheus endpoint (``docs/EPIC7_DESIGN.md`` §2).
 
@@ -587,6 +625,8 @@ class InterlockConfig:
     metrics: MetricsConfig = MetricsConfig()
     signers: Mapping[str, SignerConfig] = field(default_factory=dict)
     """``[signers.<name>]``: keys signing services hold, by name."""
+    cluster: ClusterConfig | None = None
+    """``[cluster]``: this daemon as a node of a cluster, or ``None`` alone."""
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -608,6 +648,19 @@ class InterlockConfig:
         if not database:
             return self
         return replace(self, database=database)
+
+    def with_node(self, node: str | None) -> InterlockConfig:
+        """This configuration as node ``node`` of its cluster
+        (``interlock daemon --node``); unchanged for ``None``.
+
+        :raises ConfigError: If it configures no ``[cluster]``, or ``node`` is
+            not a node's name.
+        """
+        if not node:
+            return self
+        if self.cluster is None:
+            raise ConfigError("--node names a node of a cluster: configure [cluster] first")
+        return replace(self, cluster=replace(self.cluster, node=_node_name(node, "--node")))
 
     def sink_registry(self) -> SinkRegistry:
         """The sinks as an engine takes them."""
@@ -720,6 +773,7 @@ def load_config(
         daemon=_daemon(raw.get("daemon")),
         metrics=_metrics(raw.get("metrics")),
         signers=signers,
+        cluster=_cluster(raw.get("cluster"), substrate),
     )
 
 
@@ -948,6 +1002,49 @@ def _daemon(raw: object) -> DaemonConfig:
         restart_min=timedelta(seconds=low),
         restart_max=timedelta(seconds=high),
     )
+
+
+def _cluster(raw: object, substrate: str) -> ClusterConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("'cluster' must be a table ([cluster])")
+    known = {"node", "database", "heartbeat_seconds", "session_timeout_seconds"}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(f"[cluster]: unknown key(s) {', '.join(unknown)}")
+    if substrate != "postgres":
+        raise ConfigError(
+            "[cluster] needs PostgreSQL: a cluster's nodes meet in its database, and a "
+            "SQLite file has one host"
+        )
+    node = os.environ.get(NODE_ENV) or _string(raw, "node", default="")
+    heartbeat = _seconds(raw, "heartbeat_seconds", 1.0)
+    timeout = _seconds(raw, "session_timeout_seconds", 10.0)
+    if timeout < 3 * heartbeat:
+        raise ConfigError(
+            "[cluster]: session_timeout_seconds is at least three heartbeat_seconds: a live "
+            "node must never fall silent for that long"
+        )
+    return ClusterConfig(
+        node=_node_name(node, NODE_ENV if os.environ.get(NODE_ENV) else "[cluster] node")
+        if node
+        else "",
+        database=_string(raw, "database", default=""),
+        heartbeat=timedelta(seconds=heartbeat),
+        session_timeout=timedelta(seconds=timeout),
+    )
+
+
+def _node_name(node: str, where: str) -> str:
+    from interlock.cluster import NODE_NAME
+
+    if not NODE_NAME.fullmatch(node):
+        raise ConfigError(
+            f"{where}: a node is named by letters, digits, '.', '_' and '-', 40 at most, "
+            f"not {node!r}"
+        )
+    return node
 
 
 _INBOX_KEYS = frozenset(

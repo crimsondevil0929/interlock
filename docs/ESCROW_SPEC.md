@@ -964,9 +964,10 @@ transactional outbox), [`EPIC3_DESIGN.md`](EPIC3_DESIGN.md) (typed sinks,
 operators, compensations), [`EPIC4_DESIGN.md`](EPIC4_DESIGN.md) (relay
 attestations, rate windows, settlement), [`EPIC5_DESIGN.md`](EPIC5_DESIGN.md)
 (compaction, the inbox), [`EPIC6_DESIGN.md`](EPIC6_DESIGN.md) (the runtime and
-the daemon), [`EPIC7_DESIGN.md`](EPIC7_DESIGN.md) (trace context, metrics) and
+the daemon), [`EPIC7_DESIGN.md`](EPIC7_DESIGN.md) (trace context, metrics),
 [`EPIC8_DESIGN.md`](EPIC8_DESIGN.md) (keys held by a signing service, registered,
-revoked and rotated; the security audit).
+revoked and rotated; the security audit) and [`EPIC9_DESIGN.md`](EPIC9_DESIGN.md)
+(several daemons on one database).
 
 ## 5.1 Components
 
@@ -976,14 +977,15 @@ revoked and rotated; the security audit).
 | **Substrates** | `substrate.SqliteSubstrate`, `postgres.PostgresSubstrate` | One transaction per stage (`BEGIN IMMEDIATE`; `REPEATABLE READ`). Row triggers capture every change to an observed table. A commit marker is written inside the stage's own transaction. | The capture; `interlock.stages` markers; the log of unmediated writes |
 | **AgentGov seam** | `anchor.LedgerAnchor` | Audit mode: a read-only view, verified, refreshed before every head read and breaker check. Governed mode: each plan charged its settle cost and its requests' prices. On PostgreSQL that is claim and settle: a hold before the stage, a claim committed inside it, redeemed after. | Holds, spends, anchors |
 | **Transactional outbox** | `outbound`, `outbox_sql`, `sqlite_outbox` | An `ENQUEUE` effect writes its request inside the stage, through a function gated by the stage's token. The sink registry admits it: operation, schema, size, deadline, price, the compensation it carries. | Outbox rows; a hash-linked delivery log per message |
-| **Relays** | `relay.Relay`, `adapters`, `stripe`, `sendgrid` | Lease due messages (`FOR UPDATE SKIP LOCKED`, fenced). Check the scope's AgentGov breaker. Deliver under the idempotency key, classify the reply, and sign every outcome. | Delivery-log rows, each carrying an Ed25519 attestation |
+| **Relays** | `relay.Relay`, `adapters`, `stripe`, `sendgrid` | Lease due messages (`FOR UPDATE SKIP LOCKED`, fenced), each lease naming the cluster node of its relay; a node gone, its leases are taken over at the next claim. Check the scope's AgentGov breaker. Deliver under the idempotency key, classify the reply, and sign every outcome. | Delivery-log rows, each carrying an Ed25519 attestation |
 | **Operators** | `operators.OperatorLog`, `operators.Operator` | Release, cancel, requeue, compensate, install and vacuum, each in two phases: a signed intent, the database's act under the intent's hash, then a signed outcome. | The ILOK1 operator log, each record anchored in AgentGov |
-| **Settlement** | `settlement.Settler` | Receipts each delivered request against its plan's action receipt. Credits a compensation the price its original was charged, back to the scope that paid. | ARC1 delivery receipts; `REVERSAL` credits; one settlement row per message |
+| **Settlement** | `settlement.Settler` | Receipts each delivered request against its plan's action receipt. Credits a compensation the price its original was charged, back to the scope that paid. In a cluster, each node settles the plans its own engines committed, into its own receipt log. | ARC1 delivery receipts; `REVERSAL` credits; one settlement row per message |
 | **Rate windows** | `windows` | Measure what a plan adds to each window from its diff. Read the window's history under a lock on each key, and refuse a plan that would take one past its limit. | `interlock.window_ledger` rows, written with the commit |
 | **Inbox** | `inbox.Inbox`, `inbox.InboxServer`, `inbox_store` | Verify a vendor's webhook (Stripe, Standard Webhooks, SendGrid) and record each event once. Bind it to the relay-attested delivery it names, and attest the fact. | A hash-linked event log per source; attested facts; consumed rows |
 | **Compaction** | `vacuum.Vacuum`, `compaction` | Prunes final, settled history past its retention under a checkpoint an operator signs and AgentGov anchors. The checkpoint's folds commit to everything pruned. | Checkpoints; tombstones; an optional provable archive |
 | **Runtime** | `runtime.EscrowRuntime` | One engine, configured whole: any substrate, windows, inbox keys, sinks, the claim-and-settle anchor. Or `from_config`. | — |
 | **Supervisor** | `supervisor.InterlockSupervisor`, `daemon.build_supervisor` | Runs the engines, relays, inbox, settler and vacuum in one process on one event loop. Restarts a failed part with backoff, reopens the relays and the inbox with the keys they are given now on `SIGHUP`, and stops in order without cutting anything in half. | Health (`GET /healthz`) |
+| **Cluster** | `cluster.ClusterNode`, `cluster.Leadership` | Makes a daemon a node of a cluster over one database: its session holds the node's lock for the process's life, and the roles one node leads at a time (the vacuum, the inbox's matcher, a receipt log's settler). The database alone decides when a node is gone, by ending its session; the nodes that survive then end every other session it had (fencing). | Advisory locks; `outbox_state.lease_node` |
 | **Keys** | `signers`, `keys`, `operators` | Signs through a key service that holds the private key (`RemoteSigner`). Registers keys in the operator log, and revokes them: a relay's or an inbox's in the database too, which seals what the key attested and refuses what it would attest next. | `key.registered` and `revoke-key` operator records; `key_revocations`, `key_seals` |
 
 ## 5.2 How a plan's effects flow
@@ -1085,13 +1087,26 @@ reads is after it, and is never mistaken for tampering.
   each refuse a second writer. The daemon keeps the engines and the settler,
   which share the receipt log, in one process. The vacuum opens the operator
   log only for its run.
+- **Nodes.** Several daemons over one database are nodes of a cluster. Each
+  holds its node's lock, a session-level advisory lock, for its life; one node
+  at a time leads the vacuum, the inbox's matcher, and each receipt log's
+  settler, which is the node that writes that log. A relay's lease names its
+  node, and a node gone loses its leases at the next claim. Every session that
+  holds what another waits for (a stage's, a relay's, the inbox's, a
+  governor's) is bounded by the server, and the nodes that survive end every
+  session of a node gone, so a node that freezes, or loses the network, holds
+  nothing past its session timeout and a heartbeat. Leadership decides who
+  works; what a leader does is safe under concurrency on its own.
 
 `scripts/live_stress_test.py` runs all of it for minutes against a live
-PostgreSQL, under injected faults and forged webhooks, and proves from the
-database, the ledger and the logs that no deadlock occurred, lock waits
-resolved, the windows held exactly, the ledger balanced, every effect happened
-once, no forgery was accepted, compaction kept up, and everything verified.
-`tests/test_soak.py` runs it scaled down in the test suite.
+PostgreSQL, as a cluster of daemons in processes of their own, under injected
+faults and forged webhooks, one node killed and another frozen mid-load, and
+proves from the database, the ledger and the logs that no deadlock occurred,
+lock waits resolved, the windows held exactly, the ledger balanced, every
+effect happened once, no forgery was accepted, compaction kept up, everything
+verified, one node led each role at a time, and each dead node's leases,
+locks and sessions were let go of within their bounds. `tests/test_soak.py` runs it scaled
+down in the test suite.
 
 ---
 
@@ -1208,6 +1223,7 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | Keys held by a signing service: every signature verified under the pinned key before it is used; the daemon booted with every key remote | `signers`, `config`, `wiring` | `test_signers`, `test_daemon` |
 | Keys registered and revoked in the operator log; a revocation seals what the key attested and refuses the next; history verifies under the seal; rotated in a running daemon by a reload, or after a compromise with none | `keys`, `records`, `operators`, `outbox_sql`, `sqlite_outbox`, `supervisor`, `daemon` | `test_keys`, `test_supervisor`, `test_daemon`, the soak |
 | No sensitive value in a hash: canaries through the daemon on both stores, every hash input recorded, every column crawled | `scripts/security_audit.py` | `test_security_audit` |
+| Several daemons on one database (PostgreSQL): a node's lock held for its life and refused to a second process; one node leading each role at a time; a node gone losing its locks, its roles and its leases as the database ends its session, and its other sessions as the nodes that survive fence it; each node settling its own plans; every session that holds what others wait for bounded; recovery waiting out a predecessor's transactions | `cluster`, `supervisor`, `daemon`, `outbox_sql`, `settlement`, `wiring` | `test_cluster`, `test_takeover`, `test_cluster_daemon`, `test_settlement`, `test_inbox`, `test_engine`, the soak (a node killed, a node frozen) |
 | Checked repair, refusal feedback, budgeted recovery, extension quotes | `repair`, `feedback`, `recovery`, `extension` | `test_repair`, `test_feedback`, `test_recovery`, `test_extension` |
 
 ## Partial
@@ -1229,9 +1245,15 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
   database and the substrate, so a trip committed between the check and the
   commit cannot be excluded; the `COMMITTED` record says so when it is seen
   after. Governed and same-transaction modes exclude it.
-- **One daemon process.** Engines, the settler and the receipt log they share
-  run in one process; several daemons need chain files and receipt logs of
-  their own. Relays, inboxes and vacuums already share work across processes.
+- **A node's deliveries wait for it.** In a cluster a node's engines write
+  chains and a receipt log of their own, and its settler settles their plans
+  alone: a node that never comes back leaves its deliveries unsettled until its
+  volume is given to another process as that node. Its deliveries are made, and
+  its webhooks recorded, by the rest of the cluster meanwhile.
+- **A frozen node is found by the server's timeouts.** Its leases and roles pass
+  to others after `session_timeout_seconds`, its transactions end within their
+  bounds; a vacuum's or a settler's read snapshot ends only with its process,
+  and holds no lock a writer waits for.
 - **Compensation leaves the escrow chain as it was** (E1-6): its evidence is in
   the delivery logs, the operator log, the receipt log and the ledger.
 

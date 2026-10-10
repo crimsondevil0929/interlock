@@ -34,6 +34,12 @@ compensation. Killed between any two, the next run settles the message once:
 one receipt, at most one credit, one row. One process settles at a time: the
 receipt log admits one writer.
 
+In a cluster (``docs/EPIC9_DESIGN.md`` §3.2) every node's engines write a
+receipt log and chains of their own, and a settler settles only the deliveries
+of plans its chains record (``partition``): the node that committed a plan
+settles it, into the log that holds its action receipt. The nodes' shares are
+disjoint, so no two settlers touch one message.
+
 A delivery the relays did not attest is not settled at all: it is a ghost
 (:mod:`interlock.attestations`), and is reported.
 """
@@ -93,6 +99,10 @@ _RECEIPT: Final = re.compile(r"; receipt ([0-9a-f-]{36})")
 _PRUNED_AT: Final = datetime(1970, 1, 1, tzinfo=UTC)
 """A pruned settlement's time, which its tombstone does not keep."""
 _COMMITTED: Final = frozenset({OutcomeStatus.COMMITTED, OutcomeStatus.RECOVERED_COMMITTED})
+_OUTCOMES: Final = frozenset(
+    {RecordType.COMMITTED, RecordType.ABORTED, RecordType.ORPHANED, RecordType.COMPENSATED}
+)
+"""The records that end a stage's commit intent."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +147,10 @@ class Settler:
     :param checkpoint: Called with ``"receipt"``, ``"credit"`` and
         ``"settled"`` and the message, once each step of its settlement is
         durable: the crash tests stop the process there.
+    :param partition: Settle only the deliveries of plans ``chain`` records,
+        and leave the rest to the settler whose engines committed them: a node
+        of a cluster's. Without it, a delivery of a plan no chain here records
+        is settled without a receipt, as one committed before receipts were on.
     """
 
     __slots__ = (
@@ -146,6 +160,7 @@ class Settler:
         "_operator_log",
         "_operators",
         "_outbox",
+        "_partition",
         "_pass_relays",
         "_receipts",
         "_relays",
@@ -165,8 +180,10 @@ class Settler:
         operators: Keyring | None = None,
         sinks: SinkRegistry | None = None,
         checkpoint: Callable[[str, uuid.UUID], None] | None = None,
+        partition: bool = False,
     ) -> None:
         self._outbox = settlements(outbox)
+        self._partition = partition
         self._receipts = receipts
         self._chain = chain
         self._relays = relays
@@ -185,6 +202,14 @@ class Settler:
         due = [m for m in messages if m.state == "delivered" and m.message_id not in settled_before]
         if not due:
             return SettlementReport((), 0, 0, ())
+        chain = self._chain_records()
+        if self._partition:
+            # Another node's plan is another node's to settle: its receipt
+            # goes into the log that holds its action receipt.
+            ours = {str(record.plan_id) for record in chain}
+            due = [m for m in due if m.plan_id in ours]
+            if not due:
+                return SettlementReport((), 0, 0, ())
         # A revoked relay's deliveries settle only as its revocation sealed
         # them (docs/EPIC8_DESIGN.md §2.3): the revoked keys read once a pass,
         # each seal once.
@@ -196,8 +221,9 @@ class Settler:
         context = _Context.build(
             messages,
             events,
-            chain=self._chain_records(),
+            chain=chain,
             log=self._receipts.log,
+            owes=self._receipts.owes,
             ledger=self._ledger,
             operators=self._operator_records(),
             legacy=self._outbox.legacy(),
@@ -264,9 +290,18 @@ class Settler:
                 f"was not derived from: not settled"
             )
 
-        # A plan's commit is recorded before its action receipt is issued: in
-        # one process a relay can deliver, and this run, in between. A receipt
-        # the commit names is coming; until the log holds it, nothing is settled.
+        # A stage commits before the chain records it, and its plan's action
+        # receipt is issued after that: in one process a relay can deliver,
+        # and this run, in either window. A commit not recorded yet, or a
+        # receipt the commit names that its engine still owes, is coming; until
+        # it is here, nothing is settled.
+        if message.stage_id in context.open_stages and str(message.message_id) not in (
+            context.receipts
+        ):
+            raise _UnsettledError(
+                "its stage's commit is not recorded on the chain yet (its intent is open): "
+                "not settled until it is"
+            )
         pending = context.receipt_pending(message.plan_id)
         if pending is not None and str(message.message_id) not in context.receipts:
             raise _UnsettledError(
@@ -289,7 +324,14 @@ class Settler:
         receipt = context.receipts.get(str(message.message_id))
         if receipt is None:
             action = context.action_receipt(message.plan_id)
-            if action is None:
+            named = context.plan_receipts.get(message.plan_id)
+            if action is None and named is not None and context.log.index_of(named) is None:
+                notes.append(
+                    f"no action receipt for plan {message.plan_id} to bind a delivery receipt "
+                    f"to: its commit names receipt {named}, which was never issued (the "
+                    f"process that committed it stopped first)"
+                )
+            elif action is None:
                 notes.append(
                     f"no action receipt for plan {message.plan_id} to bind a delivery receipt "
                     f"to (receipts were off, or its commit was recovered after a crash)"
@@ -489,6 +531,11 @@ class _Context:
     plan_credits: dict[str, Decimal]
     plan_receipts: dict[str, str]
     """Each committed plan's action receipt id, from the chain."""
+    open_stages: frozenset[uuid.UUID]
+    """The stages whose commit intent the chain holds with no outcome after it:
+    committing now, or left open by a process that stopped."""
+    owes: Callable[[str], bool]
+    """Whether an engine of this process may still issue a receipt."""
     plan_records: dict[str, list[str]]
     """The hashes of each plan's commit records, which its charge's memo names."""
     spends: dict[str, LedgerEntry]
@@ -509,6 +556,7 @@ class _Context:
         *,
         chain: Sequence[EscrowRecord],
         log: ReceiptLog,
+        owes: Callable[[str], bool],
         ledger: BudgetManager | None,
         operators: _Operators | None,
         legacy: Any,
@@ -519,6 +567,8 @@ class _Context:
         by_id = {m.message_id: m for m in messages}
         plan_receipts: dict[str, str] = {}
         plan_records: dict[str, list[str]] = {}
+        intents: set[uuid.UUID] = set()
+        ended: set[uuid.UUID] = set()
         for record in chain:
             if record.record_type in (RecordType.COMMIT_INTENT, RecordType.COMMITTED):
                 plan_records.setdefault(str(record.plan_id), []).append(record.record_hash)
@@ -526,6 +576,11 @@ class _Context:
                 found = _RECEIPT.search(record.note)
                 if found is not None:
                     plan_receipts[str(record.plan_id)] = found.group(1)
+            if record.stage_id is not None:
+                if record.record_type is RecordType.COMMIT_INTENT:
+                    intents.add(record.stage_id)
+                elif record.record_type in _OUTCOMES:
+                    ended.add(record.stage_id)
         credits: dict[uuid.UUID, LedgerEntry] = {}
         plan_credits: dict[str, Decimal] = {}
         spends: dict[str, LedgerEntry] = {}
@@ -557,6 +612,8 @@ class _Context:
             credits=credits,
             plan_credits=plan_credits,
             plan_receipts=plan_receipts,
+            open_stages=frozenset(intents - ended),
+            owes=owes,
             plan_records=plan_records,
             spends=spends,
             claims=claims,
@@ -567,11 +624,13 @@ class _Context:
 
     def receipt_pending(self, plan_id: str) -> str | None:
         """The action receipt the plan's commit record names, while the log
-        does not hold it yet."""
+        does not hold it yet and an engine of this process still owes it. One
+        nothing owes was never issued, and never will be: the log is asked
+        again after, since the engine logs a receipt before it stops owing it."""
         receipt_id = self.plan_receipts.get(plan_id)
         if receipt_id is None or self.log.index_of(receipt_id) is not None:
             return None
-        return receipt_id
+        return receipt_id if self.owes(receipt_id) else None
 
     def action_receipt(self, plan_id: str) -> ActionReceipt | None:
         """The action receipt the plan that committed was issued, if the log holds it."""
@@ -698,11 +757,14 @@ def _credited(entry: LedgerEntry) -> uuid.UUID | None:
 def verify_settlements(
     outbox: object,
     *,
-    log: ReceiptLog,
+    log: ReceiptLog | Sequence[ReceiptLog],
     relays: Keyring,
     ledger: Iterable[LedgerEntry] | None = None,
 ) -> tuple[str, ...]:
     """Hold the settlements to the receipt log and the ledger, and both back.
+    In a cluster, ``log`` is every node's receipt log
+    (``docs/EPIC9_DESIGN.md`` §3.2): each settlement's receipt is in one of
+    them, bound to an action receipt of the same log.
 
     Finds a settlement naming a delivery receipt the log does not hold, or one
     for another message, or one whose attestation does not verify under a
@@ -744,19 +806,22 @@ def verify_settlements(
         return None if tombstone is None else Decimal(tombstone.cost)
 
     problems: list[str] = []
-    deliveries = {d.receipt_id: d for d in log.deliveries()}
+    logs = [log] if isinstance(log, ReceiptLog) else list(log)
+    logged = {d.receipt_id: (d, holder) for holder in logs for d in holder.deliveries()}
+    deliveries = {receipt_id: receipt for receipt_id, (receipt, _) in logged.items()}
     named: set[str] = set()
     for message_id, row in sorted(rows.items()):
         if row.receipt_id is None:
             continue
         named.add(row.receipt_id)
-        receipt = deliveries.get(row.receipt_id)
-        if receipt is None:
+        found = logged.get(row.receipt_id)
+        if found is None:
             problems.append(
                 f"message {message_id}: its settlement names delivery receipt "
                 f"{row.receipt_id}, which the receipt log does not hold"
             )
             continue
+        receipt, holder = found
         if receipt.request.message_id != str(message_id):
             problems.append(
                 f"message {message_id}: its settlement names delivery receipt "
@@ -780,8 +845,8 @@ def verify_settlements(
             )
             if refused is not None and message_id in by_id:
                 problems.append(f"delivery receipt {row.receipt_id}: its delivery: {refused}")
-        index = log.index_of(receipt.action.receipt_id)
-        action = None if index is None else log.receipt(index)
+        index = holder.index_of(receipt.action.receipt_id)
+        action = None if index is None else holder.receipt(index)
         if not isinstance(action, ActionReceipt) or receipt.action.problem(action) is not None:
             problems.append(
                 f"delivery receipt {row.receipt_id} binds an action receipt the log does not "

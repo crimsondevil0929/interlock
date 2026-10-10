@@ -126,7 +126,7 @@ __all__ = [
 
 logger = logging.getLogger("interlock.postgres")
 
-INSTALL_VERSION: Final = "7"
+INSTALL_VERSION: Final = "8"
 """Bumped when the installed functions change in a way a stage depends on."""
 
 STAGEABLE_VERBS: Final = frozenset(
@@ -614,6 +614,7 @@ _INBOX_FUNCTIONS: Final = (
 through one of these, and the trace context an event came with."""
 
 _RELAY_FUNCTIONS: Final = (
+    "interlock.relay_claim(text, double precision, integer, text[], text)",
     "interlock.relay_claim(text, double precision, integer, text[])",
     "interlock.relay_sending(uuid, text, bigint, text)",
     "interlock.relay_outcome(uuid, text, bigint, integer, text, integer, text, text, bigint, text, "
@@ -692,6 +693,11 @@ def install(
     version 3 in place the same way; again, stop the relays first. The install
     that brings it records the legacy set
     (:class:`~interlock.deliveries.LegacySet`), which no later one adds to.
+
+    Version 8 (``docs/EPIC9_DESIGN.md`` §2) records the node of the cluster
+    whose relay holds each lease, and a claim takes over the leases of a node
+    that is gone. A relay of an earlier version left running keeps claiming:
+    it names no node, and what it leases only runs out.
 
     :returns: The legacy set, as this install's transaction read it: what a
         signed install vouches for.
@@ -868,12 +874,12 @@ def _install_sources(conn: psycopg.Connection[Any], sources: Sequence[InboundSou
 
 
 def installed_version(conn: psycopg.Connection[Any]) -> int:
-    """Which version installed the outbox in this database: 7 when it records
-    revoked keys and their seals, 6 when it keeps trace context, 5 when
-    vacuums compact it under checkpoints, 4 when its
-    delivery log records relays' attestations and rate windows keep their
-    history, 3 when the log records what calls created, 2 before; 0 when there
-    is no outbox."""
+    """Which version installed the outbox in this database: 8 when a lease
+    names the node of its relay, 7 when it records revoked keys and their
+    seals, 6 when it keeps trace context, 5 when vacuums compact it under
+    checkpoints, 4 when its delivery log records relays' attestations and rate
+    windows keep their history, 3 when the log records what calls created, 2
+    before; 0 when there is no outbox."""
     row = conn.execute(
         "SELECT pg_catalog.to_regclass('interlock.outbox_attempts') IS NOT NULL, "
         "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
@@ -885,7 +891,10 @@ def installed_version(conn: psycopg.Connection[Any]) -> int:
         "pg_catalog.to_regclass('interlock.window_ledger') IS NOT NULL, "
         "pg_catalog.to_regclass('interlock.checkpoints') IS NOT NULL, "
         "pg_catalog.to_regclass('interlock.outbox_traces') IS NOT NULL, "
-        "pg_catalog.to_regclass('interlock.key_revocations') IS NOT NULL"
+        "pg_catalog.to_regclass('interlock.key_revocations') IS NOT NULL, "
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+        "        WHERE attrelid = pg_catalog.to_regclass('interlock.outbox_state') "
+        "        AND attname = 'lease_node' AND NOT attisdropped)"
     ).fetchone()
     if row is None or not row[0]:
         return 0
@@ -894,7 +903,9 @@ def installed_version(conn: psycopg.Connection[Any]) -> int:
             return 4
         if not row[5]:
             return 5
-        return 7 if row[6] else 6
+        if not row[6]:
+            return 6
+        return 8 if row[7] else 7
     return 3 if row[1] else 2
 
 
@@ -924,6 +935,9 @@ class PostgresSubstrate:
         transaction-mode pooler queues a client, by this.
         :class:`~interlock.exceptions.PoolExhaustedError` when it runs out.
         Defaults to the lock timeout.
+    :param application_name: What the stage's connections are called in
+        ``pg_stat_activity``: ``interlock-stage@<node>`` in a cluster
+        (``docs/EPIC9_DESIGN.md`` §3.3).
     :param lock_timeout_seconds: How long any statement in the stage waits for
         a lock before the stage fails with :class:`StageConflictError`.
     :param enforce_table_access: Refuse to open a stage when the role can
@@ -936,6 +950,7 @@ class PostgresSubstrate:
 
     __slots__ = (
         "_acknowledged",
+        "_application",
         "_by_name",
         "_charges",
         "_conn",
@@ -973,12 +988,14 @@ class PostgresSubstrate:
         acknowledge_cascades: Collection[str] = (),
         pool_timeout_seconds: float | None = None,
         metrics: Metrics | None = None,
+        application_name: str = "interlock",
     ) -> None:
         _identifier(schema)
         pool = lock_timeout_seconds if pool_timeout_seconds is None else pool_timeout_seconds
         if pool <= 0:
             raise ValueError("pool_timeout_seconds is positive")
         self._dsn = dsn
+        self._application = application_name
         self._schema = schema
         self._tables = tuple(tables)
         self._by_name = {t.name.lower(): t for t in tables}
@@ -1142,8 +1159,10 @@ class PostgresSubstrate:
         # row keeps its hash, which the stage role cannot read.
         token = secrets.token_bytes(32)
         try:
-            conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
-            conn.execute(self._timeouts())
+            # One message: a client that stops right after BEGIN (frozen, or
+            # lost to the network) leaves a transaction the server ends at the
+            # stage bound, never one with no bound at all.
+            conn.execute(f"BEGIN ISOLATION LEVEL REPEATABLE READ; {self._timeouts()}")
             targets = ", ".join(f"{self._schema}.{t.name}" for t in self._tables)
             if targets:
                 conn.execute(f"LOCK TABLE {targets} IN ROW EXCLUSIVE MODE")
@@ -1762,7 +1781,7 @@ class PostgresSubstrate:
                 self._dsn,
                 autocommit=True,
                 prepare_threshold=None,
-                application_name="interlock",
+                application_name=self._application,
                 connect_timeout=(
                     max(1, int(self._stage_seconds))
                     if timeout is None

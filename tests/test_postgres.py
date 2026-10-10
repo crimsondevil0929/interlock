@@ -276,6 +276,62 @@ def test_a_statement_cannot_lift_the_stage_bound(pg: Pg) -> None:
     assert time.monotonic() - start < 4
 
 
+def test_a_stage_is_bounded_from_its_first_statement(
+    pg: Pg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage's bounds travel with its BEGIN: a client that stops right
+    after it (a frozen process, a host lost to the network) leaves a
+    transaction the server ends at the stage bound, never one with none."""
+    import threading
+
+    stopped = threading.Event()
+    sessions: list[int] = []
+    connect = PostgresSubstrate._connect
+
+    class Stops:
+        """The stage's connection, whose client stops after its first statement."""
+
+        def __init__(self, conn: Any) -> None:
+            self._conn, self._statements = conn, 0
+            sessions.append(conn.info.backend_pid)
+
+        def execute(self, *args: Any, **kwargs: Any) -> Any:
+            self._statements += 1
+            if self._statements == 2:
+                stopped.wait(10)
+            return self._conn.execute(*args, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(
+        PostgresSubstrate, "_connect", lambda self, **kw: Stops(connect(self, **kw))
+    )
+    failed: list[BaseException] = []
+
+    def open_stage() -> None:
+        try:
+            substrate(pg, max_stage_seconds=1).open(one("orders", "SELECT 1"))
+        except BaseException as exc:
+            failed.append(exc)
+
+    thread = threading.Thread(target=open_stage)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not sessions and time.monotonic() < deadline:
+            time.sleep(0.01)
+        (pid,) = sessions
+        alive = "SELECT count(*) FROM pg_stat_activity WHERE pid = %s"
+        while scalar(pg.admin, alive, pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not scalar(pg.admin, alive, pid), "the stage's transaction outlived its bound"
+    finally:
+        stopped.set()
+        thread.join(10)
+    assert failed, "the stage opened on a session the server had ended"
+
+
 # --------------------------------------------------------------------------
 # the cascade check on PostgreSQL
 # --------------------------------------------------------------------------

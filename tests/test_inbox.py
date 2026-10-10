@@ -736,3 +736,52 @@ def test_the_inbox_uses_its_store_only_under_its_lock(site: InboxSite) -> None:
     site.deliver("re_2")
     assert inbox.match_pending() == 1
     assert seen == []
+
+
+@pytest.mark.parametrize("outbox", ["postgres"], indirect=True)
+def test_an_inbox_frozen_mid_record_holds_its_source_no_longer_than_its_bound(
+    site: InboxSite,
+) -> None:
+    """Recording an event holds its source's log, and every other inbox waits
+    for it (``docs/EPIC9_DESIGN.md`` §3.3). One that freezes inside that
+    transaction, a host lost to the network, holds it for its session's bound,
+    and then the server rolls it back: the next inbox records."""
+    import threading
+    import time
+
+    from interlock.inbox_store import PostgresInboxStore
+    from interlock.wiring import bounded_session
+
+    site.deliver("re_1", "re_2")
+    frozen = threading.Event()
+    conn = bounded_session(
+        site.target["dsn"], application_name="interlock-inbox@frozen", idle_timeout=1.0
+    )
+    store = PostgresInboxStore(conn)
+
+    def freeze(point: str, lease: object) -> None:
+        if point == "record-uncommitted":
+            frozen.set()
+            time.sleep(3.0)  # past its bound: the server ends the session meanwhile
+
+    store.checkpoint = freeze
+    stuck = site.inbox(store=store)
+    answers: list[int] = []
+    first = threading.Thread(
+        target=lambda: answers.append(
+            site.receive(stuck, "stripe", stripe_webhook(refund_event("re_1"))).status
+        )
+    )
+    first.start()
+    assert frozen.wait(10)
+    began = time.monotonic()
+    second = site.inbox()
+    answer = site.receive(second, "stripe", stripe_webhook(refund_event("re_2", event_id="evt_2")))
+    waited = time.monotonic() - began
+    first.join(10)
+    conn.close()
+    assert answer.status == 200 and answer.body["recorded"] == 1
+    assert 0.5 < waited < 2.5, waited
+    # The frozen one's event was never recorded: its sender tries again.
+    assert answers == [503]
+    assert site.events() == 1

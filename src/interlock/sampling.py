@@ -128,10 +128,17 @@ def sample_sqlite(path: str, windows: Sequence[RateWindow], *, now_us: int) -> S
         conn.close()
 
 
-def sample_postgres(dsn: str, windows: Sequence[RateWindow], *, timeout: float) -> Sample:
+def sample_postgres(
+    dsn: str,
+    windows: Sequence[RateWindow],
+    *,
+    timeout: float,
+    application_name: str = "interlock-metrics",
+) -> Sample:
     """Read PostgreSQL's outbox, inbox and window ledger in one ``REPEATABLE
     READ READ ONLY`` transaction, bounded by ``timeout`` seconds, as the role
-    ``dsn`` names: one that may read them all."""
+    ``dsn`` names: one that may read them all. The connection is called
+    ``application_name`` in ``pg_stat_activity``."""
     import psycopg
 
     milliseconds = max(1, int(timeout * 1000))
@@ -139,7 +146,7 @@ def sample_postgres(dsn: str, windows: Sequence[RateWindow], *, timeout: float) 
         dsn,
         autocommit=True,
         prepare_threshold=None,
-        application_name="interlock-metrics",
+        application_name=application_name,
         connect_timeout=max(2, int(timeout)),
     ) as conn:
         conn.execute(

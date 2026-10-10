@@ -273,6 +273,11 @@ CREATE TABLE IF NOT EXISTS interlock.key_seals (
     PRIMARY KEY (key_id, kind, ref)
 );
 REVOKE ALL ON interlock.key_seals FROM PUBLIC;
+-- Version 8 (docs/EPIC9_DESIGN.md §2): a lease names the node of the cluster
+-- whose relay holds it, and a lease of a node that is gone is taken over at
+-- the next claim. NULL in every row leased before, and for a relay outside a
+-- cluster, whose lease only runs out.
+ALTER TABLE interlock.outbox_state ADD COLUMN IF NOT EXISTS lease_node text;
 DO $legacy$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM interlock.outbox_epochs WHERE version = '4') THEN
@@ -775,6 +780,7 @@ BEGIN
            reason = pg_catalog.left(p_reason, 1000),
            lease_owner = NULL,
            lease_expires = NULL,
+           lease_node = NULL,
            next_attempt_at = coalesce(p_next, pg_catalog.clock_timestamp()),
            updated_at = pg_catalog.clock_timestamp()
      WHERE message_id = p_message;
@@ -814,34 +820,52 @@ BEGIN
 END
 $fn$;
 
+-- The second key of a node's advisory lock, as interlock.cluster.lock_key
+-- computes it: the first four bytes of SHA-256 over 'interlock.node:<name>',
+-- signed (docs/EPIC9_DESIGN.md §1.2). Internal.
+CREATE OR REPLACE FUNCTION interlock.node_key(p_node text)
+RETURNS integer
+LANGUAGE sql IMMUTABLE STRICT
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+    SELECT ('x' || pg_catalog.substr(pg_catalog.encode(
+        pg_catalog.sha256(pg_catalog.convert_to('interlock.node:' || p_node, 'UTF8')), 'hex'),
+        1, 8))::bit(32)::integer
+$fn$;
+
 -- Leases up to p_limit messages that are due, whose dependencies are all
--- delivered, to p_relay, for p_lease_seconds. FOR UPDATE SKIP LOCKED: relays
--- racing for work never wait on each other and never take the same message.
--- A lease that ran out after its relay recorded a call and before it recorded
--- an outcome is recorded as `lost` first: the call's outcome is unknown, and
--- the sink may have acted. A message past its deadline is expired instead of
--- leased.
+-- delivered, to p_relay of node p_node, for p_lease_seconds. FOR UPDATE SKIP
+-- LOCKED: relays racing for work never wait on each other and never take the
+-- same message. A lease of a node that is gone is due at once: no session
+-- holds the node's lock (docs/EPIC9_DESIGN.md §2), which a shared try of it,
+-- held to the end of this transaction, finds out without reading pg_locks.
+-- A lease that ran out, or whose node is gone, after its relay recorded a
+-- call and before it recorded an outcome is recorded as `lost` first: the
+-- call's outcome is unknown, and the sink may have acted. A message past its
+-- deadline is expired instead of leased.
 CREATE OR REPLACE FUNCTION interlock.relay_claim(
-    p_relay text, p_lease_seconds double precision, p_limit integer,
-    p_sinks text[] DEFAULT NULL)
+    p_relay text, p_lease_seconds double precision, p_limit integer, p_sinks text[],
+    p_node text)
 RETURNS TABLE (
     out_message uuid, out_fence bigint, out_attempts integer, out_attempt_floor integer,
     out_plan text, out_scope text, out_effect text, out_sink text, out_operation text,
     out_tenant text, out_payload text, out_payload_hash text, out_idempotency_key text,
     out_not_after timestamptz, out_idempotency text, out_max_attempts integer,
     out_backoff_base_ms integer, out_backoff_cap_ms integer, out_unknown_outcome text,
-    out_lease_expires timestamptz
+    out_lease_expires timestamptz, out_taken_from text
 )
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $fn$
 DECLARE
     m record;
+    candidates refcursor;
     now_ts timestamptz := pg_catalog.clock_timestamp();
     lease_until timestamptz;
     last_event text;
     last_attempt integer;
     fate text;
+    gone text[] := '{}';
 BEGIN
     IF coalesce(p_relay, '') = '' OR coalesce(p_lease_seconds, 0) <= 0
        OR coalesce(p_limit, 0) <= 0 THEN
@@ -849,29 +873,71 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     lease_until := now_ts + pg_catalog.make_interval(secs => p_lease_seconds);
-    FOR m IN
-        SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner,
-               o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id,
-               o.payload::text AS payload, o.payload_hash, o.idempotency_key, o.not_after,
-               k.idempotency, k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms,
-               k.unknown_outcome
-          FROM interlock.outbox_state AS s
-          JOIN interlock.outbox AS o ON o.message_id = s.message_id
-          JOIN interlock.sinks AS k ON k.name = o.sink
-         WHERE s.state IN ('pending', 'leased')
-           AND s.next_attempt_at <= now_ts
-           AND (p_sinks IS NULL OR o.sink = ANY (p_sinks))
-           AND NOT EXISTS (
-                 SELECT 1
-                   FROM interlock.outbox AS dep
-                   JOIN interlock.outbox_state AS ds ON ds.message_id = dep.message_id
-                  WHERE dep.stage_id = o.stage_id
-                    AND dep.effect_id = ANY (o.depends_on)
-                    AND ds.state <> 'delivered')
-         ORDER BY s.next_attempt_at, o.enqueued_at, o.seq
-         LIMIT p_limit
-           FOR UPDATE OF s SKIP LOCKED
+    -- The nodes of the leases still running that no session holds the lock of.
+    gone := ARRAY(
+        SELECT n.node
+          FROM (SELECT DISTINCT st.lease_node AS node
+                  FROM interlock.outbox_state AS st
+                 WHERE st.state = 'leased' AND st.lease_node IS NOT NULL
+                   AND st.next_attempt_at > now_ts) AS n
+         WHERE pg_catalog.pg_try_advisory_xact_lock_shared(
+                   1229737818, interlock.node_key(n.node)));
+    IF pg_catalog.cardinality(gone) = 0 THEN
+        OPEN candidates FOR
+            SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner,
+                   s.lease_node, false AS early,
+                   o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id,
+                   o.payload::text AS payload, o.payload_hash, o.idempotency_key, o.not_after,
+                   k.idempotency, k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms,
+                   k.unknown_outcome
+              FROM interlock.outbox_state AS s
+              JOIN interlock.outbox AS o ON o.message_id = s.message_id
+              JOIN interlock.sinks AS k ON k.name = o.sink
+             WHERE s.state IN ('pending', 'leased')
+               AND s.next_attempt_at <= now_ts
+               AND (p_sinks IS NULL OR o.sink = ANY (p_sinks))
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM interlock.outbox AS dep
+                       JOIN interlock.outbox_state AS ds ON ds.message_id = dep.message_id
+                      WHERE dep.stage_id = o.stage_id
+                        AND dep.effect_id = ANY (o.depends_on)
+                        AND ds.state <> 'delivered')
+             ORDER BY s.next_attempt_at, o.enqueued_at, o.seq
+             LIMIT p_limit
+               FOR UPDATE OF s SKIP LOCKED;
+    ELSE
+        -- A gone node's leases first: theirs is the oldest work, due since
+        -- their node went, whatever their lease still says.
+        OPEN candidates FOR
+            SELECT s.message_id, s.state, s.attempts, s.attempt_floor, s.lease_owner,
+                   s.lease_node, s.next_attempt_at > now_ts AS early,
+                   o.plan_id, o.scope_id, o.effect_id, o.sink, o.operation, o.tenant_id,
+                   o.payload::text AS payload, o.payload_hash, o.idempotency_key, o.not_after,
+                   k.idempotency, k.max_attempts, k.backoff_base_ms, k.backoff_cap_ms,
+                   k.unknown_outcome
+              FROM interlock.outbox_state AS s
+              JOIN interlock.outbox AS o ON o.message_id = s.message_id
+              JOIN interlock.sinks AS k ON k.name = o.sink
+             WHERE s.state IN ('pending', 'leased')
+               AND (s.next_attempt_at <= now_ts
+                    OR (s.state = 'leased' AND s.lease_node = ANY (gone)))
+               AND (p_sinks IS NULL OR o.sink = ANY (p_sinks))
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM interlock.outbox AS dep
+                       JOIN interlock.outbox_state AS ds ON ds.message_id = dep.message_id
+                      WHERE dep.stage_id = o.stage_id
+                        AND dep.effect_id = ANY (o.depends_on)
+                        AND ds.state <> 'delivered')
+             ORDER BY (s.state = 'leased' AND s.lease_node = ANY (gone)) DESC,
+                      s.next_attempt_at, o.enqueued_at, o.seq
+             LIMIT p_limit
+               FOR UPDATE OF s SKIP LOCKED;
+    END IF;
     LOOP
+        FETCH candidates INTO m;
+        EXIT WHEN NOT FOUND;
         IF m.state = 'leased' THEN
             last_event := NULL;
             SELECT a.event, a.attempt INTO last_event, last_attempt
@@ -890,8 +956,12 @@ BEGIN
                 END;
                 PERFORM interlock.outbox_log(
                     m.message_id, last_attempt, 'lost', p_relay, NULL, NULL,
-                    'the lease of ' || coalesce(m.lease_owner, '?')
-                        || ' ran out mid-call; the sink may have acted',
+                    CASE WHEN m.early
+                        THEN 'the node ' || m.lease_node || ' of ' || coalesce(m.lease_owner, '?')
+                             || ' was gone mid-call; the sink may have acted'
+                        ELSE 'the lease of ' || coalesce(m.lease_owner, '?')
+                             || ' ran out mid-call; the sink may have acted'
+                    END,
                     CASE WHEN fate IS NULL THEN 'pending' ELSE 'dead' END);
                 IF fate IS NOT NULL THEN
                     PERFORM interlock.outbox_settle(m.message_id, 'dead', fate);
@@ -912,7 +982,7 @@ BEGIN
         UPDATE interlock.outbox_state
            SET state = 'leased', fence = fence + 1, lease_owner = p_relay,
                lease_expires = lease_until, next_attempt_at = lease_until,
-               updated_at = now_ts
+               lease_node = p_node, updated_at = now_ts
          WHERE message_id = m.message_id
         RETURNING fence INTO out_fence;
         out_message := m.message_id;
@@ -934,9 +1004,35 @@ BEGIN
         out_backoff_cap_ms := m.backoff_cap_ms;
         out_unknown_outcome := m.unknown_outcome;
         out_lease_expires := lease_until;
+        out_taken_from := CASE WHEN m.state = 'leased' AND m.early THEN m.lease_node END;
         RETURN NEXT;
     END LOOP;
+    CLOSE candidates;
 END
+$fn$;
+
+-- A relay from before version 8 names no node: what it leases only runs out.
+-- It takes over the leases of a node that is gone, as any relay does.
+CREATE OR REPLACE FUNCTION interlock.relay_claim(
+    p_relay text, p_lease_seconds double precision, p_limit integer,
+    p_sinks text[] DEFAULT NULL)
+RETURNS TABLE (
+    out_message uuid, out_fence bigint, out_attempts integer, out_attempt_floor integer,
+    out_plan text, out_scope text, out_effect text, out_sink text, out_operation text,
+    out_tenant text, out_payload text, out_payload_hash text, out_idempotency_key text,
+    out_not_after timestamptz, out_idempotency text, out_max_attempts integer,
+    out_backoff_base_ms integer, out_backoff_cap_ms integer, out_unknown_outcome text,
+    out_lease_expires timestamptz
+)
+LANGUAGE sql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+    SELECT c.out_message, c.out_fence, c.out_attempts, c.out_attempt_floor, c.out_plan,
+           c.out_scope, c.out_effect, c.out_sink, c.out_operation, c.out_tenant, c.out_payload,
+           c.out_payload_hash, c.out_idempotency_key, c.out_not_after, c.out_idempotency,
+           c.out_max_attempts, c.out_backoff_base_ms, c.out_backoff_cap_ms,
+           c.out_unknown_outcome, c.out_lease_expires
+      FROM interlock.relay_claim(p_relay, p_lease_seconds, p_limit, p_sinks, NULL::text) AS c
 $fn$;
 
 -- Records the call p_relay is about to make, immediately before it makes it,

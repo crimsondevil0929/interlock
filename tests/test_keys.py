@@ -606,7 +606,7 @@ def test_version_6_upgrades_in_place(outbox: Outbox) -> None:
             assert pg_version(conn) == 6
         outbox.reinstall(RELAY_SINKS)
         with outbox.admin() as conn:
-            assert pg_version(conn) == 7
+            assert pg_version(conn) == 8
     else:
         assert isinstance(outbox, SqliteOutbox)
         with closing(sqlite3.connect(outbox.path)) as conn:

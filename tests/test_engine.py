@@ -1145,6 +1145,34 @@ def test_a_commit_whose_answer_was_lost_is_settled_by_its_marker(db: str, landed
     assert engine.chain.unresolved_intents() == ()
 
 
+def test_recovery_waits_out_a_commit_the_server_has_not_decided(db: str) -> None:
+    """A node of a cluster started again (``docs/EPIC9_DESIGN.md`` §3.4): its
+    predecessor's commit may still be running on the server. The engines ask
+    again until the server decides, up to their bound; asked once, the
+    intent stays open for the next start."""
+    import threading
+    import time
+
+    from interlock.supervisor import EnginePool
+
+    probe = type("Undecided", (LosesTheAnswer,), {"marker": True})
+    engine = EscrowEngine(probe(db, tables=TABLES), checkers=[BlastRadius(50)])
+    with pytest.raises(CommitUnsettledError):
+        engine.execute(_probe_plan())
+    assert engine.awaiting_recovery() == 1
+    once = EnginePool(lambda index: (engine, lambda: None))
+    once.open()
+    assert engine.awaiting_recovery() == 1 and once.counters.get("recovered", 0) == 0
+    threading.Timer(0.4, lambda: setattr(probe, "marker", None)).start()
+    waits = EnginePool(lambda index: (engine, lambda: None), recover_wait=10)
+    started = time.monotonic()
+    waits.open()
+    assert engine.awaiting_recovery() == 0
+    assert waits.counters["recovered"] == 1
+    assert 0.3 < time.monotonic() - started < 5
+    assert engine.chain.records()[-1].record_type is RecordType.COMMITTED
+
+
 @pytest.mark.parametrize("marker", ["unanswered", "unreachable", "unarmed"])
 def test_a_lost_commit_nobody_can_settle_stays_open_for_recovery(
     db: str, marker: str, caplog: pytest.LogCaptureFixture

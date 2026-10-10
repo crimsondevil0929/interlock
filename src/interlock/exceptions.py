@@ -25,6 +25,7 @@ __all__ = [
     "InterlockError",
     "KeyRevokedError",
     "LedgerUnverifiedError",
+    "NodeTakenError",
     "OutboundRequestError",
     "PlanError",
     "PoolExhaustedError",
@@ -342,3 +343,9 @@ class KeyRevokedError(InterlockError):
     attests nothing new. A relay holding it stops before it claims; the
     database refuses what it would write. What it attested before its
     revocation still verifies, under the seal the revocation made."""
+
+
+class NodeTakenError(SubstrateConfigurationError):
+    """Another process is this node of the cluster (``docs/EPIC9_DESIGN.md``
+    §1.1): its session holds the node's lock. A daemon does not start as a
+    node that runs, and stops when, joining again, it finds its name taken."""

@@ -300,6 +300,11 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument(
         "--metrics", help="serves /metrics on HOST:PORT, overriding [metrics]'s listen"
     )
+    daemon.add_argument(
+        "--node",
+        help="this daemon's node of the cluster [cluster] configures, overriding its node "
+        "and INTERLOCK_NODE (docs/EPIC9_DESIGN.md)",
+    )
     daemon.add_argument("--relay-key", help=f"overrides [relay]'s key, as does {RELAY_KEY_ENV}")
     daemon.add_argument("--inbox-key", help=f"overrides [inbox]'s key, as does {INBOX_KEY_ENV}")
     keys_command = commands.add_parser(
@@ -1303,6 +1308,11 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
 
     from interlock.daemon import build_supervisor, load_application
 
+    try:
+        config = config.with_node(args.node)
+    except ConfigError as exc:
+        print(f"interlock: {exc}", file=sys.stderr)
+        return EXIT_USAGE
     application = load_application(args.app, config) if args.app else None
     supervisor = build_supervisor(
         config,
@@ -1329,9 +1339,10 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         await asyncio.wait({running, ready}, return_when=asyncio.FIRST_COMPLETED)
         if ready.done() and not running.done():
             parts = ", ".join(sorted(supervisor.status()))
+            node = "" if config.cluster is None else f" as node {config.cluster.node}"
             print(
-                f"interlock daemon running: {parts}; reload its keys with SIGHUP; stop with "
-                f"SIGTERM or Ctrl-C",
+                f"interlock daemon running{node}: {parts}; reload its keys with SIGHUP; stop "
+                f"with SIGTERM or Ctrl-C",
                 file=out,
             )
             port = supervisor.inbox_port
@@ -1346,13 +1357,19 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         await running
 
     asyncio.run(run())
-    for name, status in sorted(supervisor.status().items()):
+    report = supervisor.status()
+    for name, status in sorted(report.items()):
         counters = ", ".join(f"{k} {v}" for k, v in sorted(status.counters.items()) if v)
         print(
             f"{name}: {status.state}, {status.steps} step(s), {status.failures} failure(s)"
             + (f"; {counters}" if counters else ""),
             file=out,
         )
+    taken = report.get("cluster")
+    if taken is not None and taken.state == "failed":
+        # Another process is this node now: this one stopped for it.
+        print(f"interlock: {taken.last_error}", file=sys.stderr)
+        return EXIT_CONFIGURATION
     return EXIT_OK
 
 
