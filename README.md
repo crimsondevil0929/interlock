@@ -1597,6 +1597,64 @@ crash. Without `--app`, the daemon runs the relays, the inbox and the vacuum.
 In a process of your own, `build_supervisor(config, application)` returns the same
 `InterlockSupervisor`, to run on your event loop.
 
+### Several daemons: a cluster
+
+Run three to five daemons over one database and one AgentGov ledger, each in a pod of its
+own, and any of them can die at any moment (`docs/EPIC9_DESIGN.md`). Each is a node:
+
+```toml
+[cluster]                             # PostgreSQL only
+node = "interlock-0"                  # or INTERLOCK_NODE, or interlock daemon --node
+database = "postgresql://interlock_cluster@db/app"   # direct, or a session-mode pool
+heartbeat_seconds = 1
+session_timeout_seconds = 10          # a node silent this long holds nothing more
+```
+
+A node's name is 40 characters at most (letters, digits, `.`, `_`, `-`), and `database` is
+the database Interlock is installed in: a node's lock is that database's own, where the
+relays look for it, and a node refuses to join one without Interlock's storage. Its role
+needs no privilege for the locks; to fence (below) it needs `pg_signal_backend`, and the
+parts' roles must not be superusers, whose sessions only a superuser can end:
+
+```sql
+CREATE ROLE interlock_cluster LOGIN PASSWORD '...';
+GRANT pg_signal_backend TO interlock_cluster;
+```
+
+A node holds its node's lock in PostgreSQL, a session-level advisory lock, for as long as
+its process lives, so the database alone decides when a node is gone: when it ends the
+node's session, at once for a process killed, after `session_timeout_seconds` for one
+frozen or lost to the network. Every node runs the engines, the relays, the inbox and the
+metrics endpoint. The vacuum, and the inbox's matching of webhooks that came before their
+delivery was recorded, run on one node at a time: the one leading their role, an advisory
+lock on the same session, which another node takes at its next ask once the leader is
+gone. Each node settles the deliveries of the plans its own engines committed, into its
+own receipt log, since a delivery receipt goes into the log that holds its plan's action
+receipt: no two nodes ever settle one message.
+
+A relay's lease names its node (storage version 8: `interlock install` upgrades version 7
+in place, and a relay of version 7 left running keeps claiming). When a node is gone, the
+next claim of any relay takes its leases over, its calls in flight made again under the same
+idempotency key, without waiting for the leases to run out. In a cluster every session that
+holds what others wait for, the relays', the inbox's and every AgentGov governor's, is
+bounded by `session_timeout_seconds`, and every connection a node opens says whose it is in
+`pg_stat_activity`: `interlock-<part>@<node>`.
+
+A node gone is fenced: at each heartbeat a node ends every session of a node whose lock no
+session holds, found by its connections' names. A frozen node, or one lost to the network,
+holds nothing past its session timeout and a heartbeat: not its transactions, and not a
+lock it was waiting for, which it would otherwise take and sit on for a bound of its own,
+one wait after another. A node that may not end them says so once in its log, and they
+end at their own bounds; `interlock_cluster_fenced_total` counts the sessions a node ended.
+
+In Kubernetes: a StatefulSet, with `INTERLOCK_NODE` from the pod's name; a volume per pod
+for its escrow chains and its receipt log (`[receipts] log_id` unique per pod); the operator
+log on a `ReadWriteMany` volume every pod mounts, whose file locks work; `/healthz` for
+readiness and liveness, a node on standby for a role being healthy; and the node's session
+reaching PostgreSQL directly or through a pool in session mode, never in transaction mode.
+`interlock daemon` exits 3 when its node runs already, or when another process took its
+name while it ran.
+
 ### Metrics
 
 With `[metrics] listen` set, or `interlock daemon --metrics HOST:PORT`, the daemon serves
@@ -1663,36 +1721,49 @@ and records it; it exports no spans of its own.
 
 ### The soak
 
-`scripts/live_stress_test.py` runs the whole daemon for minutes against a live PostgreSQL,
-in a container it starts or on a server you name:
+`scripts/live_stress_test.py` runs a cluster of daemons for minutes against a live
+PostgreSQL, in a container it starts or on a server you name:
 
 ```bash
 uv run python scripts/live_stress_test.py --docker --minutes 5
 uv run python scripts/live_stress_test.py --dsn postgresql://admin:pw@localhost:5432/postgres
 ```
 
-Agents keep plans in flight: checkouts that insert an order and charge for it, carrying the
-refund that undoes it; reconciliations of what the payment API's webhooks say; notes on
-rows every agent contends for; and, now and then, a plan that must be refused. A fake
+It runs `--nodes` daemons, three by default, each `interlock daemon --node` in a process of
+its own, over one database and one ledger. On every node, agents keep plans in flight:
+checkouts that insert an order and charge for it, carrying the refund that undoes it;
+reconciliations of what the payment API's webhooks say; notes on rows every node contends
+for; and, now and then, a plan that must be refused. A fake
 payment API answers in Stripe's shape, honours idempotency keys, and fails on purpose:
 500s after acting, 429s, replies slower than the relay waits. Its webhooks come back
 signed, duplicated, early, about objects nobody created, and forged. An operator refunds
-paid orders, every action signed. Then the soak proves, from the database, the ledger and
-the logs: no deadlock; lock waits within their bounds and every lost race retried to an
+paid orders, every action signed. Webhooks reach the nodes through a balancer that takes a
+node out when it stops answering. At 45% of the load the node leading the vacuum is killed
+with `SIGKILL` while its relays have a call in flight; at 70% the node leading it then is
+frozen with `SIGSTOP` with a call in flight and a stage open, its connections left open as
+a host lost to the network leaves them, and killed once the server and the other nodes have
+ended everything it held. Each comes back, as a pod is rescheduled, and recovers. Then the soak proves, from the database, the ledger, the logs and
+each node's journal of what its agents did: no deadlock; lock waits within their bounds and every lost race retried to an
 outcome; every rate window within its limit at every instant of its history; the ledger
 balanced to the cent, each plan charged once and each refund credited once; one charge per
-order and one receipt per delivery; no forgery accepted; the vacuum keeping the outbox
+order and one receipt per delivery, but for a plan whose node died before issuing its action
+receipt; no forgery accepted; the vacuum keeping the outbox
 bounded as it runs; every verifier passing after; a graceful stop, a second daemon
 recovering nothing; every checkout's trace context carried to the payment API, onto its
 refund, back on the facts its webhooks became and on to the plans that consumed them,
 whatever the vendor sent; the metrics, scraped every second, telling what the run
-counted itself; and keys that rotate under load. The relays, the inbox and the vacuum sign
-through a key service in the soak's process, and halfway through, the operator rotates the
-relays' key: a new version, registered; the daemon reloaded; the old key revoked while a
-stale relay still holding it has a call in flight. The database refuses that relay's
-outcome, another relay delivers its message once under the new key, and everything the old
-key attested before verifies under its seal. `tests/test_soak.py` runs it for half a minute
-in the test suite.
+counted itself; keys that rotate under load; every node sharing the work; one node leading
+each role at a time; the killed node's lock gone with it, its leases taken over within a
+second and its call in flight made again and acted on once; the frozen node's leases taken
+only once its node was gone, every session it had fenced a heartbeat after, and no survivor
+waiting on one of them longer.
+The relays, the inbox and the vacuum sign through a key service in the soak's process, and
+a quarter of the way through, the operator rotates the relays' key: a new version,
+registered; every node reloaded with `SIGHUP`; the old key revoked while a stale relay still
+holding it has a call in flight. The database refuses that relay's outcome, another relay
+delivers its message once under the new key, and everything the old key attested before
+verifies under its seal. `tests/test_soak.py` runs it for a minute and a half in the test
+suite.
 
 ### The security audit
 
@@ -1838,6 +1909,10 @@ against the shipped code, not inferred.
   installed by `interlock install`, as on PostgreSQL.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
+- **A node's deliveries wait for it.** In a cluster each node settles its own plans'
+  deliveries, from its own chains and receipt log: a node that never comes back leaves them
+  unsettled until its volume is given to another process as that node. Its payments are
+  made, its webhooks recorded and its facts consumed by the rest of the cluster meanwhile.
 
 [`docs/ESCROW_SPEC.md`](docs/ESCROW_SPEC.md) is the interface contract, the architecture
 built on it (§5: components, data flows, roles, evidence, concurrency), and a conformance

@@ -1,6 +1,6 @@
 # Epic 9: high availability, several daemons on one database
 
-**Status: design** on `feat/epic9-ha-clustering`. Builds on
+**Status: built** on `feat/epic9-ha-clustering`; §9 records how. Builds on
 [`EPIC8_DESIGN.md`](EPIC8_DESIGN.md). Every part of Interlock already survives a crash, and the
 relays and the inbox already share their work across processes. This epic runs three to five
 daemons at once, each in a Kubernetes pod of its own, over one PostgreSQL database and one
@@ -10,7 +10,8 @@ twice, a webhook recorded twice, or a lock held past a bound. Four parts:
 1. **Nodes and leadership** (§1). Each daemon is a *node* of a cluster. It holds its node's
    lock in PostgreSQL for as long as it lives, and the parts that must run on one node at a
    time follow a *leadership*: an advisory lock on the same session. When a node dies, the
-   database ends its session, and with it every lock the node held.
+   database ends its session, and with it every lock the node held; the nodes that survive
+   then end every other session it had (*fencing*).
 2. **Leases that follow their node** (§2). A relay's lease names its node. A lease whose node
    is gone is taken over at the next claim, without waiting for the lease to run out.
 3. **The singletons** (§3). The vacuum and the inbox's matcher run on one node of the cluster at a time.
@@ -38,7 +39,8 @@ Decided before any code:
   a frozen process, a host lost to the network. So every session a daemon opens bounds how
   long it may sit in a transaction, and the node's own session how long it may sit silent.
   A node gone takes nothing with it past those bounds: no row lock, no ledger lock, no
-  lease, no leadership.
+  lease, no leadership. And the nodes that survive end the rest of a gone node's sessions
+  (§1.5), so a frozen node's waits for locks it would take and sit on end too.
 - **Per-node state stays per node.** Each node's engines write escrow chains of their own and
   issue action receipts into a receipt log of their own, on the node's own volume. Nothing
   about them changes: a node killed and started again recovers them exactly as a crashed
@@ -60,11 +62,14 @@ heartbeat_seconds = 1               # how often the node shows it is alive
 session_timeout_seconds = 10        # how long a silent node keeps what it holds
 ```
 
-In Kubernetes, a StatefulSet's pod name, through the downward API. `[cluster]` needs
-PostgreSQL. The node's *session* is one connection of its own, as any role (an advisory lock
-needs no privilege; the audit role will do). It must reach the server directly or through a
-pooler in session mode: a transaction-mode pooler hands a session's locks to whoever runs
-next on it.
+In Kubernetes, a StatefulSet's pod name, through the downward API: 40 characters at most,
+so that every connection's name holds it whole (§1.5). `[cluster]` needs PostgreSQL, and its
+`database` is the database Interlock is installed in: a node's lock is that database's own,
+and the relays look for it in theirs (§2), so a daemon's node refuses to join a database
+without Interlock's storage. The node's *session* is one connection of its own, as a role of
+its own: an advisory lock needs no privilege, and fencing (§1.5) needs `pg_signal_backend`.
+It must reach the server directly or through a pooler in session mode: a transaction-mode
+pooler hands a session's locks to whoever runs next on it.
 
 When the daemon starts, before its engines recover anything, the node *joins*: its session
 takes the node's lock, `pg_try_advisory_lock(NODE, key(node))`, and keeps it until the
@@ -82,10 +87,11 @@ The session is set up so the server ends it when the node goes silent:
 - `application_name` is `interlock-cluster@<node>`: who holds what is plain in
   `pg_stat_activity`.
 
-Each heartbeat reads the advisory locks the session holds (`pg_locks`, its own `pid`). A
-heartbeat that fails means the session is gone, and every leadership with it: the node
-counts itself out of every role at once, reconnects and joins again. If another process took
-the node's lock in between, the daemon stops: it is the stale one.
+Each heartbeat reads the advisory locks the session holds (`pg_locks`, its own `pid`), then
+fences the nodes gone (§1.5). A heartbeat that fails means the session is gone, and every
+leadership with it: the node counts itself out of every role at once, reconnects and joins
+again. If another process took the node's lock in between, the daemon stops: it is the stale
+one.
 
 ### 1.2 Leadership
 
@@ -128,9 +134,37 @@ named `cluster`, and each led service as `running` or `standby`.
 | `interlock_cluster_node` | gauge | `node` | 1 while the process holds its node's lock |
 | `interlock_cluster_leader` | gauge | `role` | 1 while the node leads the role |
 | `interlock_cluster_leaderships_total` | counter | `role` | times the node took the role |
+| `interlock_cluster_fenced_total` | counter | | sessions this node ended of nodes gone (§1.5) |
 | `interlock_lease_takeovers_total` | counter | | leases a relay took from a node that was gone |
 
 Labels come from configuration: the node's name and the roles its parts follow.
+
+### 1.5 Fencing
+
+A node the database counts gone may still have sessions on the server: a frozen process,
+or a host lost to the network, leaves every connection open. Each holds what it holds until
+its own bound ends it, and one waiting for a lock takes the lock when its turn comes and
+sits on it for a bound of its own: a frozen node with three sessions queued for the ledger's
+writer lock holds it for three bounds, one after another, and the whole cluster's ledger
+waits that long.
+
+So the nodes that survive *fence* a node gone. At each heartbeat a node reads
+`pg_stat_activity` for the sessions of other nodes, by their names
+(`interlock-<part>@<node>`, §3.3), and ends each with `pg_terminate_backend`, in one
+statement that first takes the node's lock shared: the try fails while any session holds
+the node's lock, so a live node's sessions are never touched, and it holds the lock to the
+statement's end, so the node cannot join again in between. A node's cluster session is left
+alone, and so is its next incarnation's, waiting there to join; the rest of an incarnation
+opens only after it joins. A name PostgreSQL may have cut, 63 bytes or more, is never read
+as a node's.
+
+A frozen node then holds nothing past its session timeout and a heartbeat, however many of
+its sessions were waiting for what. Ending another role's session takes
+`pg_signal_backend`, and a superuser's a superuser: a node that may not says so once in its
+log, and the sessions end at their own bounds (§3.3). Fencing is liveness, never safety: a
+node fenced while only paused finds its connections gone, as after a restart of the
+database, and every part opens again; nothing it did is undone that the database had
+committed.
 
 ## 2. Leases that follow their node
 
@@ -251,7 +285,7 @@ New claims, beside the twelve of Epics 6 to 8:
 | **nodes share the work** | every node committed plans, delivered messages, answered webhooks and settled its deliveries |
 | **one leader at a time** | `pg_locks`, sampled throughout: no role ever held by two sessions; every vacuum run by the node leading `vacuum` then, as the operator log names it; every receipt log settled by its own node; leadership taken by a survivor after each death |
 | **a node killed is survived** | the dead node's leases taken over within a second of its death, its call in flight made again under the same key and answered from the vendor's store; its sessions gone at once; each plan it had in flight committed whole, recovered by its next incarnation, or left nothing; its holds released and its claims redeemed |
-| **a node frozen is survived** | every transaction the frozen node held ended by the server within its bound, and its node lock with its session; its leases taken over once its node was gone, not before; no survivor waited on its locks past them; then as for a kill |
+| **a node frozen is survived** | its node's lock released at its session timeout, its leases taken over then and not before; every session it had ended by a survivor's fencing a heartbeat later, every lock it held with them, and none past its own bound; no survivor waiting on one of its sessions longer (`pg_blocking_pids`); then as for a kill |
 
 And across both deaths, every claim of Epics 6 to 8 holds: no payment made twice, no event
 recorded twice, no fact consumed twice, the ledger balancing to the cent, every log
@@ -276,7 +310,12 @@ verifying.
   transaction release their locks within the bound.
 - Recovery that waits out a predecessor's transaction.
 - Two daemons as processes on one database: one killed with a lease in hand, the other taking
-  its lease at once and its vacuum leadership after.
+  its lease at once and its vacuum leadership after; one frozen, the other ending each of its
+  sessions once its session times out.
+- Fencing: a gone node's sessions ended at a survivor's heartbeat, its lock released with
+  them; a live node's, the survivor's own, the next incarnation's and what no node opened
+  left alone; a node without the privilege saying so once. A daemon's node refusing a
+  database without Interlock's storage.
 - The soak (§5); the mutation pass.
 
 ## 7. Sequence
@@ -310,4 +349,96 @@ verifying.
   write it in turn under its lock, which the shared volume must honour.
 - **The node's session needs a session.** A transaction-mode pooler cannot carry it; every
   other connection may go through one, as before.
+- **Fencing trusts names.** A session called `interlock-<part>@<node>` is taken for that
+  node's: a connection of something else that calls itself so is ended when the node is
+  gone.
+- **A superuser's sessions are fenced only by a superuser.** Run the parts, the ledger
+  included, as roles of their own; one opened as a superuser holds what it holds to its own
+  bound when its node freezes.
+- **A stage's bounds are its transaction's.** They are `SET LOCAL`, as a transaction-mode
+  pooler needs. A statement past its bound aborts the transaction, which releases its locks,
+  and the session stays, idle in the aborted transaction and holding nothing, until a
+  survivor fences it or its process ends.
+- **A plan committed by a node that died before its action receipt** has no action receipt,
+  and its deliveries are settled without delivery receipts, as a commit recovered after a
+  crash always was (§9).
 - **SQLite has no cluster.** One file has one host.
+
+## 9. As built
+
+- **Nodes and leadership** (`interlock.cluster`, step 3): as §1. A heartbeat asks only
+  whether the session still holds the node's lock: a session that holds it holds every role
+  it took, since a session-level lock ends only with an unlock, which resigning records, or
+  with the session. One that no longer holds it is what a transaction-mode pooler in front
+  of the node's session would leave, and the node counts itself out and joins again.
+- **Leases that follow their node** (storage version 8, step 4): as §2. The test of a node
+  gone is a shared try of its lock, held to the end of the claim's transaction: it reads no
+  `pg_locks`, and keeps the node from joining again mid-claim. A gone node's leases are
+  claimed before the messages due: a lease taken over still says it runs to its expiry, and
+  ordered by that, a dead node's work in flight waited behind every message due under a
+  backlog. The order costs a sort only while some node is gone.
+- **The daemon as a node** (step 5): as §3, but for one thing. §3.3 bounds the settler's and
+  the vacuum's sessions too; they are not bounded. Each transaction they open is a read-only
+  snapshot, which holds no lock a writer waits for and is verified inside for as long as the
+  history takes, or a single statement: a settlement, a compaction. A bound would cut a long
+  survey short. Fencing ends them with the rest of a gone node's sessions.
+- **Fencing** (§1.5) was not in the design. The soak's freeze showed what the bounds alone
+  allow: the frozen node had three sessions queued for the ledger's writer lock, each took
+  it in turn and held it for its four-second idle bound, and the rest of the cluster waited
+  11.8 s for the ledger, three bounds one after another. With the default ten-second bound
+  and a busier node, that passes a governor's thirty-second lock timeout. Two rules came
+  with it: a node is named in 40 characters, so that its connections' names hold it whole;
+  and a daemon's node joins only the database Interlock is installed in, since a relay that
+  looked for the nodes' locks in another database would find every node gone, and take every
+  live node's leases over.
+- **What the soak found**, and what changed for it:
+  - A node froze 57 ms after a plan's commit record, before its action receipt: the engine
+    was booking the charge, which waits for the ledger's writer lock. The record names the
+    receipt, so the node's next incarnation waited for it on every pass, for good: the
+    delivery was never settled, its outbox row never pruned, and the run never settled. A
+    receipt is now owed while the engine call that chose its id runs
+    (`ReceiptIssuer.owe`, `owes`, `forgo`). One the chain names and nothing owes was never
+    issued and never will be: its delivery is settled without a delivery receipt, the
+    settlement naming the receipt and why, as a commit recovered after a crash always was.
+    The same change closes the window before the commit record, in which a settler found no
+    receipt for a plan whose stage had committed and settled its delivery without one for
+    good: a delivery whose stage has a commit intent with no outcome after it waits. Exactly
+    once accepts a delivery settled without a receipt only for a plan in flight on a node
+    that died, whose commit names a receipt its log does not hold.
+  - A stage frozen between its `BEGIN` and its `SET LOCAL` bounds sat in its transaction
+    with no bound at all. They are one message now.
+  - A frozen stage whose statement passed its bound aborted, and released its locks; but an
+    abort reverts `SET LOCAL`, so the session stayed, idle in the aborted transaction and
+    holding nothing. The frozen claim measured sessions ending rather than locks released,
+    and failed: it measures both now, and fencing ends the sessions.
+  - A vacuum on standby exported none of its families, which the metrics claim reads on
+    every node: they are exported at zero from the start.
+  - The harness picked a death's moment by reading the database, then signalling: the node
+    finished its call in between, and was frozen with none in flight. It now stops the node
+    first, looks, and lets it go on if it is not there yet; poised, the node is killed, or
+    left frozen.
+- **The mutation pass**: 59 mechanisms, each removed in turn, and every one fails a test.
+  The first pass left three alive, and each called for a change now in the tree. The roles
+  a node held were cleared twice, where its session was lost and again where it joined:
+  either alone was enough, so neither was guarded; they are cleared where the session is
+  lost, as §1.1 says. The test of a standby vacuum's families asked for a value, which is 0
+  for a series never written as much as for one written at zero: it reads the exposition.
+  And a daemon whose name another process took while it ran exited 3 only in an in-process
+  test: a daemon is now paused while its session ends and its name is taken, and exits 3.
+  Written ahead of the pass, for what it would have found unguarded: the wiring of a node's
+  parts (their roles, the settler's partition, each session's bound and name, recovery's
+  wait), which only the soak exercised, and fencing now hides from it; what fencing leaves
+  alone (a next incarnation waiting to join, a name PostgreSQL cut); a session that no
+  longer holds its node's lock, as a transaction-mode pooler leaves it; and a daemon's
+  node refusing a database without Interlock.
+- **The soak** (step 6): as §5, the frozen claim with fencing. Five minutes on
+  `postgres:16`, three nodes, each with four agents of three plans in flight, four engines
+  and two relays: every claim holds. 8,939 plans submitted and 8,177 charged, each once;
+  2,010 payment calls, each acted on once, and 142 replays of a key's result; 2,007 delivery
+  receipts across three logs, and three deliveries settled without one, each of a plan its
+  dead node never issued a receipt for. The killed node's lock was released 0.02 s after it
+  died and its lease taken over 0.08 s after. The frozen node's lock was released 3.79 s
+  after it froze (a four-second session timeout), its lease taken over 3.84 s after, and
+  every session it had ended 3.90 s after, by node-1's fencing; the longest any survivor
+  waited on one of its sessions was 3.45 s. `tests/test_soak.py` runs a minute and a half
+  of it.

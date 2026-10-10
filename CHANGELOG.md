@@ -9,6 +9,85 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (Epic 9: several daemons on one database; `docs/EPIC9_DESIGN.md`)
+
+- **Nodes of a cluster** (`interlock.cluster`, `[cluster]`). A daemon in a cluster is a
+  node: its session holds the node's lock in PostgreSQL, a session-level advisory lock, for
+  the life of its process, so the database alone decides when a node is gone, by ending its
+  session: at once for a process killed, after `session_timeout_seconds`
+  (`idle_session_timeout`, with TCP keepalives) for one frozen or lost to the network.
+  `ClusterNode.join` waits for a previous incarnation's session, then refuses a node that
+  runs (`NodeTakenError`); a heartbeat that finds its session gone counts the node out of
+  every role at once and joins again, and a supervisor whose node another process took
+  stops. `[cluster]`: `node` (or `INTERLOCK_NODE`, or `interlock daemon --node NAME`),
+  `database` (or `INTERLOCK_CLUSTER_DATABASE`), `heartbeat_seconds`,
+  `session_timeout_seconds`. PostgreSQL only. A node is named in 40 characters at most, and
+  a daemon's node joins only the database Interlock is installed in, where the relays look
+  for its lock.
+- **A node gone is fenced.** At each heartbeat a node ends every session of a node whose
+  lock no session holds, found by its connections' names: a frozen node's transactions, and
+  its waits for locks it would take and sit on, end once its session times out, not one
+  bound after another. It takes `pg_signal_backend` (a superuser's sessions, a superuser);
+  without it a node says so once. `interlock_cluster_fenced_total`.
+- **Roles one node leads.** `Service.leader`: a service that follows a role steps only
+  while its node leads it, an advisory lock on the node's session, and is on `standby`,
+  healthy, otherwise; it drains only as a leader, and resigns as it closes or fails. In the
+  daemon the vacuum follows `vacuum`, the inbox's matcher `inbox-matcher`, and each node's
+  settler `settler:<receipt log id>`; a vacuum's operator record names the node that ran it.
+- **Leases that follow their node** (**storage version 8**: `outbox_state.lease_node`). A
+  relay of a node names the node in each lease, and `relay_claim` takes over the leases of a
+  node no session holds the lock of at its next claim, first of everything due, without
+  waiting for them to run out: a call in flight is recorded lost and made again under its
+  idempotency key, the fence refusing the old relay's outcome. `Lease.taken_from`,
+  `interlock_lease_takeovers_total`. The four-argument `relay_claim` stays: a relay of
+  version 7 left running keeps claiming. `interlock install` upgrades version 7 in place.
+- **The settler, by receipt log.** In a cluster a settler settles only the deliveries of
+  plans its own engines' chains record (`Settler(partition=True)`), into the log that holds
+  their action receipts: the nodes' shares are disjoint. `verify_settlements` takes every
+  node's receipt log.
+- **What a node holds, the server bounds.** In a cluster the relays', the inbox's and every
+  AgentGov governor's transactions end after `session_timeout_seconds` idle, so a node that
+  freezes holds a source's log, a claim's rows or the ledger's writer lock no longer. Every
+  connection a node opens is called `interlock-<part>@<node>`, and a relay's id names its
+  node.
+- **Recovery waits out a predecessor**: `EnginePool(recover_wait=)` asks again while an
+  intent's transaction still runs on the server, as a node's previous incarnation can leave
+  one; `EscrowEngine.awaiting_recovery()`.
+- Metrics: `interlock_cluster_node`, `interlock_cluster_leader`,
+  `interlock_cluster_leaderships_total`, `interlock_cluster_fenced_total`,
+  `interlock_lease_takeovers_total`; the vacuum's
+  families are exported at zero from the start, on a standby node too.
+- **The soak, as a cluster.** `scripts/live_stress_test.py` runs `--nodes` daemons (three
+  by default), each `interlock daemon --node` in a process of its own with a journal of what
+  its agents did, behind a balancer; rotates the relays' key across them; kills the node
+  leading the vacuum with `SIGKILL`, and later freezes the one leading it then with
+  `SIGSTOP`, its connections left open, and kills it once the server and the cluster let go
+  of it; each comes back. Four new claims: **nodes share the work**, **one leader at a time**, **a node killed
+  is survived**, **a node frozen is survived**; every claim of Epics 6 to 8 holds across
+  both deaths.
+
+### Fixed (Epic 9)
+
+- **Several daemons' settlers settled each other's plans, for good.** A settler settled a
+  delivery of a plan no chain of its own recorded without its receipt, and a compensation of
+  one without its credit. A node of a cluster now settles only its own plans.
+- **An inbox that hung mid-record held its source's log forever**, every other inbox
+  process waiting behind it: an inbox's transactions now end after 60 seconds idle outside a
+  cluster, `session_timeout_seconds` in one.
+- **A delivery whose plan's action receipt was never issued was never settled.** A process
+  that stopped between a plan's commit record and its action receipt (booking the charge,
+  which waits for the ledger's lock, comes in between) left the record naming a receipt the
+  settler waited for on every pass, for good, and the message was never pruned. A receipt is
+  now owed while the engine call that chose it runs (`ReceiptIssuer.owe`, `owes`, `forgo`);
+  one the chain names that nothing owes was never issued, and its delivery is settled
+  without a delivery receipt, the settlement saying why, as a commit recovered after a crash
+  always was.
+- **A delivery settled in the moment before its commit was recorded lost its receipt.** A
+  relay can deliver, and the settler run, between a stage's commit and the chain's record of
+  it: the settler found no receipt for the plan and settled the delivery without one, for
+  good. A delivery whose stage has a commit intent with no outcome after it now waits.
+- **A stage frozen right after its `BEGIN` was never ended.** Its bounds were set in a
+  second message; they now travel with the `BEGIN`.
 ### Added (Epic 8: keys held elsewhere, rotated and revoked; the security audit; `docs/EPIC8_DESIGN.md`)
 
 - **Remote signers** (`interlock.signers`). `RemoteSigner` implements agentgov's `Signer`
