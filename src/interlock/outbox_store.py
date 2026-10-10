@@ -65,7 +65,10 @@ class OutboxStore(Protocol):
     def claim(
         self, relay_id: str, lease: timedelta, limit: int, sinks: Sequence[str], deadline: float
     ) -> list[Lease]:
-        """Lease up to ``limit`` due messages for these sinks."""
+        """Lease up to ``limit`` due messages for these sinks. A store that
+        knows clusters (:class:`PostgresOutboxStore`) also takes ``node=``,
+        the cluster node the relay runs on (``docs/EPIC9_DESIGN.md`` §2): its
+        leases name the node, and are taken over once the node is gone."""
         ...
 
     def sending(self, lease: Lease, relay_id: str, detail: str) -> int | None:
@@ -106,13 +109,26 @@ class PostgresOutboxStore:
     :param dsn: A connection string for a relay role (``relay_roles`` at
         install): it can read the outbox and call the relay functions, and
         nothing else.
+    :param application_name: What its connection is called in
+        ``pg_stat_activity``: ``interlock-relay@<node>`` in a cluster.
+    :param idle_timeout: Seconds the server lets the relay sit inside a
+        transaction before it ends the session: what a relay that froze
+        mid-claim holds, it holds no longer (``docs/EPIC9_DESIGN.md`` §3.3).
     :raises SubstrateUnavailableError: If the database cannot be reached.
     """
 
-    __slots__ = ("_conn", "_dsn", "checkpoint")
+    __slots__ = ("_conn", "_dsn", "_idle_ms", "_name", "checkpoint")
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        application_name: str = "interlock-relay",
+        idle_timeout: float = 60.0,
+    ) -> None:
         self._dsn = dsn
+        self._name = application_name
+        self._idle_ms = max(1, int(idle_timeout * 1000))
         self._conn: psycopg.Connection[Any] | None = None
         self.checkpoint: Checkpoint = _no_checkpoint
         self._connect()
@@ -128,10 +144,10 @@ class PostgresOutboxStore:
         from interlock.postgres import INSTALL_VERSION, installed_version
 
         try:
-            conn = psycopg.connect(self._dsn, autocommit=True, application_name="interlock-relay")
+            conn = psycopg.connect(self._dsn, autocommit=True, application_name=self._name)
             conn.execute("SET statement_timeout = '30s'")
             conn.execute("SET lock_timeout = '10s'")
-            conn.execute("SET idle_in_transaction_session_timeout = '60s'")
+            conn.execute(f"SET idle_in_transaction_session_timeout = {self._idle_ms}")
             current = installed_version(conn) >= int(INSTALL_VERSION)
         except psycopg.Error as exc:
             raise SubstrateUnavailableError(f"the relay cannot reach its database: {exc}") from exc
@@ -160,7 +176,14 @@ class PostgresOutboxStore:
         return SubstrateUnavailableError(f"the relay lost its database: {exc}")
 
     def claim(
-        self, relay_id: str, lease: timedelta, limit: int, sinks: Sequence[str], deadline: float
+        self,
+        relay_id: str,
+        lease: timedelta,
+        limit: int,
+        sinks: Sequence[str],
+        deadline: float,
+        *,
+        node: str | None = None,
     ) -> list[Lease]:
         import psycopg
 
@@ -170,8 +193,8 @@ class PostgresOutboxStore:
             conn = self.connection()
             with conn.transaction():
                 rows = conn.execute(
-                    "SELECT * FROM interlock.relay_claim(%s, %s, %s, %s)",
-                    (relay_id, lease.total_seconds(), limit, sorted(sinks)),
+                    "SELECT * FROM interlock.relay_claim(%s, %s, %s, %s, %s::text)",
+                    (relay_id, lease.total_seconds(), limit, sorted(sinks), node),
                 ).fetchall()
                 traces = self._traces(conn, [row[0] for row in rows]) if rows else {}
                 self.checkpoint("claim-uncommitted", None)

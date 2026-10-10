@@ -37,7 +37,7 @@ from interlock.exceptions import SubstrateConfigurationError
 from interlock.operators import OperatorLog, verify_operators
 from interlock.outbox_store import PostgresOutboxStore
 from interlock.records import Keyring, read_records
-from interlock.relay import DELIVERED, RETRYABLE, NoBreaker, Relay
+from interlock.relay import DELIVERED, RETRYABLE, Lease, NoBreaker, Relay
 from interlock.sqlite_outbox import (
     COMPACTOR,
     VERSION,
@@ -57,6 +57,7 @@ from tests.outbox_env import (
     RELAYS,
     SCOPE,
     Scripted,
+    claim_before_version_8,
     mail,
     relay_signer,
 )
@@ -145,6 +146,18 @@ class Version4Store(PostgresOutboxStore):
     def _traces(self, conn: Any, messages: list[Any]) -> dict[Any, str]:
         return {}  # a version before 6 kept no trace context
 
+    def claim(
+        self,
+        relay_id: str,
+        lease: timedelta,
+        limit: int,
+        sinks: Any,
+        deadline: float,
+        *,
+        node: str | None = None,
+    ) -> list[Lease]:
+        return claim_before_version_8(self, relay_id, lease, limit, sinks, deadline)
+
 
 @pytest.fixture
 def roles(pg_admin_dsn: str, pg_back_office: str) -> Iterator[tuple[str, str]]:
@@ -230,8 +243,8 @@ def test_version_5_over_version_4_on_postgres(
     install()
     install()
     with psycopg.connect(pg_back_office, autocommit=True) as conn:
-        # Over version 4, an install brings the current version: 5's, 6's and 7's.
-        assert installer.installed_version(conn) == int(installer.INSTALL_VERSION) == 7
+        # Over version 4, an install brings the current version: 5's to 8's.
+        assert installer.installed_version(conn) == int(installer.INSTALL_VERSION) == 8
         assert (
             conn.execute(
                 "SELECT message_id, seq, event_hash FROM interlock.outbox_attempts ORDER BY 1, 2"

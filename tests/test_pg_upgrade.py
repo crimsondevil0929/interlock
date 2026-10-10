@@ -69,6 +69,7 @@ from tests.outbox_env import (  # noqa: E402
     RELAYS,
     SCOPE,
     Scripted,
+    claim_before_version_8,
     mail,
     relay_signer,
     vouch,
@@ -218,6 +219,18 @@ class OldStore(PostgresOutboxStore):
 
     def _traces(self, conn: Any, messages: list[Any]) -> dict[Any, str]:
         return {}  # a version before 6 kept no trace context
+
+    def claim(
+        self,
+        relay_id: str,
+        lease: timedelta,
+        limit: int,
+        sinks: Any,
+        deadline: float,
+        *,
+        node: str | None = None,
+    ) -> list[Any]:
+        return claim_before_version_8(self, relay_id, lease, limit, sinks, deadline)
 
     def outcome(
         self,

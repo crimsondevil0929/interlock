@@ -341,6 +341,10 @@ class Lease:
     traceparent: str | None = None
     """The request's trace context, its plan's: sent with the call, and in
     nothing the relay attests."""
+    taken_from: str | None = None
+    """The cluster node whose lease this one took over, because the node was
+    gone before the lease ran out (``docs/EPIC9_DESIGN.md`` §2); ``None``
+    otherwise."""
 
     @classmethod
     def from_row(cls, row: Sequence[Any], deadline: float) -> Lease:
@@ -366,6 +370,7 @@ class Lease:
             unknown_outcome=str(row[18]),
             lease_expires=row[19],
             deadline=deadline,
+            taken_from=None if len(row) < 21 or row[20] is None else str(row[20]),
         )
 
 
@@ -423,6 +428,10 @@ class Relay:
         records carries its signed attestation of what the sink answered
         (ARC1 1.1; ``docs/EPIC4_DESIGN.md`` §1.1), and the database refuses an
         outcome without one. Register its public half in ``[relays.keys]``.
+    :param node: The cluster node this relay runs on (``docs/EPIC9_DESIGN.md``
+        §2): each lease names it, and another relay takes the lease over as
+        soon as the node is gone, without waiting for it to run out. ``None``
+        outside a cluster: a lease only runs out.
     :raises ValueError: On a lease shorter than twice the timeout, no
         adapters, or a key that is not Ed25519.
     :raises SubstrateUnavailableError: If the database cannot be reached.
@@ -434,6 +443,7 @@ class Relay:
         "_breaker",
         "_breaker_retry",
         "_lease",
+        "_node",
         "_relay_id",
         "_signer",
         "_store",
@@ -454,6 +464,7 @@ class Relay:
         breaker_retry: timedelta = timedelta(seconds=5),
         signer: Signer,
         metrics: Metrics | None = None,
+        node: str | None = None,
     ) -> None:
         if not adapters:
             raise ValueError("a relay needs an adapter for at least one sink")
@@ -479,6 +490,7 @@ class Relay:
         self._batch = batch
         self._breaker_retry = breaker_retry
         self._signer = signer
+        self._node = node
         self._store: OutboxStore = PostgresOutboxStore(store) if isinstance(store, str) else store
         self._store.checkpoint = self._reached
         self.metrics: Metrics = metrics if metrics is not None else NullMetrics()
@@ -556,9 +568,28 @@ class Relay:
 
     def _claim(self, limit: int) -> list[Lease]:
         deadline = time.monotonic() + self._lease.total_seconds()
-        return self._store.claim(
-            self._relay_id, self._lease, limit, sorted(self._adapters), deadline
-        )
+        sinks = sorted(self._adapters)
+        if self._node is None:
+            leases = self._store.claim(self._relay_id, self._lease, limit, sinks, deadline)
+        else:
+            # A store that knows clusters takes the node (PostgreSQL's): a
+            # relay is given one only in a cluster, which only it has.
+            clustered: Any = self._store
+            leases = clustered.claim(
+                self._relay_id, self._lease, limit, sinks, deadline, node=self._node
+            )
+        taken = sum(1 for lease in leases if lease.taken_from is not None)
+        if taken:
+            self.metrics.inc("interlock_lease_takeovers_total", taken)
+            for lease in leases:
+                if lease.taken_from is not None:
+                    logger.warning(
+                        "relay %s: took over message %s from node %s, which is gone",
+                        self._relay_id,
+                        lease.message_id,
+                        lease.taken_from,
+                    )
+        return leases
 
     def _deliver(self, lease: Lease) -> str:
         """Deliver one leased message. Returns what became of it: the state it

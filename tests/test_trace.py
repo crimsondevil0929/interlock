@@ -547,7 +547,7 @@ def test_a_postgresql_install_of_version_5_is_upgraded_in_place(outbox: Outbox) 
         assert pg_version(conn) == 5
     outbox.reinstall(RELAY_SINKS)
     with outbox.admin() as conn:
-        assert pg_version(conn) == 7
+        assert pg_version(conn) == 8
     _, (message,) = outbox.commit(mail(1), traceparent=TP)
     assert traces(outbox) == {message: TP}
 

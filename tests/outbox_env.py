@@ -67,7 +67,15 @@ from interlock.outbound import DEAD_LETTER, OperationSpec, SinkRegistry, SinkSpe
 from interlock.outbox_store import OutboxStore, PostgresOutboxStore
 from interlock.postgres import install
 from interlock.records import Keyring, read_records
-from interlock.relay import DELIVERED, Breaker, Delivery, DeliveryResult, LedgerBreaker, Relay
+from interlock.relay import (
+    DELIVERED,
+    Breaker,
+    Delivery,
+    DeliveryResult,
+    Lease,
+    LedgerBreaker,
+    Relay,
+)
 from interlock.sqlite_outbox import (
     COMPACTOR,
     OPERATOR,
@@ -98,6 +106,25 @@ RELAY_SEED = bytes.fromhex("5e" * 32)
 
 def relay_signer() -> Ed25519Signer:
     return Ed25519Signer(RELAY_SEED)
+
+
+def claim_before_version_8(
+    store: PostgresOutboxStore,
+    relay_id: str,
+    lease: timedelta,
+    limit: int,
+    sinks: Any,
+    deadline: float,
+) -> list[Lease]:
+    """A claim as a relay made it before version 8: four arguments, no node
+    (``docs/EPIC9_DESIGN.md`` §2), and no trace context."""
+    conn = store.connection()
+    with conn.transaction():
+        rows = conn.execute(
+            "SELECT * FROM interlock.relay_claim(%s, %s, %s, %s)",
+            (relay_id, lease.total_seconds(), limit, sorted(sinks)),
+        ).fetchall()
+    return [Lease.from_row(row, deadline) for row in rows]
 
 
 RELAYS = Keyring({"relay": relay_signer().public_key()})
