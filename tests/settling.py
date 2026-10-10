@@ -64,11 +64,12 @@ class Bench:
     """One back office, its receipt log and escrow chain, ready to book,
     deliver, compensate and settle."""
 
-    def __init__(self, outbox: Outbox, workdir: Path) -> None:
+    def __init__(self, outbox: Outbox, workdir: Path, *, log_id: str = LOG_ID) -> None:
         self.outbox = outbox
         self.workdir = workdir
+        workdir.mkdir(parents=True, exist_ok=True)
         outbox.reinstall(SINKS)
-        self.log: ReceiptLog = ReceiptLog(LOG_ID, LOG_KEY, path=self.receipts)
+        self.log: ReceiptLog = ReceiptLog(log_id, LOG_KEY, path=self.receipts)
         self.issuer = ReceiptIssuer(self.log, row_secret=ROW_SECRET)
         self.chain = EscrowChain(self.chain_path)
         self._sources: list[Any] = []
@@ -168,6 +169,7 @@ class Bench:
         operators: bool = True,
         sinks: SinkRegistry | None = REGISTRY,
         checkpoint: Callable[[str, uuid.UUID], None] | None = None,
+        partition: bool = False,
     ) -> Settler:
         return Settler(
             self.source(),
@@ -179,6 +181,7 @@ class Bench:
             operators=self.outbox.keyring() if operators else None,
             sinks=sinks,
             checkpoint=checkpoint,
+            partition=partition,
         )
 
     def deliveries(self) -> dict[str, list[DeliveryReceipt]]:

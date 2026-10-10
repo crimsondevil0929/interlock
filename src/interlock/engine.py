@@ -1242,6 +1242,19 @@ class EscrowEngine:
             self._anchor.settle_pending(known - still_open)
         return tuple(resolved)
 
+    def awaiting_recovery(self) -> int:
+        """Commit intents :meth:`recover` could not settle yet: their marker
+        armed, and the server still running their transaction, as a
+        predecessor that died mid-commit can leave it
+        (``docs/EPIC9_DESIGN.md`` §3.4). A later :meth:`recover` settles them."""
+        return sum(
+            1
+            for intent in self._chain.unresolved_intents()
+            if intent.stage_id is not None
+            and intent.stage_id not in self._inflight
+            and intent.note.endswith(_MARKER_ARMED)
+        )
+
     # -- internals ----------------------------------------------------------
 
     def _record(

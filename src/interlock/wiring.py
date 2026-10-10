@@ -30,9 +30,11 @@ if TYPE_CHECKING:
     from interlock.telemetry import Metrics
 
 __all__ = [
+    "ALONE",
     "INBOX_KEY_ENV",
     "RELAY_KEY_ENV",
     "RefusedError",
+    "bounded_session",
     "compactor",
     "inbox_signer",
     "inbox_store",
@@ -56,11 +58,16 @@ logger = logging.getLogger("interlock.wiring")
 
 
 def open_substrate(
-    config: InterlockConfig, *, database: str | None = None, metrics: Metrics | None = None
+    config: InterlockConfig,
+    *,
+    database: str | None = None,
+    metrics: Metrics | None = None,
+    application_name: str = "interlock",
 ) -> ShadowSubstrate:
     """The substrate the file names, connected as the stage role: ``database``,
     else ``[engine] database``, else the file's ``database``; on PostgreSQL,
-    measuring its waits into ``metrics``."""
+    measuring its waits into ``metrics``, its connections called
+    ``application_name``."""
     dsn = database or config.engine.database or config.database
     if config.substrate == "postgres":
         return PostgresSubstrate(
@@ -72,6 +79,7 @@ def open_substrate(
             pool_timeout_seconds=config.engine.pool_timeout_seconds,
             acknowledge_cascades=config.acknowledge_cascades,
             metrics=metrics,
+            application_name=application_name,
         )
     return SqliteSubstrate(
         dsn,
@@ -405,8 +413,46 @@ def operator_signer(
     return opened
 
 
-def inbox_store(config: InterlockConfig, database: str | None) -> tuple[Any, Callable[[], None]]:
-    """Where the inbox records, as its own role, and how to close it."""
+ALONE: float = 60.0
+"""Seconds a session of a part outside a cluster may sit inside a
+transaction, holding what its writes lock, before the server ends it: what
+the relays have always had (``docs/EPIC9_DESIGN.md`` §3.3)."""
+
+
+def bounded_session(dsn: str, *, application_name: str, idle_timeout: float) -> Any:
+    """A connection of a part's own, autocommit, called ``application_name``,
+    whose transactions the server ends once they sit idle ``idle_timeout``
+    seconds: a part that freezes inside one holds its locks no longer
+    (``docs/EPIC9_DESIGN.md`` §3.3).
+
+    :raises SubstrateUnavailableError: If it cannot be had.
+    """
+    import psycopg
+
+    try:
+        conn = psycopg.connect(dsn, autocommit=True, application_name=application_name)
+    except psycopg.Error as exc:
+        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
+    try:
+        conn.execute(
+            f"SET idle_in_transaction_session_timeout = {max(1, int(idle_timeout * 1000))}"
+        )
+    except psycopg.Error as exc:
+        conn.close()
+        raise SubstrateUnavailableError(f"cannot set up the connection: {exc}") from exc
+    return conn
+
+
+def inbox_store(
+    config: InterlockConfig,
+    database: str | None,
+    *,
+    application_name: str = "interlock-inbox",
+    idle_timeout: float = ALONE,
+) -> tuple[Any, Callable[[], None]]:
+    """Where the inbox records, as its own role, and how to close it. On
+    PostgreSQL its transactions are bounded by ``idle_timeout``: each holds its
+    source's log while it records, and another inbox waits for it."""
     sqlite = config.substrate != "postgres"
     dsn = (
         database
@@ -424,14 +470,9 @@ def inbox_store(config: InterlockConfig, database: str | None) -> tuple[Any, Cal
 
         store = SqliteOutboxStore(dsn, writes=INBOX)
         return store, store.close
-    import psycopg
-
     from interlock.inbox_store import PostgresInboxStore
 
-    try:
-        conn = psycopg.connect(dsn, autocommit=True)
-    except psycopg.Error as exc:
-        raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
+    conn = bounded_session(dsn, application_name=application_name, idle_timeout=idle_timeout)
     return PostgresInboxStore(conn), conn.close
 
 
@@ -446,10 +487,15 @@ def open_ledger(ledger: str, *, read_only: bool = False) -> Any:
 
 
 def compactor(
-    config: InterlockConfig, database: str | None = None
+    config: InterlockConfig,
+    database: str | None = None,
+    *,
+    application_name: str = "interlock-vacuum",
 ) -> tuple[Any, Callable[[], None]]:
     """The outbox as a vacuum acts on it, as the installer (``database``, else
-    the file's), and how to close it."""
+    the file's), and how to close it. Its transactions are not bounded: a
+    survey verifies inside its snapshot, which holds no lock a writer waits
+    for, for as long as the history takes, and the act is one statement."""
     dsn = database or config.database
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import COMPACTOR, SqliteOutboxStore
@@ -461,7 +507,7 @@ def compactor(
     from interlock.deliveries import operations
 
     try:
-        conn = psycopg.connect(dsn, autocommit=True)
+        conn = psycopg.connect(dsn, autocommit=True, application_name=application_name)
     except psycopg.Error as exc:
         raise SubstrateUnavailableError(f"cannot connect to PostgreSQL: {exc}") from exc
     return operations(conn), conn.close

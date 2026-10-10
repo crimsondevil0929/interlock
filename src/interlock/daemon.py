@@ -20,6 +20,16 @@ over one SQLite ledger share one, since a SQLite ledger has one writer.
 ``interlock daemon`` runs it::
 
     interlock daemon --config interlock.toml --app myapp.agents:build
+
+With ``[cluster]``, the daemon is a node of a cluster of daemons over one
+database (``docs/EPIC9_DESIGN.md``): it holds its node's lock for its life;
+its relays' leases name the node; the vacuum and the inbox's matcher run on
+the node that leads their role; its settler settles its own engines' plans,
+leading its receipt log's role; every connection is called
+``interlock-<part>@<node>``, and every session that holds what others wait
+for is bounded by ``[cluster] session_timeout_seconds``::
+
+    interlock daemon --config interlock.toml --app myapp.agents:build --node interlock-0
 """
 
 from __future__ import annotations
@@ -29,11 +39,19 @@ import importlib
 import logging
 import os
 import threading
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from interlock.config import METRICS_DATABASE_ENV, SETTLER_DATABASE_ENV, is_dsn
+from interlock.cluster import ClusterNode, connection_name
+from interlock.config import (
+    CLUSTER_DATABASE_ENV,
+    METRICS_DATABASE_ENV,
+    NODE_ENV,
+    SETTLER_DATABASE_ENV,
+    is_dsn,
+)
 from interlock.exceptions import SubstrateConfigurationError
 from interlock.supervisor import (
     AgentContext,
@@ -105,14 +123,56 @@ def load_application(target: str, config: InterlockConfig) -> Application:
     return application
 
 
+class _Membership:
+    """What the parts of one daemon share about its place in a cluster
+    (``docs/EPIC9_DESIGN.md`` §3.3): its node, what each part's connections
+    are called, how long a session that holds what others wait for may sit
+    inside a transaction, and the roles its singletons follow. Alone, outside
+    a cluster: no node, the names and the 60 seconds there were before."""
+
+    def __init__(self, cluster: ClusterNode | None) -> None:
+        self.cluster = cluster
+
+    @property
+    def node(self) -> str | None:
+        return None if self.cluster is None else self.cluster.node
+
+    @property
+    def bound(self) -> float:
+        from interlock.wiring import ALONE
+
+        return ALONE if self.cluster is None else self.cluster.session_timeout
+
+    def name(self, part: str, alone: str) -> str:
+        return connection_name(part, self.node, alone)
+
+    def ledger(self, ledger: str) -> str:
+        """A PostgreSQL ledger's connection string, its connections named for
+        the node; a SQLite file as it is."""
+        if self.node is None or not is_dsn(ledger):
+            return ledger
+        from psycopg.conninfo import make_conninfo
+
+        return make_conninfo(ledger, application_name=self.name("ledger", ""))
+
+    def follow(self, service: Service, role: str) -> Service:
+        """``service``, stepping only while the node leads ``role``."""
+        if self.cluster is not None:
+            service.leader = self.cluster.leadership(role)
+        return service
+
+
 class _Governors:
     """Governors of AgentGov ledgers: one of its own for each caller of a
     PostgreSQL ledger, any number of which may share it; one shared by every
-    caller of a SQLite ledger, which has one writer."""
+    caller of a SQLite ledger, which has one writer. In a cluster, a governor
+    holding the ledger's writer lock in a transaction its node froze in holds
+    it for the session timeout at most."""
 
-    def __init__(self) -> None:
+    def __init__(self, membership: _Membership | None = None) -> None:
         self._lock = threading.Lock()
         self._shared: dict[str, tuple[BudgetManager, int]] = {}
+        self._membership = membership or _Membership(None)
 
     def open(
         self, ledger: str, *, schema: str = "agentgov"
@@ -120,7 +180,10 @@ class _Governors:
         from agentgov import BudgetManager
 
         if is_dsn(ledger):
-            governor = BudgetManager.open_postgres(ledger, schema=schema)
+            membership = self._membership
+            governor = BudgetManager.open_postgres(
+                membership.ledger(ledger), schema=schema, idle_timeout=membership.bound
+            )
             return governor, governor.close
         with self._lock:
             found = self._shared.get(ledger)
@@ -166,28 +229,29 @@ def build_supervisor(
     """
     from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV, RefusedError
 
-    governors = _Governors()
+    membership = _Membership(_cluster(config))
+    governors = _Governors(membership)
     services: list[Service] = []
     engines: EnginePool | None = None
     receipts = _Receipts(config)
     metrics = Metrics()
     if application is not None and (application.checkers or application.agents):
-        engines = _engines(config, application, governors, receipts, metrics)
+        engines = _engines(config, application, governors, receipts, metrics, membership)
     try:
         if config.relay is not None:
             key = relay_key or os.environ.get(RELAY_KEY_ENV) or config.relay.key
-            services += _relays(config, key)
+            services += _relays(config, key, membership)
         if config.inbox.sources and config.inbox.keys is not None:
             key = inbox_key or os.environ.get(INBOX_KEY_ENV) or config.inbox.key
-            services.append(_inbox(config, key, listen))
+            services.append(_inbox(config, key, listen, membership))
         if engines is not None and config.receipts is not None:
-            services.append(_settler(config, engines, receipts, governors))
+            services.append(_settler(config, engines, receipts, governors, membership))
         vacuum = config.vacuum
         if vacuum.every is not None and (vacuum.key is not None or vacuum.signer is not None):
-            services.append(_vacuum(config, governors))
+            services.append(_vacuum(config, governors, membership))
         where = metrics_listen or config.metrics.listen
         if where:
-            services.append(_metrics(config, where))
+            services.append(_metrics(config, where, membership))
     except RefusedError as exc:
         raise SubstrateConfigurationError(str(exc)) from exc
     supervisor = InterlockSupervisor(
@@ -197,12 +261,36 @@ def build_supervisor(
         restart_min=config.daemon.restart_min.total_seconds(),
         restart_max=config.daemon.restart_max.total_seconds(),
         metrics=metrics,
+        cluster=membership.cluster,
     )
     supervisor.on_close(receipts.close)
     if application is not None:
         for agent in application.agents:
             supervisor.agent(agent)
     return supervisor
+
+
+def _cluster(config: InterlockConfig) -> ClusterNode | None:
+    """This daemon's node, as ``[cluster]`` names it; ``None`` alone."""
+    settings = config.cluster
+    if settings is None:
+        return None
+    if not settings.node:
+        raise SubstrateConfigurationError(
+            f"[cluster] names no node: set its node, {NODE_ENV}, or interlock daemon --node NAME"
+        )
+    dsn = settings.database or os.environ.get(CLUSTER_DATABASE_ENV, "")
+    if not dsn:
+        raise SubstrateConfigurationError(
+            f"no database for node {settings.node}'s session: set [cluster] database, or "
+            f"{CLUSTER_DATABASE_ENV}"
+        )
+    return ClusterNode(
+        dsn,
+        settings.node,
+        heartbeat=settings.heartbeat.total_seconds(),
+        session_timeout=settings.session_timeout.total_seconds(),
+    )
 
 
 class _Receipts:
@@ -238,6 +326,7 @@ def _engines(
     governors: _Governors,
     shared: _Receipts,
     metrics: Metrics,
+    membership: _Membership,
 ) -> EnginePool:
     from interlock.chain import EscrowChain
     from interlock.engine import EscrowEngine
@@ -261,7 +350,9 @@ def _engines(
             chain = EscrowChain(path) if path is not None else EscrowChain()
             closers.append(chain.close)
             engine = EscrowEngine(
-                open_substrate(config, metrics=metrics),
+                open_substrate(
+                    config, metrics=metrics, application_name=membership.name("stage", "interlock")
+                ),
                 checkers=application.checkers,
                 chain=chain,
                 anchor=open_anchor(config, governor),
@@ -278,12 +369,23 @@ def _engines(
             raise
         return engine, close
 
+    # A node's previous incarnation may leave a stage running on the server
+    # past its session: a statement waiting on a lock, then the stage's idle
+    # bound. Its next waits that out before it resolves anything.
+    wait = (
+        0.0
+        if membership.cluster is None
+        else 2 * settings.max_stage_seconds + settings.lock_timeout_seconds
+    )
     return EnginePool(
-        open_engine, workers=settings.workers, conflict_retries=settings.conflict_retries
+        open_engine,
+        workers=settings.workers,
+        conflict_retries=settings.conflict_retries,
+        recover_wait=wait,
     )
 
 
-def _metrics(config: InterlockConfig, listen: str) -> Service:
+def _metrics(config: InterlockConfig, listen: str, membership: _Membership) -> Service:
     """The metrics endpoint (``docs/EPIC7_DESIGN.md`` §2.2), sampling the
     database every ``[metrics] every_seconds`` when it may read it."""
     from interlock.sampling import sample_postgres, sample_sqlite
@@ -300,8 +402,10 @@ def _metrics(config: InterlockConfig, listen: str) -> Service:
         if dsn:
             bound = min(every, 10.0)
 
+            name = membership.name("metrics", "interlock-metrics")
+
             def sample_database() -> Sample:
-                return sample_postgres(dsn, windows, timeout=bound)
+                return sample_postgres(dsn, windows, timeout=bound, application_name=name)
 
             sample = sample_database
         else:
@@ -320,7 +424,8 @@ def _metrics(config: InterlockConfig, listen: str) -> Service:
     return MetricsService(host=host, port=int(port), every=every, sample=sample, windows=windows)
 
 
-def _relays(config: InterlockConfig, key: Any) -> list[Service]:
+def _relays(config: InterlockConfig, key: Any, membership: _Membership) -> list[Service]:
+    from interlock.outbox_store import PostgresOutboxStore
     from interlock.relay import LedgerBreaker, NoBreaker, Relay
     from interlock.wiring import relay_adapters, relay_signer
 
@@ -342,21 +447,38 @@ def _relays(config: InterlockConfig, key: Any) -> list[Service]:
         # service, or a new file (docs/EPIC8_DESIGN.md §3).
         signer = relay_signer(config, key)
         breaker: Any = (
-            LedgerBreaker.open(settings.ledger, schema=settings.ledger_schema)
+            LedgerBreaker.open(membership.ledger(settings.ledger), schema=settings.ledger_schema)
             if settings.breaker == "agentgov" and settings.ledger is not None
             else NoBreaker()
         )
+        store: Any = None
+        node = membership.node
         try:
+            store = (
+                SqliteOutboxStore(dsn)
+                if sqlite
+                else PostgresOutboxStore(
+                    dsn,
+                    application_name=membership.name("relay", "interlock-relay"),
+                    idle_timeout=membership.bound,
+                )
+            )
             relay = Relay(
-                SqliteOutboxStore(dsn) if sqlite else dsn,
+                store,
                 adapters=relay_adapters(settings),
                 breaker=breaker,
                 lease=settings.lease,
                 timeout=settings.timeout,
                 batch=settings.batch,
                 signer=signer,
+                node=node,
+                relay_id=(
+                    None if node is None else f"relay:{node}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+                ),
             )
         except BaseException:
+            if store is not None:
+                store.close()
             if isinstance(breaker, LedgerBreaker):
                 breaker.close()
             raise
@@ -376,7 +498,9 @@ def _relays(config: InterlockConfig, key: Any) -> list[Service]:
     ]
 
 
-def _inbox(config: InterlockConfig, key: Any, listen: str | None) -> Service:
+def _inbox(
+    config: InterlockConfig, key: Any, listen: str | None, membership: _Membership
+) -> Service:
     from interlock.inbox import Inbox
     from interlock.wiring import inbox_signer, inbox_store, live_keyring
 
@@ -397,7 +521,12 @@ def _inbox(config: InterlockConfig, key: Any, listen: str | None) -> Service:
         signer = inbox_signer(config, key)
         relays = live_keyring(config, "relay")
         assert relays is not None  # the configuration's keys are there still
-        store, close = inbox_store(config, None)
+        store, close = inbox_store(
+            config,
+            None,
+            application_name=membership.name("inbox", "interlock-inbox"),
+            idle_timeout=membership.bound,
+        )
         return (
             Inbox(
                 store,
@@ -411,12 +540,15 @@ def _inbox(config: InterlockConfig, key: Any, listen: str | None) -> Service:
             close,
         )
 
-    return InboxService(
+    inbox = InboxService(
         open_inbox,
         host=host,
         port=int(port),
         match_every=settings.match_every.total_seconds(),
     )
+    # Every node binds what it receives as it receives it; one matches what
+    # came before its delivery was recorded.
+    return membership.follow(inbox, "inbox-matcher")
 
 
 def _settler(
@@ -424,6 +556,7 @@ def _settler(
     engines: EnginePool,
     shared: _Receipts,
     governors: _Governors,
+    membership: _Membership,
 ) -> Service:
     from interlock.settlement import Settler
     from interlock.wiring import live_keyring
@@ -460,7 +593,11 @@ def _settler(
             else:
                 import psycopg
 
-                outbox = psycopg.connect(dsn, autocommit=True)
+                outbox = psycopg.connect(
+                    dsn,
+                    autocommit=True,
+                    application_name=membership.name("settler", "interlock-settler"),
+                )
                 closers.append(outbox.close)
             ledger = None
             if config.engine.ledger is not None:
@@ -482,16 +619,20 @@ def _settler(
                 operator_log=None if operators is None else operators.log,
                 operators=None if operators is None else operators.keyring(),
                 sinks=config.sink_registry() if config.sinks else None,
+                # In a cluster each node settles what its own engines committed.
+                partition=membership.cluster is not None,
             )
         except BaseException:
             close()
             raise
         return settler, close
 
-    return SettlerService(open_settler, every=config.settler.every.total_seconds())
+    assert config.receipts is not None  # the daemon builds a settler only beside them
+    settler = SettlerService(open_settler, every=config.settler.every.total_seconds())
+    return membership.follow(settler, f"settler:{config.receipts.log_id}")
 
 
-def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
+def _vacuum(config: InterlockConfig, governors: _Governors, membership: _Membership) -> Service:
     from interlock.operators import OperatorLog
     from interlock.vacuum import Vacuum
     from interlock.wiring import RefusedError, compactor, live_keyring, operator_signer
@@ -526,7 +667,11 @@ def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
         signer = operator_signer(config, vacuum.signer, vacuum.key, part="vacuum")
         governor = kept.get()
         governor.refresh()
-        source, close = compactor(config, vacuum.database or None)
+        source, close = compactor(
+            config,
+            vacuum.database or None,
+            application_name=membership.name("vacuum", "interlock-vacuum"),
+        )
         try:
             log = OperatorLog(
                 operators.log,
@@ -553,7 +698,14 @@ def _vacuum(config: InterlockConfig, governors: _Governors) -> Service:
         finally:
             close()
 
-    return VacuumService(open_vacuum, every=vacuum.every.total_seconds(), close=kept.close)
+    node = membership.node
+    service = VacuumService(
+        open_vacuum,
+        every=vacuum.every.total_seconds(),
+        close=kept.close,
+        reason="scheduled by the daemon" + ("" if node is None else f" on {node}"),
+    )
+    return membership.follow(service, "vacuum")
 
 
 class _Kept:

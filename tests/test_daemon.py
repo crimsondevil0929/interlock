@@ -399,6 +399,8 @@ class Daemon:
     def __init__(self, path: Path, *extra: str) -> None:
         env = {k: v for k, v in os.environ.items() if not k.startswith("INTERLOCK_")}
         env["PYTHONPATH"] = os.pathsep.join([str(ROOT / "src"), str(ROOT)])
+        self.environment = {**env, **ENVIRONMENT}
+        self.cwd = ROOT
         self.process = subprocess.Popen(  # noqa: S603
             [
                 sys.executable,
@@ -410,8 +412,8 @@ class Daemon:
                 str(path),
                 *extra,
             ],
-            cwd=ROOT,
-            env={**env, **ENVIRONMENT},
+            cwd=self.cwd,
+            env=self.environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

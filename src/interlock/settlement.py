@@ -34,6 +34,12 @@ compensation. Killed between any two, the next run settles the message once:
 one receipt, at most one credit, one row. One process settles at a time: the
 receipt log admits one writer.
 
+In a cluster (``docs/EPIC9_DESIGN.md`` §3.2) every node's engines write a
+receipt log and chains of their own, and a settler settles only the deliveries
+of plans its chains record (``partition``): the node that committed a plan
+settles it, into the log that holds its action receipt. The nodes' shares are
+disjoint, so no two settlers touch one message.
+
 A delivery the relays did not attest is not settled at all: it is a ghost
 (:mod:`interlock.attestations`), and is reported.
 """
@@ -137,6 +143,10 @@ class Settler:
     :param checkpoint: Called with ``"receipt"``, ``"credit"`` and
         ``"settled"`` and the message, once each step of its settlement is
         durable: the crash tests stop the process there.
+    :param partition: Settle only the deliveries of plans ``chain`` records,
+        and leave the rest to the settler whose engines committed them: a node
+        of a cluster's. Without it, a delivery of a plan no chain here records
+        is settled without a receipt, as one committed before receipts were on.
     """
 
     __slots__ = (
@@ -146,6 +156,7 @@ class Settler:
         "_operator_log",
         "_operators",
         "_outbox",
+        "_partition",
         "_pass_relays",
         "_receipts",
         "_relays",
@@ -165,8 +176,10 @@ class Settler:
         operators: Keyring | None = None,
         sinks: SinkRegistry | None = None,
         checkpoint: Callable[[str, uuid.UUID], None] | None = None,
+        partition: bool = False,
     ) -> None:
         self._outbox = settlements(outbox)
+        self._partition = partition
         self._receipts = receipts
         self._chain = chain
         self._relays = relays
@@ -185,6 +198,14 @@ class Settler:
         due = [m for m in messages if m.state == "delivered" and m.message_id not in settled_before]
         if not due:
             return SettlementReport((), 0, 0, ())
+        chain = self._chain_records()
+        if self._partition:
+            # Another node's plan is another node's to settle: its receipt
+            # goes into the log that holds its action receipt.
+            ours = {str(record.plan_id) for record in chain}
+            due = [m for m in due if m.plan_id in ours]
+            if not due:
+                return SettlementReport((), 0, 0, ())
         # A revoked relay's deliveries settle only as its revocation sealed
         # them (docs/EPIC8_DESIGN.md §2.3): the revoked keys read once a pass,
         # each seal once.
@@ -196,7 +217,7 @@ class Settler:
         context = _Context.build(
             messages,
             events,
-            chain=self._chain_records(),
+            chain=chain,
             log=self._receipts.log,
             ledger=self._ledger,
             operators=self._operator_records(),
@@ -698,11 +719,14 @@ def _credited(entry: LedgerEntry) -> uuid.UUID | None:
 def verify_settlements(
     outbox: object,
     *,
-    log: ReceiptLog,
+    log: ReceiptLog | Sequence[ReceiptLog],
     relays: Keyring,
     ledger: Iterable[LedgerEntry] | None = None,
 ) -> tuple[str, ...]:
     """Hold the settlements to the receipt log and the ledger, and both back.
+    In a cluster, ``log`` is every node's receipt log
+    (``docs/EPIC9_DESIGN.md`` §3.2): each settlement's receipt is in one of
+    them, bound to an action receipt of the same log.
 
     Finds a settlement naming a delivery receipt the log does not hold, or one
     for another message, or one whose attestation does not verify under a
@@ -744,19 +768,22 @@ def verify_settlements(
         return None if tombstone is None else Decimal(tombstone.cost)
 
     problems: list[str] = []
-    deliveries = {d.receipt_id: d for d in log.deliveries()}
+    logs = [log] if isinstance(log, ReceiptLog) else list(log)
+    logged = {d.receipt_id: (d, holder) for holder in logs for d in holder.deliveries()}
+    deliveries = {receipt_id: receipt for receipt_id, (receipt, _) in logged.items()}
     named: set[str] = set()
     for message_id, row in sorted(rows.items()):
         if row.receipt_id is None:
             continue
         named.add(row.receipt_id)
-        receipt = deliveries.get(row.receipt_id)
-        if receipt is None:
+        found = logged.get(row.receipt_id)
+        if found is None:
             problems.append(
                 f"message {message_id}: its settlement names delivery receipt "
                 f"{row.receipt_id}, which the receipt log does not hold"
             )
             continue
+        receipt, holder = found
         if receipt.request.message_id != str(message_id):
             problems.append(
                 f"message {message_id}: its settlement names delivery receipt "
@@ -780,8 +807,8 @@ def verify_settlements(
             )
             if refused is not None and message_id in by_id:
                 problems.append(f"delivery receipt {row.receipt_id}: its delivery: {refused}")
-        index = log.index_of(receipt.action.receipt_id)
-        action = None if index is None else log.receipt(index)
+        index = holder.index_of(receipt.action.receipt_id)
+        action = None if index is None else holder.receipt(index)
         if not isinstance(action, ActionReceipt) or receipt.action.problem(action) is not None:
             problems.append(
                 f"delivery receipt {row.receipt_id} binds an action receipt the log does not "

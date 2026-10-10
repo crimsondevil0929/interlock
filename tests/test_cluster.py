@@ -8,6 +8,7 @@ stepping a led service only while its node leads, and leaving last.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -294,8 +295,12 @@ def test_a_failed_leader_steps_aside(nodes: Any) -> None:
         deadline = time.monotonic() + 5
         while not supervisor.status()["vacuum"].failures and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
-        # Backing off, the failed leader holds the role no more.
-        taken.append(await asyncio.to_thread(rival.lead, "vacuum"))
+        # Backing off for two seconds, the failed leader has resigned the role
+        # as it closed: the rival takes it well within the backoff.
+        within = time.monotonic() + 1.5
+        while not await asyncio.to_thread(rival.lead, "vacuum") and time.monotonic() < within:
+            await asyncio.sleep(0.02)
+        taken.append(rival.leads("vacuum"))
 
     run(supervisor, body)
     assert taken == [True]
@@ -465,3 +470,53 @@ def test_a_node_named_without_a_cluster_is_refused(tmp_path: Path) -> None:
         load_config(path).with_node("a")
     with pytest.raises(ConfigError, match="named by letters"):
         load_config(config(tmp_path, "")).with_node("not a name")
+
+
+# -- what a node holds, bounded (docs/EPIC9_DESIGN.md §3.3) ---------------------------
+
+
+def test_a_governor_frozen_holding_the_ledger_holds_it_no_longer_than_the_bound(
+    pg_database: str, nodes: Any
+) -> None:
+    """A node's AgentGov governor that freezes holding the ledger's writer lock,
+    every governor of the fleet waiting, holds it for the node's session
+    timeout, and is named for the node while it does."""
+    import psycopg
+    from agentgov import BudgetManager
+
+    from interlock.daemon import _Governors, _Membership
+
+    with BudgetManager.open_postgres(pg_database) as owner:
+        owner.open_root("agent", "10")
+    governors = _Governors(_Membership(nodes("a", heartbeat=0.3, session_timeout=1.0)))
+    frozen, close = governors.open(pg_database)
+    other = BudgetManager.open_postgres(pg_database)
+    stuck = threading.Event()
+
+    store: Any = frozen.store
+
+    def freeze() -> None:
+        with contextlib.suppress(Exception), store.writer():
+            stuck.set()
+            time.sleep(3.0)  # past the bound: the server ends the session meanwhile
+
+    holder = threading.Thread(target=freeze)
+    holder.start()
+    try:
+        assert stuck.wait(10)
+        with psycopg.connect(pg_database, autocommit=True) as conn:
+            names = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT application_name FROM pg_stat_activity WHERE state LIKE 'idle in%'"
+                )
+            }
+        assert "interlock-ledger@a" in names
+        began = time.monotonic()
+        other.open_root("other", "1")
+        assert 0.5 < time.monotonic() - began < 2.5
+    finally:
+        holder.join(10)
+        other.close()
+        with contextlib.suppress(Exception):
+            close()

@@ -935,6 +935,9 @@ class PostgresSubstrate:
         transaction-mode pooler queues a client, by this.
         :class:`~interlock.exceptions.PoolExhaustedError` when it runs out.
         Defaults to the lock timeout.
+    :param application_name: What the stage's connections are called in
+        ``pg_stat_activity``: ``interlock-stage@<node>`` in a cluster
+        (``docs/EPIC9_DESIGN.md`` §3.3).
     :param lock_timeout_seconds: How long any statement in the stage waits for
         a lock before the stage fails with :class:`StageConflictError`.
     :param enforce_table_access: Refuse to open a stage when the role can
@@ -947,6 +950,7 @@ class PostgresSubstrate:
 
     __slots__ = (
         "_acknowledged",
+        "_application",
         "_by_name",
         "_charges",
         "_conn",
@@ -984,12 +988,14 @@ class PostgresSubstrate:
         acknowledge_cascades: Collection[str] = (),
         pool_timeout_seconds: float | None = None,
         metrics: Metrics | None = None,
+        application_name: str = "interlock",
     ) -> None:
         _identifier(schema)
         pool = lock_timeout_seconds if pool_timeout_seconds is None else pool_timeout_seconds
         if pool <= 0:
             raise ValueError("pool_timeout_seconds is positive")
         self._dsn = dsn
+        self._application = application_name
         self._schema = schema
         self._tables = tuple(tables)
         self._by_name = {t.name.lower(): t for t in tables}
@@ -1773,7 +1779,7 @@ class PostgresSubstrate:
                 self._dsn,
                 autocommit=True,
                 prepare_threshold=None,
-                application_name="interlock",
+                application_name=self._application,
                 connect_timeout=(
                     max(1, int(self._stage_seconds))
                     if timeout is None

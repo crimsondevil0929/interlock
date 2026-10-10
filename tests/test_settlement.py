@@ -866,3 +866,80 @@ def test_a_delivery_attested_after_its_relays_key_was_revoked_is_never_settled(
         assert bench.settler().settle().settled == (forged,)
     found = verify_settlements(bench.source(), log=bench.log, relays=RELAYS)
     assert any("its delivery" in p and "did not seal it" in p for p in found), found
+
+
+# --------------------------------------------------------------------------
+# a cluster: each node settles its own plans (docs/EPIC9_DESIGN.md §3.2)
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def other(outbox: Outbox, tmp_path: Path) -> Iterator[Bench]:
+    """A second node over the same outbox and ledger: its engine, its escrow
+    chain, its receipt log."""
+    built = Bench(outbox, tmp_path / "other", log_id="settlement-receipts-other")
+    try:
+        yield built
+    finally:
+        built.close()
+
+
+def test_in_a_cluster_each_node_settles_its_own_plans_into_its_own_log(
+    bench: Bench, other: Bench
+) -> None:
+    mine, theirs = bench.book(1), other.book(2)
+    bench.deliver()
+    # Each settles the delivery of the plan its own engine committed, and
+    # leaves the other's alone: nothing for it to receipt it with.
+    first = bench.settler(partition=True).settle()
+    assert (first.settled, first.receipts, first.problems) == ((mine,), 1, ())
+    second = other.settler(partition=True).settle()
+    assert (second.settled, second.receipts, second.problems) == ((theirs,), 1, ())
+    assert list(bench.deliveries()) == [str(mine)]
+    assert list(other.deliveries()) == [str(theirs)]
+    for node in (bench, other):
+        ((receipt,),) = node.deliveries().values()
+        assert node.verified(receipt) == 0
+    # Verified together, every settlement holds; one node's log alone names the
+    # other's settlement, whose receipt it does not hold.
+    assert verify_settlements(bench.source(), log=[bench.log, other.log], relays=RELAYS) == ()
+    (alone,) = verify_settlements(bench.source(), log=bench.log, relays=RELAYS)
+    assert f"message {theirs}" in alone and "which the receipt log does not hold" in alone
+
+
+def test_a_compensation_is_settled_and_credited_by_its_originals_node(
+    bench: Bench, other: Bench
+) -> None:
+    booked = other.book(1)
+    bench.deliver()
+    compensation = other.compensate(booked)
+    bench.deliver()
+    assert bench.settler(partition=True).settle().settled == ()
+    report = other.settler(partition=True).settle()
+    assert sorted(report.settled) == sorted([booked, compensation])
+    assert (report.receipts, report.credits, report.problems) == (2, 1, ())
+    assert len(credits(other)) == 1
+    assert (
+        verify_settlements(
+            bench.source(),
+            log=[bench.log, other.log],
+            relays=RELAYS,
+            ledger=bench.outbox.governor.audit_trail(),
+        )
+        == ()
+    )
+
+
+def test_a_settler_outside_a_cluster_settles_another_engines_plan_without_its_receipt(
+    bench: Bench, other: Bench
+) -> None:
+    """Why a node's settler is partitioned: one that is not settles a plan no
+    chain of its own records for good, with no receipt, as a plan committed
+    before receipts were on."""
+    theirs = other.book(1)
+    bench.deliver()
+    report = bench.settler().settle()
+    assert report.settled == (theirs,) and report.receipts == 0
+    assert other.settler(partition=True).settle().settled == ()
+    note = settlements(bench)[theirs].note
+    assert "no action receipt for plan" in note

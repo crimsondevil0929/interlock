@@ -642,6 +642,10 @@ class EnginePool:
         chain, before the worker takes a plan.
     :param queue: How many plans may wait for a worker before a submitter
         waits too; ``workers * 16`` by default.
+    :param recover_wait: Seconds recovery asks again, as long as an intent's
+        transaction is still running on the server: in a cluster, a node's
+        previous incarnation can leave one past its session
+        (``docs/EPIC9_DESIGN.md`` §3.4). ``0``: asked once.
     """
 
     name = "engines"
@@ -656,6 +660,7 @@ class EnginePool:
         retry_cap: float = 0.25,
         recover: bool = True,
         queue: int | None = None,
+        recover_wait: float = 0.0,
     ) -> None:
         if workers < 1:
             raise ValueError("an engine pool has at least one worker")
@@ -667,6 +672,7 @@ class EnginePool:
         self._retry_base = retry_base
         self._retry_cap = retry_cap
         self._recover = recover
+        self._recover_wait = recover_wait
         self.queue = queue if queue is not None else workers * 16
         self._engines: list[EscrowEngine] = []
         self._closers: list[Callable[[], None]] = []
@@ -705,9 +711,21 @@ class EnginePool:
                 if self._recover:
                     recovered = engine.recover()
                     self.count("recovered", len(recovered))
+                    self._wait_out(engine)
         except BaseException:
             self.close()
             raise
+
+    def _wait_out(self, engine: EscrowEngine) -> None:
+        """Recover again while an intent's transaction still runs on the
+        server, up to ``recover_wait``; what is left then is the next start's."""
+        awaiting = getattr(engine, "awaiting_recovery", None)
+        if awaiting is None:
+            return
+        deadline = time.monotonic() + self._recover_wait
+        while awaiting() and time.monotonic() < deadline:
+            time.sleep(0.25)
+            self.count("recovered", len(engine.recover()))
 
     def execute(self, index: int, plan: EffectPlan) -> StageResult:
         """Stage ``plan`` on worker ``index``'s engine, again after each
