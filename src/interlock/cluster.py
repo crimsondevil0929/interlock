@@ -215,29 +215,22 @@ class ClusterNode:
         logger.info("node %s joined the cluster", self.node)
 
     def leave(self) -> None:
-        """Release every lock the node holds, and close its session. Another
-        process may be this node from now on. Idempotent."""
-        import psycopg
-
+        """Close the node's session, and with it every lock the node holds:
+        another process may be this node from now on. Idempotent."""
         with self._lock:
             conn, self._conn = self._conn, None
             self._joined = False
             self._held.clear()
-        if conn is None:
-            return
-        try:
-            conn.execute("SELECT pg_catalog.pg_advisory_unlock_all()")
-        except psycopg.Error:
-            pass  # a session gone holds nothing
-        _close(conn)
+        if conn is not None:
+            _close(conn)
 
     # -- staying -------------------------------------------------------------
 
     def heartbeat(self) -> None:
-        """Show the server the node is alive, and read what its session holds.
-        A session gone (the server ended it, or the network did) takes every
-        role with it: the node counts itself out of each at once, and joins
-        again.
+        """Show the server the node is alive, and that its session still holds
+        the node's lock. A session gone (the server ended it, or the network
+        did) takes every role with it: the node counts itself out of each at
+        once, and joins again.
 
         :raises NodeTakenError: If another process took the node's lock while
             its session was gone.
@@ -254,20 +247,10 @@ class ClusterNode:
                 except psycopg.Error as exc:
                     self._lose(f"its session is gone ({exc})")
                 else:
-                    held = {(int(c), _signed(int(o))) for c, o in rows}
-                    if (NODE_LOCK, self._key) not in held:
-                        self._lose("its session no longer holds the node's lock")
-                    else:
-                        lost = {
-                            role
-                            for role in self._held
-                            if (LEADER_LOCK, lock_key("role", role)) not in held
-                        }
-                        for role in sorted(lost):
-                            logger.warning("node %s no longer leads %s", self.node, role)
-                        self._held -= lost
+                    if (NODE_LOCK, self._key) in {(int(c), _signed(int(o))) for c, o in rows}:
                         self.counters["heartbeats"] += 1
                         return
+                    self._lose("its session no longer holds the node's lock")
         self.join()
 
     def lead(self, role: str) -> bool:

@@ -58,6 +58,17 @@ def holders(dsn: str, kind: int, key: int) -> list[str]:
         ]
 
 
+def released(dsn: str, kind: int, key: int, within: float = 5.0) -> bool:
+    """Whether an advisory lock is soon held by no session: a session closed
+    lets go of its locks as its server process exits, a moment after."""
+    deadline = time.monotonic() + within
+    while holders(dsn, kind, key):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 def terminate(dsn: str, application: str) -> None:
     """The server ends a session, as it does one whose client died."""
     import psycopg
@@ -81,7 +92,7 @@ def test_a_node_holds_its_lock_for_its_life(pg_database: str, nodes: Any) -> Non
     assert a.counters["heartbeats"] == 1
     a.leave()
     assert not a.joined
-    assert holders(pg_database, NODE_LOCK, lock_key("node", "a")) == []
+    assert released(pg_database, NODE_LOCK, lock_key("node", "a"))
 
 
 def test_a_second_process_is_refused_a_node_that_runs(nodes: Any) -> None:
