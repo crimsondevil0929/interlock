@@ -879,3 +879,87 @@ def test_a_reload_keeps_the_settlers_and_the_vacuums_governors() -> None:
     assert run(supervisor, body) == {"settler": None, "vacuum": None}
     # Opened once, at the start; closed once, at the stop.
     assert opened == ["settler"] and sorted(closed) == ["settler", "vacuum"]
+
+
+# -- a role in a cluster (docs/EPIC9_DESIGN.md §1.2) ---------------------------------
+
+
+class Role:
+    """A leadership whose answer the test gives: its node leads while
+    ``leading`` is set."""
+
+    def __init__(self, leading: bool = False) -> None:
+        self.leading = threading.Event()
+        if leading:
+            self.leading.set()
+        self.role = "vacuum"
+        self.retry = 0.01
+        self.asked = 0
+        self.resigned = 0
+
+    @property
+    def held(self) -> bool:
+        return self.leading.is_set()
+
+    def lead(self) -> bool:
+        self.asked += 1
+        return self.leading.is_set()
+
+    def resign(self) -> None:
+        self.resigned += 1
+        self.leading.clear()
+
+
+def test_a_service_that_follows_a_role_steps_only_while_its_node_leads() -> None:
+    log: list[tuple[str, str]] = []
+    vacuum = Recorder("vacuum", log)
+    role = Role()
+    vacuum.leader = role  # type: ignore[assignment]
+    supervisor = InterlockSupervisor(services=[vacuum])
+
+    async def body() -> None:
+        await asyncio.sleep(0.1)
+        assert supervisor.status()["vacuum"].state == "standby"
+        assert vacuum.counters.get("steps", 0) == 0 and role.asked > 2
+        assert supervisor.health()[0] == 200
+        role.leading.set()
+        while vacuum.counters.get("steps", 0) < 3:
+            await asyncio.sleep(0.005)
+        assert supervisor.status()["vacuum"].state == "running"
+        role.leading.clear()  # another node took it
+        await asyncio.sleep(0.05)
+        steps = vacuum.counters["steps"]
+        await asyncio.sleep(0.05)
+        assert vacuum.counters["steps"] == steps
+        assert supervisor.status()["vacuum"].state == "standby"
+        role.leading.set()
+
+    run(supervisor, body)
+    # A leader drains as it stops, and resigns as it closes.
+    assert ("vacuum", "drain") in log and role.resigned == 1
+
+
+def test_a_standby_service_neither_drains_nor_holds_its_role_through_a_failure() -> None:
+    log: list[tuple[str, str]] = []
+    standby = Recorder("standby", log)
+    standby.leader = Role()  # type: ignore[assignment]
+    supervisor = InterlockSupervisor(services=[standby])
+
+    async def body() -> None:
+        await asyncio.sleep(0.05)
+
+    run(supervisor, body)
+    assert ("standby", "drain") not in log and ("standby", "close") in log
+    # A leader whose step fails steps aside while it backs off.
+    flaky = Recorder("flaky", log, fail=1)
+    role = Role(leading=True)
+    flaky.leader = role  # type: ignore[assignment]
+    supervisor = InterlockSupervisor(services=[flaky], restart_min=0.5, restart_max=0.5)
+
+    async def failed() -> None:
+        while not supervisor.status()["flaky"].failures:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)
+        assert role.resigned == 1
+
+    run(supervisor, failed)

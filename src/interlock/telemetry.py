@@ -249,6 +249,30 @@ CATALOG: Final = (
         "What vacuums pruned: messages, window_rows, inbox_events.",
         ("kind",),
     ),
+    # -- the cluster (docs/EPIC9_DESIGN.md §1.4) -------------------------------------------
+    Metric(
+        "interlock_cluster_node",
+        GAUGE,
+        "1 while this process holds its node's lock in the cluster.",
+        ("node",),
+    ),
+    Metric(
+        "interlock_cluster_leader",
+        GAUGE,
+        "1 while this node leads a role: vacuum, inbox-matcher, settler:<receipt log>.",
+        ("role",),
+    ),
+    Metric(
+        "interlock_cluster_leaderships_total",
+        COUNTER,
+        "Times this node took a role.",
+        ("role",),
+    ),
+    Metric(
+        "interlock_lease_takeovers_total",
+        COUNTER,
+        "Leases a relay took over from a node that was gone, before they ran out.",
+    ),
     # -- the sampler itself ----------------------------------------------------------------
     Metric(
         "interlock_metrics_sampled_at_seconds",

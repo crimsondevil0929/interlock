@@ -46,6 +46,12 @@ them, bounds them and stops them::
   and the metrics endpoint have nothing to open again: the vacuum opens its key
   at each run, and every part holds rows to keyrings that follow the operator
   log as it runs. Engines and agents are untouched.
+- **A cluster** (``cluster=``, ``docs/EPIC9_DESIGN.md`` §1): the node joins
+  before the engines open, holding its node's lock in PostgreSQL, heartbeats
+  on a thread of its own, and leaves last, after everything has closed. A
+  service that follows a role (:attr:`Service.leader`) steps only while its
+  node leads the role, and is on *standby* otherwise: open, healthy, its step
+  skipped. A node that finds its name taken by another process stops.
 """
 
 from __future__ import annotations
@@ -67,6 +73,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 from interlock.exceptions import (
     ChainInUseError,
     CommitUnsettledError,
+    NodeTakenError,
     PoolExhaustedError,
     StageConflictError,
     SupervisorStoppedError,
@@ -76,6 +83,7 @@ from interlock.trace import parse_traceparent
 
 if TYPE_CHECKING:
     from interlock.builder import PlanBuilder
+    from interlock.cluster import ClusterNode, Leadership
     from interlock.engine import EscrowEngine, StageResult
     from interlock.inbox import Inbox, InboxServer
     from interlock.relay import Relay
@@ -112,13 +120,17 @@ BACKING_OFF = "backing-off"
 STOPPING = "stopping"
 STOPPED = "stopped"
 FAILED = "failed"
+STANDBY = "standby"
+"""A service that follows a role its node does not lead: open and healthy,
+its step skipped (``docs/EPIC9_DESIGN.md`` §1.2)."""
 
 
 @dataclass(frozen=True, slots=True)
 class ServiceStatus:
     """A service's health, as :meth:`InterlockSupervisor.status` reports it.
 
-    :ivar state: ``starting``, ``running``, ``backing-off``, ``stopping``,
+    :ivar state: ``starting``, ``running``, ``standby`` (a service whose
+        node does not lead its role), ``backing-off``, ``stopping``,
         ``stopped``, or ``failed`` (an agent that raised).
     :ivar steps: Steps run to the end.
     :ivar failures: Steps, or opens, that raised.
@@ -151,6 +163,10 @@ class Service:
         self._counting = threading.Lock()
         self.metrics: Metrics = NullMetrics()
         """What the service measures into: the supervisor's, once bound."""
+        self.leader: Leadership | None = None
+        """The role the service follows in a cluster (``docs/EPIC9_DESIGN.md``
+        §1.2): it steps only while its node leads the role, and drains only
+        then. ``None``: it steps on every node."""
 
     def count(self, counter: str, n: int = 1) -> None:
         """Add ``n`` to one of the service's counters. Thread-safe."""
@@ -188,6 +204,16 @@ class Service:
         that raises does: it is closed, and opened again after the backoff."""
         self.close()
         self.open()
+
+
+def _close(service: Service) -> None:
+    """Close ``service``, and resign the role it follows: its node does none of
+    the role's work now, and another node may take it at its next ask."""
+    try:
+        service.close()
+    finally:
+        if service.leader is not None:
+            service.leader.resign()
 
 
 # --------------------------------------------------------------------------
@@ -887,6 +913,8 @@ class InterlockSupervisor:
     :param restart_max: ...up to this many.
     :param metrics: What every part measures into (:mod:`interlock.telemetry`);
         a registry of its own by default. :class:`MetricsService` serves it.
+    :param cluster: This process as a node of a cluster: joined before the
+        engines open, left after everything has closed.
     """
 
     def __init__(
@@ -898,8 +926,13 @@ class InterlockSupervisor:
         restart_min: float = 0.5,
         restart_max: float = 30.0,
         metrics: Metrics | None = None,
+        cluster: ClusterNode | None = None,
     ) -> None:
-        names = [s.name for s in services] + (["engines"] if engines is not None else [])
+        names = (
+            [s.name for s in services]
+            + (["engines"] if engines is not None else [])
+            + (["cluster"] if cluster is not None else [])
+        )
         twice = sorted({n for n in names if names.count(n) > 1})
         if twice:
             raise ValueError(f"services share a name: {', '.join(twice)}")
@@ -928,9 +961,18 @@ class InterlockSupervisor:
         self._busy = 0
         self._reloaded: list[Callable[[Mapping[str, str | None]], None]] = []
         self._signalled: set[asyncio.Task[None]] = set()
+        self._cluster = cluster
+        self._cluster_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._cluster_task: asyncio.Task[None] | None = None
+        self._cluster_halt: asyncio.Event | None = None
+        self._cluster_state = STARTING if cluster is not None else STOPPED
+        self._cluster_error: str | None = None
+        self._cluster_failures = 0
         self.metrics = metrics if metrics is not None else Metrics()
         """What every part measures into."""
         self.metrics.collect(self._collect)
+        if cluster is not None:
+            self.metrics.collect(cluster.collect)
         if engines is not None:
             engines.metrics = self.metrics
 
@@ -1093,6 +1135,8 @@ class InterlockSupervisor:
 
     async def _start(self) -> None:
         assert self._loop is not None and self._ready is not None
+        if self._cluster is not None:
+            await self._join(self._cluster)
         if self._engines is not None:
             self._engine_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=self._engines.workers, thread_name_prefix="interlock-engine"
@@ -1128,6 +1172,72 @@ class InterlockSupervisor:
         for agent in self._agents:
             self._start_agent(agent)
         self._ready.set()
+
+    # -- the cluster --------------------------------------------------------
+
+    async def _join(self, cluster: ClusterNode) -> None:
+        """The node joins, before anything opens: a node's previous
+        incarnation leaves its chains to the one that holds its lock."""
+        assert self._loop is not None
+        self._cluster_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="interlock-cluster"
+        )
+        try:
+            await self._loop.run_in_executor(self._cluster_executor, cluster.join)
+        except BaseException as exc:
+            self._cluster_state = FAILED
+            self._cluster_error = f"{type(exc).__name__}: {exc}"
+            raise
+        self._cluster_state = RUNNING
+        self._cluster_halt = asyncio.Event()
+        self._cluster_task = self._loop.create_task(self._heartbeats(cluster), name="cluster")
+
+    async def _heartbeats(self, cluster: ClusterNode) -> None:
+        """Every heartbeat, until the node leaves: through a shutdown too, so
+        a leader keeps its roles while it drains."""
+        assert self._loop is not None and self._cluster_halt is not None
+        halt = self._cluster_halt
+        while not halt.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(halt.wait(), timeout=cluster.heartbeat_seconds)
+            if halt.is_set():
+                return
+            try:
+                await self._loop.run_in_executor(self._cluster_executor, cluster.heartbeat)
+            except NodeTakenError as exc:
+                # Another process is this node now: this one is the stale one.
+                self._cluster_state = FAILED
+                self._cluster_failures += 1
+                self._cluster_error = f"{type(exc).__name__}: {exc}"
+                logger.error("cluster: %s; stopping", exc)
+                self.stop()
+                return
+            except Exception as exc:
+                self._cluster_state = BACKING_OFF
+                self._cluster_failures += 1
+                self._cluster_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("cluster: a heartbeat failed: %s", self._cluster_error)
+                continue
+            self._cluster_state = RUNNING
+
+    async def _leave(self) -> None:
+        """The node leaves, last: its roles and its lock, released."""
+        assert self._loop is not None
+        cluster, executor = self._cluster, self._cluster_executor
+        if cluster is None or executor is None:
+            return
+        if self._cluster_halt is not None:
+            self._cluster_halt.set()
+        if self._cluster_task is not None:
+            with contextlib.suppress(Exception):
+                await self._cluster_task
+        try:
+            await self._loop.run_in_executor(executor, cluster.leave)
+        except Exception:
+            logger.exception("cluster: leaving failed")
+        executor.shutdown(wait=False)
+        if self._cluster_state != FAILED:
+            self._cluster_state = STOPPED
 
     # -- the engines --------------------------------------------------------
 
@@ -1257,6 +1367,14 @@ class InterlockSupervisor:
                     await self._loop.run_in_executor(running.executor, service.open)
                     running.opened = True
                     running.opened_once.set()
+                leader = service.leader
+                if leader is not None and not await self._loop.run_in_executor(
+                    running.executor, leader.lead
+                ):
+                    # Another node leads the role: asked again shortly.
+                    running.state = STANDBY
+                    due = time.monotonic() + leader.retry
+                    continue
                 running.state = RUNNING
                 running.busy = True
                 began = time.monotonic()
@@ -1283,7 +1401,8 @@ class InterlockSupervisor:
                 if running.opened:
                     running.opened = False
                     try:
-                        await self._loop.run_in_executor(running.executor, service.close)
+                        # A leader that failed steps aside while it backs off.
+                        await self._loop.run_in_executor(running.executor, _close, service)
                     except Exception:
                         logger.exception("%s: closing after a failure failed", service.name)
                 running.opened_once.set()
@@ -1398,7 +1517,8 @@ class InterlockSupervisor:
                 # A service still in its step is not drained: the drain would
                 # only queue behind the step, past the bound.
                 idle = running.task is None or running.task.done()
-                if running.opened and idle and not self._force:
+                leads = running.service.leader is None or running.service.leader.held
+                if running.opened and idle and leads and not self._force:
                     try:
                         await self._wait(
                             [self._loop.run_in_executor(running.executor, running.service.drain)],
@@ -1414,7 +1534,7 @@ class InterlockSupervisor:
         closing: dict[asyncio.Future[None], str] = {}
         for running in self._running.values():
             try:
-                closing[self._loop.run_in_executor(running.executor, running.service.close)] = (
+                closing[self._loop.run_in_executor(running.executor, _close, running.service)] = (
                     running.service.name
                 )
             except Exception:
@@ -1445,6 +1565,9 @@ class InterlockSupervisor:
                 close()
             except Exception:
                 logger.exception("closing a shared resource failed")
+        # 8. The node leaves the cluster: its next incarnation, which waits
+        # for the node's lock, finds every file this one held closed.
+        await self._leave()
 
     async def _drained(self) -> None:
         """Until every queued plan has been taken by a worker, or no worker is
@@ -1487,6 +1610,16 @@ class InterlockSupervisor:
                 self._engine_error,
                 self._engines.counters,
             )
+        if self._cluster is not None:
+            counters = dict(self._cluster.counters)
+            report["cluster"] = ServiceStatus(
+                "cluster",
+                self._cluster_state,
+                counters.get("heartbeats", 0),
+                self._cluster_failures,
+                self._cluster_error,
+                counters,
+            )
         for name, running in self._running.items():
             report[name] = ServiceStatus(
                 name,
@@ -1524,8 +1657,13 @@ class InterlockSupervisor:
         import interlock
 
         metrics.set("interlock_build_info", 1, version=interlock.__version__)
+        if self._cluster is not None:
+            metrics.set(
+                "interlock_service_up", int(self._cluster_state == RUNNING), service="cluster"
+            )
         for name, running in tuple(self._running.items()):
-            metrics.set("interlock_service_up", int(running.state == RUNNING), service=name)
+            up = running.state in (RUNNING, STANDBY)
+            metrics.set("interlock_service_up", int(up), service=name)
             metrics.set("interlock_service_busy", int(running.busy), service=name)
             metrics.set("interlock_service_steps_total", running.steps, service=name)
             metrics.set("interlock_service_failures_total", running.failures, service=name)
@@ -1538,11 +1676,13 @@ class InterlockSupervisor:
             metrics.set("interlock_engine_queue_depth", 0 if queue is None else queue.qsize())
 
     def health(self) -> tuple[int, dict[str, Any]]:
-        """``GET /healthz``: ``200`` while the engines and every service are
-        running, ``503`` otherwise, with :meth:`status` as JSON."""
+        """``GET /healthz``: ``200`` while the engines, the cluster's node and
+        every service are running, or on standby, ``503`` otherwise, with
+        :meth:`status` as JSON."""
         report = self.status()
-        services = [s for name, s in report.items() if name == "engines" or name in self._running]
-        healthy = bool(services) and all(s.state == RUNNING for s in services)
+        parts = {"engines", "cluster", *self._running}
+        services = [s for name, s in report.items() if name in parts]
+        healthy = bool(services) and all(s.state in (RUNNING, STANDBY) for s in services)
         body = {
             "status": "ok" if healthy else "degraded",
             "services": {
