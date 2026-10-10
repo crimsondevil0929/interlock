@@ -501,6 +501,15 @@ class VacuumService(Service):
         self._busy_retry = busy_retry
         self._close = close
 
+    def bind(self, supervisor: InterlockSupervisor) -> None:
+        super().bind(supervisor)
+        # Every outcome, and every kind pruned, at zero from the start: a node
+        # whose vacuum is on standby in a cluster exports them too, as zeros.
+        for outcome in ("applied", "nothing", "refused", "rejected", "abandoned", "busy"):
+            self.metrics.inc("interlock_vacuum_runs_total", 0, outcome=outcome)
+        for kind in ("messages", "window_rows", "inbox_events"):
+            self.metrics.inc("interlock_vacuum_pruned_total", 0, kind=kind)
+
     def step(self) -> float:
         try:
             with self._open_vacuum() as vacuum:

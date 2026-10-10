@@ -313,6 +313,107 @@ def test_a_frozen_node_is_fenced_once_its_session_times_out(cluster: Cluster) ->
     assert any("node a is gone; its sessions ended" in line for line in b.lines + b.errors)
 
 
+WIRING = """
+[engine]
+ledger = "{owner}"
+
+[receipts]
+log = "{home}/receipts.jsonl"
+key = "{home}/receipts.key"
+log_id = "receipts-w"
+
+[settler]
+database = "{owner}"
+every_seconds = 1
+
+[inbox]
+key = "{home}/inbox.key"
+listen = "127.0.0.1:0"
+database = "{owner}"
+
+[[inbox.sources]]
+name = "stripe"
+kind = "stripe"
+secret_env = "WIRING_WEBHOOK_SECRET"
+
+[inbox.keys]
+inbox = "{inbox}"
+"""
+
+
+def test_a_nodes_parts_follow_their_roles_and_bound_their_sessions(
+    cluster: Cluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon as a node (§3): the vacuum, the inbox's matcher and the
+    settler of the node's receipt log follow their roles, and the settler
+    settles only the node's own plans; every session that holds what others
+    wait for is bounded by the session timeout, and called for its node; and
+    recovery waits out a predecessor's transactions."""
+    import interlock.outbox_store
+    import interlock.settlement
+    import interlock.wiring
+    from interlock.daemon import Application, build_supervisor
+
+    home = tmp_path / "w"
+    home.mkdir()
+    generate_key(home / "receipts.key")
+    inbox = generate_key(home / "inbox.key").public_key().spec()
+    path = home / "interlock.toml"
+    base = cluster.configs["a"].read_text().replace('node = "a"', 'node = "w"')
+    path.write_text(base + WIRING.format(owner=cluster.owner, home=home, inbox=inbox))
+
+    sessions: list[tuple[str, float]] = []
+    bounded = interlock.wiring.bounded_session
+
+    def bounded_spy(dsn: str, *, application_name: str, idle_timeout: float) -> Any:
+        sessions.append((application_name, idle_timeout))
+        return bounded(dsn, application_name=application_name, idle_timeout=idle_timeout)
+
+    stores: list[dict[str, Any]] = []
+    store = interlock.outbox_store.PostgresOutboxStore
+
+    def store_spy(dsn: str, **kwargs: Any) -> Any:
+        stores.append(kwargs)
+        return store(dsn, **kwargs)
+
+    settlers: list[dict[str, Any]] = []
+
+    class Settler:
+        def __init__(self, outbox: object, **kwargs: Any) -> None:
+            settlers.append(kwargs)
+
+    monkeypatch.setattr(interlock.wiring, "bounded_session", bounded_spy)
+    monkeypatch.setattr(interlock.outbox_store, "PostgresOutboxStore", store_spy)
+    monkeypatch.setattr(interlock.settlement, "Settler", Settler)
+    config = load_config(path)
+    supervisor = build_supervisor(config, Application(checkers=[BlastRadius(5)]))
+    try:
+        services = {service.name: service for service in supervisor._services}
+        roles = {
+            name: None if service.leader is None else service.leader.role
+            for name, service in services.items()
+        }
+        assert roles == {
+            "relay-0": None,
+            "inbox": "inbox-matcher",
+            "settler": "settler:receipts-w",
+            "vacuum": "vacuum",
+        }
+        for name in ("relay-0", "inbox", "settler"):
+            services[name].open()
+            services[name].close()
+        assert stores == [{"application_name": "interlock-relay@w", "idle_timeout": 2.0}]
+        assert sessions == [("interlock-inbox@w", 2.0)]
+        (settler,) = settlers
+        assert settler["partition"] is True
+        engines = supervisor._engines
+        assert engines is not None
+        assert engines._recover_wait == 2 * 10.0 + 2.0  # twice the stage bound, and its lock's
+    finally:
+        for close in reversed(supervisor._closers):
+            close()
+
+
 def test_a_second_daemon_as_a_node_that_runs_is_refused(cluster: Cluster) -> None:
     a = Daemon(cluster.configs["a"])
     try:

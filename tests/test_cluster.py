@@ -247,6 +247,12 @@ def test_a_gone_nodes_sessions_are_ended_at_a_survivors_heartbeat(
     b.heartbeat()
     assert b.counters["fenced"] == 0  # a is alive: nothing is ended
     terminate(pg_database, "interlock-cluster@a")
+    kept += [
+        # a's next incarnation, waiting to join: its cluster session holds nothing yet
+        session(pg_database, "interlock-cluster@a"),
+        # a name PostgreSQL cut to 63 bytes, whose node part is no node's whole name
+        session(pg_database, "interlock-" + "x" * 45 + "@" + "b" * 10),
+    ]
     b.heartbeat()
     assert b.counters["fenced"] == 2
     assert all(ended(pg_database, pid) for pid in gone)
@@ -265,6 +271,40 @@ def test_a_gone_nodes_sessions_are_ended_at_a_survivors_heartbeat(
     assert metrics.value("interlock_cluster_fenced_total") == 2
     for conn in [stage, ledger, fresh, *kept]:
         conn.close()
+
+
+def test_a_session_that_no_longer_holds_the_nodes_lock_counts_it_out(
+    pg_database: str, nodes: Any
+) -> None:
+    """A transaction-mode pooler hands the node's lock to whoever runs next on
+    the server's session: the node's queries then run on a session that holds
+    nothing. The heartbeat finds the lock gone, counts the node out of every
+    role, and joins again."""
+    a = nodes("a")
+    a.join()
+    assert a.lead("vacuum")
+    a._conn.execute("SELECT pg_advisory_unlock_all()")  # as another client's session
+    a.heartbeat()
+    assert a.counters["lost"] == 1 and a.counters["joins"] == 2
+    assert a.joined and not a.leads("vacuum")
+    assert holders(pg_database, NODE_LOCK, lock_key("node", "a")) == ["interlock-cluster@a"]
+
+
+def test_a_vacuum_on_standby_exports_its_families_at_zero() -> None:
+    """A node whose vacuum is on standby has run none: its families say so, at
+    zero, from the start, rather than not at all."""
+    from interlock.supervisor import VacuumService
+
+    def never() -> Any:
+        raise AssertionError("a vacuum on standby runs nothing")
+
+    service = VacuumService(never, every=60)
+    supervisor = InterlockSupervisor(services=[service])
+    service.bind(supervisor)
+    for outcome in ("applied", "nothing", "refused", "rejected", "abandoned", "busy"):
+        assert supervisor.metrics.value("interlock_vacuum_runs_total", outcome=outcome) == 0
+    for kind in ("messages", "window_rows", "inbox_events"):
+        assert supervisor.metrics.value("interlock_vacuum_pruned_total", kind=kind) == 0
 
 
 def test_a_node_that_may_not_end_a_gone_nodes_sessions_says_so_once(
