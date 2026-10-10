@@ -414,6 +414,41 @@ def test_a_nodes_parts_follow_their_roles_and_bound_their_sessions(
             close()
 
 
+def test_a_daemons_node_refuses_a_database_without_interlock(
+    cluster: Cluster, pg_admin_dsn: str, tmp_path: Path
+) -> None:
+    """A node's lock is its database's own, and the relays look for it in
+    Interlock's: a daemon whose [cluster] database is another is refused."""
+    from psycopg import sql
+
+    from interlock.daemon import _cluster
+    from interlock.exceptions import SubstrateConfigurationError
+
+    name = f"interlock_t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    try:
+        elsewhere = make_conninfo(pg_admin_dsn, dbname=name)
+        path = tmp_path / "elsewhere.toml"
+        text = cluster.configs["a"].read_text()
+        path.write_text(
+            text.replace(
+                f'[cluster]\nnode = "a"\ndatabase = "{cluster.owner}"',
+                f'[cluster]\nnode = "a"\ndatabase = "{elsewhere}"',
+            )
+        )
+        assert elsewhere in path.read_text()
+        node = _cluster(load_config(path))
+        assert node is not None
+        with pytest.raises(SubstrateConfigurationError, match="holds no Interlock storage"):
+            node.join()
+    finally:
+        with psycopg.connect(pg_admin_dsn, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
+            )
+
+
 def test_a_second_daemon_as_a_node_that_runs_is_refused(cluster: Cluster) -> None:
     a = Daemon(cluster.configs["a"])
     try:
