@@ -152,6 +152,78 @@ def test_a_spent_budget_falls_back_to_a_sound_greedy_pass() -> None:
     assert result.trials == len(seen) <= 12
 
 
+def chains(count: int, length: int) -> EffectPlan:
+    """``count`` independent chains of ``length`` steps: c0s0 <- c0s1 <- ..."""
+    edges: list[tuple[str, Sequence[str]]] = []
+    for c in range(count):
+        for s in range(length):
+            edges.append((f"c{c}s{s}", (f"c{c}s{s - 1}",) if s else ()))
+    return dag(*edges)
+
+
+def whole_chains(kept: frozenset[str], length: int) -> list[int] | None:
+    """The chains ``kept`` holds whole, or ``None`` when it holds part of one."""
+    held = sorted({int(name[1:].split("s")[0]) for name in kept})
+    if len(kept) != len(held) * length:
+        return None
+    return held
+
+
+def test_steps_admitted_only_together_are_kept_together_when_the_budget_runs_out() -> None:
+    """Each chain is admitted only whole (a row with the requests it rides
+    with), and at most two at once. No single step is admitted alone, so a
+    greedy pass over steps keeps nothing; one over the plan's independent
+    parts keeps the first two chains."""
+    plan = chains(3, 4)
+
+    def rule(kept: frozenset[str]) -> bool:
+        held = whole_chains(kept, 4)
+        return held is not None and len(held) <= 2
+
+    seen, evaluate = judge(rule)
+    result = search(plan, evaluate, max_trials=24)
+    assert result.stopped == "budget" and not result.exhaustive
+    assert result.kept == frozenset(f"c{c}s{s}" for c in (0, 1) for s in range(4))
+    assert result.trials == len(seen) <= 24
+
+
+def test_a_dropped_part_is_explained_by_adding_it_back_whole() -> None:
+    """The third chain's head, added back alone, would be refused for being
+    alone; added back with what depends on it, for being a third chain."""
+    plan = chains(3, 3)
+
+    def rule(kept: frozenset[str]) -> bool:
+        held = whole_chains(kept, 3)
+        return held is not None and len(held) <= 2
+
+    _, evaluate = judge(rule)
+    result = search(plan, evaluate, max_trials=40)
+    assert result.kept == frozenset(f"c{c}s{s}" for c in (0, 1) for s in range(3))
+    (head,) = result.probes
+    assert head == "c2s0"
+    probe = result.probes[EffectId("c2s0")]
+    assert probe.kept == frozenset(f"c{c}s{s}" for c in range(3) for s in range(3))
+    assert not probe.admitted
+
+
+def test_a_probe_adds_back_only_a_runnable_part() -> None:
+    """``d`` depends on ``b`` and on ``c``; with ``a`` kept and the rest
+    dropped, ``b``'s probe may not take ``d``, whose other dependency is not
+    kept."""
+    plan = dag(("a", ()), ("b", ("a",)), ("c", ("a",)), ("d", ("b", "c")))
+    deps = {"b": {"a"}, "c": {"a"}, "d": {"b", "c"}}
+    seen, evaluate = judge(lambda kept: kept == {"a"})
+    result = search(plan, evaluate, max_trials=64)
+    assert result.kept == frozenset({"a"})
+    for kept in seen:
+        for effect in kept:
+            assert deps.get(effect, set()) <= kept
+    assert {e: t.kept for e, t in result.probes.items()} == {
+        "b": frozenset({"a", "b"}),
+        "c": frozenset({"a", "c"}),
+    }
+
+
 def test_nothing_admissible_is_reported_as_such() -> None:
     plan = dag(("a", ()), ("b", ()))
     _, evaluate = judge(lambda kept: False)
@@ -533,12 +605,14 @@ def test_steps_admission_would_refuse_are_dropped_before_anything_is_staged(
 
 
 def test_a_small_budget_still_proposes_an_admitted_plan(back_office: str) -> None:
+    """Three trials: the whole plan, one candidate of the search, and one of
+    the greedy pass, which adds the plan's first independent part whole."""
     engine = sqlite_engine(back_office)
     repair = engine.repair(support_batch(), max_trials=3)
     assert (repair.stopped, repair.exhaustive, repair.trials) == ("budget", False, 3)
-    assert repair.kept == ("hold_500",)
+    assert repair.kept == ("hold_500", "bump_items_500")
     assert {d.effect_id: d.cause for d in repair.dropped} == dict.fromkeys(
-        ("reprice_501", "hold_600", "bump_items_500"), "unevaluated"
+        ("reprice_501", "hold_600"), "unevaluated"
     )
     text = repair.feedback.render()
     assert text.startswith("Resubmit a part of the plan") and "not tried alone" in text

@@ -21,6 +21,16 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ### Fixed (the customer acceptance matrix)
 
+- **A repair whose trial budget ran out proposed nothing when a plan's steps are admitted
+  only together.** The greedy fallback added one step at a time, and `CrossEffectAgreement`
+  is strict both ways: an allocation without the pick release and the booking it rides with
+  is refused, and so is each of those alone. A refused wave of fulfilment orders was
+  answered "No part of the plan would be admitted" when two of its orders would have been.
+  The fallback now adds the plan's independent parts (the connected components of its
+  dependency graph) whole first, then single steps; a plan whose parts are single steps is
+  searched as before. And a dropped step is explained by adding it back with the dropped
+  steps that depend on it, so the agent is told the order was one too many, not that its
+  allocation lacked its requests.
 - A `tenant_isolation` refusal of a plan that touched only other tenants' rows told the agent
   its declared tenants were "none": the hint named only the tenants touched, and the
   sanitizer keeps only the plan's own. It names the plan's own too now.

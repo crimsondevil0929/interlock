@@ -444,11 +444,15 @@ assert runtime.execute(repair.proposal).committed
   depends on. The whole plan is tried, then every such sub-plan one step smaller, and
   so on, later steps dropped first within a size; the first admitted one is a largest,
   and `repair.exhaustive` says so. `max_trials` (default 32) bounds the search; when it
-  runs out, a greedy pass keeps each step whose addition is admitted, which is sound but
-  may not be largest. The stage's time bound ends the search too.
-- **Explained without leaking.** Each dropped step says why, from its own trial: the
-  constraints that refused it, sanitized like every other feedback, a dropped
-  dependency, or a statement the substrate refuses outright.
+  runs out, a greedy pass keeps each of the plan's independent parts (the connected
+  components of its dependency graph), then each step, whose addition is admitted, which
+  is sound but may not be largest. Parts first, because steps a rule admits only together
+  (a row and the request it rides with) are each refused alone. The stage's time bound
+  ends the search too.
+- **Explained without leaking.** Each dropped step says why, from its own trial, adding it
+  back with the dropped steps that depend on it: the constraints that refused it,
+  sanitized like every other feedback, a dropped dependency, or a statement the substrate
+  refuses outright.
 
 Both substrates have savepoints. A repair's trials all run inside one stage, so the
 stage's locks are held for the whole search.
