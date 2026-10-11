@@ -103,6 +103,11 @@ ignore = ["S101"]
 # reproduced; every secret it makes comes from `secrets` (S311). It runs
 # docker by name, as its operator would (S603, S607).
 "scripts/live_stress_test.py" = ["S311", "S603", "S607"]
+# The acceptance suite builds SQL from the table and column names its own
+# domain definitions declare (S608): nothing the model sends is interpolated,
+# and the model's statements run only through the engine. It asks git for the
+# commit it ran at (S603, S607).
+"demo/customer_acceptance_suite.py" = ["S603", "S607", "S608"]
 
 [tool.mypy]
 python_version = "3.11"

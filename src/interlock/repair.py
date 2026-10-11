@@ -25,13 +25,17 @@ rolled back to the savepoint before the next.
    within a size the ones that drop the latest steps first. The first
    admitted candidate is a largest admissible sub-plan, and the result says
    so (``exhaustive``).
-3. If the trial budget runs out first: one greedy pass in dependency order,
-   keeping each step whose addition is admitted. Its result was staged and
-   admitted, so it is sound, but it may not be the largest; ``exhaustive`` is
-   then false.
+3. If the trial budget runs out first: a greedy pass. It keeps each of the
+   plan's independent parts (the connected components of its dependency
+   graph), in order, whose addition is admitted; then each further step, in
+   dependency order, whose addition is admitted. Steps a rule admits only
+   together, an allocation with the requests it rides with, are kept or
+   dropped together. Its result was staged and admitted, so it is sound, but
+   it may not be the largest; ``exhaustive`` is then false.
 4. For each dropped step whose dependencies were kept, one more trial with
-   that step added back, which records the constraints that refuse it. A step
-   whose dependency was dropped is reported as dropped for that reason.
+   that step added back, with the dropped steps that depend on it, which
+   records the constraints that refuse it. A step whose dependency was
+   dropped is reported as dropped for that reason.
 
 Each trial costs one statement per effect it keeps, so a search is roughly
 ``max_trials * n`` statements, and it runs inside one stage's time bound: a
@@ -262,11 +266,23 @@ def _levels(
 def _greedy(
     order: Sequence[Effect], trials: _Trials
 ) -> tuple[frozenset[EffectId] | None, str | None]:
-    """Keep each step, in dependency order, whose addition is admitted."""
+    """Keep each independent part of the plan, then each step, in dependency
+    order, whose addition is admitted.
+
+    Parts first: a rule that admits steps only together (strict both ways,
+    as ``CrossEffectAgreement`` is) refuses every one of them added alone,
+    and a pass over steps would keep nothing.
+    """
     kept: frozenset[EffectId] = frozenset()
     try:
+        parts = _parts(order)
+        if any(len(part) > 1 for part in parts):
+            for part in parts:
+                candidate = kept | part
+                if trials.run(candidate).admitted:
+                    kept = candidate
         for effect in order:
-            if not set(effect.depends_on) <= kept:
+            if effect.effect_id in kept or not set(effect.depends_on) <= kept:
                 continue
             candidate = kept | {effect.effect_id}
             if trials.run(candidate).admitted:
@@ -278,16 +294,47 @@ def _greedy(
     return (kept or None), None
 
 
+def _parts(order: Sequence[Effect]) -> list[frozenset[EffectId]]:
+    """The plan's independent parts: the connected components of its
+    dependency graph, each closed under dependencies, in the order their
+    first steps run."""
+    root: dict[EffectId, EffectId] = {e.effect_id: e.effect_id for e in order}
+
+    def find(effect: EffectId) -> EffectId:
+        while root[effect] != effect:
+            root[effect] = root[root[effect]]
+            effect = root[effect]
+        return effect
+
+    for effect in order:
+        for dependency in effect.depends_on:
+            root[find(effect.effect_id)] = find(dependency)
+    parts: dict[EffectId, set[EffectId]] = {}
+    for effect in order:
+        parts.setdefault(find(effect.effect_id), set()).add(effect.effect_id)
+    return [frozenset(part) for part in parts.values()]
+
+
 def _probe(
     order: Sequence[Effect], kept: frozenset[EffectId], trials: _Trials
 ) -> dict[EffectId, Trial]:
-    """Add each dropped step whose dependencies were kept back alone."""
+    """Add each dropped step whose dependencies were kept back, with the
+    dropped steps that depend on it and on nothing else dropped: the part of
+    the plan it heads, which is what was left out. A step a rule admits only
+    with its dependants is refused alone for that rule, and that is not why
+    its part was dropped."""
     probes: dict[EffectId, Trial] = {}
     for effect in order:
         if effect.effect_id in kept or not set(effect.depends_on) <= kept:
             continue
+        added = {effect.effect_id}
+        for later in order:
+            if later.effect_id in kept or later.effect_id in added:
+                continue
+            if set(later.depends_on) & added and set(later.depends_on) <= kept | added:
+                added.add(later.effect_id)
         try:
-            probes[effect.effect_id] = trials.run(kept | {effect.effect_id})
+            probes[effect.effect_id] = trials.run(kept | added)
         except (_BudgetSpentError, _StageExpiredError):
             break
     return probes

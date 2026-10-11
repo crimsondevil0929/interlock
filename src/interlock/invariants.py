@@ -145,39 +145,75 @@ class TenantIsolation:
     Reads tenant labels out of the captured row images. Tables with no
     ``TableSpec.tenant_column`` contribute nothing to the count, so a plan
     confined to those tables passes this check by construction.
+
+    :param max_tenants: How many tenants one plan's rows may span.
+    :param declared: Also hold the rows to the tenants the plan's effects
+        declare (``Effect.tenant_id``). A count alone admits a plan declared
+        for one tenant that changes only another tenant's rows: it spans one
+        tenant. When the operator stamps every effect with the tenant its
+        agent acts for, ``declared=True`` refuses a row of any other tenant,
+        one row as much as many; a plan that declares no tenant may then
+        change no tenant's rows.
     """
 
-    __slots__ = ("_max_tenants",)
+    __slots__ = ("_declared", "_max_tenants")
 
-    def __init__(self, max_tenants: int = 1) -> None:
+    def __init__(self, max_tenants: int = 1, *, declared: bool = False) -> None:
         self._max_tenants = max_tenants
+        self._declared = declared
 
     @property
     def name(self) -> str:
         return "tenant_isolation"
 
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
-        if diff.tenant_count <= self._max_tenants:
-            return ()
-        return (
-            InvariantViolation(
-                invariant=self.name,
-                severity=Severity.BLOCKING,
-                message=(f"plan spans {diff.tenant_count} tenants, limit is {self._max_tenants}"),
-                evidence={"tenants": ",".join(sorted(diff.tenant_ids))},
-            ),
-        )
+        found: list[InvariantViolation] = []
+        if diff.tenant_count > self._max_tenants:
+            found.append(
+                InvariantViolation(
+                    invariant=self.name,
+                    severity=Severity.BLOCKING,
+                    message=(
+                        f"plan spans {diff.tenant_count} tenants, limit is {self._max_tenants}"
+                    ),
+                    evidence={"tenants": ",".join(sorted(diff.tenant_ids))},
+                )
+            )
+        if self._declared:
+            declared = _declared_tenants(plan)
+            undeclared = diff.tenant_ids - declared
+            if undeclared:
+                found.append(
+                    InvariantViolation(
+                        invariant=self.name,
+                        severity=Severity.BLOCKING,
+                        message=(
+                            f"plan changes rows of {len(undeclared)} tenant(s) its effects do "
+                            f"not declare: {', '.join(sorted(undeclared))}"
+                        ),
+                        evidence={
+                            "undeclared": ",".join(sorted(undeclared)),
+                            "declared": ",".join(sorted(declared)),
+                        },
+                    )
+                )
+        return tuple(found)
 
     def hint(
         self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
     ) -> FeedbackHint:
-        # The tenants touched go in for the sanitizer to cut down to the ones
-        # the plan declared; how many there were never leaves this method.
-        return FeedbackHint(
-            kind=Guidance.TENANT_SCOPE,
-            tenants=tuple(sorted(diff.tenant_ids)),
-            limit=self._max_tenants,
-        )
+        # The tenants touched, and the plan's own, go in for the sanitizer to
+        # cut down to the ones the plan declared: the agent is told its own,
+        # and that there were others. How many never leaves this method.
+        tenants = tuple(sorted(diff.tenant_ids | _declared_tenants(plan)))
+        if "undeclared" in violation.evidence:
+            return FeedbackHint(kind=Guidance.UNDECLARED_TENANT, tenants=tenants)
+        return FeedbackHint(kind=Guidance.TENANT_SCOPE, tenants=tenants, limit=self._max_tenants)
+
+
+def _declared_tenants(plan: EffectPlan) -> frozenset[str]:
+    """The tenants a plan's effects declare (``Effect.tenant_id``)."""
+    return frozenset(e.tenant_id for e in plan.effects if e.tenant_id is not None)
 
 
 class TableAllowlist:

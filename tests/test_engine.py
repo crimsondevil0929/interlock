@@ -173,6 +173,100 @@ def test_cross_tenant_plan_is_refused(db: str) -> None:
     assert totals(db) == before
 
 
+def one_foreign_row(tenant: str | None = "acme") -> EffectPlan:
+    """A plan declared for ``tenant`` that changes globex's one order, and
+    nothing of its own."""
+    return make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 0 WHERE id = 4",
+            tenant_id=tenant,
+        )
+    )
+
+
+def test_a_count_alone_admits_a_plan_that_changes_only_another_tenants_row(db: str) -> None:
+    """The count is the default: one foreign tenant is one tenant."""
+    engine = EscrowEngine(SqliteSubstrate(db, tables=TABLES), checkers=[TenantIsolation(1)])
+    result = engine.execute(one_foreign_row())
+    assert result.committed
+    assert result.diff is not None and result.diff.tenant_ids == frozenset({"globex"})
+
+
+def test_a_plan_held_to_its_declared_tenants_changes_no_other_tenants_row(db: str) -> None:
+    before = totals(db)
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES), checkers=[TenantIsolation(1, declared=True)]
+    )
+    result = engine.execute(one_foreign_row())
+    assert not result.committed
+    assert result.blocked_by == ("tenant_isolation",)
+    assert result.verdict is not None
+    (violation,) = result.verdict.violations
+    assert violation.evidence == {"undeclared": "globex", "declared": "acme"}
+    assert totals(db) == before
+    assert result.feedback is not None
+    rendered = result.feedback.render()
+    assert "a tenant it does not declare; its declared tenants are acme" in rendered
+    assert "globex" not in rendered
+
+
+def test_declared_tenants_admit_the_plans_own_rows(db: str) -> None:
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES), checkers=[TenantIsolation(1, declared=True)]
+    )
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = 150 WHERE id = 1",
+            tenant_id="acme",
+        )
+    )
+    assert engine.execute(plan).committed
+
+
+def test_held_to_declared_tenants_a_plan_that_declares_none_may_change_no_tenants_rows(
+    db: str,
+) -> None:
+    before = totals(db)
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES), checkers=[TenantIsolation(1, declared=True)]
+    )
+    result = engine.execute(one_foreign_row(None))
+    assert not result.committed
+    assert result.blocked_by == ("tenant_isolation",)
+    assert totals(db) == before
+
+
+def test_a_plan_that_spans_and_strays_is_refused_for_both(db: str) -> None:
+    """Two tenants, one of them undeclared: past the count, and outside the
+    declaration. Each is said once."""
+    engine = EscrowEngine(
+        SqliteSubstrate(db, tables=TABLES), checkers=[TenantIsolation(1, declared=True)]
+    )
+    plan = make_plan(
+        Effect(
+            effect_id=EffectId("e1"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total = total WHERE id IN (1, 4)",
+            tenant_id="acme",
+        )
+    )
+    result = engine.execute(plan)
+    assert not result.committed
+    assert result.blocked_by == ("tenant_isolation", "tenant_isolation")
+    assert result.feedback is not None
+    assert [c.guidance.value for c in result.feedback.constraints] == [
+        "tenant_scope",
+        "undeclared_tenant",
+    ]
+
+
 def test_value_guard_catches_an_aggregate_that_every_row_passes(db: str) -> None:
     """Each row stays a valid float. The total collapses. Only the sum sees it."""
     plan = make_plan(

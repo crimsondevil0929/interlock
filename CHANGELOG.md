@@ -9,6 +9,43 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added (the customer acceptance matrix; `docs/CUSTOMER_ACCEPTANCE_MATRIX.md`)
+
+- **The customer acceptance suite** (`demo/customer_acceptance_suite.py`). Four unrelated
+  domains on SQLite, each with its own schema, triggers, constraints and simulated outside
+  APIs: accounts-payable disbursements on a double-entry ledger, cluster operations, a
+  multi-tenant SaaS admin console, and fulfilment in dependent stages. One function builds
+  every domain's policy from the same checkers. A live Claude model (`BENCHMARK_API_KEY`,
+  metered by AgentGov) is given each domain's compliant request, its out-of-policy
+  directives and its conflicting figures; everything it proposes goes through `PlanBuilder`
+  and the engine, and committed requests are delivered by the relay. Oracles independent of
+  Interlock check every outcome. Reference proposals, eight policy dimensions in every
+  domain, run with no model in `tests/test_acceptance_suite.py`. `--matrix` renders the run
+  as markdown; `docs/CUSTOMER_ACCEPTANCE_MATRIX.md` is the last live run.
+- **`TenantIsolation(declared=True)`** holds a plan's rows to the tenants its effects declare
+  (`Effect.tenant_id`), not only to a count. `TenantIsolation(1)` alone admits a plan
+  declared for one tenant that changes only another tenant's rows, since that spans one
+  tenant; building the acceptance suite found it. With `declared=True` such a plan is
+  refused, and a plan that declares no tenant may change no tenant's rows. Its own guidance, `undeclared_tenant`, under the
+  `tenant_isolation` name, tells the agent its declared tenants and never names or counts
+  the other. Off by default: a plan that never declares a tenant is judged as before.
+
+### Fixed (the customer acceptance matrix)
+
+- **A repair whose trial budget ran out proposed nothing when a plan's steps are admitted
+  only together.** The greedy fallback added one step at a time, and `CrossEffectAgreement`
+  is strict both ways: an allocation without the pick release and the booking it rides with
+  is refused, and so is each of those alone. A refused wave of fulfilment orders was
+  answered "No part of the plan would be admitted" when two of its orders would have been.
+  The fallback now adds the plan's independent parts (the connected components of its
+  dependency graph) whole first, then single steps; a plan whose parts are single steps is
+  searched as before. And a dropped step is explained by adding it back with the dropped
+  steps that depend on it, so the agent is told the order was one too many, not that its
+  allocation lacked its requests.
+- A `tenant_isolation` refusal of a plan that touched only other tenants' rows told the agent
+  its declared tenants were "none": the hint named only the tenants touched, and the
+  sanitizer keeps only the plan's own. It names the plan's own too now.
+
 ### Added (Epic 9: several daemons on one database; `docs/EPIC9_DESIGN.md`)
 
 - **Nodes of a cluster** (`interlock.cluster`, `[cluster]`). A daemon in a cluster is a

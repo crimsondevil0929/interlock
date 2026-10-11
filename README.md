@@ -260,7 +260,7 @@ blocking violation: fail closed.
 | Checker | Bounds |
 |---|---|
 | `BlastRadius` | captured mutations in one plan |
-| `TenantIsolation` | distinct tenants one plan may span |
+| `TenantIsolation` | distinct tenants one plan may span; with `declared=True`, the tenants its effects declare |
 | `ColumnValueGuard` | fall in a column total, table-wide |
 | `TenantDrawdownGuard` | fall in a column total, **per tenant** |
 | `NoDelete` | deletions outside granted tables |
@@ -274,6 +274,13 @@ blocking violation: fail closed.
 | `RecipientAllowlist` | where a request may send: email domains and addresses, https hosts, per tenant |
 | `OutboundTenantIsolation` | the tenants one plan's requests may span |
 | `FactAgreement` | a write against the inbound fact it must follow ([inbox](#inbound-facts-the-zero-trust-inbox)) |
+
+`TenantIsolation(1)` counts tenants: a plan declared for `acme` that changes one row of
+`globex`, and none of its own, spans one tenant and passes. When an agent acts for one
+tenant and the operator stamps every effect with it (`tenant_id=`, never the model's
+choice), pass `declared=True`: a row of any tenant the plan's effects do not declare is
+refused, one row as much as many, and the agent is told its own tenants and nothing of the
+other.
 
 `TenantDrawdownGuard` exists because `ColumnValueGuard` sums the column across
 the whole diff, and a sum is the wrong denominator on a multi-tenant
@@ -437,11 +444,15 @@ assert runtime.execute(repair.proposal).committed
   depends on. The whole plan is tried, then every such sub-plan one step smaller, and
   so on, later steps dropped first within a size; the first admitted one is a largest,
   and `repair.exhaustive` says so. `max_trials` (default 32) bounds the search; when it
-  runs out, a greedy pass keeps each step whose addition is admitted, which is sound but
-  may not be largest. The stage's time bound ends the search too.
-- **Explained without leaking.** Each dropped step says why, from its own trial: the
-  constraints that refused it, sanitized like every other feedback, a dropped
-  dependency, or a statement the substrate refuses outright.
+  runs out, a greedy pass keeps each of the plan's independent parts (the connected
+  components of its dependency graph), then each step, whose addition is admitted, which
+  is sound but may not be largest. Parts first, because steps a rule admits only together
+  (a row and the request it rides with) are each refused alone. The stage's time bound
+  ends the search too.
+- **Explained without leaking.** Each dropped step says why, from its own trial, adding it
+  back with the dropped steps that depend on it: the constraints that refused it,
+  sanitized like every other feedback, a dropped dependency, or a statement the substrate
+  refuses outright.
 
 Both substrates have savepoints. A repair's trials all run inside one stage, so the
 stage's locks are held for the whole search.
@@ -1778,6 +1789,30 @@ reads it:
 
 ```bash
 uv run python scripts/security_audit.py --docker
+```
+
+### The customer acceptance matrix
+
+`demo/customer_acceptance_suite.py` puts a live Claude model in front of four unrelated
+business domains on SQLite: accounts-payable disbursements on a double-entry ledger, cluster
+operations, a multi-tenant SaaS admin console, and fulfilment in dependent stages for a
+third-party warehouse. Each has its own schema, triggers, constraints and simulated outside
+APIs, and each policy is built by one function from the same checkers; only table and
+column names and limits differ. The model is given each domain's everyday request, requests
+that conflict with its rules (another tenant's rows, a cap, a table outside its remit, an
+append-only log), and conflicting figures, and everything it proposes goes through
+`PlanBuilder` and `EscrowEngine.execute`. Oracles that do not ask Interlock check every
+outcome: other tenants' rows byte for byte, each committed request against its rows, the
+domain's own invariants, delivery order and count, and that nothing shown to the model names
+another tenant's data. Reference proposals, one per policy dimension in every domain, run
+the same tool with no model, in CI (`tests/test_acceptance_suite.py`). The last live run is
+recorded in [`docs/CUSTOMER_ACCEPTANCE_MATRIX.md`](docs/CUSTOMER_ACCEPTANCE_MATRIX.md), with
+every tool call the first model named made, exactly as it made it.
+
+```bash
+uv run python demo/customer_acceptance_suite.py --offline    # the references; no model
+BENCHMARK_API_KEY=sk-ant-... uv run python demo/customer_acceptance_suite.py \
+    --matrix docs/CUSTOMER_ACCEPTANCE_MATRIX.md
 ```
 
 ## Unrecorded writes
