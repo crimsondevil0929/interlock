@@ -62,8 +62,8 @@ jobs:
       - name: Type-check the package (mypy --strict)
         run: uv run mypy src/
 
-      - name: Type-check tests and the demo (mypy --strict)
-        run: uv run mypy --strict tests/ demo.py
+      - name: Type-check tests and the demos (mypy --strict)
+        run: uv run mypy --strict tests/ demo.py demo/customer_acceptance_suite.py
 
       - name: Tests with coverage
         run: uv run pytest -v --cov=interlock --cov-report=term-missing --cov-report=xml
