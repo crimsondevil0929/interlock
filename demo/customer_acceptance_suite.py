@@ -173,10 +173,9 @@ run: an unmetered model is an unmetered budget."""
 MAX_TOKENS = 4096
 MAX_TURNS = 10
 """Fail-safe: bounds every conversation independently of the governor."""
-DOMAIN_ENVELOPE = "6.00"
-"""The most one domain may spend on one model, enforced by AgentGov."""
 CASE_ENVELOPE = "1.20"
-"""The most one conversation may spend."""
+"""The most one conversation may spend, enforced by AgentGov. A domain's root
+envelope on each model is this times its cases."""
 
 RELAY_KEY = Ed25519Signer(hashlib.sha256(b"interlock customer acceptance relay").digest())
 """The relay's key: it attests every outcome it records."""
@@ -3970,23 +3969,24 @@ def run_live_case(
     started = time.monotonic()
     ws = open_workspace(domain, root, name)
     desk = PlanDesk(ws, scope)
-    governor.delegate("acceptance", scope, money(CASE_ENVELOPE))
-    breaker = CognitiveBreaker(manager=governor, policy=CognitivePolicy(retain_arguments=False))
-    metered = Interceptor(
-        governor,
-        scope,
-        model=model,
-        pricing=PRICING.get(model),
-        max_output_tokens=MAX_TOKENS,
-        estimated_input_tokens=8000,
-        cognitive=breaker,
-        trajectory=scope,
-    )
     run = AgentRun()
     delivery = DeliveryReport()
     problems: list[str] = []
     achieved: bool | None = None
+    breaker: CognitiveBreaker | None = None
     try:
+        governor.delegate("acceptance", scope, money(CASE_ENVELOPE))
+        breaker = CognitiveBreaker(manager=governor, policy=CognitivePolicy(retain_arguments=False))
+        metered = Interceptor(
+            governor,
+            scope,
+            model=model,
+            pricing=PRICING.get(model),
+            max_output_tokens=MAX_TOKENS,
+            estimated_input_tokens=8000,
+            cognitive=breaker,
+            trajectory=scope,
+        )
         run = run_agent(
             client,
             model=model,
@@ -4021,7 +4021,8 @@ def run_live_case(
         verdict = "ERROR"
         problems.append(f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}")
     finally:
-        breaker.close()
+        if breaker is not None:
+            breaker.close()
         ws.close()
     plans = proposals(desk)
     say(
@@ -4073,7 +4074,9 @@ def run_domain(
         for model in models:
             governor = BudgetManager.open_sqlite(str(root / f"{domain.key}.{model}.governor.db"))
             try:
-                governor.open_root("acceptance", money(DOMAIN_ENVELOPE))
+                governor.open_root(
+                    "acceptance", money(str(Decimal(CASE_ENVELOPE) * len(domain.live)))
+                )
                 for case in domain.live:
                     live.append(
                         run_live_case(
@@ -4249,7 +4252,8 @@ def render_matrix(results: Mapping[str, Any]) -> str:
     ]
     if results["models"]:
         out.append(
-            f"| Model | {', '.join(f'`{m}`' for m in results['models'])} "
+            f"| {'Models' if len(results['models']) > 1 else 'Model'} | "
+            f"{', '.join(f'`{m}`' for m in results['models'])} "
             f"(adaptive thinking, effort {results['effort']}) |"
         )
         out.append(
@@ -4259,14 +4263,22 @@ def render_matrix(results: Mapping[str, Any]) -> str:
         )
         out.append(
             f"| Model calls | {calls}, ${cost:.2f} metered by AgentGov "
-            f"(${DOMAIN_ENVELOPE} per domain, ${CASE_ENVELOPE} per case) |"
+            f"(${CASE_ENVELOPE} per case) |"
+        )
+        ledgers = [state for d in domains for state in d["ledgers"].values()]
+        unverified = [state for state in ledgers if state != "verified"]
+        out.append(
+            f"| AgentGov ledgers | {len(ledgers) - len(unverified)} of {len(ledgers)} verified "
+            f"(`verify_integrity`)"
+            + (f": {_cell('; '.join(unverified))}" if unverified else "")
+            + " |"
         )
         out.append(
             f"| Plans the model proposed | {len(plans)}: "
             f"{sum(a['outcome'] == 'committed' for a in plans)} committed, "
             f"{sum(a['outcome'] == 'refused' for a in plans)} refused by a checker, "
-            f"{sum(a['outcome'] == 'error' for a in plans)} refused by the database or "
-            f"admission, {sum(a['outcome'] == 'malformed' for a in plans)} malformed |"
+            f"{sum(a['outcome'] == 'error' for a in plans)} rejected by admission or the "
+            f"database, {sum(a['outcome'] == 'malformed' for a in plans)} malformed |"
         )
     else:
         out.append("| Model | none: `--offline`, reference proposals only |")
@@ -4709,7 +4721,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.matrix:
         Path(args.matrix).write_text(render_matrix(results))
         print(f"matrix written to {args.matrix}")
-    return 1 if counts.get("FAIL") or counts.get("ERROR") else 0
+    unverified = [m for d in ran for m, state in d["ledgers"].items() if state != "verified"]
+    if unverified:
+        print(f"AgentGov ledgers that did not verify: {unverified}")
+    return 1 if counts.get("FAIL") or counts.get("ERROR") or unverified else 0
 
 
 if __name__ == "__main__":
