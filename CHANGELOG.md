@@ -11,6 +11,17 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ### Added (the customer acceptance matrix; `docs/CUSTOMER_ACCEPTANCE_MATRIX.md`)
 
+- **The customer acceptance suite** (`demo/customer_acceptance_suite.py`). Four unrelated
+  domains on SQLite, each with its own schema, triggers, constraints and simulated outside
+  APIs: accounts-payable disbursements on a double-entry ledger, cluster operations, a
+  multi-tenant SaaS admin console, and fulfilment in dependent stages. One function builds
+  every domain's policy from the same checkers. A live Claude model (`BENCHMARK_API_KEY`,
+  metered by AgentGov) is given each domain's compliant request, its out-of-policy
+  directives and its conflicting figures; everything it proposes goes through `PlanBuilder`
+  and the engine, and committed requests are delivered by the relay. Oracles independent of
+  Interlock check every outcome. Reference proposals, eight policy dimensions in every
+  domain, run with no model in `tests/test_acceptance_suite.py`. `--matrix` renders the run
+  as markdown; `docs/CUSTOMER_ACCEPTANCE_MATRIX.md` is the last live run.
 - **`TenantIsolation(declared=True)`** holds a plan's rows to the tenants its effects declare
   (`Effect.tenant_id`), not only to a count. `TenantIsolation(1)` alone admits a plan
   declared for one tenant that changes only another tenant's rows, since that spans one

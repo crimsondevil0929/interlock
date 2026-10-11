@@ -1791,6 +1791,30 @@ reads it:
 uv run python scripts/security_audit.py --docker
 ```
 
+### The customer acceptance matrix
+
+`demo/customer_acceptance_suite.py` puts a live Claude model in front of four unrelated
+business domains on SQLite: accounts-payable disbursements on a double-entry ledger, cluster
+operations, a multi-tenant SaaS admin console, and fulfilment in dependent stages for a
+third-party warehouse. Each has its own schema, triggers, constraints and simulated outside
+APIs, and each policy is built by one function from the same checkers; only table and
+column names and limits differ. The model is given each domain's everyday request, requests
+that conflict with its rules (another tenant's rows, a cap, a table outside its remit, an
+append-only log), and conflicting figures, and everything it proposes goes through
+`PlanBuilder` and `EscrowEngine.execute`. Oracles that do not ask Interlock check every
+outcome: other tenants' rows byte for byte, each committed request against its rows, the
+domain's own invariants, delivery order and count, and that nothing shown to the model names
+another tenant's data. Reference proposals, one per policy dimension in every domain, run
+the same tool with no model, in CI (`tests/test_acceptance_suite.py`). The last live run is
+recorded in [`docs/CUSTOMER_ACCEPTANCE_MATRIX.md`](docs/CUSTOMER_ACCEPTANCE_MATRIX.md), with
+every tool call the first model named made, exactly as it made it.
+
+```bash
+uv run python demo/customer_acceptance_suite.py --offline    # the references; no model
+BENCHMARK_API_KEY=sk-ant-... uv run python demo/customer_acceptance_suite.py \
+    --matrix docs/CUSTOMER_ACCEPTANCE_MATRIX.md
+```
+
 ## Unrecorded writes
 
 The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
