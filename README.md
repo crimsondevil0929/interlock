@@ -1970,7 +1970,9 @@ uv pip install git+https://github.com/crimsondevil0929/interlock
 ```
 
 Signing, a relay's attestations and an operator's records, needs the `sign` extra
-(`cryptography`); verifying never does.
+(`cryptography`); verifying never does. `kms-aws` adds `boto3` for `AwsKmsSigner`, a key
+AWS KMS holds, and `otel` agentgov's OpenTelemetry metrics; both pass through to
+agentgov's extras of the same names.
 
 **Developing on both repos at once.** `uv sync` resolves agentgov from PyPI, and a sibling
 `../agentgov` checkout is not consulted on its own. To point `uv` at one, add to

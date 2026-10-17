@@ -8,6 +8,9 @@
   signature that does not verify; and no error carries the credential.
 - A coroutine's loop never waits on the service.
 - The operator log and an ARC1 attestation sign through one unchanged.
+- They are agentgov's own classes under Interlock's names; a key AWS KMS holds
+  signs an attestation at signature version 2, and a record only within the
+  4096 bytes KMS signs.
 """
 
 from __future__ import annotations
@@ -222,3 +225,95 @@ def test_the_operator_log_and_an_arc1_attestation_sign_through_it(
         ),
     ).sign(signer)
     statement.verify(signer.public_key())
+
+
+# --------------------------------------------------------------------------
+# agentgov's signers, under Interlock's names
+# --------------------------------------------------------------------------
+
+
+def test_the_signers_are_agentgovs_own_under_interlocks_names() -> None:
+    """They moved to ``agentgov.receipts.signing`` in agentgov 1.0: one class
+    under either name, so an ``isinstance`` check or a subclass of either holds
+    for both."""
+    from agentgov.receipts import kms_aws, signing
+
+    import interlock
+    from interlock import signers
+
+    assert signers.RemoteSigner is signing.RemoteSigner is interlock.RemoteSigner
+    assert signers.HttpRemoteSigner is signing.HttpRemoteSigner is interlock.HttpRemoteSigner
+    assert signers.AwsKmsSigner is kms_aws.AwsKmsSigner is interlock.AwsKmsSigner
+
+
+_SPKI = bytes.fromhex("302a300506032b6570032100")
+"""An Ed25519 SubjectPublicKeyInfo (RFC 8410) before its 32-byte key."""
+
+
+class _AwsKms:
+    """As much of boto3's KMS client as ``AwsKmsSigner`` calls, over one
+    Ed25519 key."""
+
+    arn = "arn:aws:kms:us-east-1:111122223333:key/interlock-relay"
+
+    def __init__(self, key: Ed25519Signer) -> None:
+        self.key = key
+        self.signed: list[bytes] = []
+
+    def get_public_key(self, *, KeyId: str) -> dict[str, Any]:  # noqa: N803
+        return {
+            "KeyId": self.arn,
+            "KeySpec": "ECC_NIST_EDWARDS25519",
+            "KeyUsage": "SIGN_VERIFY",
+            "SigningAlgorithms": ["ED25519_SHA_512", "ED25519_PH_SHA_512"],
+            "PublicKey": _SPKI + self.key.public_key().raw,
+        }
+
+    def sign(self, **request: Any) -> dict[str, Any]:
+        assert (request["MessageType"], request["SigningAlgorithm"]) == ("RAW", "ED25519_SHA_512")
+        self.signed.append(request["Message"])
+        return {
+            "KeyId": self.arn,
+            "Signature": self.key.sign(request["Message"]),
+            "SigningAlgorithm": "ED25519_SHA_512",
+        }
+
+
+def test_a_key_aws_kms_holds_signs_an_attestation_and_a_record(tmp_path: Path) -> None:
+    """An attestation is an ARC1 document: signed at signature version 2, a
+    digest, whatever its size. An operator record is signed whole, and KMS
+    signs at most 4096 bytes: a larger one is refused, and nothing is signed."""
+    from interlock.signers import AwsKmsSigner
+
+    local = Ed25519Signer.generate()
+    kms = _AwsKms(local)
+    signer = AwsKmsSigner("alias/interlock-relay", client=kms)
+    assert isinstance(signer, RemoteSigner) and signer.key_id == local.key_id
+    assert signer.arn == kms.arn
+
+    statement = Attestation(
+        request=DeliveredRequest(
+            message_id="m",
+            effect_id="e",
+            sink="mail",
+            operation="send",
+            payload_hash="0" * 64,
+            idempotency_key="k",
+        ),
+        outcome=AttestedOutcome(
+            attempt=1, result="delivered", status_code=200, response_digest=None, remote_ref=None
+        ),
+    ).sign(signer)
+    assert statement.signature is not None and statement.signature.version == 2
+    statement.verify(local.public_key())
+
+    keyring = Keyring({"alice": signer.public_key().spec()})
+    path = tmp_path / "ops.ilok1"
+    with RecordLog(signer, log_id="ops", path=path, keyring=keyring) as log:
+        log.append(RecordKind.OPERATOR_INSTALLED, scope="ops", body={"registry": "x"})
+        signed = len(kms.signed)
+        with pytest.raises(SignerUnavailableError, match="KMS signs 1 to 4096 bytes"):
+            log.append(RecordKind.OPERATOR_INSTALLED, scope="ops", body={"registry": "x" * 4096})
+        assert len(kms.signed) == signed
+    (record,) = RecordLog.load(path, keyring)
+    assert record.key_id == local.key_id
