@@ -7,7 +7,61 @@ and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 Releases before 0.1.2 are described by their tags and commit history.
 
-## [Unreleased]
+## [1.0.2] - 2026-10-17
+
+Requires agentgov 1.0.0 (`interlock-agentgov>=1.0.0` on PyPI), and makes none of the
+calls agentgov 1.0 deprecates. **Back up an AgentGov ledger before the first 1.0 governor
+opens it for writing**: agentgov 1.0 upgrades a ledger in place, and 0.4 cannot open the
+result; stop every 0.x governor of a shared ledger first
+(agentgov's `docs/MIGRATING_TO_1.0.md`).
+
+### Changed
+
+- **A settlement credit names the charge it reverses** (`refund(..., reverses=)`): AgentGov
+  bounds it by what is left of that spend, and its chain records which spend it returns.
+  Interlock's own bound, the plan's charge less its credits, is unchanged.
+- **The commit guard is one of the governor's transactions** (`BudgetManager.transaction()`,
+  in place of the deprecated `ledger.lock`). In one process it excludes a trip between the
+  breaker check and the commit as before. Over a ledger shared through PostgreSQL it now
+  holds the fleet's writer lock from the check through the substrate's commit, so no
+  governor anywhere trips the scope between the two; a lock not granted within the
+  governor's `lock_timeout` refuses the commit with `AnchorError`. Nothing is written in it.
+- **A budget guard's hold and grant, and a recovery's hold and funding, are transactions
+  too:** the check and the act are one step across a fleet, and a grant or a funding that
+  fails part-way writes nothing (it could leave the steps before it written).
+- Reading the ledger's head (an anchor's position, the vacuum's, a relay's breaker reading)
+  takes no deprecated lock.
+- **`interlock.signers` is agentgov's own signers** (`agentgov.receipts.signing`), which
+  moved there in agentgov 1.0 unchanged: `RemoteSigner` and `HttpRemoteSigner` are the same
+  classes under either name.
+
+### Added
+
+- **`AwsKmsSigner`** (`interlock.AwsKmsSigner`, `interlock.signers.AwsKmsSigner`;
+  agentgov's), an Ed25519 key AWS KMS holds, with the `kms-aws` extra (`boto3`). It signs
+  ARC1 documents (a relay's attestations, the receipt log) at signature version 2, a digest.
+  Interlock's own records (the operator log, the vacuum's, the inbox's) are signed whole,
+  and KMS signs at most 4096 bytes, so through it each must stay within that.
+  `[signers.<name>]` still takes `type = "http"` only.
+- Extras `kms-aws` and `otel`, passing through to agentgov's.
+- Python 3.13 and 3.14: in the classifiers, and in CI's test matrix.
+
+### Fixed (in the tests, found when agentgov's CI ran this suite)
+
+- The fake key service listens with a backlog of 64, not socketserver's 5: eight
+  concurrent signs could overflow it on a busy runner and wait out TCP's one-second
+  retransmission (`test_signing_off_the_loop_leaves_it_running`).
+- The soak's "metrics agree" claim no longer requires `interlock_plan_conflicts_total` of
+  an incarnation started mid-run, which may lose no race in its shorter life; "lock waits
+  resolve" still requires races across the cluster.
+- The crash-consistency tests probe the writer lock with `PostgresStore.writer_lock_held()`:
+  opening a governor no longer takes it. A settlement test spends before posting a credit,
+  since agentgov 1.0 refuses a refund beyond what was spent.
+- The suite treats a `DeprecationWarning` as an error.
+
+## [1.0.1] - 2026-10-10
+
+Published to PyPI. Requires agentgov 0.4.0 or later.
 
 ### Added (the customer acceptance matrix; `docs/CUSTOMER_ACCEPTANCE_MATRIX.md`)
 
@@ -45,6 +99,10 @@ Releases before 0.1.2 are described by their tags and commit history.
 - A `tenant_isolation` refusal of a plan that touched only other tenants' rows told the agent
   its declared tenants were "none": the hint named only the tenants touched, and the
   sanitizer keeps only the plan's own. It names the plan's own too now.
+
+## [1.0.0] - 2026-10-10
+
+Published to PyPI. Requires agentgov 0.4.0 or later.
 
 ### Added (Epic 9: several daemons on one database; `docs/EPIC9_DESIGN.md`)
 
@@ -125,6 +183,10 @@ Releases before 0.1.2 are described by their tags and commit history.
   good. A delivery whose stage has a commit intent with no outcome after it now waits.
 - **A stage frozen right after its `BEGIN` was never ended.** Its bounds were set in a
   second message; they now travel with the `BEGIN`.
+## [1.0.0-rc1] - 2026-10-09
+
+Tagged; not published to PyPI.
+
 ### Added (Epic 8: keys held elsewhere, rotated and revoked; the security audit; `docs/EPIC8_DESIGN.md`)
 
 - **Remote signers** (`interlock.signers`). `RemoteSigner` implements agentgov's `Signer`
@@ -163,6 +225,10 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 - **A failed service reported itself running while it closed.** Its state is now
   `backing-off` from the moment its step fails, so `status()` and `/healthz` agree with it.
+
+## [0.7.0] - 2026-10-09
+
+Tagged; not published to PyPI.
 
 ### Added (Epic 7: trace context, metrics, a pooler-safe stage; `docs/EPIC7_DESIGN.md`)
 
@@ -227,6 +293,10 @@ Releases before 0.1.2 are described by their tags and commit history.
   `PostgresSubstrate(metrics=...)`; `open_substrate(config, metrics=...)`. The package
   exports `Metrics`, `MetricsService`, `new_traceparent`, `child_traceparent` and
   `parse_traceparent`.
+
+## [0.6.0] - 2026-10-08
+
+Tagged; not published to PyPI.
 
 ### Added (Epic 6: the runtime daemon, and the system under load; `docs/EPIC6_DESIGN.md`)
 
@@ -302,6 +372,10 @@ Releases before 0.1.2 are described by their tags and commit history.
   instead of reading the whole ledger every run; a run that finds the operator log in use
   tries again after a second.
 
+## [0.5.0] - 2026-10-04
+
+Tagged; not published to PyPI.
+
 ### Added (Epic 5: the zero-trust inbox, cryptographic compaction, the last checkers; `docs/EPIC5_DESIGN.md`)
 
 - **The vacuum** (`interlock.vacuum.Vacuum`, `interlock vacuum`; schema version 5). Prunes
@@ -351,6 +425,10 @@ Releases before 0.1.2 are described by their tags and commit history.
   not `1`; a field named like a credential is folded through NFKC before it is compared.
 - `IL009` names both the rate windows' history and the inbox: neither is a stage's to read.
   A window past pruned history raises `IL011`, surfaced as `SubstrateConfigurationError`.
+
+## [0.4.0] - 2026-10-04
+
+Requires agentgov 0.4.0 (`interlock-agentgov` on PyPI). Published to PyPI.
 
 ### Added (Epic 4: delivery receipts, rate windows, ledger-integrated compensations; `docs/EPIC4_DESIGN.md`)
 
