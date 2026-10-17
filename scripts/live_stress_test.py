@@ -4601,6 +4601,13 @@ def trace_survives(run: Run) -> Claim:
     )
 
 
+QUIET_WHEN_RESTARTED = frozenset({"interlock_plan_conflicts_total"})
+"""Families a process exports a sample of only once what they count happens,
+and which an incarnation started mid-run may never see in its shorter life: a
+restarted node that lost no race exports no conflict. That races happen and
+resolve is the "lock waits resolve" claim's, over the whole cluster."""
+
+
 def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -> Claim:
     """What each node exported, against what it did, as the run counted it
     (``docs/EPIC7_DESIGN.md`` §5): every process that lived to its stop, its
@@ -4626,7 +4633,13 @@ def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -
             problems.append(
                 f"{where}: scrape errors {dict(scraper.errors)}; fell {scraper.fell[:2]}"
             )
-        silent = sorted(n for n in catalog if n not in last and f"{n}_count" not in last)
+        silent = sorted(
+            n
+            for n in catalog
+            if n not in last
+            and f"{n}_count" not in last
+            and not (number > 0 and n in QUIET_WHEN_RESTARTED)
+        )
         if scraper.families != catalog or silent:
             problems.append(
                 f"{where}: families missing {sorted(catalog - scraper.families)}; silent {silent}"
@@ -4695,8 +4708,8 @@ def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -
         [
             f"{sum(s.scrapes for s in run.scrapers.values())} scrapes of "
             f"{len(run.scrapers)} processes, every one well formed; {len(catalog)} families "
-            f"exported by each process that lived to its stop ({checked}), each with data; no "
-            f"counter fell",
+            f"exported by each process that lived to its stop ({checked}), each with data (a "
+            f"restarted one's conflicts once it lost a race); no counter fell",
             f"each such process's plans by outcome and webhooks by answer what its journal and "
             f"the vendor counted; its receipts and settlement lags one for one; "
             f"{takeovers:.0f} leases taken over from nodes gone, as the relays exported them",
