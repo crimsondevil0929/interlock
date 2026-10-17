@@ -277,6 +277,65 @@ def test_a_governed_commit_holds_the_governor_until_it_lands(db: str) -> None:
     assert not escrow.execute(plan(5.0)).committed
 
 
+def test_a_governed_commit_over_a_shared_ledger_holds_every_governor(
+    db: str, pg_database: str
+) -> None:
+    """Over a ledger shared through PostgreSQL the guard is one of the
+    governor's transactions, holding the fleet's writer lock: another
+    governor's trip lands strictly after the commit too."""
+    gov = BudgetManager.open_postgres(pg_database)
+    other = BudgetManager.open_postgres(pg_database)
+    try:
+        gov.open_root("agent", money("1.00"))
+        tripper = threading.Thread(target=other.trip, args=("agent", "tripped elsewhere"))
+        blocked: list[bool] = []
+
+        class TripsDuringCommit(SqliteSubstrate):
+            def commit(self, handle: StageHandle) -> CommitReceipt:
+                tripper.start()
+                tripper.join(timeout=0.5)
+                blocked.append(tripper.is_alive())
+                return super().commit(handle)
+
+        escrow = engine(
+            db,
+            anchor=LedgerAnchor(governed=gov),
+            substrate=TripsDuringCommit(db, tables=TABLES),
+        )
+        result = escrow.execute(plan())
+        tripper.join(timeout=10)
+
+        assert blocked == [True], "the other governor's trip waited for the guarded commit"
+        assert result.committed and (1, 777.0) in totals(db)
+        assert gov.is_halted("agent", fresh=True), "and landed after it"
+    finally:
+        other.close()
+        gov.close()
+
+
+def test_a_substrates_failure_inside_the_commit_guard_is_its_own(db: str) -> None:
+    """The guard translates the governor's own failures only: a substrate
+    whose commit fails raises its own error, the stage is aborted, and the
+    governor's transaction ends with it."""
+    gov = BudgetManager()
+    gov.open_root("agent", money("1.00"))
+
+    class FailsToCommit(SqliteSubstrate):
+        def commit(self, handle: StageHandle) -> CommitReceipt:
+            raise sqlite3.OperationalError("disk I/O error")
+
+    escrow = engine(
+        db, anchor=LedgerAnchor(governed=gov), substrate=FailsToCommit(db, tables=TABLES)
+    )
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        escrow.execute(plan())
+
+    assert (1, 777.0) not in totals(db)
+    assert escrow.chain.records()[-1].record_type is RecordType.ABORTED
+    with gov.transaction() as txn:  # none is left open
+        assert txn.available("agent") == money("1.00")
+
+
 def test_a_halt_racing_an_audit_commit_is_recorded_on_the_commit(
     db: str, governor: tuple[str, BudgetManager]
 ) -> None:

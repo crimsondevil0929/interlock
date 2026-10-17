@@ -1056,7 +1056,7 @@ class RecoveryRuntime:
 
     def _authorize(self, number: int, rung: Rung) -> Authorization:
         estimate = self._policy.step_estimate
-        with self._governor.ledger.lock:
+        with self._governor.transaction():
             available = self._governor.available(self._billing)
             if estimate <= available:
                 try:
@@ -1217,7 +1217,7 @@ class RecoveryRuntime:
         reserve = policy.reserve
         memo = f"recovery reserve for {self._scope}"
         try:
-            with governor.ledger.lock:
+            with governor.transaction():  # all of it, or none
                 if policy.funding is not None:
                     governor.delegate(policy.funding, self._recovery, reserve, memo=memo)
                     source, origin = "delegated", policy.funding
@@ -1230,8 +1230,7 @@ class RecoveryRuntime:
                     source, origin = "treasury", None
         except (AgentGovError, ValueError) as exc:
             raise RecoveryError(
-                f"cannot fund {self._recovery!r} with {reserve}: {exc}. The ledger shows how "
-                f"far it got"
+                f"cannot fund {self._recovery!r} with {reserve}: {exc}. Nothing was written"
             ) from exc
         return self._open_record(
             {"source": source, "from": origin, "amount": money(reserve)}, adopted=None

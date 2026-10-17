@@ -48,6 +48,7 @@ import re
 import threading
 import uuid
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
@@ -360,7 +361,7 @@ class BudgetGuard:
         if needed <= 0:
             raise ValueError(f"an authorization is positive, got {needed}")
         governor = self._governor
-        with governor.ledger.lock:
+        with _transaction(governor):
             halted = governor.halted_by(scope_id)
             reason = breaker_reason(governor, halted) if halted is not None else None
             if halted is not None and (halted != scope_id or not spent_out(reason or "")):
@@ -472,7 +473,7 @@ class BudgetGuard:
             reset = False
             carried = Decimal(0)
             try:
-                with governor.ledger.lock:
+                with _transaction(governor):  # all of it, or none
                     if parent is None:
                         halted = governor.halted_by(scope)
                         if halted is not None and not spent_out(breaker_reason(governor, halted)):
@@ -504,8 +505,10 @@ class BudgetGuard:
                                 scope, memo=f"carried into {target} by extension {grant_id}"
                             )
                         governor.delegate(parent, target, granted + carried, memo=memo)
-                        entry = governor.audit_trail(target)[0]
                         source = "delegate"
+                if source == "delegate":
+                    # The allocation that opened the scope, read once it committed.
+                    entry = governor.find_entries(scope_id=target, limit=1)[0]
             except AgentGovError as exc:
                 raise ExtensionError(
                     f"{_origin_of(parent, scope)} cannot fund {granted} for quote "
@@ -661,6 +664,16 @@ def _signed_spend(entry: LedgerEntry) -> Decimal:
     if entry.entry_type is EntryType.REVERSAL:
         return -entry.amount
     return Decimal(0)
+
+
+def _transaction(governor: BudgetManager) -> AbstractContextManager[object]:
+    """The governor's transaction, around a check and the act it decides. None
+    over a read-only view: it can act on nothing (its act raises), so nothing
+    can come between, and a transaction would refuse it the check as well."""
+    store = governor.store
+    if store is not None and store.read_only:
+        return nullcontext()
+    return governor.transaction()
 
 
 def _next_extension(governor: BudgetManager, scope: str) -> str:

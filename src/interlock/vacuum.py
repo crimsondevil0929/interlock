@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Final
 from agentgov.core import EntryType
 from agentgov.receipts.canonical import canonical_bytes
 
+from interlock.anchor import _head
 from interlock.compaction import (
     GENESIS,
     Checkpoint,
@@ -988,9 +989,7 @@ class Vacuum:
         return VacuumReport("applied", draft, *counts, (), found.kept, written, events, held)
 
     def _head(self) -> tuple[int, str]:
-        ledger = self._ledger.ledger
-        with ledger.lock:
-            return len(ledger), str(ledger.head_hash)
+        return _head(self._ledger)
 
     def _anchored(self, intent: Any) -> bool:
         memo = anchor_memo(intent)

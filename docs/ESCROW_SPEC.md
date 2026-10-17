@@ -679,7 +679,8 @@ Methods called:
 | `BudgetManager.open_sqlite(path, read_only=True)` | Attach. Read-only mode takes no advisory file lock, so it is safe against a live governing process. |
 | `manager.verify_integrity()` | Admissibility gate (E3-2). |
 | `manager.refresh()` | Catch a read-only view up with the governor, verified, before every head read and breaker check (E3-4). Since `agentgov` v0.1.2. |
-| `manager.ledger.head_hash`, `len(manager.ledger)`, `manager.ledger.lock` | The anchor value and its sequence, read together under the ledger's lock. |
+| `manager.ledger.head_hash`, `len(manager.ledger)` | The anchor value and its sequence, read together: the sequence is read on either side of the hash, and again until both reads agree (`ledger.lock`, which held them together, is deprecated since `agentgov` 1.0). |
+| `manager.transaction()` | Governed mode: the commit guard, from the breaker check through the substrate's commit. Since `agentgov` 1.0. |
 | `manager.ledger.entries()` | Chain read for anchor resolution. |
 | `manager.audit_trail(scope_id)` | Correlate committed plans to settled spend. |
 | `manager.control_events` | Halted-scope check (E3-6), and the reason a scope was halted. |
