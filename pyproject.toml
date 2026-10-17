@@ -1,6 +1,6 @@
 [project]
 name = "interlock-escrow"
-version = "1.0.1"
+version = "1.0.2"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,15 +16,17 @@ keywords = [
     "audit",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Typing :: Typed",
 ]
 dependencies = [
-    "interlock-agentgov>=0.4.0",
+    "interlock-agentgov>=1.0.0",
 ]
 
 [project.scripts]
@@ -36,7 +38,13 @@ postgres = ["psycopg[binary]>=3.2"]
 # operator's records (interlock outbox release, compensate...), an inbox's
 # (interlock inbox serve, which also verifies SendGrid's ECDSA signatures).
 # Verifying any of them needs nothing extra.
-sign = ["interlock-agentgov[sign]>=0.4.0"]
+sign = ["interlock-agentgov[sign]>=1.0.0"]
+# Signing with an Ed25519 key held by AWS KMS (interlock.signers.AwsKmsSigner,
+# AgentGov's own): boto3, through AgentGov's extra.
+kms-aws = ["interlock-agentgov[kms-aws]>=1.0.0"]
+# AgentGov's OpenTelemetry metrics (agentgov.otel.OpenTelemetryMetrics), for a
+# governor Interlock anchors to.
+otel = ["interlock-agentgov[otel]>=1.0.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -67,6 +75,9 @@ testpaths = ["tests"]
 # A test still running after five minutes has every thread's stack dumped, so
 # a hang shows where it is.
 faulthandler_timeout = 300
+# A deprecated call is an error here, not a warning: agentgov 1.0 deprecates
+# what 2.0 removes, and Interlock makes none of those calls.
+filterwarnings = ["error::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100

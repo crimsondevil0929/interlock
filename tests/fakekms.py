@@ -38,6 +38,10 @@ class _Server(ThreadingHTTPServer):
     some machines (``tests/fakesink.py``)."""
 
     daemon_threads = True
+    # Deeper than socketserver's 5. Each sign is a connection of its own, and
+    # when a burst of them overflows the backlog while the accept loop lags,
+    # the overflow waits out TCP's one-second retransmission timeout.
+    request_queue_size = 64
 
     def server_bind(self) -> None:
         socketserver.TCPServer.server_bind(self)

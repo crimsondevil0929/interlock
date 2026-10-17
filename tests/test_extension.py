@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 from agentgov import BudgetManager
-from agentgov.core import Authorization, EntryType
+from agentgov.core import Authorization, EntryType, LedgerEntry
 from agentgov.exceptions import CircuitOpenError
 from agentgov.receipts import HmacKey, ReceiptLog, verify_bundle
 
@@ -57,8 +57,8 @@ def guard_for(gov: BudgetManager, **kwargs: Any) -> BudgetGuard:
     return BudgetGuard(gov, RecordLog(HmacKey.generate(), log_id="support"), **kwargs)
 
 
-def spend(gov: BudgetManager, scope: str, amount: str) -> None:
-    gov.capture(gov.authorize(scope, amount), amount)
+def spend(gov: BudgetManager, scope: str, amount: str) -> LedgerEntry:
+    return gov.capture(gov.authorize(scope, amount), amount)
 
 
 def quoted(outcome: Authorization | ExtensionRequest) -> ExtensionRequest:
@@ -335,8 +335,8 @@ def test_a_grant_never_lifts_a_safety_halt() -> None:
 
 def test_spend_to_date_is_net_of_vendor_refunds() -> None:
     gov = governor()
-    spend(gov, "support-agent", "4.60")
-    gov.refund("support-agent", "0.10", memo="vendor credit")
+    charged = spend(gov, "support-agent", "4.60")
+    gov.refund("support-agent", "0.10", memo="vendor credit", reverses=charged)
     quote = quoted(guard_for(gov).authorize("support-agent", "0.80"))
     assert quote.spend.spent == Decimal("4.50") and quote.spend.available == Decimal("0.50")
 
