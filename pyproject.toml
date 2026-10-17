@@ -75,6 +75,9 @@ testpaths = ["tests"]
 # A test still running after five minutes has every thread's stack dumped, so
 # a hang shows where it is.
 faulthandler_timeout = 300
+# A deprecated call is an error here, not a warning: agentgov 1.0 deprecates
+# what 2.0 removes, and Interlock makes none of those calls.
+filterwarnings = ["error::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
