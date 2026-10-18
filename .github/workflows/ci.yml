@@ -231,8 +231,9 @@ jobs:
         # warnings themselves rather than treating any stderr as failure.
         run: |
           set -o pipefail
-          uv build 2>&1 | tee build.log
-          if grep -i '^warning' build.log; then
+          # The log goes outside the checkout: the sdist packs the source tree.
+          uv build 2>&1 | tee "${{ runner.temp }}/build.log"
+          if grep -i '^warning' "${{ runner.temp }}/build.log"; then
             echo "::error::uv build emitted packaging warnings"
             exit 1
           fi

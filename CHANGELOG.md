@@ -7,6 +7,21 @@ and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 Releases before 0.1.2 are described by their tags and commit history.
 
+## [Unreleased]
+
+### Fixed
+
+- **The sdist packs no build log or Hypothesis cache.** 1.0.2's carries the release
+  workflow's `build.log`, written into the checkout as it built: both workflows now
+  write it to the runner's temporary directory, and `.gitignore` ignores `*.log` and
+  `.hypothesis/`.
+
+### Fixed (in the tests)
+
+- `test_interlock_daemon_reloads_on_sighup` registers its key after the vacuum's run as
+  the daemon starts, which holds the operator log open for appending; on a slow runner
+  `keys register` could reach it first and be refused.
+
 ## [1.0.2] - 2026-10-17
 
 Requires agentgov 1.0.0 (`interlock-agentgov>=1.0.0` on PyPI), and makes none of the

@@ -14,6 +14,10 @@ wheels/
 .ruff_cache/
 .mypy_cache/
 .coverage
+.hypothesis/
+
+# Logs, such as a build's: the sdist packs whatever is not ignored
+*.log
 
 # Live stress-test artifacts (scripts/live_stress_test.py). Evidence, not
 # repository content; regenerate with the script.

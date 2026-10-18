@@ -571,6 +571,12 @@ def scrape(port: int) -> dict[str, dict[tuple[tuple[str, str], ...], float]]:
         return parse(answer.read().decode())
 
 
+def vacuum_runs(scraped: dict[str, dict[tuple[tuple[str, str], ...], float]]) -> float:
+    """The vacuum's runs that ended, not counting one deferred as busy."""
+    runs = scraped.get("interlock_vacuum_runs_total", {})
+    return sum(n for labels, n in runs.items() if dict(labels)["outcome"] != "busy")
+
+
 def test_the_daemon_serves_what_every_part_measures(site: Site) -> None:
     config = site.rewrite("[daemon]", METRICS)
     charged: list[StageResult] = []
@@ -1008,9 +1014,13 @@ def test_interlock_daemon_reloads_on_sighup(site: Site, tmp_path: Path) -> None:
     """A key file replaced, its new key registered, and ``SIGHUP``: the relay
     opens again with it."""
     site.rewrite("every_seconds = 1\n", "every_seconds = 3600\n")
-    daemon = Daemon(site.path)
+    daemon = Daemon(site.path, "--metrics", "127.0.0.1:0")
     try:
         daemon.wait_for("interlock daemon running:")
+        port = int(daemon.wait_for("serving metrics on port").rsplit(" ", 1)[1])
+        # The vacuum runs once as the daemon starts, holding the operator log
+        # open for appending until it ends: the operator acts after that run.
+        asyncio.run(until(lambda: vacuum_runs(scrape(port)) >= 1))
         fresh = generate_key(tmp_path / "relay-2.key")
         os.replace(tmp_path / "relay-2.key", site.path.parent / "relay.key")
         register = ("keys", "register", "--role", "relay", "--name", "relay-2")
@@ -1021,7 +1031,7 @@ def test_interlock_daemon_reloads_on_sighup(site: Site, tmp_path: Path) -> None:
     finally:
         code = daemon.stop()
     assert code == 0, (daemon.lines, daemon.errors)
-    assert reloaded == "reloaded: inbox, relay-0, vacuum"
+    assert reloaded == "reloaded: inbox, metrics, relay-0, vacuum"
     (relay,) = [line for line in daemon.lines if line.startswith("relay-0: stopped")]
     assert "0 failure(s)" in relay and "reloads 1" in relay
 
