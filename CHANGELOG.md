@@ -15,6 +15,10 @@ Releases before 0.1.2 are described by their tags and commit history.
   workflow's `build.log`, written into the checkout as it built: both workflows now
   write it to the runner's temporary directory, and `.gitignore` ignores `*.log` and
   `.hypothesis/`.
+- **The SQLite store binds its parameters by name** where a query uses one twice
+  (`:ids`, not `?1`). CPython 3.12.3 and earlier, Ubuntu 24.04's system Python among
+  them, warn that a numbered placeholder bound from a sequence is a named one
+  (`DeprecationWarning`); later releases do not. The queries are unchanged otherwise.
 
 ### Fixed (in the tests)
 
