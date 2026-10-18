@@ -1355,9 +1355,9 @@ class SqliteOutboxStore:
                 f"o.operation, o.idempotency_key, o.payload_hash, s.state, s.attempts, "
                 f"s.log_seq, s.log_head FROM {OUTBOX} AS o JOIN {STATE} AS s "
                 f"ON s.message_id = o.message_id "
-                f"WHERE ?1 IS NULL OR o.message_id IN (SELECT value FROM json_each(?1)) "
+                f"WHERE :ids IS NULL OR o.message_id IN (SELECT value FROM json_each(:ids)) "
                 f"ORDER BY o.enqueued_at, o.message_id",
-                (ids,),
+                {"ids": ids},
             ).fetchall()
         ]
         events = [
@@ -1381,9 +1381,9 @@ class SqliteOutboxStore:
                 f"SELECT message_id, seq, attempt, event, actor, at, status_code, "
                 f"response_digest, detail, state_after, remote_ref, authority, prev_hash, "
                 f"event_hash FROM {LOG} "
-                f"WHERE ?1 IS NULL OR message_id IN (SELECT value FROM json_each(?1)) "
+                f"WHERE :ids IS NULL OR message_id IN (SELECT value FROM json_each(:ids)) "
                 f"ORDER BY message_id, seq",
-                (ids,),
+                {"ids": ids},
             ).fetchall()
         ]
         return messages, events
@@ -1396,9 +1396,10 @@ class SqliteOutboxStore:
             f"o.tenant_id, o.cost, s.state, s.attempts, s.reason, s.lease_owner, o.not_after, "
             f"o.enqueued_at, s.next_attempt_at FROM {OUTBOX} AS o JOIN {STATE} AS s "
             f"ON s.message_id = o.message_id "
-            f"WHERE (?1 IS NULL OR s.state = ?1) AND (?2 IS NULL OR o.scope_id = ?2) "
-            f"ORDER BY o.enqueued_at, o.seq LIMIT ?3",
-            (state, scope_id, limit),
+            f"WHERE (:state IS NULL OR s.state = :state) "
+            f"AND (:scope_id IS NULL OR o.scope_id = :scope_id) "
+            f"ORDER BY o.enqueued_at, o.seq LIMIT :limit",
+            {"state": state, "scope_id": scope_id, "limit": limit},
         ).fetchall()
         return tuple(
             MessageView(
