@@ -45,6 +45,29 @@ result; stop every 0.x governor of a shared ledger first
   `[signers.<name>]` still takes `type = "http"` only.
 - Extras `kms-aws` and `otel`, passing through to agentgov's.
 - Python 3.13 and 3.14: in the classifiers, and in CI's test matrix.
+- **`.github/workflows/release.yml`**, as agentgov's: a `v*` tag builds the distributions
+  (refusing a tag that is not `pyproject.toml`'s and `interlock.__version__`'s version, or
+  a build with packaging warnings), publishes them to PyPI by trusted publishing from the
+  `pypi` environment with a PEP 740 attestation each, attests their build provenance, and
+  creates the GitHub release with a CycloneDX SBOM of everything the package and its
+  extras install. It publishes nothing until `interlock-escrow`'s trusted publisher is
+  registered on PyPI.
+
+### Fixed
+
+- **The vacuum keeps a message while a fact bound to it is pending.** A fact continues its
+  delivery's trace context, which is read from the message's when the agent reads its
+  facts. A vacuum that pruned a delivered, settled message past its retention before its
+  fact was consumed took that context with it, and the fact continued no trace (the soak's
+  "trace context survives" claim, on CI). The survey now keeps such a stage, and the
+  database refuses on its own to prune one. On PostgreSQL `interlock.outbox_compact`
+  checks under a `SHARE` lock on `interlock.inbox_facts`, which a fact being recorded holds
+  off until the commit: a fact matched after the survey has the run refused (`rejected`),
+  and a later run prunes the message once the fact is consumed. No schema, installation
+  version or hash changes. The survey's half holds at once; run `interlock install` again
+  for the database's. The soak's "the vacuum compacts" claim follows the rule: a stage a
+  pending fact binds is not yet prunable, and a run refused for a fact matched after it
+  surveyed is explained.
 
 ### Fixed (in the tests, found when agentgov's CI ran this suite)
 
