@@ -370,7 +370,31 @@ def _config(checker: object) -> list[tuple[str, str]]:
         if slots
         else dict(getattr(checker, "__dict__", {}))
     )
-    return [(type(checker).__qualname__, ""), *sorted((k, repr(v)) for k, v in state.items())]
+    return [(type(checker).__qualname__, ""), *sorted((k, _render(v)) for k, v in state.items())]
+
+
+def _render(value: object) -> str:
+    """``repr(value)``, with every set's members in sorted order.
+
+    A set of strings reprs in hash order, which ``PYTHONHASHSEED`` changes
+    from one process to the next, so a digest over it could not be
+    recomputed anywhere else. Everything else renders exactly as ``repr``
+    does, so a configuration holding no set keeps the digest it had.
+    """
+    if isinstance(value, set | frozenset):
+        members = ", ".join(sorted(_render(v) for v in value))
+        if isinstance(value, frozenset):
+            return f"frozenset({{{members}}})" if value else "frozenset()"
+        return f"{{{members}}}" if value else "set()"
+    if isinstance(value, dict) and type(value) is dict:
+        return "{" + ", ".join(f"{_render(k)}: {_render(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, list) and type(value) is list:
+        return "[" + ", ".join(_render(v) for v in value) + "]"
+    if isinstance(value, tuple) and type(value) is tuple:
+        if len(value) == 1:
+            return f"({_render(value[0])},)"
+        return "(" + ", ".join(_render(v) for v in value) + ")"
+    return repr(value)
 
 
 def _gaps(substrate: object, report: object, outbound: int = 0) -> tuple[str, ...]:

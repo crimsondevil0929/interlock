@@ -19,6 +19,14 @@ Releases before 0.1.2 are described by their tags and commit history.
   (`:ids`, not `?1`). CPython 3.12.3 and earlier, Ubuntu 24.04's system Python among
   them, warn that a numbered placeholder bound from a sequence is a named one
   (`DeprecationWarning`); later releases do not. The queries are unchanged otherwise.
+- **A receipt's checker digests are the same in every process.** `checker_records`
+  digested a checker's configuration from its `repr`, and a set of strings reprs in hash
+  order, which `PYTHONHASHSEED` changes: `TableAllowlist`, `NoDelete`, `SinkAllowlist`,
+  `RecipientAllowlist` and `FactAgreement` digested differently in each process, so a
+  receipt's `decision.checkers` could not be recomputed from the configuration anywhere
+  else. Sets now render with their members sorted. A configuration that holds no set
+  digests exactly as before; the five above digest once, the same way everywhere, which
+  `tests/test_checker_records.py` checks under nine seeds for all 17 built-in checkers.
 
 ### Fixed (in the tests)
 
