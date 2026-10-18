@@ -276,12 +276,12 @@ def test_the_daemon_signs_with_every_key_at_a_signing_service(
             "id": "evt_1",
             "object": "event",
             "type": "payment_intent.succeeded",
-            "data": {"object": {**intent, "status": "succeeded"}},
+            "data": {"object": {**intent, "id": "pi_unknown", "status": "succeeded"}},
         }
-        # Recorded, so attested. (Its fact may not be: the vacuum, every second
-        # with no retention, may have pruned the payment by now.)
+        # Recorded, so attested, and bound to nothing the outbox delivered: a
+        # fact on the payment would keep it from the vacuum until consumed.
         status, answer = await asyncio.to_thread(post, inbox, stripe_webhook(event))
-        assert status == 200 and answer["recorded"] == 1
+        assert status == 200 and (answer["recorded"], answer["matched"]) == (1, 0)
         await until(lambda: supervisor.status()["vacuum"].counters.get("applied", 0) >= 1)
         supervisor.stop()
         await running

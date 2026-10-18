@@ -32,7 +32,7 @@ from typing import Any
 import pytest
 from agentgov import BudgetManager
 from agentgov.cognitive import CognitiveBreaker, CognitivePolicy
-from agentgov.core import Authorization
+from agentgov.core import Authorization, EntryType
 from agentgov.exceptions import (
     AgentThrashingError,
     CircuitOpenError,
@@ -580,7 +580,8 @@ def test_what_recovery_spent_is_net_of_vendor_refunds() -> None:
         assert (runtime.scope_id, runtime.records.log_id) == ("support-agent", "support")
         step = runtime.recover(thrash(), history(), max_tokens=4096)
         runtime.settle(step, "0.04")
-        gov.refund(runtime.recovery_scope, "0.01", memo="vendor credit")
+        (charged,) = gov.find_entries(scope_id=runtime.recovery_scope, entry_type=EntryType.SPEND)
+        gov.refund(runtime.recovery_scope, "0.01", memo="vendor credit", reverses=charged)
     closed = runtime.records.records()[-1]
     assert closed.kind == RecordKind.RECOVERY_CLOSED
     assert Decimal(closed.body["spent"]) == Decimal("0.03")

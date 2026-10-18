@@ -470,7 +470,9 @@ class Settler:
         sink: SinkSpec | None = None if self._sinks is None else self._sinks.get(message.sink)
         assert charge is not None and sink is not None
         # The scope the ledger charged, at the registry's price: what
-        # _why_no_credit held the outbox's columns to, not the columns.
+        # _why_no_credit held the outbox's columns to, not the columns. The
+        # credit names the charge it reverses, so AgentGov bounds it by what
+        # is left of that spend and the chain records which spend it returns.
         entry = self._ledger.refund(
             charge.scope_id,
             sink.cost_per_call,
@@ -478,6 +480,7 @@ class Settler:
                 f"{CREDIT_MEMO}{message.message_id} compensates {original.message_id} under "
                 f"{charge.entry_hash[:16]}"
             ),
+            reverses=charge,
         )
         context.credits[message.message_id] = entry
         context.plan_credits[original.plan_id] = (

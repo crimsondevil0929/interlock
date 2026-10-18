@@ -142,7 +142,7 @@ from interlock.relay import (
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
 from interlock.settlement import SettlementReport, Settler, verify_settlements
-from interlock.signers import HttpRemoteSigner, RemoteSigner
+from interlock.signers import AwsKmsSigner, HttpRemoteSigner, RemoteSigner
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
 from interlock.supervisor import (
     AgentContext,
@@ -185,7 +185,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 __all__ = [
     "AdmissionError",
@@ -194,6 +194,7 @@ __all__ = [
     "AnchorError",
     "AnchorPoint",
     "Application",
+    "AwsKmsSigner",
     "BlastRadius",
     "BudgetGuard",
     "CascadeReport",

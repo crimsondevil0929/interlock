@@ -235,9 +235,8 @@ class LedgerAnchor:
             return AnchorPoint.unanchored()
         self._refresh()
         with _barrier("a chain-head read"):
-            ledger = source.ledger
-            with ledger.lock:
-                return AnchorPoint(anchored=True, head_hash=ledger.head_hash, sequence=len(ledger))
+            sequence, head = _head(source)
+            return AnchorPoint(anchored=True, head_hash=head, sequence=sequence)
 
     def _refresh(self) -> None:
         """Catch the attached views up with the ledger, verifying every new entry.
@@ -297,10 +296,12 @@ class LedgerAnchor:
     def guard_commit(self, scope_id: str) -> Iterator[None]:
         """Check the scope is live, and keep it so until the block exits.
 
-        Wrap the substrate commit in this. With a governed manager, the
-        governor's own lock is held from the check through the commit, so a
-        trip in this process lands strictly before the check (and the commit is
-        refused) or strictly after the commit, never between them.
+        Wrap the substrate commit in this. With a governed manager, the check
+        and the commit run in one of the governor's transactions, so a trip
+        lands strictly before the check (and the commit is refused) or strictly
+        after the commit, never between them: a trip in this process, and over
+        a ledger shared through PostgreSQL a trip by any governor, since the
+        transaction holds the fleet's writer lock. Nothing is written in it.
 
         An audit view is a separate process's database, and no lock spans it
         and the substrate. The check there reads the governor's committed state
@@ -314,11 +315,15 @@ class LedgerAnchor:
             self.assert_scope_live(scope_id)
             yield
             return
-        with _barrier("a commit guard"):
-            lock = self._governed.ledger.lock
-        with lock:
+        # The barrier covers the transaction's own begin and end, never the
+        # block: a substrate's error from its commit is the substrate's.
+        with ExitStack() as stack:
+            with _barrier("a commit guard"):
+                stack.enter_context(self._governed.transaction())
             self.assert_scope_live(scope_id)
             yield
+            with _barrier("a commit guard"):
+                stack.close()
 
     def reserve(self, plan_id: str, scope_id: str, cost: Decimal) -> Authorization | None:
         """Place the hold a plan's claim will settle against, before its stage
@@ -631,6 +636,21 @@ class JoinedCommit:
         memo = f"interlock:{record_hash[:16]}"
         with _barrier(f"a settlement claim on scope {self._scope_id!r}"):
             return self._transaction.claim(self._scope_id, cost, memo=memo, hold=reservation)
+
+
+def _head(source: BudgetManager) -> tuple[int, str]:
+    """The ledger's sequence and the hash of its newest entry, read together.
+
+    Each read takes the ledger's lock, a commit moves both under it, and a
+    transaction holds it for its whole block. The sequence only grows, so one
+    read the same before and after the hash brackets a hash of that sequence.
+    """
+    ledger = source.ledger
+    while True:
+        sequence = len(ledger)
+        head = ledger.head_hash
+        if len(ledger) == sequence:
+            return sequence, head
 
 
 def _halted(source: BudgetManager, scope_id: str) -> str | None:

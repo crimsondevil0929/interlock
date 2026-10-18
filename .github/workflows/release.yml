@@ -1,0 +1,116 @@
+name: Release
+
+# Publishes a version tag to PyPI by trusted publishing: no API token exists
+# anywhere, PyPI exchanges this workflow's OIDC identity for a short-lived one.
+# Every distribution carries a PEP 740 attestation (PyPI shows and verifies
+# it) and a GitHub build provenance attestation (`gh attestation verify`), and
+# the GitHub release carries a CycloneDX SBOM of everything the package and
+# its extras install.
+#
+# Before the first release, register this repository, this workflow
+# (release.yml) and the `pypi` environment as a trusted publisher of
+# interlock-escrow on PyPI, and give the environment required reviewers.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build the distributions and their SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: The tag names the version in pyproject.toml and interlock.__version__
+        run: |
+          declared=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          module=$(python3 -c "import ast; tree = ast.parse(open('src/interlock/__init__.py').read()); print(next(n.value.value for n in tree.body if isinstance(n, ast.Assign) and any(getattr(t, 'id', '') == '__version__' for t in n.targets)))")
+          if [ "v$declared" != "$GITHUB_REF_NAME" ] || [ "$module" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, pyproject.toml $declared, interlock.__version__ $module"
+            exit 1
+          fi
+
+      - name: Build, failing on packaging warnings
+        run: |
+          set -o pipefail
+          uv build 2>&1 | tee build.log
+          if grep -i '^warning' build.log; then
+            echo "::error::uv build emitted packaging warnings"
+            exit 1
+          fi
+
+      # The package depends on interlock-agentgov, and its extras on more. The
+      # SBOM lists every package `pip install 'interlock-escrow[...]'` can bring
+      # in, at the versions this release was tested with (uv.lock).
+      - name: Describe the dependencies (CycloneDX)
+        run: |
+          mkdir sbom
+          uv export --frozen --no-dev --all-extras --no-emit-project --no-hashes \
+            --format requirements-txt --output-file sbom/requirements.txt
+          uvx --from cyclonedx-bom==7.4.0 cyclonedx-py requirements sbom/requirements.txt \
+            --output-format JSON --output-file "sbom/interlock-escrow-${GITHUB_REF_NAME#v}.cdx.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/interlock-escrow/
+    permissions:
+      id-token: write # trusted publishing, and signing the attestations
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Attest the distributions' build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*
+
+      - name: Publish, with a PEP 740 attestation for each file
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
+
+  github-release:
+    name: GitHub release, with the SBOM
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets/
+
+      - name: Create the release from the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          if [[ "$GITHUB_REF_NAME" =~ (a|b|rc)[0-9]+$ ]]; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes $prerelease \
+            --title "interlock-escrow ${GITHUB_REF_NAME#v}" assets/dist/* assets/sbom/*.cdx.json

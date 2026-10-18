@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
         os: [ubuntu-latest]
         include:
           # SQLite trigger semantics and file locking differ by platform, and
@@ -46,10 +46,10 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      # agentgov resolves from its public git repository via a PEP 508 direct
-      # reference, pinned in uv.lock to an exact commit. --frozen asserts the
-      # lock matches pyproject.toml, so a dependency edit that was not
-      # re-locked fails here rather than silently resolving to something else.
+      # agentgov resolves from PyPI, pinned in uv.lock to an exact release.
+      # --frozen asserts the lock matches pyproject.toml, so a dependency edit
+      # that was not re-locked fails here rather than silently resolving to
+      # something else.
       - name: Install the project
         run: uv sync --frozen --python ${{ matrix.python-version }}
 
@@ -154,7 +154,7 @@ jobs:
 
       # A path source resolves only when agentgov happens to sit next to the
       # checkout, so a third party's clone never builds. agentgov comes from
-      # PyPI (interlock-agentgov>=0.4.0): clone into a directory with no
+      # PyPI (interlock-agentgov>=1.0.0): clone into a directory with no
       # sibling checkout and resolve from scratch, from the lockfile.
       #
       # Gates `git clone` + `uv sync`. The standalone wheel is gated below.
@@ -200,7 +200,7 @@ jobs:
           name = [n for n in z.namelist() if n.endswith('METADATA')][0]
           meta = z.read(name).decode()
           requires = [l.split(': ', 1)[1] for l in meta.splitlines() if l.startswith('Requires-Dist: interlock-agentgov')]
-          assert 'interlock-agentgov>=0.4.0' in requires, requires
+          assert 'interlock-agentgov>=1.0.0' in requires, requires
           assert not any(' @ ' in r for r in requires), requires  # no direct reference
           print('wheel metadata requires', requires)
           "

@@ -66,7 +66,6 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 from agentgov import BudgetManager  # noqa: E402
 from agentgov.core import EntryType  # noqa: E402
-from agentgov.exceptions import StorageError  # noqa: E402
 from agentgov.postgres import PostgresStore  # noqa: E402
 from agentgov.receipts import (  # noqa: E402
     ActionReceipt,
@@ -363,14 +362,15 @@ class Crash:
             return len(spends), len(governor.pending_claims()), len(holds)
 
     def ledger_is_locked(self) -> bool:
-        """Whether some transaction holds the shared ledger's writer lock: a
-        governor cannot open for writing within a short wait."""
+        """Whether some transaction holds the shared ledger's writer lock,
+        probed within a short wait; the probe writes nothing. (Opening a
+        governor no longer takes the lock in agentgov 1.0, so it cannot probe
+        it.)"""
+        store = PostgresStore(self.pg.admin, read_only=True)
         try:
-            BudgetManager.open_postgres(self.pg.admin, lock_timeout=0.3).close()
-        except StorageError as exc:
-            assert "waiting for the writer lock" in str(exc), exc
-            return True
-        return False
+            return store.writer_lock_held(0.3)
+        finally:
+            store.close()
 
     @property
     def chain(self) -> Path:

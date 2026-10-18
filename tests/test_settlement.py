@@ -39,7 +39,7 @@ from typing import Any
 
 import pytest
 from agentgov import BudgetManager
-from agentgov.core import EntryType
+from agentgov.core import EntryType, LedgerEntry
 from agentgov.receipts import ActionReceipt, verify_bundle
 
 from interlock import BlastRadius
@@ -142,6 +142,8 @@ def test_a_delivered_compensation_credits_what_the_ledger_charged(bench: Bench) 
     # the booking moved.
     assert credit.amount == BOOKINGS.cost_per_call == Decimal("0.25")
     assert credit.memo.startswith(f"{CREDIT_MEMO}{cancel} compensates {booked}")
+    # It names the charge it reverses, so AgentGov bounds it by that spend.
+    assert credit.ref == _charge(bench, booked).entry_id
     assert bench.outbox.governor.available(SCOPE) == before + Decimal("0.25")
     rows = settlements(bench)
     assert rows[cancel].credit == credit.entry_hash and rows[cancel].note == ""
@@ -228,6 +230,22 @@ def _plan(bench: Bench, message: uuid.UUID) -> str:
     return str(plan)
 
 
+def _charge(bench: Bench, message: uuid.UUID) -> LedgerEntry:
+    """The ledger's charge for the plan that committed ``message``: the spend
+    whose memo names one of the plan's chain records."""
+    plan = _plan(bench, message)
+    memos = {
+        f"interlock:{r.record_hash[:16]}" for r in bench.chain.records() if str(r.plan_id) == plan
+    }
+    governor = bench.outbox.governor
+    (charge,) = [
+        e
+        for e in governor.find_entries(scope_id=SCOPE, entry_type=EntryType.SPEND)
+        if e.memo in memos
+    ]
+    return charge
+
+
 def test_without_a_ledger_nothing_is_credited(bench: Bench) -> None:
     booked = bench.book(1)
     bench.deliver()
@@ -307,8 +325,12 @@ def test_verify_settlements_names_a_credit_no_settlement_made(bench: Bench) -> N
     cancel = bench.compensate(booked)
     bench.deliver()
     bench.settler().settle()
-    # A second credit for the same compensation, posted around settlement.
-    bench.outbox.governor.refund(SCOPE, "0.25", memo=f"{CREDIT_MEMO}{cancel} again")
+    # A second credit for the same compensation, posted around settlement
+    # (within what the scope spent: agentgov 1.0 refuses a refund beyond it).
+    unrelated = bench.outbox.governor.spend(SCOPE, "0.25", memo="unrelated")
+    bench.outbox.governor.refund(
+        SCOPE, "0.25", memo=f"{CREDIT_MEMO}{cancel} again", reverses=unrelated
+    )
     found = verify_settlements(
         bench.source(), log=bench.log, relays=RELAYS, ledger=bench.outbox.governor.audit_trail()
     )
@@ -568,7 +590,12 @@ def test_a_plans_charge_caps_what_its_compensations_earn(bench: Bench) -> None:
     one = bench.compensate(first)
     bench.deliver()
     charge = SETTLE_COST + 2 * BOOKINGS.cost_per_call
-    bench.outbox.governor.refund(SCOPE, charge, memo=f"{CREDIT_MEMO}{one} compensates {first}")
+    bench.outbox.governor.refund(
+        SCOPE,
+        charge,
+        memo=f"{CREDIT_MEMO}{one} compensates {first}",
+        reverses=_charge(bench, first),
+    )
     report = bench.settler().settle()
     assert report.credits == 0 and report.problems == ()
     note = settlements(bench)[two].note
@@ -641,7 +668,12 @@ def test_verify_settlements_holds_each_settlement_to_the_log_and_the_ledger(
     assert rows.settle(third, receipt_id=receipt.receipt_id, credit=None, note="")
     assert rows.settle(fourth, receipt_id=missing, credit=None, note="")
     assert rows.settle(cancel, receipt_id=None, credit="f" * 64, note="")
-    bench.outbox.governor.refund(SCOPE, "0.30", memo=f"{CREDIT_MEMO}{cancel} compensates {first}")
+    bench.outbox.governor.refund(
+        SCOPE,
+        "0.30",
+        memo=f"{CREDIT_MEMO}{cancel} compensates {first}",
+        reverses=_charge(bench, first),
+    )
     ledger = bench.outbox.governor.audit_trail()
     found = verify_settlements(bench.source(), log=bench.log, relays=RELAYS, ledger=ledger)
     assert set(found) == {

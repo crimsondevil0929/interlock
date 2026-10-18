@@ -69,7 +69,8 @@ exactly once                one object per idempotency key and per order; one re
                             issuing; every event recorded once, every fact consumed once
 no forgery accepted         every forged webhook answered 400 or 401, and recorded nowhere
 the vacuum compacts         checkpoints throughout; messages, window rows and events pruned;
-                            nothing prunable outlives its retention by more than a few runs
+                            nothing prunable outlives its retention by more than a few runs;
+                            every run not applied its node's death or a fact just bound
 everything verifies         delivery logs, attestations, operators, keys, settlements against
                             every node's receipt log, the inbox, every node's escrow chains
 shutdown is graceful        every node stopped within the drain bound, nothing cut; a second
@@ -2533,10 +2534,15 @@ SELECT a.usename::text, EXTRACT(EPOCH FROM clock_timestamp() - l.waitstart)::flo
 LINGERING_STAGES = """
 WITH m AS (
     SELECT o.stage_id,
-           s.state = 'cancelled'
-           OR (s.state = 'delivered' AND EXISTS (
-                   SELECT 1 FROM interlock.outbox_settlements t
-                    WHERE t.message_id = o.message_id)) AS final,
+           (s.state = 'cancelled'
+            OR (s.state = 'delivered' AND EXISTS (
+                    SELECT 1 FROM interlock.outbox_settlements t
+                     WHERE t.message_id = o.message_id)))
+           AND NOT EXISTS (
+               SELECT 1 FROM interlock.inbox_facts f
+                WHERE f.message_id = o.message_id
+                  AND NOT EXISTS (SELECT 1 FROM interlock.inbox_consumed c
+                                   WHERE c.fact_id = f.fact_id)) AS final,
            (SELECT max(a.at) FROM interlock.outbox_attempts a
              WHERE a.message_id = o.message_id) AS last_at
       FROM interlock.outbox o JOIN interlock.outbox_state s ON s.message_id = o.message_id
@@ -4313,6 +4319,14 @@ class VacuumRun:
     """The node that ran it, as its reason names it."""
     outcome: str = "open"
     pruned: dict[str, int] = field(default_factory=dict, compare=False)
+    why: str = field(default="", compare=False)
+    """Why the database refused it, when it did."""
+
+
+BOUND_SINCE_SURVEYED = re.compile(r"message \S+ is bound by a fact not consumed yet")
+"""Why the database refuses a run when a webhook is matched to a message it
+surveyed, before it acts: the fact needs the message, its trace context with
+it, and the next run prunes it once the fact is consumed."""
 
 
 def vacuum_runs(evidence: Evidence) -> list[VacuumRun]:
@@ -4336,6 +4350,7 @@ def vacuum_runs(evidence: Evidence) -> list[VacuumRun]:
             found.pruned = {k: int(v) for k, v in dict(record.body.get("pruned") or {}).items()}
         elif record.kind == REFUSED.value:
             found.outcome = "rejected"
+            found.why = str(record.body.get("why") or "")
         elif record.kind == ABANDONED.value:
             found.outcome = "abandoned"
     return sorted(runs.values())
@@ -4347,12 +4362,15 @@ def vacuum_compacts(run: Run, evidence: Evidence, conn: psycopg.Connection[Any])
     pruned: Counter[str] = Counter()
     for r in runs:
         pruned.update(r.pruned)
-    # A run abandoned by its node's death: its intent signed as it died.
+    # A run abandoned by its node's death: its intent signed as it died. A run
+    # refused for a fact matched after it surveyed: the database's own check.
     deaths = [(d.node, d.at) for d in run.deaths]
+    bound = [r for r in runs if BOUND_SINCE_SURVEYED.fullmatch(r.why)]
     unexplained = [
         (r.at, r.node, r.outcome)
         for r in runs
         if r.outcome != "applied"
+        and not BOUND_SINCE_SURVEYED.fullmatch(r.why)
         and not any(r.node == n and r.at <= died + 1.0 for n, died in deaths)
     ]
     vacuum = counters(evidence, "vacuum")
@@ -4384,7 +4402,8 @@ def vacuum_compacts(run: Run, evidence: Evidence, conn: psycopg.Connection[Any])
             f"whichever node led the vacuum: "
             + ", ".join(f"{o} {n}" for o, n in sorted(outcomes.items()))
             + f"; surveys refused {vacuum.get('refused', 0)}; {vacuum.get('busy', 0)} runs put off "
-            f"while another writer held the operator log",
+            f"while another writer held the operator log; {len(bound)} refused by the database "
+            f"for a fact matched after they surveyed",
             f"pruned: {pruned.get('messages', 0)} messages, {pruned.get('windows', 0)} window "
             f"rows, {pruned.get('inbox_events', 0)} inbound events",
             f"the live outbox peaked at {live_max} messages; {run.live_at_end} of "
@@ -4601,6 +4620,13 @@ def trace_survives(run: Run) -> Claim:
     )
 
 
+QUIET_WHEN_RESTARTED = frozenset({"interlock_plan_conflicts_total"})
+"""Families a process exports a sample of only once what they count happens,
+and which an incarnation started mid-run may never see in its shorter life: a
+restarted node that lost no race exports no conflict. That races happen and
+resolve is the "lock waits resolve" claim's, over the whole cluster."""
+
+
 def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -> Claim:
     """What each node exported, against what it did, as the run counted it
     (``docs/EPIC7_DESIGN.md`` §5): every process that lived to its stop, its
@@ -4626,7 +4652,13 @@ def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -
             problems.append(
                 f"{where}: scrape errors {dict(scraper.errors)}; fell {scraper.fell[:2]}"
             )
-        silent = sorted(n for n in catalog if n not in last and f"{n}_count" not in last)
+        silent = sorted(
+            n
+            for n in catalog
+            if n not in last
+            and f"{n}_count" not in last
+            and not (number > 0 and n in QUIET_WHEN_RESTARTED)
+        )
         if scraper.families != catalog or silent:
             problems.append(
                 f"{where}: families missing {sorted(catalog - scraper.families)}; silent {silent}"
@@ -4695,8 +4727,8 @@ def metrics_agree(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) -
         [
             f"{sum(s.scrapes for s in run.scrapers.values())} scrapes of "
             f"{len(run.scrapers)} processes, every one well formed; {len(catalog)} families "
-            f"exported by each process that lived to its stop ({checked}), each with data; no "
-            f"counter fell",
+            f"exported by each process that lived to its stop ({checked}), each with data (a "
+            f"restarted one's conflicts once it lost a race); no counter fell",
             f"each such process's plans by outcome and webhooks by answer what its journal and "
             f"the vendor counted; its receipts and settlement lags one for one; "
             f"{takeovers:.0f} leases taken over from nodes gone, as the relays exported them",

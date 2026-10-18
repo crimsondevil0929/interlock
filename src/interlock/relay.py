@@ -52,7 +52,7 @@ from agentgov.receipts import Attestation, AttestedOutcome, DeliveredRequest
 from agentgov.receipts.canonical import canonical_bytes, loads_strict
 from agentgov.receipts.signing import Signer
 
-from interlock.anchor import _halted
+from interlock.anchor import _halted, _head
 from interlock.exceptions import KeyRevokedError, SubstrateUnavailableError
 from interlock.outbox_store import OutboxStore, PostgresOutboxStore
 from interlock.telemetry import Metrics, NullMetrics
@@ -231,9 +231,8 @@ class LedgerBreaker:
     def check(self, scope_id: str) -> BreakerReading:
         manager = self._manager
         manager.refresh()
-        ledger = manager.ledger
-        with ledger.lock:
-            position = f"agentgov entry {len(ledger)}, head {ledger.head_hash[:16]}"
+        sequence, head = _head(manager)
+        position = f"agentgov entry {sequence}, head {head[:16]}"
         try:
             manager.node(scope_id)
         except UnknownScopeError:

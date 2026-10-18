@@ -115,7 +115,9 @@ context, is the one it always was.
 | Read by | the relay, the agent's facts | relay, settler, inbox and audit roles (`SELECT`); stage roles through `interlock.inbox_pending_traces` |
 
 Each row references its parent (the outbox row, the inbox event) `ON DELETE CASCADE`:
-the vacuum prunes trace context with what it describes, and nothing else changes in
+the vacuum prunes trace context with what it describes. A pending fact's context is read
+from its delivery's row at the time, so since 1.0.2 the vacuum keeps a message while a
+fact bound to it is pending (`EPIC5_DESIGN.md` §1.2). Nothing else changes in
 compaction. A `CHECK` holds every stored value to the format. The SQLite outbox becomes
 version 6 and PostgreSQL's installation version 6; both upgrade in place with
 `interlock install`, by adding tables and functions. No existing table, column, function

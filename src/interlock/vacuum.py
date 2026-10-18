@@ -9,9 +9,11 @@ in two phases like every other (``docs/EPIC3_DESIGN.md`` §6):
    log and fact. Anything that does not verify is evidence of tampering:
    nothing is pruned while it stands. Then collect what may go: stages whose
    every message is delivered and settled, or cancelled, older than the
-   retention, in no row of the legacy set; rate-window history older than the
-   longest window's span plus a margin; and each inbound source's longest
-   prefix of events older than the retention whose facts were all consumed.
+   retention, in no row of the legacy set, and bound by no fact still pending
+   (whose trace context is read from the message); rate-window history older
+   than the longest window's span plus a margin; and each inbound source's
+   longest prefix of events older than the retention whose facts were all
+   consumed.
 2. **Archive** (optional). Write what will go to a file, whose SHA-256 the
    checkpoint carries: :func:`verify_archive` proves it against the checkpoint.
 3. **Intent.** Sign an ``operator.intent``, action ``compact``, carrying the
@@ -48,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Final
 from agentgov.core import EntryType
 from agentgov.receipts.canonical import canonical_bytes
 
+from interlock.anchor import _head
 from interlock.compaction import (
     GENESIS,
     Checkpoint,
@@ -211,6 +214,7 @@ def _survey(
     settled = outbox.settlements()
     legacy = outbox.legacy()
     legacy_messages = {m for m, _ in legacy.rows} if legacy is not None else set()
+    awaited = _awaited(outbox)
     outbox_horizon = now - retain
     stages: dict[uuid.UUID, list[LoggedMessage]] = {}
     for message in messages:
@@ -220,7 +224,9 @@ def _survey(
     log_rows = 0
     if not problems:
         for stage, members in sorted(stages.items(), key=lambda item: str(item[0])):
-            why = _kept(members, logs, settled, legacy_messages, by_message, outbox_horizon)
+            why = _kept(
+                members, logs, settled, legacy_messages, awaited, by_message, outbox_horizon
+            )
             if why is not None:
                 if by_message.keys() & {m.message_id for m in members}:
                     kept.append((stage, why))
@@ -350,11 +356,23 @@ def _inbox_prefixes(
     return found
 
 
+def _awaited(outbox: OutboxOperations) -> set[uuid.UUID]:
+    """The messages a fact still pending is bound to. Each stays until its
+    fact is consumed: the fact's trace context is its delivery's, read from
+    the message's (``docs/EPIC7_DESIGN.md`` §1.4), and goes with it."""
+    from interlock.inbox_store import inbox_reader
+
+    reader = inbox_reader(outbox)
+    consumed = reader.inbound_consumed()
+    return {f.message_id for f in reader.inbound_facts() if f.fact_id not in consumed}
+
+
 def _kept(
     members: Sequence[LoggedMessage],
     logs: Mapping[uuid.UUID, Sequence[LogEvent]],
     settled: Mapping[uuid.UUID, Any],
     legacy: set[uuid.UUID],
+    awaited: set[uuid.UUID],
     problems: Mapping[uuid.UUID, Sequence[str]],
     horizon: datetime,
 ) -> str | None:
@@ -369,6 +387,8 @@ def _kept(
             return f"{where} is delivered and not settled yet"
         if message.message_id in legacy:
             return f"{where} is in the legacy set, which is kept"
+        if message.message_id in awaited:
+            return f"{where} is bound by a fact not consumed yet"
         log = logs.get(message.message_id, ())
         if not log or log[-1].at >= horizon:
             return f"{where} is within its retention"
@@ -988,9 +1008,7 @@ class Vacuum:
         return VacuumReport("applied", draft, *counts, (), found.kept, written, events, held)
 
     def _head(self) -> tuple[int, str]:
-        ledger = self._ledger.ledger
-        with ledger.lock:
-            return len(ledger), str(ledger.head_hash)
+        return _head(self._ledger)
 
     def _anchored(self, intent: Any) -> bool:
         memo = anchor_memo(intent)
