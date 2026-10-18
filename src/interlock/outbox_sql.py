@@ -1710,6 +1710,7 @@ DECLARE
     first_seq integer;
     inbox_events integer := 0;
     inbox_facts integer := 0;
+    awaited uuid;
 BEGIN
     IF body ->> 'v' IS DISTINCT FROM 'interlock-checkpoint-v1' THEN
         RAISE EXCEPTION 'interlock: not a checkpoint' USING ERRCODE = 'IL010';
@@ -1880,6 +1881,26 @@ BEGIN
         IF root IS DISTINCT FROM body -> 'inbox' ->> 'root'
            OR inbox_facts IS DISTINCT FROM (body -> 'inbox' ->> 'facts')::integer THEN
             RAISE EXCEPTION 'interlock: the facts are not the ones the checkpoint commits to'
+                USING ERRCODE = 'IL010';
+        END IF;
+    END IF;
+
+    -- No message a fact still pending is bound to: the fact's trace context
+    -- is read from the message's (docs/EPIC7_DESIGN.md §1.4). The lock waits
+    -- out every fact being recorded, and holds off the next until this
+    -- commits; a fact is recorded in a transaction of its own, which waits on
+    -- nothing this one holds.
+    IF pg_catalog.cardinality(targets) > 0
+       AND pg_catalog.to_regclass('interlock.inbox_facts') IS NOT NULL THEN
+        LOCK TABLE interlock.inbox_facts IN SHARE MODE;
+        SELECT f.message_id INTO awaited
+          FROM interlock.inbox_facts AS f
+         WHERE f.message_id = ANY (targets)
+           AND NOT EXISTS (SELECT 1 FROM interlock.inbox_consumed AS k
+                            WHERE k.fact_id = f.fact_id)
+         LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'interlock: message % is bound by a fact not consumed yet', awaited
                 USING ERRCODE = 'IL010';
         END IF;
     END IF;

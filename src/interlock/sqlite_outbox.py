@@ -2253,6 +2253,19 @@ class SqliteOutboxStore:
                     "the window history is not the one the checkpoint commits to"
                 )
             events, facts = _inbox_cuts(conn, checkpoint)
+            # No message a fact still pending is bound to: the fact's trace
+            # context is read from the message's (docs/EPIC7_DESIGN.md §1.4).
+            awaited = conn.execute(
+                f"SELECT f.message_id FROM {SQLITE_FACTS} AS f "
+                f"WHERE f.message_id IN (SELECT value FROM json_each(?)) "
+                f"AND NOT EXISTS (SELECT 1 FROM {SQLITE_CONSUMED} AS k "
+                f"WHERE k.fact_id = f.fact_id) LIMIT 1",
+                (targets,),
+            ).fetchone()
+            if awaited is not None:
+                raise CompactionRefusedError(
+                    f"message {awaited[0]} is bound by a fact not consumed yet"
+                )
             for table in (SETTLEMENTS, LOG, STATE, OUTBOX):
                 conn.execute(
                     f"DELETE FROM {table} WHERE message_id IN (SELECT value FROM json_each(?))",

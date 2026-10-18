@@ -5,6 +5,9 @@ the checkpoint, which names where the log was cut and the hash there; the
 rest of the log links to it, and goes on.
 
 - A pending fact stops its source's prefix, and so does a recent event.
+- A pending fact keeps the message it is bound to, and with it the trace
+  context the fact continues: in the survey, and in the database on its own,
+  for a fact recorded after the survey.
 - Without ``[inbox.keys]`` the inbox stays; a source that does not verify is
   kept whole; a finding that is no one source's prunes nothing.
 - The database refuses, on its own, a cut other than the one verified: a log
@@ -30,11 +33,13 @@ from interlock import BlastRadius, PlanBuilder
 from interlock.compaction import GENESIS, Checkpoint, InboxCut, inbox_root
 from interlock.exceptions import CompactionRefusedError
 from interlock.inbox import InboxReport, inbox_genesis, verify_inbox
+from interlock.relay import NoBreaker, Relay
 from interlock.types import InboundFact
 from interlock.vacuum import verify_archive
 from tests.inbox_env import (
     INBOX_KEYS,
     InboxSite,
+    Referencing,
     delete_event,
     inbox_signer,
     inbox_site,
@@ -43,8 +48,19 @@ from tests.inbox_env import (
     standard_webhook,
     stripe_webhook,
 )
-from tests.outbox_env import BACKENDS, RELAYS, Outbox, PostgresOutbox, build_either
+from tests.outbox_env import (
+    BACKENDS,
+    RELAYS,
+    SCOPE,
+    Outbox,
+    PostgresOutbox,
+    build_either,
+    relay_signer,
+)
+from tests.settling import Bench
 from tests.test_vacuum import _body
+
+TP = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
 RETAIN = timedelta(hours=1)
 THEN = datetime.now(UTC) - timedelta(hours=2)
@@ -489,3 +505,105 @@ def test_a_vacuum_reads_one_state_of_the_database_while_the_inbox_records(
     # The prefix it verified: stripe's events 1 to 3, and hooks' first.
     assert (report.outcome, report.problems, report.inbox_events) == ("applied", (), 4)
     assert _report(site).problems == ()
+
+
+# --------------------------------------------------------------------------
+# a pending fact keeps its message, and the trace context it continues
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def traced(outbox: Outbox, tmp_path: Path) -> Iterator[tuple[Bench, InboxSite]]:
+    """A back office that settles what it delivers, the inbox beside it."""
+    bench = Bench(outbox, tmp_path / "bench")
+    try:
+        with inbox_site(outbox) as site:
+            yield bench, site
+    finally:
+        bench.close()
+
+
+def _settled(bench: Bench, ref: str) -> uuid.UUID:
+    """A refund committed in ``TP``'s trace, delivered creating ``ref``, and
+    settled: its message, due to the vacuum as soon as nothing binds it."""
+    plan = (
+        PlanBuilder(SCOPE, traceparent=TP)
+        .enqueue(sink="payments", operation="refund", payload={"ref": ref, "amount": "25.00"})
+        .build()
+    )
+    assert bench.engine().execute(plan).committed
+    (message,) = bench.outbox.messages(plan.plan_id)
+    relay = Relay(
+        bench.outbox.store(),
+        adapters={"payments": Referencing()},
+        breaker=NoBreaker(),
+        signer=relay_signer(),
+    )
+    with relay:
+        bench.outbox.drain(relay)
+    assert bench.outbox.state(message) == "delivered"
+    assert bench.settler().settle().settled == (message,)
+    return message
+
+
+def _pending(site: InboxSite) -> InboundFact:
+    (fact,) = site.outbox.engine(inbox=INBOX_KEYS).facts(SCOPE)
+    return fact
+
+
+def test_a_message_stays_while_a_fact_bound_to_it_is_pending(
+    traced: tuple[Bench, InboxSite],
+) -> None:
+    """The fact's trace context is its delivery's, read from the message: a
+    message pruned under a pending fact would leave the fact none."""
+    bench, site = traced
+    message = _settled(bench, "re_1")
+    # The vendor's webhook carries no trace context of its own.
+    webhook = stripe_webhook(refund_event("re_1", event_id="evt_1"))
+    assert site.receive(site.inbox(), "stripe", webhook).body == {"recorded": 1, "matched": 1}
+    assert _pending(site).traceparent == TP
+
+    # Past its retention, delivered and settled: kept, with or without the
+    # inbox's keys, and the fact still continues the delivery's trace.
+    with site.outbox.vacuum() as vacuum:
+        assert (vacuum.run().outcome, site.outbox.requests()) == ("nothing", 1)
+    assert (_vacuum(site, retain=timedelta(0)).outcome, site.outbox.requests()) == ("nothing", 1)
+    assert _pending(site).traceparent == TP
+
+    # Consumed, the fact binds nothing, and the message goes.
+    _consume(site, _pending(site))
+    report = _vacuum(site, retain=timedelta(0))
+    assert (report.outcome, report.messages) == ("applied", 1)
+    assert message not in {m.message_id for m in site.outbox.compactor().snapshot(None)[0]}
+    site.outbox.verify()
+
+
+def test_a_fact_recorded_while_a_vacuum_acts_keeps_its_message(
+    traced: tuple[Bench, InboxSite],
+) -> None:
+    """The race the soak found: the vacuum surveys a settled message no fact
+    binds, then its webhook is matched before the vacuum acts. The database
+    refuses the act on its own, and the fact keeps its delivery's trace."""
+    bench, site = traced
+    message = _settled(bench, "re_1")
+    inbox = site.inbox()
+    answers: list[Any] = []
+
+    def matched(point: str) -> None:
+        if point == "anchored":
+            webhook = stripe_webhook(refund_event("re_1", event_id="evt_1"))
+            answers.append(site.receive(inbox, "stripe", webhook).body)
+
+    with site.outbox.vacuum(checkpoint=matched) as vacuum:
+        assert vacuum.survey().tombstones[0].message_id == message
+        report = vacuum.run()
+    assert answers == [{"recorded": 1, "matched": 1}]
+    assert report.outcome == "rejected"
+    assert report.problems == (f"message {message} is bound by a fact not consumed yet",)
+    assert site.outbox.requests() == 1 and site.outbox.compactor().checkpoints() == []
+    assert _pending(site).traceparent == TP
+    # The next vacuum keeps the message too, until the fact is consumed.
+    assert _vacuum(site, retain=timedelta(0)).outcome == "nothing"
+    _consume(site, _pending(site))
+    assert _vacuum(site, retain=timedelta(0)).outcome == "applied"
+    site.outbox.verify()

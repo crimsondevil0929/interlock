@@ -64,6 +64,9 @@ files and ledgers with their own lifecycles.
   - holds no lease, and its last log row is older than `retain` (default 30 days). Past
     retention a delivered request can no longer be compensated: retention is that window;
   - is in no row of the legacy set;
+  - is bound by no fact still pending (since 1.0.2). The fact's trace context is its
+    delivery's, read from the message's when the agent reads its facts
+    (`EPIC7_DESIGN.md` §1.4);
   - verifies: its log recomputes from its genesis, every outcome carries a registered
     relay's valid attestation, every operator row carries the authority of an applied
     signed intent, and no unresolved intent names it.
@@ -547,6 +550,9 @@ Where the implementation settled what the design left open, or refined it.
   - a log head that moved;
   - a message not final and settled, or still leased;
   - a message of the legacy set;
+  - a message a pending fact is bound to (since 1.0.2, §1.2). On PostgreSQL the check
+    holds a `SHARE` lock on `inbox_facts` until the commit, so a fact recorded after the
+    survey is not missed;
   - half a stage;
   - folds other than the signed ones.
 - **The guards.** The trigger names stay what they were, so tests and tools that lift a
