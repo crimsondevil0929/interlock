@@ -894,12 +894,16 @@ A quote has three parts, and is a signed `extension.quoted` record anchored in t
   rounded up to the cent. `requested` is that, less what the scope has left.
 
 A quote is answered once, before it expires, by the guard that issued it: `grant()` or
-`decline()`, each a signed record naming the quote. A root scope is topped up in place, and
-if the money running out is what tripped it, its breaker is reset. A delegated scope cannot
-be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along what the old
-scope had left, and the task bills there from then on. A grant the parent cannot make
-changes nothing. A scope halted for any other reason is not quoted: `authorize()` raises
-AgentGov's `CircuitOpenError`, because more money is not the answer to a safety halt.
+`decline()`, each a signed record naming the quote. The quote is a signed record too, so a
+guard opened over a persisted log adopts the quotes in it that no record answers and that
+have not expired: a restart loses none, and whichever guard of the log answers one, it is
+answered once (`BudgetGuard(..., adopt=False)` adopts none). A root scope is topped up in
+place, and if the money running out is what tripped it, its breaker is reset. A delegated
+scope cannot be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along
+what the old scope had left, and the task bills there from then on. A grant the parent
+cannot make changes nothing. A scope halted for any other reason is not quoted:
+`authorize()` raises AgentGov's `CircuitOpenError`, because more money is not the answer to
+a safety halt.
 
 A `RecoveryRuntime` given the guard quotes for its own reserve the same way: when a step
 will not fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up

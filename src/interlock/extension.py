@@ -22,7 +22,10 @@ the breaker. The request is a signed quote with three parts:
 
 A quote is a request, not a grant. The operator answers it with
 :meth:`BudgetGuard.grant` or :meth:`BudgetGuard.decline`, once, before it
-expires, and the answer is a signed record naming the quote. AgentGov funds a
+expires, and the answer is a signed record naming the quote. The quote is a
+signed record too, so a guard opened over a log that holds quotes no record
+answers yet adopts those that have not expired: a restart loses none of them,
+and whichever guard of the log answers one, it is answered once. AgentGov funds a
 root scope directly, and the grant tops it up (resetting its breaker, if the
 money running out is what tripped it). A delegated scope cannot be topped up,
 so the grant delegates a new scope beside it, ``{scope}/ext-N`` (numbered side
@@ -47,7 +50,7 @@ import logging
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -302,6 +305,9 @@ class BudgetGuard:
     :param margin: Added to an estimate, as a fraction.
     :param ttl: How long a quote may be answered.
     :param clock: The time source; a test supplies its own.
+    :param adopt: Adopt the quotes ``records`` already holds that no record
+        answers and that have not expired, as the guard that issued them would
+        hold them had it not stopped (module docstring).
     """
 
     def __init__(
@@ -313,6 +319,7 @@ class BudgetGuard:
         margin: Decimal = Decimal("0.25"),
         ttl: timedelta = timedelta(hours=1),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        adopt: bool = True,
     ) -> None:
         if margin < 0:
             raise ValueError("a margin cannot be negative")
@@ -324,6 +331,8 @@ class BudgetGuard:
         self._clock = clock
         self._lock = threading.RLock()
         self._pending: dict[str, _Pending] = {}
+        if adopt:
+            self._adopt()
 
     @property
     def records(self) -> RecordLog:
@@ -578,10 +587,24 @@ class BudgetGuard:
 
     # -- internals ----------------------------------------------------------------
 
+    def _adopt(self) -> None:
+        records = self._records.records()
+        answered = _answered(records)
+        now = self._clock()
+        for record in records:
+            if record.kind != RecordKind.EXTENSION_QUOTED or record.body.get("quote") in answered:
+                continue
+            quote = _request_of(record)
+            if quote is not None and now <= quote.expires_at:
+                self._pending[quote.quote_id] = _Pending(quote)
+
     def _answerable(self, quote: ExtensionRequest, *, expired_ok: bool = False) -> _Pending:
         pending = self._pending.get(quote.quote_id)
         if pending is None or pending.quote != quote:
             raise ExtensionError(f"quote {quote.quote_id} was not issued by this guard")
+        if pending.decided is None:
+            # Another guard of this log adopted it too, and may have answered it.
+            pending.decided = _answered(self._records.records()).get(quote.quote_id)
         if pending.decided is not None:
             raise ExtensionError(f"quote {quote.quote_id} was already {pending.decided}")
         if not expired_ok and self._clock() > quote.expires_at:
@@ -648,6 +671,78 @@ class BudgetGuard:
                 record.log,
                 exc_info=True,
             )
+
+
+_ANSWERS: Final = {
+    RecordKind.EXTENSION_GRANTED.value: "granted",
+    RecordKind.EXTENSION_DECLINED.value: "declined",
+}
+
+
+def _answered(records: Sequence[SignedRecord]) -> dict[str, str]:
+    """Each quote a record answers, by id: ``granted`` or ``declined``."""
+    found: dict[str, str] = {}
+    for record in records:
+        answer = _ANSWERS.get(record.kind)
+        if answer is None:
+            continue
+        quote = record.body.get("quote")
+        if isinstance(quote, dict) and isinstance(quote.get("id"), str):
+            found.setdefault(quote["id"], answer)
+    return found
+
+
+def _request_of(record: SignedRecord) -> ExtensionRequest | None:
+    """The quote an ``extension.quoted`` record signed, as the guard that
+    issued it held it; ``None`` for a body this release does not read."""
+    body = record.body
+    try:
+        spend, progress, estimate = body["spend"], body["progress"], body["estimate"]
+        checkpoint, declared = progress["checkpoint"], progress["milestones"]
+        return ExtensionRequest(
+            quote_id=str(body["quote"]),
+            scope_id=str(body["scope"]),
+            task=str(body["task"]),
+            needed=Decimal(body["needed"]),
+            spend=Spend(
+                spent=Decimal(spend["spent"]),
+                held=Decimal(spend["held"]),
+                available=Decimal(spend["available"]),
+                scopes=tuple((str(s["scope"]), Decimal(s["spent"])) for s in spend["scopes"]),
+            ),
+            progress=Progress(
+                committed=int(progress["committed"]),
+                rows=int(progress["rows"]),
+                receipts=tuple(str(r) for r in progress["receipts"]),
+                log=progress["log"],
+                checkpoint=None
+                if checkpoint is None
+                else (int(checkpoint["tree_size"]), str(checkpoint["root"])),
+                recovery_steps=int(progress["recovery_steps"]),
+                milestones=None
+                if declared is None
+                else Milestones(
+                    done=int(declared["done"]),
+                    total=int(declared["total"]),
+                    unit=str(declared["unit"]),
+                ),
+            ),
+            estimate=Estimate(
+                method=str(estimate["method"]),
+                completion=Decimal(estimate["completion"]),
+                margin=Decimal(estimate["margin"]),
+                total=Decimal(estimate["total"]),
+                unit_cost=None if estimate["unit_cost"] is None else Decimal(estimate["unit_cost"]),
+                remaining=estimate["remaining"],
+            ),
+            requested=Decimal(body["requested"]),
+            issued_at=datetime.fromisoformat(body["issued_at"]),
+            expires_at=datetime.fromisoformat(body["expires_at"]),
+            halted_by=body["halted_by"],
+            record=record,
+        )
+    except (KeyError, TypeError, ValueError, ArithmeticError):
+        return None
 
 
 def _origin_of(parent: str | None, scope: str) -> str:

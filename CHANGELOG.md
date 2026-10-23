@@ -24,6 +24,11 @@ Releases before 0.1.2 are described by their tags and commit history.
   head as whoever decided on the action read it, principals approving it, say. A target
   whose log has moved since, or that has no expected head, refuses the action before
   anything is signed. Without it, the operator reads the heads itself, as before.
+- **A budget guard adopts the quotes its log left open.** A quote is an
+  `extension.quoted` record, and a `BudgetGuard` opened over a log holding quotes no
+  record answers yet, and that have not expired, holds them as the guard that issued them
+  did: a restart, or another process taking the log over, loses none. A quote is answered
+  once, whichever guard of the log answers it. `adopt=False` adopts none.
 
 ### Fixed
 
