@@ -9,8 +9,8 @@
 - A coroutine's loop never waits on the service.
 - The operator log and an ARC1 attestation sign through one unchanged.
 - They are agentgov's own classes under Interlock's names; a key AWS KMS holds
-  signs an attestation at signature version 2, and a record only within the
-  4096 bytes KMS signs.
+  signs an attestation and a record at signature version 2: a digest, within
+  the 4096 bytes KMS signs, whatever their size.
 """
 
 from __future__ import annotations
@@ -280,9 +280,9 @@ class _AwsKms:
 
 
 def test_a_key_aws_kms_holds_signs_an_attestation_and_a_record(tmp_path: Path) -> None:
-    """An attestation is an ARC1 document: signed at signature version 2, a
-    digest, whatever its size. An operator record is signed whole, and KMS
-    signs at most 4096 bytes: a larger one is refused, and nothing is signed."""
+    """An attestation is an ARC1 document, and an operator record an ILOK1 one:
+    each is signed at signature version 2, a digest, whatever its size, and
+    KMS, which signs at most 4096 bytes, signs both."""
     from interlock.signers import AwsKmsSigner
 
     local = Ed25519Signer.generate()
@@ -311,9 +311,7 @@ def test_a_key_aws_kms_holds_signs_an_attestation_and_a_record(tmp_path: Path) -
     path = tmp_path / "ops.ilok1"
     with RecordLog(signer, log_id="ops", path=path, keyring=keyring) as log:
         log.append(RecordKind.OPERATOR_INSTALLED, scope="ops", body={"registry": "x"})
-        signed = len(kms.signed)
-        with pytest.raises(SignerUnavailableError, match="KMS signs 1 to 4096 bytes"):
-            log.append(RecordKind.OPERATOR_INSTALLED, scope="ops", body={"registry": "x" * 4096})
-        assert len(kms.signed) == signed
-    (record,) = RecordLog.load(path, keyring)
-    assert record.key_id == local.key_id
+        log.append(RecordKind.OPERATOR_INSTALLED, scope="ops", body={"registry": "x" * 8192})
+    assert max(len(message) for message in kms.signed) < 100
+    records = RecordLog.load(path, keyring)
+    assert [(r.key_id, r.version) for r in records] == [(local.key_id, 2)] * 2

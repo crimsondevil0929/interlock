@@ -835,7 +835,8 @@ names a scope to delegate it from. `close()` returns what is left to the parent.
 
 **Every act is signed first.** Opening, each step, each settlement and the close are
 `RecordLog` entries: ILOK1, agentgov's canonical JSON under an `ILOK1/record/v1` signing
-prefix, hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
+prefix (or `ILOK1/record/v2` over its SHA-512, for a key service that limits what it
+signs, as ARC1 1.2's version 2 does), hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
 `check_anchors()` catches a log truncated or rewritten after the fact. A step's record names
 the halt (and a refused plan's ARC1 receipt), the rung and exactly what it did, the hold
 that pays for it, the policy's digest, and the transcript before and after, and is written

@@ -14,6 +14,7 @@ from interlock.exceptions import AnchorError, ChainInUseError, RecordIntegrityEr
 from interlock.records import (
     GENESIS,
     RECORD_DOMAIN,
+    RECORD_DOMAIN_V2,
     RecordKind,
     RecordLog,
     SignedRecord,
@@ -212,3 +213,86 @@ def test_a_record_that_cannot_be_written_leaves_the_log_as_it_was(
     assert log.append(KIND, scope="s", body={}).seq == 2
     log.close()
     assert len(RecordLog.load(path, key)) == 2
+
+
+# -- signature version 2: the record's digest is signed (as ARC1 1.2's are) ---------
+
+
+class _Limited:
+    """A signer that, as a key service may, signs at most 4096 bytes, and
+    prefers digests (``AwsKmsSigner``'s ``signature_version``)."""
+
+    signature_version = 2
+
+    def __init__(self) -> None:
+        from agentgov.receipts.signing import Ed25519Signer
+
+        self._key = Ed25519Signer.generate()
+        self.alg, self.key_id = self._key.alg, self._key.key_id
+        self.signed: list[bytes] = []
+
+    def sign(self, message: bytes) -> bytes:
+        assert 1 <= len(message) <= 4096, len(message)
+        self.signed.append(message)
+        return self._key.sign(message)
+
+    def verify(self, message: bytes, signature: bytes) -> bool:
+        return self._key.verify(message, signature)
+
+    def public_key(self) -> Any:
+        return self._key.public_key()
+
+
+def test_a_log_signs_digests_when_its_signer_prefers_them(tmp_path: Path) -> None:
+    """A key service that limits what it signs signs any record at version 2:
+    the domain and the record's SHA-512, its ``sv`` among what is signed."""
+    signer = _Limited()
+    path = tmp_path / "records.jsonl"
+    with RecordLog(signer, path=path) as log:  # type: ignore[arg-type]
+        assert log.signature_version == 2
+        record = log.append(KIND, scope="s", body={"targets": ["x" * 64] * 200})
+    assert len(json.dumps(record.to_json())) > 4096
+    assert record.version == 2 and record.to_json()["sig"]["sv"] == 2
+    assert record.signing_input().startswith(RECORD_DOMAIN_V2)
+    assert len(record.signing_input()) == len(RECORD_DOMAIN_V2) + 64 == len(signer.signed[0])
+    (loaded,) = RecordLog.load(path, signer.public_key())
+    assert loaded == record and SignedRecord.from_json(record.to_json()) == record
+    record.verify(signer.public_key())
+
+
+def test_a_signature_version_is_chosen_and_what_is_signed_says_which() -> None:
+    key = HmacKey.generate()
+    assert RecordLog(key).signature_version == 1  # an HMAC key has no preference
+    first = RecordLog(key, signature_version=2).append(KIND, scope="s", body={})
+    assert first.signing_input().startswith(RECORD_DOMAIN_V2)
+    for wrong in (0, 3, True, "2"):
+        with pytest.raises(ValueError, match="1 or 2"):
+            RecordLog(key, signature_version=wrong)  # type: ignore[arg-type]
+    # A signature names its version: one read as another verifies under neither.
+    claimed = first.to_json()
+    del claimed["sig"]["sv"]
+    with pytest.raises(RecordIntegrityError, match="does not verify"):
+        SignedRecord.from_json(claimed).verify(key)
+    for sv in (1, True, "2", 3):
+        raw = first.to_json()
+        raw["sig"]["sv"] = sv
+        with pytest.raises(RecordIntegrityError, match="sv is 2"):
+            SignedRecord.from_json(raw)
+
+
+def test_a_log_holds_records_of_both_versions(tmp_path: Path) -> None:
+    """A log a key service signs from some record on (a key moved to KMS)
+    keeps its earlier records as they were signed, and verifies each."""
+    key = HmacKey.generate()
+    path = tmp_path / "records.jsonl"
+    with RecordLog(key, path=path) as log:
+        filled(log, 2)
+    with RecordLog(key, path=path, signature_version=2) as log:
+        filled(log, 2)
+    records = RecordLog.load(path, key)
+    assert [r.version for r in records] == [1, 1, 2, 2]
+    rows = lines(path)
+    rows[3]["body"]["cost"] = "0.01"
+    write(path, rows)
+    with pytest.raises(RecordIntegrityError, match="record 4's signature does not verify"):
+        RecordLog.load(path, key)

@@ -9,6 +9,17 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added
+
+- **ILOK1 records can be signed at signature version 2**, as ARC1 1.2's documents are:
+  `"sv": 2` in `sig`, and the signature covers `ILOK1/record/v2\n` and the SHA-512 of the
+  canonical record, its `sv` included, under 100 bytes whatever the record's size. A
+  `RecordLog` signs at its signer's `signature_version` (`AwsKmsSigner`'s is 2) unless
+  `signature_version=` says otherwise. So a key AWS KMS holds, which signs at most 4096
+  bytes, signs operator, recovery and extension records of any size: an
+  `operator.applied` naming hundreds of rows, a compensation of many targets. Version 1
+  records read and verify as before, and one log may hold both.
+
 ### Fixed
 
 - **The sdist packs no build log or Hypothesis cache.** 1.0.2's carries the release
