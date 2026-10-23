@@ -19,6 +19,11 @@ Releases before 0.1.2 are described by their tags and commit history.
   bytes, signs operator, recovery and extension records of any size: an
   `operator.applied` naming hundreds of rows, a compensation of many targets. Version 1
   records read and verify as before, and one log may hold both.
+- **An operator acts only on the state its deciders saw** (`expected_heads=` on
+  `Operator.release`, `cancel`, `requeue` and `compensate`): each target's delivery-log
+  head as whoever decided on the action read it, principals approving it, say. A target
+  whose log has moved since, or that has no expected head, refuses the action before
+  anything is signed. Without it, the operator reads the heads itself, as before.
 
 ### Fixed
 

@@ -588,8 +588,22 @@ class Operator:
             },
         )
 
-    def release(self, message_ids: Sequence[uuid.UUID], *, reason: str | None = None) -> Outcome:
-        """Release held messages for delivery."""
+    def release(
+        self,
+        message_ids: Sequence[uuid.UUID],
+        *,
+        reason: str | None = None,
+        expected_heads: Mapping[uuid.UUID, str] | None = None,
+    ) -> Outcome:
+        """Release held messages for delivery.
+
+        :param expected_heads: Each target's delivery-log head as whoever
+            decided on the action read it. Given, the action is refused before
+            anything is signed when a target's log has moved since, or a target
+            has none here: it acts only on the state its deciders saw.
+        :raises OperatorRefusedError: As above, or when the outbox holds no
+            such message.
+        """
         return self._act(
             "release",
             message_ids,
@@ -600,6 +614,7 @@ class Operator:
                 authority=authority,
                 expected_head=target.head,
             ),
+            expected_heads=expected_heads,
         )
 
     def release_scope(self, scope_id: str, *, reason: str | None = None) -> Outcome:
@@ -609,8 +624,15 @@ class Operator:
             raise OperatorRefusedError(f"no message of scope {scope_id!r} is held")
         return self.release(held, reason=reason or f"scope {scope_id}")
 
-    def cancel(self, message_id: uuid.UUID, *, reason: str) -> Outcome:
-        """Cancel a pending, held or dead message; what waits for it dies too."""
+    def cancel(
+        self,
+        message_id: uuid.UUID,
+        *,
+        reason: str,
+        expected_heads: Mapping[uuid.UUID, str] | None = None,
+    ) -> Outcome:
+        """Cancel a pending, held or dead message; what waits for it dies too.
+        ``expected_heads`` as :meth:`release`'s."""
         return self._act(
             "cancel",
             [message_id],
@@ -622,11 +644,18 @@ class Operator:
                 authority=authority,
                 expected_head=target.head,
             ),
+            expected_heads=expected_heads,
         )
 
-    def requeue(self, message_id: uuid.UUID, *, reason: str | None = None) -> Outcome:
+    def requeue(
+        self,
+        message_id: uuid.UUID,
+        *,
+        reason: str | None = None,
+        expected_heads: Mapping[uuid.UUID, str] | None = None,
+    ) -> Outcome:
         """Send a dead message back with a fresh budget of attempts, and what
-        died waiting for it."""
+        died waiting for it. ``expected_heads`` as :meth:`release`'s."""
         return self._act(
             "requeue",
             [message_id],
@@ -640,6 +669,7 @@ class Operator:
                 )
                 > 0
             ),
+            expected_heads=expected_heads,
         )
 
     def compensate(
@@ -651,6 +681,7 @@ class Operator:
         reason: str | None = None,
         registry: SinkRegistry | None = None,
         now: datetime | None = None,
+        expected_heads: Mapping[uuid.UUID, str] | None = None,
     ) -> Outcome:
         """Enqueue the compensations delivered requests carried (E4-3): each
         a new message, its placeholder bound to what its original's delivery
@@ -662,8 +693,9 @@ class Operator:
             decision, not a default (E4-5).
         :param registry: Check each compensation against the sinks as the
             engine admits requests (the database checks it again).
-        :raises OperatorRefusedError: If a target cannot be compensated, before
-            anything is signed.
+        :param expected_heads: Each original's head, as :meth:`release`'s.
+        :raises OperatorRefusedError: If a target cannot be compensated, or its
+            log moved past its expected head, before anything is signed.
         :raises OutboundRequestError: If a compensation is not admissible.
         """
         plan = self._compensation_plan(message_ids, plan_id, late, now or datetime.now(UTC))
@@ -702,6 +734,7 @@ class Operator:
             reason,
             run,
             details=details,
+            expected_heads=expected_heads,
         )
 
     # -- the two phases ------------------------------------------------------
@@ -714,6 +747,7 @@ class Operator:
         run: Callable[[_Target, str], bool],
         *,
         details: Mapping[uuid.UUID, Mapping[str, Any]] | None = None,
+        expected_heads: Mapping[uuid.UUID, str] | None = None,
     ) -> Outcome:
         if not message_ids:
             raise OperatorRefusedError(f"nothing to {action}")
@@ -722,6 +756,19 @@ class Operator:
         missing = [str(m) for m in message_ids if m not in heads]
         if missing:
             raise OperatorRefusedError(f"the outbox holds no message {', '.join(missing)}")
+        if expected_heads is not None:
+            moved = [
+                f"{m} (at {heads[m][:16]}, expected {expected_heads[m][:16]})"
+                if m in expected_heads
+                else f"{m} (no head expected)"
+                for m in message_ids
+                if expected_heads.get(m) != heads[m]
+            ]
+            if moved:
+                raise OperatorRefusedError(
+                    f"not the state the action was decided on: {', '.join(moved)}; nothing "
+                    f"was signed"
+                )
         targets = [_Target(m, heads[m]) for m in message_ids]
         extra = details or {}
         intent = self._log.append(
