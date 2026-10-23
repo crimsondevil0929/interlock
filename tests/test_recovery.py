@@ -714,6 +714,58 @@ def test_a_restart_adopts_the_recovery_and_keeps_what_it_tightened(tmp_path: Pat
     gov.close()
 
 
+def test_a_closed_recovery_reopens_on_a_fresh_reserve_when_asked(tmp_path: Path) -> None:
+    """``reopen=True``: a recovery that was closed opens again, funded as the
+    first was, on ``{scope}/recovery/ext-N`` (a delegated scope is funded
+    once), with the ladder begun again and its opening naming the close. A
+    restart adopts that recovery alone; each close returns what it left."""
+    gov = governor(tmp_path / "gov.db")
+    key = HmacKey.generate()
+    path = tmp_path / "records.jsonl"
+
+    def opened(log: RecordLog, **kwargs: Any) -> RecoveryRuntime:
+        return RecoveryRuntime(
+            gov, "support-agent", policy(), log, tools=TOOLS, trajectory="ticket-9001", **kwargs
+        )
+
+    log = RecordLog(key, log_id="support", path=path)
+    first = opened(log)
+    step = first.recover(thrash(), history(), max_tokens=4096)  # revoke lookup
+    first.settle(step, "0.03")
+    closed = first.close()
+    assert closed is not None
+    with pytest.raises(RecoveryError, match="was closed"):
+        opened(log)
+    second = opened(log, reopen=True)
+    reserve = "support-agent/recovery/ext-1"
+    assert second.billing_scope == reserve and second.episode == second.opened
+    assert second.opened.body["funding"] == {
+        "source": "carved",
+        "from": "support-agent",
+        "amount": "1.00000000",
+        "scope": reserve,
+        "reopens": {"seq": closed.seq, "hash": closed.record_hash},
+    }
+    assert (second.revoked, second.taken, gov.available(reserve)) == ((), 0, Decimal("1.00"))
+    step = second.recover(thrash(), history(), max_tokens=4096)  # the ladder begun again
+    assert step.rung is Rung.REVOKE_TOOL and step.authorization.scope_id == reserve
+    second.settle(step, "0.03")
+    log.close()  # the process dies, the second recovery open
+
+    log = RecordLog(key, log_id="support", path=path)
+    third = opened(log, reopen=True)  # adopts the open one: reopens nothing
+    assert (third.billing_scope, third.revoked, third.taken) == (reserve, ("lookup",), 1)
+    assert third.episode == second.opened and third.opened.body["adopted"]["billing"] == reserve
+    third.close()
+    assert gov.available(reserve) == 0  # what it left went back
+    fourth = opened(log, reopen=True)
+    assert fourth.billing_scope == "support-agent/recovery/ext-2"
+    fourth.close()
+    log.close()
+    gov.verify_integrity()
+    gov.close()
+
+
 def test_a_recovery_scope_without_its_records_is_refused() -> None:
     gov = governor()
     gov.delegate("org", "support-agent/recovery", "1")

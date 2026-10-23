@@ -248,7 +248,7 @@ def test_a_log_signs_digests_when_its_signer_prefers_them(tmp_path: Path) -> Non
     the domain and the record's SHA-512, its ``sv`` among what is signed."""
     signer = _Limited()
     path = tmp_path / "records.jsonl"
-    with RecordLog(signer, path=path) as log:  # type: ignore[arg-type]
+    with RecordLog(signer, path=path) as log:
         assert log.signature_version == 2
         record = log.append(KIND, scope="s", body={"targets": ["x" * 64] * 200})
     assert len(json.dumps(record.to_json())) > 4096

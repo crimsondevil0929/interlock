@@ -679,8 +679,14 @@ class RecoveryRuntime:
         may revoke.
     :param trajectory: The task's trajectory, recorded.
     :param guard: Quotes for more when the reserve runs out.
-    :raises RecoveryError: If the reserve cannot be funded, or the recovery
-        scope exists without its records.
+    :param reopen: When the scope's recovery was closed, open another: a
+        fresh reserve, funded as the first was, on ``{scope}/recovery/ext-N``
+        (a delegated scope is funded once), billed from then on, and the
+        ladder begun again. The opening record names the close it follows.
+        Without it, a closed recovery refuses to open again.
+    :raises RecoveryError: If the reserve cannot be funded, the recovery
+        scope exists without its records, or its recovery was closed and
+        ``reopen`` is not given.
     """
 
     def __init__(
@@ -693,6 +699,7 @@ class RecoveryRuntime:
         tools: Iterable[str] = (),
         trajectory: str | None = None,
         guard: BudgetGuard | None = None,
+        reopen: bool = False,
     ) -> None:
         self._governor = governor
         self._guard = guard
@@ -718,8 +725,9 @@ class RecoveryRuntime:
             governor.node(scope_id)
         except AgentGovError as exc:
             raise RecoveryError(f"scope {scope_id!r} is not registered with the governor") from exc
+        self._episode: SignedRecord | None = None
         if self._recovery in governor.scopes():
-            self._opened = self._adopt()
+            self._opened = self._adopt(reopen=reopen)
         else:
             self._opened = self._fund()
 
@@ -759,6 +767,14 @@ class RecoveryRuntime:
     def opened(self) -> SignedRecord:
         """The ``recovery.opened`` record this runtime wrote."""
         return self._opened
+
+    @property
+    def episode(self) -> SignedRecord:
+        """The ``recovery.opened`` record that funded the reserve this runtime
+        bills: the one it wrote, or, adopting, the one it resumed. The scope's
+        records from it on are this recovery's; any before, a closed one's."""
+        assert self._episode is not None
+        return self._episode
 
     @property
     def steps(self) -> tuple[RecoveryStep, ...]:
@@ -1211,44 +1227,64 @@ class RecoveryRuntime:
         self._steps.append(step)
         return step
 
-    def _fund(self) -> SignedRecord:
+    def _fund(self, reopens: SignedRecord | None = None) -> SignedRecord:
+        """Fund the reserve: ``{scope}/recovery``, or, reopening after
+        ``reopens``, the next free ``{scope}/recovery/ext-N``."""
         governor, policy = self._governor, self._policy
+        target = self._recovery if reopens is None else _next_reserve(governor, self._recovery)
         parent = governor.node(self._scope).parent_id
         reserve = policy.reserve
         memo = f"recovery reserve for {self._scope}"
         try:
             with governor.transaction():  # all of it, or none
                 if policy.funding is not None:
-                    governor.delegate(policy.funding, self._recovery, reserve, memo=memo)
+                    governor.delegate(policy.funding, target, reserve, memo=memo)
                     source, origin = "delegated", policy.funding
                 elif parent is not None:
                     governor.release(self._scope, reserve, memo=f"{memo}, carved out")
-                    governor.delegate(parent, self._recovery, reserve, memo=memo)
+                    governor.delegate(parent, target, reserve, memo=memo)
                     source, origin = "carved", self._scope
                 else:
-                    governor.open_root(self._recovery, reserve, memo=f"{memo} (root scope)")
+                    governor.open_root(target, reserve, memo=f"{memo} (root scope)")
                     source, origin = "treasury", None
         except (AgentGovError, ValueError) as exc:
             raise RecoveryError(
-                f"cannot fund {self._recovery!r} with {reserve}: {exc}. Nothing was written"
+                f"cannot fund {target!r} with {reserve}: {exc}. Nothing was written"
             ) from exc
-        return self._open_record(
-            {"source": source, "from": origin, "amount": money(reserve)}, adopted=None
-        )
+        funding: dict[str, Any] = {"source": source, "from": origin, "amount": money(reserve)}
+        if reopens is not None:
+            funding["scope"] = target
+            funding["reopens"] = {"seq": reopens.seq, "hash": reopens.record_hash}
+            self._billing = target
+            self._billed = [target]
+        self._episode = self._open_record(funding, adopted=None)
+        return self._episode
 
-    def _adopt(self) -> SignedRecord:
+    def _adopt(self, *, reopen: bool) -> SignedRecord:
         mine = [r for r in self._records.records() if r.scope == self._scope]
-        if not any(
-            r.kind == RecordKind.RECOVERY_OPENED and r.body.get("recovery_scope") == self._recovery
-            for r in mine
-        ):
+        funded = [
+            index
+            for index, r in enumerate(mine)
+            if r.kind == RecordKind.RECOVERY_OPENED
+            and r.body.get("recovery_scope") == self._recovery
+            and r.body.get("funding") is not None
+        ]
+        if not funded:
             raise RecoveryError(
                 f"{self._recovery!r} already exists, but this record log holds no record of "
                 f"opening it, so what it already revoked is unknown. Resume with the log "
                 f"that opened it"
             )
-        if any(r.kind == RecordKind.RECOVERY_CLOSED for r in mine):
-            raise RecoveryError(f"the recovery of {self._scope!r} was closed")
+        # This recovery's records: from the opening that funded its reserve on.
+        mine = mine[funded[-1] :]
+        closed = next((r for r in mine if r.kind == RecordKind.RECOVERY_CLOSED), None)
+        if closed is not None:
+            if not reopen:
+                raise RecoveryError(f"the recovery of {self._scope!r} was closed")
+            return self._fund(reopens=closed)
+        self._episode = mine[0]
+        billing = str(mine[0].body["funding"].get("scope", self._recovery))
+        self._billing, self._billed = billing, [billing]
         settled = {r.body["step"] for r in mine if r.kind == RecordKind.RECOVERY_SETTLED}
         unsettled = 0
         for record in mine:
@@ -1327,6 +1363,16 @@ class RecoveryRuntime:
                 record.log,
                 exc_info=True,
             )
+
+
+def _next_reserve(governor: BudgetManager, recovery: str) -> str:
+    """The next free ``{recovery}/ext-N``: a reopened recovery's reserve,
+    numbered beside the scopes extension grants funded."""
+    taken = set(governor.scopes())
+    n = 1
+    while f"{recovery}/ext-{n}" in taken:
+        n += 1
+    return f"{recovery}/ext-{n}"
 
 
 def _spend_for(entries: Iterable[LedgerEntry], authorization: Authorization) -> LedgerEntry | None:

@@ -26,7 +26,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from datetime import timedelta
 from decimal import Decimal
@@ -237,11 +237,12 @@ def test_an_action_on_another_state_than_its_deciders_saw_is_refused_unsigned(
     heads = outbox.operations().heads([first, second])
     stale = {first: heads[first], second: "0" * 64}
     with outbox.signed("alice") as alice:
-        for attempt in (
+        attempts: list[Callable[[], object]] = [
             lambda: alice.release([first, second], expected_heads=stale),
             lambda: alice.cancel(second, reason="x", expected_heads=stale),
             lambda: alice.requeue(second, expected_heads=stale),
-        ):
+        ]
+        for attempt in attempts:
             with pytest.raises(OperatorRefusedError, match=f"{second} \\(at "):
                 attempt()
         with pytest.raises(OperatorRefusedError, match=f"{second} \\(no head expected\\)"):

@@ -842,7 +842,10 @@ the halt (and a refused plan's ARC1 receipt), the rung and exactly what it did, 
 that pays for it, the policy's digest, and the transcript before and after, and is written
 before the step is returned. Persist the log (`RecordLog(..., path=...)`): a runtime
 restarted over it adopts the recovery scope and replays what was revoked and lowered, so a
-restart never loosens a constraint.
+restart never loosens a constraint. A recovery that was closed opens again only with
+`RecoveryRuntime(..., reopen=True)`: a fresh reserve, funded as the first was, on
+`{scope}/recovery/ext-N` (a delegated scope is funded once), the ladder begun again, and
+its opening record naming the close it follows. For a scope that hosts task after task.
 
 ## Extension quotes
 

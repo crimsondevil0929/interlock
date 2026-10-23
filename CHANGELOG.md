@@ -29,6 +29,14 @@ Releases before 0.1.2 are described by their tags and commit history.
   record answers yet, and that have not expired, holds them as the guard that issued them
   did: a restart, or another process taking the log over, loses none. A quote is answered
   once, whichever guard of the log answers it. `adopt=False` adopts none.
+- **A closed recovery can be reopened** (`RecoveryRuntime(..., reopen=True)`), for a
+  scope that hosts task after task. A recovery once closed refused to open again, and
+  nothing funded `{scope}/recovery` again (a delegated scope is funded once). Reopened, it
+  funds a fresh reserve as the first was funded, on `{scope}/recovery/ext-N`, bills it
+  from then on, and begins the ladder again; its `recovery.opened` record names the close
+  it follows (`funding.reopens`) and the reserve (`funding.scope`). A restart adopts the
+  open recovery alone, and `episode` is the opening that funded it. Without `reopen`, a
+  closed recovery refuses to open, as before.
 
 ### Fixed
 
