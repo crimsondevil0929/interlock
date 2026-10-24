@@ -27,6 +27,18 @@ uv run python demo.py
       Byte-identical to before the plan ran. Nothing reached disk.
 ```
 
+## The stack: consequence control, under the gateway
+
+Gateways decide whether an agent may make a call. This stack decides whether the call's
+consequence may stand, and proves it to someone who trusts neither the agent nor the
+operator. It sits under an MCP or policy gateway, not in place of one.
+
+| Layer | Package | The question it answers |
+|---|---|---|
+| [AgentGov](https://github.com/crimsondevil0929/agentgov) | [`interlock-agentgov`](https://pypi.org/project/interlock-agentgov/) | May this scope spend this amount, counted across its whole delegation tree and every session, with in-flight calls held? |
+| [Interlock](https://github.com/crimsondevil0929/interlock) | [`interlock-escrow`](https://pypi.org/project/interlock-escrow/) | Does what this transaction actually changed, read back from the database, satisfy policy? Commit it or roll it back, and deliver its outside calls exactly once. |
+| [Fiduciary](https://github.com/crimsondevil0929/fiduciary) | [`interlock-fiduciary`](https://pypi.org/project/interlock-fiduciary/) | Who set those limits, and who approved each exception? Signed mandates, quorum warrants, and an audit bundle anyone verifies offline. |
+
 ## Why authorization does not catch this
 
 A prompt-injected agent is a fully authorized agent. It is doing something it has
@@ -2023,4 +2035,6 @@ PostgreSQL commit, and at random instants, then checks exactly what recovery mak
 verification fails exactly there. `INTERLOCK_CRASH_SEED` and `INTERLOCK_CRASH_ROUNDS`
 replay or lengthen the random-instant run.
 
-Apache-2.0.
+## License
+
+Apache-2.0: see [LICENSE](LICENSE). To report a vulnerability, see [SECURITY.md](SECURITY.md).
