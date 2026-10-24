@@ -664,6 +664,16 @@ the claim is booked.
 - **A stage stuck in `COMMIT` holds the ledger** until the server decides: no governor can
   write meanwhile, bounded by the stage's `lock_timeout`.
 
+## Fiduciary, the layer above
+
+[Fiduciary](https://github.com/crimsondevil0929/fiduciary)
+([`interlock-fiduciary`](https://pypi.org/project/interlock-fiduciary/)) says who set the
+limits Interlock and AgentGov enforce, and who approved an exception. A principal's signed
+mandate compiles into Interlock's checkers and AgentGov's policies; what it does not allow
+goes to the principals as a ticket, and a quorum's warrant is executed once, through
+Interlock's operators and AgentGov's ledger; a lineage exports as an audit bundle anyone
+verifies offline. It uses Interlock's public API only, as Interlock uses AgentGov's.
+
 ## Receipts
 
 With a `ReceiptIssuer`, every plan the engine adjudicates, committed or refused, gets a
