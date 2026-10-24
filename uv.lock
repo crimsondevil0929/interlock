@@ -619,7 +619,7 @@ sign = [
 
 [[package]]
 name = "interlock-escrow"
-version = "1.0.2"
+version = "1.0.3"
 source = { editable = "." }
 dependencies = [
     { name = "interlock-agentgov" },

@@ -7,7 +7,16 @@ and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 Releases before 0.1.2 are described by their tags and commit history.
 
-## [Unreleased]
+## [1.0.3] - 2026-10-23
+
+Requires agentgov 1.0.0 (`interlock-agentgov>=1.0.0` on PyPI); agentgov 1.0.1 works as
+well. Every addition is opt-in or keeps the default it had, with one exception: **a log an
+`AwsKmsSigner` signs is written at signature version 2 from this release on** (the
+signer's own `signature_version`, which `RecordLog` now honors). 1.0.2 cannot read a
+version 2 record, so upgrade every process that reads such a log (a cluster's other
+nodes, a verifier) before one writes it, or pass `signature_version=1` until they are.
+Every other signer writes version 1, as before, and every log 1.0.2 wrote reads and
+verifies here.
 
 ### Added
 
