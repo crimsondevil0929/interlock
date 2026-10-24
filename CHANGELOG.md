@@ -18,6 +18,10 @@ Releases before 0.1.2 are described by their tags and commit history.
   after 1.0.3's merge). Each node's relay now calls the payment API under a path of its
   own, and the API holds the victim's calls, made and unanswered, while `die()` waits for
   one to arrive; it lets them go on once the node is dead, or frozen.
+- `test_relays_racing_never_share_a_message` starts its eight relays from one barrier:
+  started one after another, the first could drain the outbox before the last began, and
+  "the work was shared" failed on a slow runner (this PR's first CI run) with every
+  exactly-once assertion holding.
 
 ## [1.0.3] - 2026-10-23
 

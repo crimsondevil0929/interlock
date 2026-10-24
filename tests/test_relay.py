@@ -165,9 +165,13 @@ def test_relays_racing_never_share_a_message(outbox: Outbox, sink: str) -> None:
     fake = outbox.sink(sink)
     relays = [outbox.relay(relay_id=f"racer-{n}") for n in range(8)]
     errors: list[BaseException] = []
+    # All eight race from one instant: started one after another, the first
+    # could drain the outbox before the last began, on a slow runner.
+    start = threading.Barrier(len(relays))
 
     def work(relay: Relay) -> None:
         try:
+            start.wait(30)
             idle = 0
             while idle < 3:
                 report = relay.run_once(limit=3)
