@@ -35,10 +35,11 @@ here and moved there in agentgov 1.0, unchanged: an ``isinstance`` check, a
 subclass and a ``key_id`` mean the same under either name.
 :class:`AwsKmsSigner` (``agentgov.receipts.kms_aws``) is one for a key AWS KMS
 holds, with ``boto3`` (the ``kms-aws`` extra). KMS signs at most 4096 bytes, so
-it signs ARC1 documents (a relay's attestations, the receipt log) at signature
-version 2, a digest, whatever their size; Interlock's own signed records (the
-operator log, the vacuum's, the inbox's) are signed whole, so through it each
-must stay within those 4096 bytes.
+it signs at signature version 2, a digest, whatever the document's size: ARC1
+documents (a relay's attestations, the receipt log) and ILOK1 records (the
+operator log, the vacuum's records in it, a recovery's and a budget guard's).
+An inbound statement (the inbox's) is signed whole, so through it each must stay
+within those 4096 bytes.
 """
 
 from __future__ import annotations

@@ -17,7 +17,12 @@ A record, as written (one per line)::
      "sig": {"alg": "hmac-sha256", "key_id": "...", "signature": "<hex>"}}
 
 - The signature covers ``ILOK1/record/v1\\n`` followed by the canonical bytes
-  of the record with ``sig`` reduced to its ``alg`` and ``key_id``.
+  of the record with ``sig`` reduced to its ``alg`` and ``key_id``. Or, at
+  signature version 2 (``"sv": 2`` in ``sig``, as ARC1 1.2 signs), it covers
+  ``ILOK1/record/v2\\n`` followed by the SHA-512 of those bytes, ``sv``
+  included: under 100 bytes whatever the record's size, so a key service that
+  limits what it signs (AWS KMS: 4096 bytes) signs any record. A log's signer
+  chooses: a key service that prefers digests says so (``signature_version``).
 - A record's hash is SHA-256 over the canonical bytes of the whole record,
   signature included. The next record's ``prev`` is that hash; the first
   record's is 64 zeros.
@@ -63,7 +68,9 @@ __all__ = [
     "ANCHOR_PREFIX",
     "GENESIS",
     "RECORD_DOMAIN",
+    "RECORD_DOMAIN_V2",
     "RECORD_VERSION",
+    "SIGNATURE_VERSIONS",
     "Keyring",
     "RecordKind",
     "RecordLog",
@@ -83,6 +90,12 @@ RECORD_DOMAIN: Final = b"ILOK1/record/v1\n"
 """Prefix on every signing input. ARC1 signs under ``ARC1/...`` prefixes, so
 the two formats' signatures cannot stand in for each other."""
 
+RECORD_DOMAIN_V2: Final = b"ILOK1/record/v2\n"
+"""Prefix on a signature version 2 signing input: the record's SHA-512 follows."""
+
+SIGNATURE_VERSIONS: Final = (1, 2)
+"""1 signs the canonical record; 2 signs its SHA-512 (module docstring)."""
+
 GENESIS: Final = "0" * 64
 """The ``prev`` of a log's first record."""
 
@@ -94,6 +107,8 @@ _KEY_ID = re.compile(r"[0-9a-f]{16}")
 _HASH = re.compile(r"[0-9a-f]{64}")
 _FIELDS = frozenset({"v", "log", "seq", "kind", "issued_at", "scope", "body", "prev", "sig"})
 _SIGNATURE_BYTES = {"hmac-sha256": 32, "ed25519": 64}
+_SIG = frozenset({"alg", "key_id", "signature"})
+_SIG_V2 = frozenset({"alg", "key_id", "sv", "signature"})
 
 
 class RecordKind(StrEnum):
@@ -178,6 +193,8 @@ class SignedRecord:
     alg: str
     key_id: str
     signature: bytes
+    version: int = 1
+    """The signature's version: 1 over the record, 2 over its SHA-512."""
 
     @property
     def body(self) -> dict[str, Any]:
@@ -199,17 +216,22 @@ class SignedRecord:
             "prev": self.prev,
         }
 
+    def _sig(self) -> dict[str, Any]:
+        """``sig`` without the signature: what the signature covers of it."""
+        sig: dict[str, Any] = {"alg": self.alg, "key_id": self.key_id}
+        if self.version != 1:
+            sig["sv"] = self.version
+        return sig
+
     def signing_input(self) -> bytes:
         """The exact bytes the signature covers."""
-        return RECORD_DOMAIN + canonical_bytes(
-            {**self._unsigned(), "sig": {"alg": self.alg, "key_id": self.key_id}}
-        )
+        encoded = canonical_bytes({**self._unsigned(), "sig": self._sig()})
+        if self.version == 1:
+            return RECORD_DOMAIN + encoded
+        return RECORD_DOMAIN_V2 + hashlib.sha512(encoded).digest()
 
     def to_json(self) -> dict[str, Any]:
-        return {
-            **self._unsigned(),
-            "sig": {"alg": self.alg, "key_id": self.key_id, "signature": self.signature.hex()},
-        }
+        return {**self._unsigned(), "sig": {**self._sig(), "signature": self.signature.hex()}}
 
     @property
     def record_hash(self) -> str:
@@ -248,8 +270,16 @@ class SignedRecord:
             found = sorted(raw) if isinstance(raw, dict) else type(raw).__name__
             raise RecordIntegrityError(f"not an ILOK1 record: fields {found}")
         sig = raw["sig"]
-        if not isinstance(sig, dict) or set(sig) != {"alg", "key_id", "signature"}:
-            raise RecordIntegrityError("an ILOK1 record's sig is {alg, key_id, signature}")
+        if not isinstance(sig, dict) or set(sig) not in (_SIG, _SIG_V2):
+            raise RecordIntegrityError(
+                "an ILOK1 record's sig is {alg, key_id, signature}, or {alg, key_id, sv, "
+                "signature} at signature version 2"
+            )
+        version = sig.get("sv", 1)
+        if "sv" in sig and (type(version) is not int or version != 2):
+            raise RecordIntegrityError(
+                "an ILOK1 record's sig.sv is 2: a version 1 signature has no sv"
+            )
         alg, key_id, signature = sig["alg"], sig["key_id"], sig["signature"]
         checks = (
             (raw["v"] == RECORD_VERSION, f"v must be {RECORD_VERSION!r}"),
@@ -287,6 +317,7 @@ class SignedRecord:
             alg=alg,
             key_id=key_id,
             signature=value,
+            version=version,
         )
 
 
@@ -582,6 +613,10 @@ class RecordLog:
         existing file is verified under it, each record under its own
         signer's key, and ``signer`` must be one of its keys as the log stands:
         registered (in ``keyring``, or by a record of the log), and not revoked.
+    :param signature_version: 2 signs each record's SHA-512, so a key service
+        that limits what it signs signs any record; the signer's own
+        ``signature_version`` (``AwsKmsSigner``'s is 2), or 1, by default.
+        Records already in the file keep the versions they were signed at.
     :raises ChainInUseError: If another live log has the file open.
     :raises RecordIntegrityError: If the existing file does not verify.
     :raises ValueError: If ``signer`` is not a trusted key of ``keyring`` as
@@ -599,6 +634,7 @@ class RecordLog:
         "_records",
         "_signer",
         "_trusted",
+        "_version",
     )
 
     def __init__(
@@ -608,9 +644,18 @@ class RecordLog:
         log_id: str = "interlock",
         path: str | Path | None = None,
         keyring: Keyring | None = None,
+        signature_version: int | None = None,
     ) -> None:
         if not _LOG_ID.fullmatch(log_id):
             raise ValueError(f"a log id is 1-64 characters of [A-Za-z0-9._:@/-], got {log_id!r}")
+        chosen = (
+            signature_version
+            if signature_version is not None
+            else getattr(signer, "signature_version", 1)
+        )
+        if type(chosen) is not int or chosen not in SIGNATURE_VERSIONS:
+            raise ValueError(f"a signature version is 1 or 2, got {chosen!r}")
+        self._version: int = chosen
         self._keyring = keyring
         self._trusted = keyring
         self._signer = signer
@@ -677,6 +722,11 @@ class RecordLog:
     def signer(self) -> Signer:
         return self._signer
 
+    @property
+    def signature_version(self) -> int:
+        """The version this log signs its records at."""
+        return self._version
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._records)
@@ -715,6 +765,7 @@ class RecordLog:
                 alg=self._signer.alg,
                 key_id=self._signer.key_id,
                 signature=b"",
+                version=self._version,
             )
             record = dataclasses.replace(
                 unsigned, signature=self._signer.sign(unsigned.signing_input())

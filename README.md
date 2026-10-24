@@ -835,13 +835,17 @@ names a scope to delegate it from. `close()` returns what is left to the parent.
 
 **Every act is signed first.** Opening, each step, each settlement and the close are
 `RecordLog` entries: ILOK1, agentgov's canonical JSON under an `ILOK1/record/v1` signing
-prefix, hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
+prefix (or `ILOK1/record/v2` over its SHA-512, for a key service that limits what it
+signs, as ARC1 1.2's version 2 does), hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
 `check_anchors()` catches a log truncated or rewritten after the fact. A step's record names
 the halt (and a refused plan's ARC1 receipt), the rung and exactly what it did, the hold
 that pays for it, the policy's digest, and the transcript before and after, and is written
 before the step is returned. Persist the log (`RecordLog(..., path=...)`): a runtime
 restarted over it adopts the recovery scope and replays what was revoked and lowered, so a
-restart never loosens a constraint.
+restart never loosens a constraint. A recovery that was closed opens again only with
+`RecoveryRuntime(..., reopen=True)`: a fresh reserve, funded as the first was, on
+`{scope}/recovery/ext-N` (a delegated scope is funded once), the ladder begun again, and
+its opening record naming the close it follows. For a scope that hosts task after task.
 
 ## Extension quotes
 
@@ -893,12 +897,16 @@ A quote has three parts, and is a signed `extension.quoted` record anchored in t
   rounded up to the cent. `requested` is that, less what the scope has left.
 
 A quote is answered once, before it expires, by the guard that issued it: `grant()` or
-`decline()`, each a signed record naming the quote. A root scope is topped up in place, and
-if the money running out is what tripped it, its breaker is reset. A delegated scope cannot
-be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along what the old
-scope had left, and the task bills there from then on. A grant the parent cannot make
-changes nothing. A scope halted for any other reason is not quoted: `authorize()` raises
-AgentGov's `CircuitOpenError`, because more money is not the answer to a safety halt.
+`decline()`, each a signed record naming the quote. The quote is a signed record too, so a
+guard opened over a persisted log adopts the quotes in it that no record answers and that
+have not expired: a restart loses none, and whichever guard of the log answers one, it is
+answered once (`BudgetGuard(..., adopt=False)` adopts none). A root scope is topped up in
+place, and if the money running out is what tripped it, its breaker is reset. A delegated
+scope cannot be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along
+what the old scope had left, and the task bills there from then on. A grant the parent
+cannot make changes nothing. A scope halted for any other reason is not quoted:
+`authorize()` raises AgentGov's `CircuitOpenError`, because more money is not the answer to
+a safety halt.
 
 A `RecoveryRuntime` given the guard quotes for its own reserve the same way: when a step
 will not fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up

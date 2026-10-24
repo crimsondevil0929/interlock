@@ -10,7 +10,8 @@ Tested against a real AgentGov ledger:
 - A scope spent out is quoted; a scope halted for safety is not.
 - Answers: a root topped up and its spent breaker reset, a delegated scope
   extended beside itself, and a quote answered once, in time, by the guard
-  that issued it.
+  that issued it or one opened over its log since, which adopts the quotes
+  it left open.
 - Recovery: a spent reserve comes with a quote, and a grant lets it go on.
 """
 
@@ -302,6 +303,62 @@ def test_a_quote_is_answered_once_in_time_by_the_guard_that_issued_it() -> None:
         stranger.grant(dataclasses.replace(late), approved_by="ops")
     guard.records.verify()
     assert check_anchors(guard.records.records(), gov.audit_trail()) == len(guard.records)
+
+
+def test_a_guard_restarted_over_its_log_adopts_the_quotes_it_left_open(tmp_path: Path) -> None:
+    """A quote is a signed record, so a guard opened over the log that holds it
+    adopts it, as the guard that issued it held it: unanswered, and not yet
+    expired. An answered quote and an expired one are not adopted; and
+    whichever guard of one log answers a quote, it is answered once."""
+    now = [datetime(2026, 9, 26, 9, 0, tzinfo=UTC)]
+    gov = governor()
+    key = HmacKey.generate()
+    path = tmp_path / "runtime.jsonl"
+
+    def opened(**kwargs: Any) -> BudgetGuard:
+        log = RecordLog(key, log_id="support", path=path)
+        return BudgetGuard(gov, log, clock=lambda: now[0], ttl=timedelta(minutes=30), **kwargs)
+
+    first = opened()
+    spend(gov, "support-agent", "4.60")
+    done = Milestones(done=2, total=4, unit="tickets")
+    kept = quoted(first.authorize("support-agent", "0.50", milestones=done))  # until 9:30
+    answered = quoted(first.authorize("support-agent", "0.50"))
+    first.decline(answered, declined_by="ops")
+    now[0] += timedelta(minutes=10)
+    late = quoted(first.authorize("support-agent", "0.50"))  # until 9:40
+    first.records.close()
+
+    now[0] += timedelta(minutes=15)  # 9:25: a restart
+    second = opened()
+    assert second.pending() == (kept, late)  # each as it was issued, to the decimal
+    assert second.grant(kept, approved_by="ops", amount="1").scope_id == "support-agent/ext-1"
+    now[0] += timedelta(minutes=20)  # 9:45
+    with pytest.raises(ExtensionError, match="expired"):
+        second.grant(late, approved_by="ops")
+    second.records.close()
+    third = opened()
+    assert third.pending() == ()  # one answered, one expired: nothing to adopt
+    third.records.close()
+    now[0] -= timedelta(minutes=20)
+    assert opened(adopt=False).pending() == ()
+
+
+def test_a_quote_two_guards_of_one_log_hold_is_answered_once() -> None:
+    gov = governor()
+    log = RecordLog(HmacKey.generate(), log_id="support")
+    issuer = BudgetGuard(gov, log)
+    spend(gov, "support-agent", "4.60")
+    quote = quoted(issuer.authorize("support-agent", "0.50"))
+    other = BudgetGuard(gov, log)  # adopts it
+    assert other.pending() == (quote,)
+    issuer.grant(quote, approved_by="ops")
+    for guard in (other, issuer):
+        with pytest.raises(ExtensionError, match="already granted"):
+            guard.grant(quote, approved_by="ops")
+        with pytest.raises(ExtensionError, match="already granted"):
+            guard.decline(quote, declined_by="ops")
+    assert gov.scopes().count("support-agent/ext-1") == 1
 
 
 def test_a_grant_the_funder_cannot_make_leaves_the_quote_open() -> None:

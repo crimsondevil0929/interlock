@@ -26,7 +26,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from datetime import timedelta
 from decimal import Decimal
@@ -224,6 +224,33 @@ def test_nothing_to_act_on_is_refused_before_anything_is_signed(outbox: Outbox) 
         with pytest.raises(OperatorRefusedError, match="is held"):
             alice.release_scope("nobody")
     assert read_records(outbox.operator_log) == ()
+
+
+def test_an_action_on_another_state_than_its_deciders_saw_is_refused_unsigned(
+    outbox: Outbox,
+) -> None:
+    """``expected_heads``: whoever decided on an action (principals approving
+    it, say) read each target's delivery-log head. The operator acts on that
+    state only: a head that has moved since, or a target with none expected,
+    is refused before anything is signed, by every action."""
+    first, second = held(outbox, mail(1), mail(2))
+    heads = outbox.operations().heads([first, second])
+    stale = {first: heads[first], second: "0" * 64}
+    with outbox.signed("alice") as alice:
+        attempts: list[Callable[[], object]] = [
+            lambda: alice.release([first, second], expected_heads=stale),
+            lambda: alice.cancel(second, reason="x", expected_heads=stale),
+            lambda: alice.requeue(second, expected_heads=stale),
+        ]
+        for attempt in attempts:
+            with pytest.raises(OperatorRefusedError, match=f"{second} \\(at "):
+                attempt()
+        with pytest.raises(OperatorRefusedError, match=f"{second} \\(no head expected\\)"):
+            alice.release([first, second], expected_heads={first: heads[first]})
+        assert read_records(outbox.operator_log) == ()
+        outcome = alice.release([first, second], expected_heads=heads)
+    assert outcome.applied and {row.message_id for row in outcome.rows} == {first, second}
+    assert [t["head"] for t in outcome.intent.body["targets"]] == [heads[first], heads[second]]
 
 
 # --------------------------------------------------------------------------
@@ -546,8 +573,13 @@ def test_a_plan_is_undone_in_reverse_order(outbox: Outbox, stripe: FakeStripe) -
     first, second = charged(outbox, stripe, charge(builder, "balance", 4000, after="deposit"))
     with outbox.signed("alice") as alice, pytest.raises(OperatorRefusedError, match="first"):
         alice.compensate([first])
+    heads = outbox.operations().heads([first, second])
     with outbox.signed("alice") as alice:
-        outcome = alice.compensate(plan_id=_plan_of(outbox, first))
+        with pytest.raises(OperatorRefusedError, match="decided on"):
+            alice.compensate(
+                plan_id=_plan_of(outbox, first), expected_heads={**heads, first: "0" * 64}
+            )
+        outcome = alice.compensate(plan_id=_plan_of(outbox, first), expected_heads=heads)
     assert [t["message"] for t in outcome.intent.body["targets"]] == [str(second), str(first)]
     deliver(outbox, stripe)
     refunds = stripe.of("refund")

@@ -9,6 +9,35 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Added
+
+- **ILOK1 records can be signed at signature version 2**, as ARC1 1.2's documents are:
+  `"sv": 2` in `sig`, and the signature covers `ILOK1/record/v2\n` and the SHA-512 of the
+  canonical record, its `sv` included, under 100 bytes whatever the record's size. A
+  `RecordLog` signs at its signer's `signature_version` (`AwsKmsSigner`'s is 2) unless
+  `signature_version=` says otherwise. So a key AWS KMS holds, which signs at most 4096
+  bytes, signs operator, recovery and extension records of any size: an
+  `operator.applied` naming hundreds of rows, a compensation of many targets. Version 1
+  records read and verify as before, and one log may hold both.
+- **An operator acts only on the state its deciders saw** (`expected_heads=` on
+  `Operator.release`, `cancel`, `requeue` and `compensate`): each target's delivery-log
+  head as whoever decided on the action read it, principals approving it, say. A target
+  whose log has moved since, or that has no expected head, refuses the action before
+  anything is signed. Without it, the operator reads the heads itself, as before.
+- **A budget guard adopts the quotes its log left open.** A quote is an
+  `extension.quoted` record, and a `BudgetGuard` opened over a log holding quotes no
+  record answers yet, and that have not expired, holds them as the guard that issued them
+  did: a restart, or another process taking the log over, loses none. A quote is answered
+  once, whichever guard of the log answers it. `adopt=False` adopts none.
+- **A closed recovery can be reopened** (`RecoveryRuntime(..., reopen=True)`), for a
+  scope that hosts task after task. A recovery once closed refused to open again, and
+  nothing funded `{scope}/recovery` again (a delegated scope is funded once). Reopened, it
+  funds a fresh reserve as the first was funded, on `{scope}/recovery/ext-N`, bills it
+  from then on, and begins the ladder again; its `recovery.opened` record names the close
+  it follows (`funding.reopens`) and the reserve (`funding.scope`). A restart adopts the
+  open recovery alone, and `episode` is the opening that funded it. Without `reopen`, a
+  closed recovery refuses to open, as before.
+
 ### Fixed
 
 - **The sdist packs no build log or Hypothesis cache.** 1.0.2's carries the release
