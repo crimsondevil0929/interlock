@@ -7,6 +7,18 @@ and this project intends to follow [Semantic Versioning](https://semver.org/)
 from 1.0.0 onward. Before 1.0.0, minor versions may include breaking changes.
 Releases before 0.1.2 are described by their tags and commit history.
 
+## [Unreleased]
+
+### Fixed (in the tests)
+
+- **The soak kills a node mid-call by design, not by luck.** `die()` stopped the node
+  leading the vacuum at random instants for up to 30 s, looking for one with a call in
+  flight; on a slow runner, where rate windows refuse most plans, it found none, killed it
+  anyway, and "a node killed is survived" failed with nothing else wrong (once, on `main`
+  after 1.0.3's merge). Each node's relay now calls the payment API under a path of its
+  own, and the API holds the victim's calls, made and unanswered, while `die()` waits for
+  one to arrive; it lets them go on once the node is dead, or frozen.
+
 ## [1.0.3] - 2026-10-23
 
 Requires agentgov 1.0.0 (`interlock-agentgov>=1.0.0` on PyPI); agentgov 1.0.1 works as

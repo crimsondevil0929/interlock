@@ -140,13 +140,13 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, LiteralString, TypeVar
+from typing import Any, Final, LiteralString, TypeVar
 
 import psycopg
 from agentgov import BudgetManager
@@ -752,7 +752,7 @@ workers = {settings.relays}
 
 [[relay.endpoints]]
 sink = {_q(SINK)}
-url = {_q(f"http://127.0.0.1:{api_port}")}
+url = {_q(f"http://127.0.0.1:{api_port}/{node}")}
 secret_env = {_q(API_KEY_ENV)}
 
 [operators]
@@ -938,6 +938,23 @@ class Faults:
         )
 
 
+HOLD_SECONDS: Final = 60.0
+"""The longest a held call waits for its release, whatever becomes of it."""
+
+
+@dataclass
+class Hold:
+    """One node's calls to the payment API, held made and unanswered: so a
+    node can be stopped with a call in flight, by design rather than by luck."""
+
+    node: str
+    arrived: threading.Event = field(default_factory=threading.Event)
+    """Set as a call of the node's is held."""
+    released: threading.Event = field(default_factory=threading.Event)
+    keys: list[str] = field(default_factory=list)
+    """The idempotency key of each call held."""
+
+
 class PaymentAPI:
     """Stripe, as far as the relay relies on it, on localhost.
 
@@ -946,6 +963,10 @@ class PaymentAPI:
     ``Idempotent-Replayed: true``, and acts on nothing. A call while the key's
     first is still running is answered 409. Each object it creates is handed
     to the vendor, which sends its webhook.
+
+    Each node's relay calls it under a path of its own (``/<node>/v1/...``),
+    so a node's calls can be held (:meth:`holding`): received, and neither
+    acted on nor answered until released.
     """
 
     def __init__(self, key: str, vendor: Vendor, faults: Faults, seed: int) -> None:
@@ -958,6 +979,7 @@ class PaymentAPI:
         self._numbers: Counter[str] = Counter()
         self._stored: dict[str, tuple[str, dict[str, Any], int, dict[str, Any]]] = {}
         self._running: set[str] = set()
+        self._hold: Hold | None = None
         self.objects: dict[str, dict[str, Any]] = {}
         self.executions: Counter[str] = Counter()
         """Calls that acted, by idempotency key."""
@@ -989,6 +1011,21 @@ class PaymentAPI:
         self._server.shutdown()
         self._server.server_close()
 
+    @contextlib.contextmanager
+    def holding(self, node: str) -> Iterator[Hold]:
+        """Hold every call ``node`` makes from now until the hold is released
+        or this ends, whichever is first; the calls held then go on as if
+        they had just arrived."""
+        hold = Hold(node)
+        with self._lock:
+            self._hold = hold
+        try:
+            yield hold
+        finally:
+            with self._lock:
+                self._hold = None
+            hold.released.set()
+
     def _handle(self, handler: BaseHTTPRequestHandler) -> None:
         length = int(handler.headers.get("Content-Length") or 0)
         body = handler.rfile.read(length)
@@ -1002,8 +1039,16 @@ class PaymentAPI:
             self._answer(handler, 400, stripe_error("invalid_request_error", "idempotency_key"))
             return
         params = parse_form(body)
-        path = handler.path
+        node, _, rest = handler.path.lstrip("/").partition("/")
+        path = "/" + rest
         traceparent = handler.headers.get("traceparent")
+        with self._lock:
+            hold = self._hold if self._hold is not None and self._hold.node == node else None
+            if hold is not None:
+                hold.keys.append(key)
+        if hold is not None:
+            hold.arrived.set()
+            hold.released.wait(HOLD_SECONDS)
         with self._lock:
             latency = self._rng.uniform(0.002, 0.03)
         time.sleep(latency)
@@ -3051,25 +3096,32 @@ def die(run: Run, how: str) -> DeathReport | None:
     what the database and the cluster do about it; and bring it back, as a
     pod is rescheduled. Never raises: what went wrong is the claims' to report.
 
-    The moment is found by stopping the node (``SIGSTOP``) and looking: a
-    stopped process changes nothing, so what is read then is what it dies
-    holding. Not poised, it is let go on (``SIGCONT``), as if descheduled for a
-    few milliseconds, and looked at again shortly. Poised, it is killed
-    (``SIGKILL``), or left frozen."""
+    The moment is made: the payment API holds the node's calls, so the first
+    one it makes stays in flight (:meth:`PaymentAPI.holding`), and each time
+    one is held the node is stopped (``SIGSTOP``) and looked at. A stopped
+    process changes nothing, so what is read then is what it dies holding.
+    Not poised (for a freeze, no stage open yet), it is let go on
+    (``SIGCONT``), as if descheduled for a few milliseconds, and looked at
+    again at the next call held or shortly. Poised, it is killed
+    (``SIGKILL``), or left frozen, and only then are its calls let go on: the
+    one in flight is answered to a process gone, or stopped."""
     node = victim(run)
     if node is None:
         return None
     report = DeathReport(how, node.name, node.incarnation)
     try:
         conn = psycopg.connect(run.site.owner, autocommit=True)
+        hold = contextlib.ExitStack()
         try:
+            held = hold.enter_context(run.api.holding(node.name))
             deadline = time.monotonic() + 30
             while True:
                 stopped = node.freeze()
                 if _poised(conn, node, how) or time.monotonic() > deadline:
                     break
                 node.thaw()
-                time.sleep(random.uniform(0.005, 0.03))
+                if held.arrived.wait(random.uniform(0.005, 0.03)):
+                    held.arrived.clear()
             holders = run.watch.leaders[-1][1] if run.watch.leaders else {}
             report.led = sorted(role for role, holder in holders.items() if holder == node.name)
             scraper = run.scraper(node)
@@ -3091,6 +3143,7 @@ def die(run: Run, how: str) -> DeathReport | None:
                 ).fetchall()
             )
             report.at = node.kill() if how == "killed" else stopped
+            hold.close()  # its calls go on now, the one in flight among them
             say(
                 run.settings,
                 f"  {time.monotonic() - run.started:6.0f}s  node {node.name} {how}, leading "
@@ -3102,6 +3155,7 @@ def die(run: Run, how: str) -> DeathReport | None:
                 node.kill()
                 report.killed_after = time.time() - report.at
         finally:
+            hold.close()
             conn.close()
         report.fencers = fencers(run, node)
         rest = run.settings.restart_after - (time.time() - report.at - report.killed_after)
