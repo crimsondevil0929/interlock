@@ -255,7 +255,7 @@ def _parser() -> argparse.ArgumentParser:
     vacuum.add_argument(
         "--verify-archive",
         metavar="FILE",
-        help="prove an archive a vacuum wrote against its checkpoint, and do nothing else",
+        help="verify a vacuum archive against its checkpoint, and do nothing else",
     )
     inbox = commands.add_parser(
         "inbox",
@@ -302,8 +302,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     daemon.add_argument(
         "--node",
-        help="this daemon's node of the cluster [cluster] configures, overriding its node "
-        "and INTERLOCK_NODE (docs/EPIC9_DESIGN.md)",
+        help="this daemon's node name in the [cluster] configuration; overrides [cluster] node "
+        "and INTERLOCK_NODE",
     )
     daemon.add_argument("--relay-key", help=f"overrides [relay]'s key, as does {RELAY_KEY_ENV}")
     daemon.add_argument("--inbox-key", help=f"overrides [inbox]'s key, as does {INBOX_KEY_ENV}")
@@ -336,8 +336,8 @@ def _parser() -> argparse.ArgumentParser:
             public.add_argument(
                 "--public-of",
                 metavar="SIGNER",
-                help="the public half of the key a [signers.<name>] holds, as its service "
-                "serves it now",
+                help="print the current public key of a [signers.<name>] key, as its signing "
+                "service reports it",
             )
         else:
             key_action.add_argument("key_id", help="the key's id: 16 hex characters")

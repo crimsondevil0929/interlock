@@ -9,6 +9,22 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ColumnValueGuard` and `TenantDrawdownGuard` count each row once.** A column total
+  summed every image the stage captured, so a row written twice (by a statement and a
+  trigger, or by repeated writes in one plan) counted twice, and extra no-op writes could
+  dilute a real drop below the guard's limit. `EffectDiff.column_total` and
+  `tenant_column_totals` now take each row's value before the plan and after it. A row
+  repriced from 1,000.00 to 100.00 by a trigger reads as a 90% drop, not 45%.
+
+### Changed
+
+- **Agent feedback shows a built-in checker's configured limit as configured.** Row,
+  tenant and outbound-request limits were bucketed like measured counts, so a refusal
+  could read "the plan changed 10-99 rows; the limit is 10-99". The measured count stays
+  bucketed; the limit is policy and now reads exactly ("the limit is 20").
+
 ### Fixed (in the tests)
 
 - **The soak kills a node mid-call by design, not by luck.** `die()` stopped the node

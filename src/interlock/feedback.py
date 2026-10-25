@@ -14,8 +14,9 @@ A refused plan produces two records, built from the same adjudication:
   * **row counts** only as buckets: 0, 1, 2-9, 10-99, 100-999, 1000+;
   * **no aggregate, ever**: no column total, no fraction of one, no count of
     tenants or tables the plan did not name, nothing a rate window holds. The
-    one number that is not a bucketed row count is a built-in checker's
-    configured limit, as a whole percentage: policy, not data;
+    numbers that are not bucketed counts are a built-in checker's configured
+    limits (a row or request limit, a tenant limit, a whole percentage) and the
+    plan's own stated row count: policy and the agent's own input, not data;
   * **windows** only by name, as the operator configured them, and only from
     the built-in rate-window check;
   * **sinks** only as the plan's own requests name them;
@@ -198,8 +199,9 @@ class FeedbackHint:
         plan names.
     :ivar measured: A row count the plan produced. Bucketed; built-in
         checkers only.
-    :ivar limit: A row limit the checker was configured with. Bucketed;
-        built-in checkers only.
+    :ivar limit: A limit the checker was configured with (rows, tenants,
+        requests), or the plan's own stated row count. Shown as configured:
+        policy, not data. Built-in checkers only.
     :ivar percent: A fractional limit the checker was configured with, as a
         whole percentage. Built-in checkers only.
     :ivar window: The name of the rate window that refused the plan. Kept
@@ -354,7 +356,7 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"{c.limit or 'lower'}. Narrow the statements' WHERE clauses or split the work."
     ),
     Guidance.TENANT_SCOPE: lambda c: (
-        f"the plan changed rows of more tenants than one plan may "
+        f"the plan changed rows of more tenants than allowed "
         f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. "
         f"Confine every statement to its declared tenants."
     ),
@@ -376,7 +378,7 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     ),
     # For this kind ``limit`` carries the plan's own stated count.
     Guidance.STATED_FOOTPRINT: lambda c: (
-        f"the plan stated {c.limit or 'a number of'} rows; the database measured "
+        f"the plan stated {c.limit or 'a number of'} row(s); the database measured "
         f"{c.measured or 'more'}."
     ),
     Guidance.SCHEMA_CHANGE: lambda c: (
@@ -435,10 +437,10 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"that is not a single plain address."
     ),
     Guidance.OUTBOUND_TENANT: lambda c: (
-        f"the plan's outbound requests reach beyond its tenants "
-        f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. A "
-        f"request goes only to a tenant the plan's rows involve, and its payload names that "
-        f"tenant where it names one."
+        f"the plan's outbound requests involve more tenants than allowed "
+        f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. "
+        f"Each request must go to a tenant whose rows the plan changes, and name that tenant "
+        f"if its payload names one."
     ),
     Guidance.INBOUND_FACT: lambda c: (
         "a fact the plan consumes is not pending for its scope, or does not verify. Read the "
@@ -574,7 +576,9 @@ def sanitize(
     window = ""
     if trusted:
         measured = bucket(hint.measured) if isinstance(hint.measured, int) else None
-        limit = bucket(hint.limit) if isinstance(hint.limit, int) else None
+        # A configured limit is policy, shown as configured: bucketed, it could
+        # read "changed 10-99 rows; the limit is 10-99".
+        limit = str(hint.limit) if isinstance(hint.limit, int) and hint.limit >= 0 else None
         if isinstance(hint.percent, int) and 0 <= hint.percent <= 100:
             percent = hint.percent
         # A window's name only for a window's guidance, from the built-in

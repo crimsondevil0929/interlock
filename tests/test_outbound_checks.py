@@ -262,11 +262,11 @@ def test_outbound_count_bounds_a_plan_and_each_sink() -> None:
     assert none.evidence == {"measured": "1", "limit": "0"}
 
 
-def test_outbound_count_tells_bucketed_counts_and_the_plans_own_sink() -> None:
+def test_outbound_count_tells_a_bucketed_count_its_limit_and_the_plans_own_sink() -> None:
     eleven = plan_of(*(refund(str(n)) for n in range(11)))
     (told,) = feedback(OutboundCount(per_sink={"payments": 9}), eleven).blocking
-    assert (told.measured, told.limit, told.sinks) == ("10-99", "2-9", ("payments",))
-    assert "the plan enqueues 10-99 outbound request(s) to payments; the limit is 2-9" in (
+    assert (told.measured, told.limit, told.sinks) == ("10-99", "9", ("payments",))
+    assert "the plan enqueues 10-99 outbound request(s) to payments; the limit is 9" in (
         told.render()
     )
 
@@ -623,7 +623,7 @@ PROPERTY = settings(
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
-_ALLOWED_NUMBERS = {"0", "1", "2", "9", "10", "99", "100", "999", "1000"}
+_ALLOWED_NUMBERS = {"0", "1", "2", "3", "9", "10", "99", "100", "999", "1000"}
 
 
 @PROPERTY
@@ -642,7 +642,7 @@ def test_feedback_never_carries_a_payload_value(
     for constraint in told.constraints:
         assert set(constraint.tenants) <= set(DECLARED)
         assert constraint.measured in (None, *BUCKETS)
-        assert constraint.limit in (None, *BUCKETS)
+        assert constraint.limit in (None, "0", "1", "2", "3")  # OutboundCount's, as configured
         assert set(constraint.sinks) <= {e.request.sink for e in plan.effects if e.request}
     assert set(re.findall(r"\d+(?:\.\d+)?", told.render())) <= _ALLOWED_NUMBERS
 

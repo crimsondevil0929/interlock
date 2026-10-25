@@ -180,7 +180,7 @@ def test_every_kind_renders_from_a_template() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_blast_radius_names_only_the_plans_tables_and_buckets_counts() -> None:
+def test_blast_radius_names_only_the_plans_tables_and_buckets_its_count() -> None:
     plan = plan_of(("orders", "acme"))
     rows = [row("orders", i, "acme", D("10.00"), D("0.00")) for i in range(40)]
     rows += [row("order_audit", 100 + i, "acme", None, D("1.00")) for i in range(189)]
@@ -194,7 +194,7 @@ def test_blast_radius_names_only_the_plans_tables_and_buckets_counts() -> None:
         "tenants": [],
         "columns": [],
         "measured": "100-999",
-        "limit": "2-9",
+        "limit": "8",
         "percent": None,
         "withheld_tables": True,
         "withheld_tenants": False,
@@ -202,7 +202,18 @@ def test_blast_radius_names_only_the_plans_tables_and_buckets_counts() -> None:
     }
     assert "order_audit" not in text_of(fb)
     assert "229" not in text_of(fb)
+    assert "the plan changed 100-999 rows; the limit is 8." in text_of(fb)
     assert fb.outcome == "refused"
+
+
+def test_a_count_and_its_limit_in_one_bucket_still_read_apart() -> None:
+    """Fifty rows over a limit of twenty: both bucket to 10-99, and only the
+    count is bucketed, so the agent reads which is which."""
+    plan = plan_of(("orders", "acme"))
+    rows = [row("orders", i, "acme", D("10.00"), D("9.00")) for i in range(50)]
+    (c,) = feedback(plan, rows, [BlastRadius(20)]).constraints
+    assert (c.measured, c.limit) == ("10-99", "20")
+    assert "the plan changed 10-99 rows; the limit is 20." in c.render()
 
 
 def test_tenant_isolation_never_names_or_counts_other_tenants() -> None:
@@ -337,7 +348,7 @@ def test_an_advisory_rides_on_a_committed_plan() -> None:
     assert fb.outcome == "committed"
     (c,) = fb.constraints
     assert not c.blocking
-    assert c.render() == "stated_footprint: the plan stated 1 rows; the database measured 10-99."
+    assert c.render() == "stated_footprint: the plan stated 1 row(s); the database measured 10-99."
 
 
 def test_constraints_are_ordered_canonically_and_duplicates_collapse() -> None:
@@ -742,15 +753,25 @@ def test_feedback_names_only_what_the_plan_names(case: Scenario) -> None:
     for c in fb.constraints:
         assert set(c.tables) <= named_tables
         assert set(c.tenants) <= set(case.declared)
-        assert c.measured in (None, *BUCKETS) and c.limit in (None, *BUCKETS)
+        assert c.measured in (None, *BUCKETS)
+        assert c.limit in (None, *_policy(case))
         assert c.percent in (None, *(int(f * 100) for f in FRACTIONS))
     for tenant in set(case.tenants) - set(case.declared):
         assert tenant not in rendered
     for table in set(case.tables) - named_tables:
         assert table not in rendered
     allowed = {"0", "1", "2", "9", "10", "99", "100", "999", "1000"}
-    allowed |= {str(int(f * 100)) for f in FRACTIONS}
+    allowed |= {str(int(f * 100)) for f in FRACTIONS} | _policy(case)
     assert _numbers(fb) <= allowed
+
+
+def _policy(case: Scenario) -> set[str]:
+    """The numbers the agent may be told as they are: a built-in checker's
+    configured limit, and the plan's own stated row count."""
+    kinds = ("blast", "tenants", "declared")
+    limits = {str(int(c.number)) for c in case.checkers if c.kind in kinds}
+    stated = case.plan().stated_rows
+    return limits | ({str(stated)} if stated is not None else set())
 
 
 @PROPERTY
