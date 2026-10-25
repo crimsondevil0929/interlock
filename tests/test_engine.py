@@ -17,6 +17,7 @@ import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,6 +40,7 @@ from interlock import (
     SqliteSubstrate,
     StageState,
     TableSpec,
+    TenantDrawdownGuard,
     TenantIsolation,
     TruncationGuard,
     default_checkers,
@@ -757,6 +759,50 @@ def test_blast_radius_counts_mutations_not_distinct_rows(db: str) -> None:
     orders = [d for d in result.diff.deltas if d.table == "orders"]
     assert len(orders) == 2
     assert len({(d.table, d.primary_key) for d in orders}) == 1
+
+
+def _touched_then_halved(times: int) -> EffectPlan:
+    """Order 1 written ``times`` times without changing it, then halved."""
+    noop = [
+        Effect(
+            effect_id=EffectId(f"touch{n}"),
+            kind=EffectKind.UPDATE,
+            target="sqlite:orders",
+            statement="UPDATE orders SET total=total WHERE id=1",
+            tenant_id="acme",
+        )
+        for n in range(times)
+    ]
+    halve = Effect(
+        effect_id=EffectId("halve"),
+        kind=EffectKind.UPDATE,
+        target="sqlite:orders",
+        statement="UPDATE orders SET total=total*0.5 WHERE id=1",
+        tenant_id="acme",
+    )
+    return make_plan(*noop, halve)
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        ColumnValueGuard("orders", "total", max_drop_fraction=0.30),
+        TenantDrawdownGuard("orders", "total", max_drop_fraction=0.30),
+    ],
+    ids=["column", "tenant"],
+)
+def test_writing_a_row_again_does_not_dilute_a_value_guard(db: str, guard: Any) -> None:
+    """A row counts once, before the plan and after it, however many images
+    the stage captured of it: nine no-op writes do not turn a 50% fall into a
+    10% one."""
+    result = engine_for(db, checkers=[guard]).execute(_touched_then_halved(9))
+    assert not result.committed
+    assert result.diff is not None
+    assert len([d for d in result.diff.deltas if d.table == "orders"]) == 10
+    before, after = result.diff.column_total("orders", "total")
+    assert after == before / 2
+    (violation,) = result.verdict.violations if result.verdict else ()
+    assert "50.0%" in violation.message
 
 
 def test_column_value_guard_does_not_bound_inflation(db: str) -> None:

@@ -711,17 +711,31 @@ class EffectDiff:
         Rows absent from one side contribute zero to that side, which is the
         correct treatment for inserts and deletes.
 
+        Each row counts once: its value before the plan and its value after it,
+        however many times the plan (or a trigger) wrote it in between. Summing
+        every captured image instead would let repeated writes to the same rows
+        dilute a fall below a guard's limit.
+
         :returns: ``(before_total, after_total)`` as exact decimals.
         """
         before = after = Decimal(0)
-        for delta in self.deltas:
-            if delta.table != table:
-                continue
-            if delta.before is not None:
-                before += _as_decimal(delta.before.get(column))
-            if delta.after is not None:
-                after += _as_decimal(delta.after.get(column))
+        for first, last in self._net(table):
+            if first.before is not None:
+                before += _as_decimal(first.before.get(column))
+            if last.after is not None:
+                after += _as_decimal(last.after.get(column))
         return before, after
+
+    def _net(self, table: str) -> list[tuple[RowDelta, RowDelta]]:
+        """Each row of ``table`` once: its first captured image and its last.
+
+        The substrates return a row's images in the order they were captured.
+        """
+        rows: dict[str, list[RowDelta]] = {}
+        for delta in self.deltas:
+            if delta.table == table:
+                rows.setdefault(delta.primary_key, []).append(delta)
+        return [(images[0], images[-1]) for images in rows.values()]
 
     def tenant_column_totals(self, table: str, column: str) -> dict[str, tuple[Decimal, Decimal]]:
         """As :meth:`column_total`, but grouped by tenant.
@@ -731,19 +745,22 @@ class EffectDiff:
         platform-wide sum, so a table-scoped guard admits a single-tenant
         wipe. Rows whose tenant could not be read group under ``""``.
 
+        Each row counts once, as in :meth:`column_total`: its value before the
+        plan under the tenant its first image was read as, its value after
+        under the tenant its last image was read as.
+
         :returns: ``{tenant_id: (before_total, after_total)}``.
         """
         totals: dict[str, tuple[Decimal, Decimal]] = {}
-        for delta in self.deltas:
-            if delta.table != table:
-                continue
-            tenant = delta.tenant_id or ""
-            before, after = totals.get(tenant, (Decimal(0), Decimal(0)))
-            if delta.before is not None:
-                before += _as_decimal(delta.before.get(column))
-            if delta.after is not None:
-                after += _as_decimal(delta.after.get(column))
-            totals[tenant] = (before, after)
+        for first, last in self._net(table):
+            if first.before is not None:
+                tenant = first.tenant_id or ""
+                before, after = totals.get(tenant, (Decimal(0), Decimal(0)))
+                totals[tenant] = (before + _as_decimal(first.before.get(column)), after)
+            if last.after is not None:
+                tenant = last.tenant_id or ""
+                before, after = totals.get(tenant, (Decimal(0), Decimal(0)))
+                totals[tenant] = (before, after + _as_decimal(last.after.get(column)))
         return totals
 
     def content_hash(self) -> str:

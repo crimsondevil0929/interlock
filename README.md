@@ -14,13 +14,13 @@ uv run python demo.py
     MEASURED by the database, not predicted from the plan:
       rows updated    63   inserted    63   deleted   103
       blast radius   229 rows across 4 tenants
-      orders.total $21,350.25 -> $425.25
+      orders.total $20,925.00 -> $0.00
 
     ADJUDICATED by 7 deterministic checks:
       BLOCK   blast_radius          plan would mutate 229 rows, limit is 8
       BLOCK   tenant_isolation      plan spans 4 tenants, limit is 1
       BLOCK   no_delete             plan deletes 103 row(s) from ungranted table(s): order_audit
-      BLOCK   column_value_guard    orders.total falls 98.0% (21,350.25 to 425.25), limit is 30%
+      BLOCK   column_value_guard    orders.total falls 100.0% (20,925.00 to 0.00), limit is 30%
       advise  stated_footprint      agent stated 6 row(s); substrate measured 229 (38.2x)
 
     OUTCOME  ROLLED BACK
@@ -36,7 +36,7 @@ operator. It sits under an MCP or policy gateway, not in place of one.
 | Layer | Package | The question it answers |
 |---|---|---|
 | [AgentGov](https://github.com/crimsondevil0929/agentgov) | [`interlock-agentgov`](https://pypi.org/project/interlock-agentgov/) | May this scope spend this amount, counted across its whole delegation tree and every session, with in-flight calls held? |
-| [Interlock](https://github.com/crimsondevil0929/interlock) | [`interlock-escrow`](https://pypi.org/project/interlock-escrow/) | Does what this transaction actually changed, read back from the database, satisfy policy? Commit it or roll it back, and deliver its outside calls exactly once. |
+| [Interlock](https://github.com/crimsondevil0929/interlock) | [`interlock-escrow`](https://pypi.org/project/interlock-escrow/) | Does what this transaction actually changed, read back from the database, satisfy policy? Commit it or roll it back, and deliver its outbound API calls exactly once. |
 | [Fiduciary](https://github.com/crimsondevil0929/fiduciary) | [`interlock-fiduciary`](https://pypi.org/project/interlock-fiduciary/) | Who set those limits, and who approved each exception? Signed mandates, quorum warrants, and an audit bundle anyone verifies offline. |
 
 ## Why authorization does not catch this
@@ -53,17 +53,14 @@ why this runs inside the deployment rather than at the model provider.
 The demo is also a control for model quality: the agent loops zero times, costs $0.0012,
 and emits valid SQL on the first attempt. The damage is not a model-quality failure.
 
-**`demo.py`'s agent is scripted, not live.** `injected_plan` (a function local to
-`demo.py`, not part of the package) and the rest of Act 2's
-input are hardcoded `EffectPlan`s in `demo.py` itself; no model is called anywhere in that
-file. That is deliberate -- it isolates one variable (does the *escrow* stop this plan?)
-from another (would a *real* model produce it?) -- but it means demo.py cannot answer the
-second question, and an adversarial audit of this project found that a real, current
-Claude model declines the exact injected instruction shown above, across several
-realistic framings of the same prompt injection. For the first question answered against
-a real model instead of a scripted stand-in, see [`scripts/live_gauntlet.py`](scripts/live_gauntlet.py):
-eight scenarios, a real `anthropic.Anthropic` client, real governed spend, and verdicts the
-script itself says are not reproducible, because what the model chooses to do is not.
+**`demo.py` uses a scripted agent, not a live model.** `injected_plan` and the rest of
+Act 2's input are fixed `EffectPlan`s defined in `demo.py`; no model is called. This
+separates two questions: does escrow stop this plan, and would a real model produce it?
+The demo answers only the first. Current Claude models decline the injected instruction
+shown above in several realistic phrasings. For runs against a real model, see
+[`scripts/live_gauntlet.py`](scripts/live_gauntlet.py): eight scenarios with a real
+`anthropic.Anthropic` client and governed spend. Its results are not reproducible, because
+model behavior varies.
 
 ## What it measures
 
@@ -76,9 +73,8 @@ routinely different:
 | SQL `rowcount` | 1 row |
 | **Measured** | **2 rows across 2 tables** |
 
-A compliance trigger nobody remembered doubled the footprint. No plan inspection, SQL
-parser or policy engine reading the statement could know that. The database knew, because
-it had just done it.
+An audit trigger that the plan does not mention doubled the footprint. Inspecting the plan
+or parsing the SQL cannot reveal that; reading the change back from the database does.
 
 ## Lifecycle
 
@@ -362,9 +358,9 @@ result = runtime.execute_sql("UPDATE orders SET total = 0", table="orders", tena
 assert not result.committed
 print(result.feedback.render())  # for the agent
 # The plan was refused and rolled back; nothing changed.
-# - tenant_isolation: the plan changed rows of more tenants than one plan may
-#   (at most 1); its declared tenants are acme. Confine every statement to its
-#   declared tenants.
+# - tenant_isolation: the plan changed rows of more tenants than allowed (at most
+#   1); its declared tenants are acme. Confine every statement to its declared
+#   tenants.
 assert "globex" in result.refusal.evidence.tenants_touched  # for the operator
 ```
 
@@ -436,8 +432,8 @@ repair = runtime.repair(plan)  # advisory: nothing is committed here
 print(repair.feedback.render())  # for the agent
 # Resubmit the largest part of the plan that would be admitted: keep reprice_1,
 # reprice_2; drop reprice_3.
-# - reprice_3: tenant_isolation: the plan changed rows of more tenants than one plan
-#   may (at most 1); its declared tenants are acme. Confine every statement to its
+# - reprice_3: tenant_isolation: the plan changed rows of more tenants than allowed
+#   (at most 1); its declared tenants are acme. Confine every statement to its
 #   declared tenants.
 assert runtime.execute(repair.proposal).committed
 ```
@@ -1935,7 +1931,8 @@ against the shipped code, not inferred.
 - **`blast_radius` counts captured mutations, not distinct rows.** A row mutated twice in
   one plan contributes 2, so the limit is conservative and is not a row tally.
 - **`ColumnValueGuard` and `TenantDrawdownGuard` are one-directional.** Both fire on a
-  fall in the column total. An inflation passes, and so does any diff whose pre-image total
+  fall in the column total, which counts each row once: its value before the plan and its
+  value after, however many times the plan or a trigger wrote it. An inflation passes, and so does any diff whose pre-image total
   is zero, which includes every insert-only plan. `TenantDrawdownGuard` re-denominates
   per tenant; it does not make the guard symmetric.
 - **`StatedFootprint` is a cooperative diagnostic.** It reads `Effect.stated_rows`. An agent
