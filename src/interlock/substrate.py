@@ -521,17 +521,19 @@ class SqliteSubstrate:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def open(self, plan: EffectPlan, *, stage_id: uuid.UUID | None = None) -> StageHandle:
+    def open(self, plan: EffectPlan) -> StageHandle:
         """Bind a connection, install capture triggers, and begin.
 
         The connection is dedicated for the stage's life and is not returned to
         a pool mid-stage.
-
-        :param stage_id: The stage's id, when a substrate this database is the
-            control database of (:class:`~interlock.git_substrate.GitSubstrate`)
-            names it, so its outbox rows, markers and window history carry the
-            id the escrow chain records. A fresh id otherwise.
         """
+        return self._open(plan, uuid.uuid4())
+
+    def _open(self, plan: EffectPlan, stage_id: uuid.UUID) -> StageHandle:
+        """:meth:`open`, under ``stage_id``: what a substrate this database is
+        the control database of (:class:`~interlock.git_substrate.GitSubstrate`)
+        calls, so the outbox rows, markers and window history carry the id the
+        escrow chain records."""
         if self._handle is not None:
             raise StageConflictError(
                 f"substrate {self.substrate_id!r} already has stage {self._handle.stage_id} open"
@@ -565,7 +567,7 @@ class SqliteSubstrate:
 
         opened = datetime.now(UTC)
         handle = StageHandle(
-            stage_id=stage_id if stage_id is not None else uuid.uuid4(),
+            stage_id=stage_id,
             plan_id=plan.plan_id,
             substrate_id=self.substrate_id,
             opened_at=opened,
@@ -916,25 +918,24 @@ class SqliteSubstrate:
         self._charges = tuple(charges)
         return tuple(measures)
 
-    def commit(
-        self,
-        handle: StageHandle,
-        *,
-        prepare: Callable[[sqlite3.Connection], None] | None = None,
-    ) -> CommitReceipt:
+    def commit(self, handle: StageHandle) -> CommitReceipt:
         """Make the staged work durable.
 
         With commit markers on, the stage's marker row is written inside the
         same transaction immediately before ``COMMIT``, so it becomes durable
         with the effects or not at all; and with it, what the plan adds to
         each rate window it was measured against.
-
-        :param prepare: Called with the stage's connection after every row the
-            commit writes and before ``COMMIT``, inside the transaction. A
-            substrate this database is the control database of commits its own
-            effects there; if it raises, nothing here commits and the stage
-            stays open for the caller to abort.
         """
+        return self._commit(handle, None)
+
+    def _commit(
+        self, handle: StageHandle, prepare: Callable[[sqlite3.Connection], None] | None
+    ) -> CommitReceipt:
+        """:meth:`commit`, calling ``prepare`` with the stage's connection after
+        every row the commit writes and before ``COMMIT``, inside the
+        transaction. A substrate this database is the control database of
+        commits its own effects there; if ``prepare`` raises, nothing here
+        commits and the stage stays open for the caller to abort."""
         conn = self._require(handle)
         self._assert_live(handle)
         committed_at = datetime.now(UTC)

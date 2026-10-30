@@ -1126,7 +1126,7 @@ class GitSubstrate:
         under the same id."""
         assert self._control is not None
         if stage.control is None:
-            stage.control = self._control.open(stage.plan, stage_id=stage.handle.stage_id)
+            stage.control = self._control._open(stage.plan, stage.handle.stage_id)
         return stage.control
 
     def pending_facts(self, scope_id: str) -> tuple[InboundFact, ...]:
@@ -1214,7 +1214,7 @@ class GitSubstrate:
             if self._control is None:
                 move(None)
             else:
-                self._control.commit(self._control_stage(stage), prepare=move)
+                self._control._commit(self._control_stage(stage), move)
         except StageConflictError:
             raise
         except Exception as exc:

@@ -32,8 +32,9 @@ Releases before 0.1.2 are described by their tags and commit history.
   inbox and rate windows' history are written in a SQLite stage under the same stage id.
   The branch moves inside that transaction, after a redo record of it is on disk, so a
   crash between the two commits is finished by recovery or by the next stage.
-- **`SqliteSubstrate` gains what a control database needs.** `open(stage_id=)`,
-  `commit(prepare=)`, `applied_elsewhere()` and `path`. Every existing call is unchanged.
+- **`SqliteSubstrate` gains what a control database needs.** `applied_elsewhere()` and
+  `path`, and private `_open` and `_commit` beneath `open` and `commit`, whose signatures
+  are unchanged.
 
 No wire format changes. ILOK1 records, ARC1 receipts and every verdict and hash are what
 they were; a Git stage's records and receipts are the same documents with other table

@@ -134,9 +134,7 @@ class Repo:
             target = self.seed / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text)
-        subprocess.run(
-            [sys.executable, "tools/codegen.py"], cwd=self.seed, check=True
-        )
+        subprocess.run([sys.executable, "tools/codegen.py"], cwd=self.seed, check=True)
         self.base = commit_all(self.seed, "seed")
         git(root, "clone", "-q", "--bare", str(self.seed), str(self.origin))
         git(self.seed, "remote", "add", "origin", str(self.origin))
@@ -208,6 +206,11 @@ def edit(table: str, statement: str, *, rows: int | None = 1, **parameters: str)
 INVOICE = "src/acme/billing/invoice.py"
 FIX = ("src", f"replace '{INVOICE}' :old :new")
 FIX_ARGS = {"old": "return sum(lines)", "new": "return round(sum(lines), 2)"}
+
+
+def fix() -> PlanBuilder:
+    """The everyday edit: one line of ``src/acme/billing/invoice.py``."""
+    return edit(*FIX, old=FIX_ARGS["old"], new=FIX_ARGS["new"])
 
 
 # --------------------------------------------------------------------------
@@ -352,7 +355,7 @@ def test_configuration_is_checked(repo: Repo, tmp_path: Path) -> None:
 
 def test_a_plan_commits_with_its_trailer_and_only_what_was_measured(repo: Repo) -> None:
     sub = substrate(repo)
-    result = engine(sub).execute(edit(*FIX, **FIX_ARGS).build())
+    result = engine(sub).execute(fix().build())
     assert result.committed, result.verdict
     assert result.diff is not None
     [row] = result.diff.deltas
@@ -564,13 +567,13 @@ def test_a_failing_hook_fails_the_stage(repo: Repo) -> None:
     lint = GitHook("lint", (sys.executable, "-c", "import sys; sys.exit('style')"))
     sub = substrate(repo, hooks=(lint,))
     with pytest.raises(StageError, match="hook lint failed"):
-        engine(sub, checkers=[]).execute(edit(*FIX, **FIX_ARGS).build())
+        engine(sub, checkers=[]).execute(fix().build())
     slow = GitHook("slow", (sys.executable, "-c", "import time; time.sleep(5)"), timeout=0.2)
     with pytest.raises(StageError, match="ran past"):
-        engine(substrate(repo, hooks=(slow,)), checkers=[]).execute(edit(*FIX, **FIX_ARGS).build())
+        engine(substrate(repo, hooks=(slow,)), checkers=[]).execute(fix().build())
     gone = GitHook("gone", ("/nonexistent/hook",))
     with pytest.raises(StageError, match="could not run"):
-        engine(substrate(repo, hooks=(gone,)), checkers=[]).execute(edit(*FIX, **FIX_ARGS).build())
+        engine(substrate(repo, hooks=(gone,)), checkers=[]).execute(fix().build())
     assert repo.head() == repo.base
 
 
@@ -581,7 +584,7 @@ def test_a_failing_hook_fails_the_stage(repo: Repo) -> None:
 
 def test_a_push_while_the_stage_is_open_commits_nothing(repo: Repo) -> None:
     sub = substrate(repo)
-    plan = edit(*FIX, **FIX_ARGS).build()
+    plan = fix().build()
     handle = sub.open(plan)
     try:
         for effect in plan.topological_order():
@@ -608,7 +611,7 @@ def test_the_engine_records_a_lost_race_as_aborted(repo: Repo) -> None:
     sub.diff = diff_then_push  # type: ignore[method-assign]
     built = engine(sub)
     with pytest.raises(StageConflictError):
-        built.execute(edit(*FIX, **FIX_ARGS).build())
+        built.execute(fix().build())
     kinds = [r.record_type for r in built.chain.records()]
     assert kinds[-2:] == [RecordType.COMMIT_INTENT, RecordType.ABORTED]
 
@@ -634,7 +637,7 @@ def test_expect_head_pins_a_plan_to_the_commit_its_approvers_saw(repo: Repo) -> 
 
 def test_one_stage_at_a_time_and_never_on_a_checked_out_branch(repo: Repo, tmp_path: Path) -> None:
     sub = substrate(repo)
-    plan = edit(*FIX, **FIX_ARGS).build()
+    plan = fix().build()
     handle = sub.open(plan)
     try:
         with pytest.raises(StageConflictError, match="already has stage"):
@@ -651,7 +654,7 @@ def test_one_stage_at_a_time_and_never_on_a_checked_out_branch(repo: Repo, tmp_p
 
 def test_commit_refuses_a_worktree_changed_after_it_was_measured(repo: Repo) -> None:
     sub = substrate(repo)
-    plan = edit(*FIX, **FIX_ARGS).build()
+    plan = fix().build()
     handle = sub.open(plan)
     try:
         for effect in plan.topological_order():
@@ -672,7 +675,7 @@ def test_commit_refuses_a_worktree_changed_after_it_was_measured(repo: Repo) -> 
 def test_an_expired_stage_commits_nothing(repo: Repo) -> None:
     sub = substrate(repo, max_stage_seconds=0.0)
     with pytest.raises(StageError, match="exceeded"):
-        engine(sub, checkers=[]).execute(edit(*FIX, **FIX_ARGS).build())
+        engine(sub, checkers=[]).execute(fix().build())
     assert repo.head() == repo.base
 
 
@@ -689,13 +692,13 @@ def test_repair_finds_the_part_of_a_plan_that_passes(repo: Repo) -> None:
             table="deps",
             statement="replace 'pyproject.toml' 'httpx==0.27.0' 'httpx==0.28.1'",
             stated_rows=1,
-            effect_id="manifest",  # type: ignore[arg-type]
+            effect_id="manifest",
         )
         .update(
             table="workflows",
             statement="write '.github/workflows/release.yml' 'on: push\njobs: {x: {}}\n'",
             stated_rows=1,
-            effect_id="matrix",  # type: ignore[arg-type]
+            effect_id="matrix",
             independent=True,
         )
         .build()
@@ -760,7 +763,7 @@ def committed_stage(built: EscrowEngine) -> uuid.UUID:
 def test_resolve_intent_reads_the_trailer(repo: Repo) -> None:
     sub = substrate(repo)
     built = engine(sub, checkers=[])
-    assert built.execute(edit(*FIX, **FIX_ARGS).build()).committed
+    assert built.execute(fix().build()).committed
     assert sub.resolve_intent(committed_stage(built)) is True
     assert sub.resolve_intent(uuid.uuid4()) is False
 
@@ -770,7 +773,7 @@ def test_a_crash_after_the_swap_recovers_as_committed(repo: Repo, tmp_path: Path
     crash_after(sub, "_swap")
     chain = EscrowChain(tmp_path / "plans.chain")
     with pytest.raises(Crash):
-        engine(sub, chain=chain, checkers=[]).execute(edit(*FIX, **FIX_ARGS).build())
+        engine(sub, chain=chain, checkers=[]).execute(fix().build())
     chain.close()
     assert [r.record_type for r in EscrowChain.load(tmp_path / "plans.chain").records()][
         -1
@@ -786,7 +789,7 @@ def test_a_crash_before_the_swap_recovers_as_rolled_back(repo: Repo, tmp_path: P
     crash_after(sub, "_commit_object")
     chain = EscrowChain(tmp_path / "plans.chain")
     with pytest.raises(Crash):
-        engine(sub, chain=chain, checkers=[]).execute(edit(*FIX, **FIX_ARGS).build())
+        engine(sub, chain=chain, checkers=[]).execute(fix().build())
     chain.close()
     fresh = engine(substrate(repo), chain=EscrowChain(tmp_path / "plans.chain"), checkers=[])
     [record] = fresh.recover()
@@ -833,9 +836,7 @@ def outbox(control: str) -> list[tuple[str, str]]:
 def test_a_request_commits_with_the_branch(repo: Repo, control: str) -> None:
     sub = substrate(repo, control=control)
     assert sub.capabilities.outbound and sub.control == control
-    result = engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(
-        with_request(edit(*FIX, **FIX_ARGS))
-    )
+    result = engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(with_request(fix()))
     assert result.committed and result.diff is not None
     assert len(result.diff.outbound) == 1
     [(stage, payload)] = outbox(control)
@@ -863,9 +864,7 @@ def test_a_lost_race_rolls_the_request_back_too(repo: Repo, control: str) -> Non
 
     sub.diff = diff_then_push  # type: ignore[method-assign]
     with pytest.raises(StageConflictError):
-        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(
-            with_request(edit(*FIX, **FIX_ARGS))
-        )
+        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(with_request(fix()))
     assert outbox(control) == []
     redo = Path(git(repo.origin, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     assert not list((redo / "interlock" / "redo").glob("*.json"))
@@ -875,11 +874,9 @@ def test_without_a_control_database_there_is_no_outbox(repo: Repo) -> None:
     sub = substrate(repo)
     assert not sub.capabilities.outbound
     with pytest.raises(OutboundRequestError):
-        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(
-            with_request(edit(*FIX, **FIX_ARGS))
-        )
+        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(with_request(fix()))
     assert sub.pending_facts("agent") == ()
-    handle = sub.open(edit(*FIX, **FIX_ARGS).build())
+    handle = sub.open(fix().build())
     try:
         with pytest.raises(InboundFactError):
             sub.consume_facts(handle, [uuid.uuid4()], "agent")
@@ -906,7 +903,7 @@ def test_a_crash_between_the_swap_and_the_control_commit_is_finished(
     chain = EscrowChain(tmp_path / "plans.chain")
     with pytest.raises(Crash):
         engine(sub, chain=chain, checkers=[], sinks=SinkRegistry((CI,))).execute(
-            with_request(edit(*FIX, **FIX_ARGS))
+            with_request(fix())
         )
     chain.close()
     assert outbox(control) == []  # the control transaction died with the process
@@ -928,9 +925,7 @@ def test_the_next_stage_finishes_a_half_done_commit_first(repo: Repo, control: s
     sub = substrate(repo, control=control)
     crash_after(sub, "_swap")
     with pytest.raises(Crash):
-        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(
-            with_request(edit(*FIX, **FIX_ARGS))
-        )
+        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(with_request(fix()))
     later = substrate(repo, control=control)
     engine(later, checkers=[], sinks=SinkRegistry((CI,))).execute(
         with_request(edit("docs", "write 'docs/a.md' 'a'"), n=2)
@@ -944,11 +939,9 @@ def test_a_redo_whose_commit_never_landed_is_dropped(repo: Repo, control: str) -
     def dies_before_moving(*args: Any) -> None:
         raise Crash("before the swap")
 
-    sub._swap = dies_before_moving  # type: ignore[method-assign]
+    sub._swap = dies_before_moving  # type: ignore[method-assign,assignment]
     with pytest.raises(Crash):
-        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(
-            with_request(edit(*FIX, **FIX_ARGS))
-        )
+        engine(sub, checkers=[], sinks=SinkRegistry((CI,))).execute(with_request(fix()))
     [redo] = Path(sub._common, "interlock", "redo").glob("*.json")
     assert substrate(repo, control=control).resolve_intent(uuid.UUID(redo.stem)) is False
     assert not redo.exists()
@@ -963,9 +956,9 @@ def test_a_swap_that_times_out_is_unsettled_then_resolved(repo: Repo) -> None:
         real(*args)
         raise SubstrateUnavailableError("git update-ref did not finish within 30s")
 
-    sub._swap = swap_then_time_out  # type: ignore[method-assign]
+    sub._swap = swap_then_time_out  # type: ignore[method-assign,assignment]
     built = engine(sub, checkers=[])
-    result = built.execute(edit(*FIX, **FIX_ARGS).build())
+    result = built.execute(fix().build())
     assert result.committed  # the trailer answered: the branch moved
 
 
@@ -981,7 +974,7 @@ def test_a_control_commit_that_fails_after_the_swap_is_settled_as_committed(
 
     monkeypatch.setattr(sub, "_swap", swap_then_fail)
     built = engine(sub, checkers=[], sinks=SinkRegistry((CI,)))
-    result = built.execute(with_request(edit(*FIX, **FIX_ARGS)))
+    result = built.execute(with_request(fix()))
     assert result.committed
     assert len(outbox(control)) == 1
     [committed] = [r for r in built.chain.records() if r.record_type is RecordType.COMMITTED]
@@ -990,7 +983,7 @@ def test_a_control_commit_that_fails_after_the_swap_is_settled_as_committed(
 
 def test_unsettled_is_raised_when_recovery_cannot_finish(repo: Repo, control: str) -> None:
     sub = substrate(repo, control=control)
-    plan = with_request(edit(*FIX, **FIX_ARGS))
+    plan = with_request(fix())
     built = engine(sub, checkers=[], sinks=SinkRegistry((CI,)))
     real = sub._swap
 
@@ -998,7 +991,7 @@ def test_unsettled_is_raised_when_recovery_cannot_finish(repo: Repo, control: st
         real(*args)
         raise sqlite3.OperationalError("disk I/O error")
 
-    sub._swap = swap_then_fail  # type: ignore[method-assign]
+    sub._swap = swap_then_fail  # type: ignore[method-assign,assignment]
     sub.resolve_intent = lambda stage_id: None  # type: ignore[method-assign]
     with pytest.raises(CommitUnsettledError):
         built.execute(plan)
@@ -1105,7 +1098,7 @@ def test_a_dependency_bump_commits_only_with_cis_word_for_those_bytes(
 def test_reconciliation_names_every_commit_no_stage_made(repo: Repo) -> None:
     sub = substrate(repo)
     built = engine(sub, checkers=[])
-    assert built.execute(edit(*FIX, **FIX_ARGS).build()).committed
+    assert built.execute(fix().build()).committed
     clean = reconcile_git(sub, built.chain.records(), since=repo.base)
     assert clean.clean and clean.stages_checked == 1 and clean.writes_checked == 1
     pushed = repo.push("docs/hotfix.md", "hotfix\n", "hotfix pushed around the agent")
@@ -1119,7 +1112,7 @@ def test_reconciliation_names_every_commit_no_stage_made(repo: Repo) -> None:
 def test_reconciliation_names_a_force_push(repo: Repo) -> None:
     sub = substrate(repo)
     built = engine(sub, checkers=[])
-    assert built.execute(edit(*FIX, **FIX_ARGS).build()).committed
+    assert built.execute(fix().build()).committed
     agent_head = repo.head()
     git(repo.seed, "fetch", "-q", "origin")
     git(repo.seed, "checkout", "-q", "--orphan", "rewrite")
@@ -1156,7 +1149,7 @@ def test_the_commit_is_the_measured_diff(
             table=sub.classify(path),
             statement="write :p :t",
             parameters={"p": path, "t": text},
-            effect_id=f"w{n}",  # type: ignore[arg-type]
+            effect_id=f"w{n}",
         )
     result = engine(sub, checkers=[]).execute(plan.build())
     assert result.committed and result.diff is not None
