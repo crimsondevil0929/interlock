@@ -780,11 +780,18 @@ What goes into one:
   change, from which one row can be disclosed later without the rest; and a hash of the
   observed schema, foreign keys included.
 - **Coverage:** the observed tables, and every gap in words: an acknowledged cascade, a
-  substrate that did not read the foreign keys or does not refuse unobserved tables.
+  substrate that did not read the foreign keys or does not refuse unobserved tables. And
+  how strongly the effect was measured, when it was measured short of a transaction: a
+  plan whose only effect is the requests it commits says only the request was measured.
 - **Decision:** the verdict hash, each checker with a digest of its configuration, the
   issuer's policy epoch, and, for a repair, the refused plan's receipt as `repair_of`.
 - **Cost:** the AgentGov transaction that settled the plan. The receipt is issued last,
   after the reverse anchor, so agentgov's verifier can check the cost against the ledger.
+
+A product that serves many tenants from one store can hand each tenant its own receipts:
+`ReceiptIssuer(log, tenants="declared")` names only the tenants a plan declares, and
+counts any others its diff reached, so a refused plan still says how far it went without
+saying into whose rows.
 
 The receipt and the escrow chain name each other: the stage's terminal record carries
 the receipt id, and the receipt's `anchors.escrow` names that record by sequence and
