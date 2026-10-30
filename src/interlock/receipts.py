@@ -111,9 +111,13 @@ class ReceiptIssuer:
         makes rows disclosable only while this issuer lives.
     :param policy_epoch: The version of the checker policy, recorded in every
         decision. Bump it when the checkers change.
+    :param tenants: Which tenants a receipt names: every one the diff touched
+        (``"touched"``, the default), or only those the plan's effects declare
+        (``"declared"``), the rest counted in ``summary.other_tenants`` (ARC1
+        1.3), so a receipt handed to one tenant names no other.
     """
 
-    __slots__ = ("_epoch", "_issuer", "_log", "_owed", "_owed_lock", "_row_secret")
+    __slots__ = ("_epoch", "_issuer", "_log", "_owed", "_owed_lock", "_row_secret", "_tenants")
 
     def __init__(
         self,
@@ -122,9 +126,13 @@ class ReceiptIssuer:
         issuer: str = "interlock",
         row_secret: bytes | None = None,
         policy_epoch: int = 0,
+        tenants: str = "touched",
     ) -> None:
         if row_secret is not None and len(row_secret) != 32:
             raise ValueError("a row secret is 32 bytes")
+        if tenants not in ("touched", "declared"):
+            raise ValueError(f"a receipt names the tenants touched or declared, not {tenants!r}")
+        self._tenants = tenants
         self._log = log
         self._issuer = issuer
         self._row_secret = row_secret if row_secret is not None else secrets.token_bytes(32)
@@ -190,6 +198,14 @@ class ReceiptIssuer:
         observed = sorted(getattr(substrate, "observed_tables", frozenset()))
         limits = [c.limit for c in checkers if isinstance(c, BlastRadius)]
         measurement = measurement_of(substrate, diff)
+        touched = (
+            diff.tenant_ids
+            | {o.tenant_id for o in diff.outbound if o.tenant_id}
+            | {f.tenant_id for f in diff.facts if f.tenant_id}
+        )
+        named = touched
+        if self._tenants == "declared":
+            named = touched & {e.tenant_id for e in plan.effects if e.tenant_id}
         draft = ActionReceipt(
             receipt_id=receipt_id,
             issued_at=datetime.now(UTC),
@@ -220,11 +236,8 @@ class ReceiptIssuer:
                     updated=diff.rows_updated,
                     deleted=diff.rows_deleted,
                     tables=tuple(diff.tables_touched | outbox),
-                    tenants=tuple(
-                        diff.tenant_ids
-                        | {o.tenant_id for o in diff.outbound if o.tenant_id}
-                        | {f.tenant_id for f in diff.facts if f.tenant_id}
-                    ),
+                    tenants=tuple(named),
+                    other_tenants=len(touched - named),
                 ),
                 truncated=diff.truncated,
             ),

@@ -1018,3 +1018,40 @@ def test_a_meter_may_hold_on_one_scope_whatever_scope_a_plan_bills(
     meter.hold(_order(5, scope="med-rec/ext-1"))
     assert mme.available("med-rec") == 70
     assert repr(meter) == repr(Meter(mme, RowSum("med_orders", "mme_per_day"), 30))
+
+
+def test_a_receipt_may_name_only_the_tenants_a_plan_declares(
+    ward: tuple[str, BudgetManager], tmp_path: Path
+) -> None:
+    from interlock.receipts import ReceiptIssuer
+
+    path, _ = ward
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO med_orders VALUES (2, 'f-2', 'p-2', 'oxycodone', 10, 'active')")
+        conn.execute("INSERT INTO med_orders VALUES (3, 'f-3', 'p-3', 'oxycodone', 10, 'active')")
+    plan = (
+        PlanBuilder("med-rec", intent="pause every order")
+        .update(
+            table="med_orders",
+            statement="UPDATE med_orders SET status = 'paused'",
+            tenant_id="f-1",
+        )
+        .build()
+    )
+    found = {}
+    for tenants in ("touched", "declared"):
+        log = ReceiptLog(
+            "ward", HmacKey(b"k" * 32, key_id="ward"), path=tmp_path / f"{tenants}.jsonl"
+        )
+        engine = EscrowEngine(
+            SqliteSubstrate(path, tables=[MED_ORDERS]),
+            checkers=[TenantIsolation(1, declared=True)],
+            receipts=ReceiptIssuer(log, tenants=tenants),
+        )
+        result = engine.execute(plan)
+        assert not result.committed and result.receipt is not None
+        found[tenants] = result.receipt.effect.summary
+    assert (found["touched"].tenants, found["touched"].other_tenants) == (("f-1", "f-2", "f-3"), 0)
+    assert (found["declared"].tenants, found["declared"].other_tenants) == (("f-1",), 2)
+    with pytest.raises(ValueError, match="touched or declared"):
+        ReceiptIssuer(log, tenants="own")

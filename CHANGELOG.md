@@ -46,7 +46,9 @@ had: each new field enters a hash only when it is set.
 - **Honest receipts.** `SubstrateCapabilities.measurement` declares a driver's class, and
   every receipt carries it (ARC1 1.3 `coverage.measurement`): `transactional` on SQLite,
   PostgreSQL and Git, and `request-only` for a plan whose only effect is the requests it
-  commits, which then names its sinks in `cost.served_by`.
+  commits, which then names its sinks in `cost.served_by`. `ReceiptIssuer(tenants=
+  "declared")` names only the tenants a plan's effects declare and counts the rest (ARC1
+  1.3 `summary.other_tenants`), so a receipt handed to one tenant names no other.
 - **Holding an operation for a warrant.** `OperationSpec(hold=True)` (`hold = true` on a
   `[[sinks.operations]]` entry, of any sink, typed ones too): every request of it enters
   the outbox held, with a `held` row in its delivery log written in the stage's own
