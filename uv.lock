@@ -599,12 +599,8 @@ wheels = [
 
 [[package]]
 name = "interlock-agentgov"
-version = "1.0.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/98/d7/4d17a4703e4966e3dbe630a39eafc49a27d58f6036c8f6fb0a3b35df0f8e/interlock_agentgov-1.0.0.tar.gz", hash = "sha256:d459a35ce8722179abb3fbef65ad65b4f74705f3b12bcd729983d5833974ae90", size = 1011899, upload-time = "2026-10-17T17:53:37.723Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/65/0a/d164e9a258d5acc67580e67e9d1ef95761a081690615fc1dd1dea253cf16/interlock_agentgov-1.0.0-py3-none-any.whl", hash = "sha256:58f994aebc8149f3bf975f9d9dfac78c6ae0fd2f6fdd6bcdbedfbf57f4acd959", size = 306541, upload-time = "2026-10-17T17:53:35.972Z" },
-]
+version = "1.1.0"
+source = { git = "https://github.com/crimsondevil0929/agentgov?rev=9a42d2af55f59c95b88aa39f661839a452be6090#9a42d2af55f59c95b88aa39f661839a452be6090" }
 
 [package.optional-dependencies]
 kms-aws = [
@@ -619,7 +615,7 @@ sign = [
 
 [[package]]
 name = "interlock-escrow"
-version = "1.1.0"
+version = "1.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "interlock-agentgov" },
@@ -653,10 +649,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "interlock-agentgov", specifier = ">=1.0.0" },
-    { name = "interlock-agentgov", extras = ["kms-aws"], marker = "extra == 'kms-aws'", specifier = ">=1.0.0" },
-    { name = "interlock-agentgov", extras = ["otel"], marker = "extra == 'otel'", specifier = ">=1.0.0" },
-    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", specifier = ">=1.0.0" },
+    { name = "interlock-agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=9a42d2af55f59c95b88aa39f661839a452be6090" },
+    { name = "interlock-agentgov", extras = ["kms-aws"], marker = "extra == 'kms-aws'", git = "https://github.com/crimsondevil0929/agentgov?rev=9a42d2af55f59c95b88aa39f661839a452be6090" },
+    { name = "interlock-agentgov", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/crimsondevil0929/agentgov?rev=9a42d2af55f59c95b88aa39f661839a452be6090" },
+    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", git = "https://github.com/crimsondevil0929/agentgov?rev=9a42d2af55f59c95b88aa39f661839a452be6090" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres", "sign", "kms-aws", "otel"]
