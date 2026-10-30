@@ -53,6 +53,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
+from interlock.feedback import AgentFeedback
 from interlock.git_substrate import (
     DEFAULT_CLASSES,
     STAGE_TRAILER,
@@ -1165,3 +1166,43 @@ def test_the_commit_is_the_measured_diff(
         assert git(repo.origin, "diff", "--name-only", repo.base, "main").splitlines() == sorted(
             changed
         )
+
+
+# --------------------------------------------------------------------------
+# what the agent is told, in a repository's nouns
+# --------------------------------------------------------------------------
+
+
+def test_the_agent_is_told_about_files_not_rows(repo: Repo) -> None:
+    sub = substrate(repo)
+    built = engine(sub)
+    cascade = built.execute(
+        edit("src", "write 'src/acme/api/schema.json' :t", t='{"version": "1.1"}\n').build()
+    )
+    assert cascade.feedback is not None
+    told = cascade.feedback.render()
+    assert "files, counting the ones the repository's hooks wrote; the limit is 10" in told
+    assert "the plan stated 1 file(s); the repository measured" in told
+    assert "rows" not in told and "WHERE" not in told and "database" not in told
+    workflow = built.execute(edit("workflows", "write '.github/workflows/release.yml' 'x'").build())
+    assert workflow.feedback is not None
+    assert "files of class workflows, which it may not write" in workflow.feedback.render()
+    assert workflow.feedback.to_json()["constraints"][0]["substrate"] == "git"
+
+
+def test_a_lost_race_tells_the_agent_the_branch_moved(repo: Repo) -> None:
+    sub = substrate(repo)
+    real = sub.diff
+
+    def diff_then_push(handle: Any) -> Any:
+        measured = real(handle)
+        repo.push("docs/race.md", "race\n")
+        return measured
+
+    sub.diff = diff_then_push  # type: ignore[method-assign]
+    with pytest.raises(StageConflictError) as raised:
+        engine(sub).execute(fix().build())
+    assert isinstance(raised.value.feedback, AgentFeedback)
+    told = raised.value.feedback.render()
+    assert "the branch moved after the plan was measured" in told
+    assert "The same plan may succeed if resubmitted." in told

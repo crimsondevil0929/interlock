@@ -450,7 +450,9 @@ def dropped_effects(
 
 def feedback_for_hints(plan: EffectPlan, judged: Adjudication) -> tuple[ConstraintFeedback, ...]:
     """A trial's blocking constraints, sanitized against the whole ``plan``."""
-    return agent_feedback(plan, judged.hints, committed=False).blocking
+    return agent_feedback(
+        plan, judged.hints, committed=False, substrate=judged.diff.substrate_id
+    ).blocking
 
 
 @dataclass(frozen=True, slots=True)

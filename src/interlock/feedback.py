@@ -247,19 +247,25 @@ class ConstraintFeedback:
     withheld_tenants: bool = False
     window: str = ""
     sinks: tuple[str, ...] = ()
+    substrate: str = ""
+    """The substrate that measured the plan, when its nouns are not SQL's: on
+    ``git`` a row is a file and a table is a path class."""
 
     @property
     def constraint(self) -> str:
         return _LABELS[self.guidance]
 
     def render(self) -> str:
-        """One sentence, from the kind's fixed template."""
-        return f"{self.constraint}: {_TEMPLATES[self.guidance](self)}"
+        """One sentence, from the kind's fixed template, in the substrate's nouns."""
+        template = _NOUNS.get(self.substrate, {}).get(self.guidance, _TEMPLATES[self.guidance])
+        return f"{self.constraint}: {template(self)}"
 
     def to_json(self) -> dict[str, Any]:
         named: dict[str, Any] = {"window": self.window} if self.window else {}
         if self.sinks:
             named["sinks"] = list(self.sinks)
+        if self.substrate:
+            named["substrate"] = self.substrate
         return {
             "constraint": self.constraint,
             "guidance": self.guidance.value,
@@ -453,6 +459,58 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
 }
 
 
+_GIT: Final[Mapping[Guidance, Any]] = {
+    Guidance.ROW_LIMIT: lambda c: (
+        f"the plan changed {c.measured or 'too many'} files, counting the ones the "
+        f"repository's hooks wrote; the limit is {c.limit or 'lower'}. Change fewer files, "
+        f"or split the work."
+    ),
+    Guidance.TENANT_SCOPE: lambda c: (
+        f"the plan changed files of more owners than allowed "
+        f"(at most {c.limit or 'a set number'}); its declared owners are {_tenants(c)}. "
+        f"Confine the plan to the files its declared owners hold."
+    ),
+    Guidance.UNDECLARED_TENANT: lambda c: (
+        f"the plan changed files of an owner it does not declare; its declared owners are "
+        f"{_tenants(c)}. Confine the plan to the files its declared owners hold."
+    ),
+    Guidance.TABLE_SCOPE: lambda c: (
+        f"the plan changed files of class {_tables(c, fallback='a class it does not name')}, "
+        f"which it may not write."
+    ),
+    Guidance.NO_DELETE: lambda c: (
+        f"the plan deletes files of class {_tables(c, fallback='a class it does not name')}, "
+        f"where deletes are not allowed."
+    ),
+    Guidance.TRUNCATED: lambda c: (
+        f"the plan changed more files than can be measured ({c.measured or 'too many'}). "
+        f"Split the work."
+    ),
+    Guidance.STATED_FOOTPRINT: lambda c: (
+        f"the plan stated {c.limit or 'a number of'} file(s); the repository measured "
+        f"{c.measured or 'more'}, counting the files its hooks wrote."
+    ),
+    Guidance.STATEMENT_KIND: lambda c: (
+        "a statement is not one this repository stages: write, replace, delete, mode, patch "
+        "or expect-head, on a path inside the repository that no hook runs."
+    ),
+    Guidance.STATEMENT_FAILED: lambda c: (
+        "an edit could not be made in the repository: a replace whose text is not there "
+        "exactly once, a file that is not there, a patch that does not apply, or a hook "
+        "that failed."
+    ),
+    Guidance.CONFLICT: lambda c: (
+        "the branch moved after the plan was measured, or another stage was open; nothing "
+        "was committed."
+    ),
+    Guidance.UNAVAILABLE: lambda c: "the repository could not be reached.",
+}
+
+_NOUNS: Final[Mapping[str, Mapping[Guidance, Any]]] = {"git": _GIT}
+"""Each substrate whose nouns are not SQL's, and the templates it says them in.
+A kind it does not name keeps the SQL template."""
+
+
 # --------------------------------------------------------------------------
 # The operator's record
 # --------------------------------------------------------------------------
@@ -541,9 +599,15 @@ class HintedViolation:
 
 
 def sanitize(
-    hint: FeedbackHint, plan: EffectPlan, *, blocking: bool, trusted: bool
+    hint: FeedbackHint,
+    plan: EffectPlan,
+    *,
+    blocking: bool,
+    trusted: bool,
+    substrate: str = "",
 ) -> ConstraintFeedback:
-    """Reduce a hint to what the plan itself entitles the agent to see."""
+    """Reduce a hint to what the plan itself entitles the agent to see, in
+    ``substrate``'s nouns."""
     scope = _Scope.of(plan)
     kind = hint.kind if isinstance(hint.kind, Guidance) else Guidance.OPERATOR
     tables: list[str] = []
@@ -605,11 +669,12 @@ def sanitize(
         withheld_tenants=withheld_tenants,
         window=window,
         sinks=sinks,
+        substrate=substrate if substrate in _NOUNS else "",
     )
 
 
 def agent_feedback(
-    plan: EffectPlan, hinted: Iterable[HintedViolation], *, committed: bool
+    plan: EffectPlan, hinted: Iterable[HintedViolation], *, committed: bool, substrate: str = ""
 ) -> AgentFeedback:
     """The agent's record of an adjudicated plan.
 
@@ -625,6 +690,7 @@ def agent_feedback(
             plan,
             blocking=item.violation.severity is Severity.BLOCKING,
             trusted=item.trusted,
+            substrate=substrate,
         )
         unique.setdefault(repr(constraint.to_json()), constraint)
     kinds = list(Guidance)
@@ -655,7 +721,9 @@ _REASON_GUIDANCE: Final[Mapping[str, Guidance]] = {
 }
 
 
-def feedback_for_error(plan: EffectPlan, error: BaseException) -> AgentFeedback:
+def feedback_for_error(
+    plan: EffectPlan, error: BaseException, *, substrate: str = ""
+) -> AgentFeedback:
     """The agent's record of a plan that never reached a verdict.
 
     Reads the exception's type and structured fields, never its message:
@@ -692,6 +760,6 @@ def feedback_for_error(plan: EffectPlan, error: BaseException) -> AgentFeedback:
         hint = FeedbackHint(kind=Guidance.UNAVAILABLE)
     return AgentFeedback(
         outcome="error",
-        constraints=(sanitize(hint, plan, blocking=blocking, trusted=False),),
+        constraints=(sanitize(hint, plan, blocking=blocking, trusted=False, substrate=substrate),),
         retryable=retryable,
     )
