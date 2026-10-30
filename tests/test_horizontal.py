@@ -1008,3 +1008,13 @@ def test_a_meter_releases_the_hold_of_a_plan_that_consumed_nothing(
     assert mme.available("med-rec") == 100
     meter.release(held)  # released already: nothing happens
     assert mme.available("med-rec") == 100
+
+
+def test_a_meter_may_hold_on_one_scope_whatever_scope_a_plan_bills(
+    ward: tuple[str, BudgetManager],
+) -> None:
+    _, mme = ward
+    meter = Meter(mme, RowSum("med_orders", "mme_per_day"), 30, scope="med-rec")
+    meter.hold(_order(5, scope="med-rec/ext-1"))
+    assert mme.available("med-rec") == 70
+    assert repr(meter) == repr(Meter(mme, RowSum("med_orders", "mme_per_day"), 30))

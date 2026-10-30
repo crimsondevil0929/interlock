@@ -68,6 +68,9 @@ class Meter:
     :param per_plan: The most one plan may consume, and what it holds before
         it stages: a scope's envelope must have this much left for a plan to
         run.
+    :param scope: The ledger scope every plan's hold is placed on; each
+        plan's own scope when omitted. Fiduciary places a lineage's on its
+        subject, whatever satellite the plan is billed to.
     :raises ValueError: On a ``per_plan`` that is not a positive number, or a
         measure that is not one.
     """
@@ -79,10 +82,16 @@ class Meter:
     # The ledger is the deployment's, not the policy's: a meter is described,
     # and its check digested, by its unit, measure and per-plan bound alone.
     ledger: BudgetManager = field(repr=False, compare=False)
+    scope: str | None = field(repr=False, compare=False)
     _window: RateWindow = field(repr=False, compare=False)
 
     def __init__(
-        self, ledger: BudgetManager, measure: Measure, per_plan: Decimal | int | str
+        self,
+        ledger: BudgetManager,
+        measure: Measure,
+        per_plan: Decimal | int | str,
+        *,
+        scope: str | None = None,
     ) -> None:
         unit = ledger.unit
         # A window over the whole plan measures it as a window would: the
@@ -98,6 +107,7 @@ class Meter:
             raise ValueError(f"meter of {unit.code}: per_plan is more than zero")
         object.__setattr__(self, "unit", unit.code)
         object.__setattr__(self, "ledger", ledger)
+        object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "measure", measure)
         object.__setattr__(self, "per_plan", unit_amount(window.limit, ledger))
         object.__setattr__(self, "_window", window)
@@ -118,19 +128,20 @@ class Meter:
         # Quietly: the hold is the most a plan may consume, not what it will,
         # so an envelope too small for it is a refusal, not an overdraft to
         # latch the breaker for.
+        scope = self.scope or plan.scope_id
         try:
             held = self.ledger.try_authorize(
-                plan.scope_id, self.per_plan, memo=f"{METER_MEMO}{plan.plan_id}"
+                scope, self.per_plan, memo=f"{METER_MEMO}{plan.plan_id}"
             )
         except AgentGovError as exc:
             raise MeterExhaustedError(
-                f"scope {plan.scope_id!r} cannot hold this plan's {_text(self.per_plan)} "
+                f"scope {scope!r} cannot hold this plan's {_text(self.per_plan)} "
                 f"{self.unit}, so it is not staged: {type(exc).__name__}: {exc}",
                 unit=self.unit,
             ) from exc
         if held is None:
             raise MeterExhaustedError(
-                f"scope {plan.scope_id!r} has less than this plan's {_text(self.per_plan)} "
+                f"scope {scope!r} has less than this plan's {_text(self.per_plan)} "
                 f"{self.unit} left, so it is not staged",
                 unit=self.unit,
             )
