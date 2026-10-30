@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from agentgov import BudgetManager
 
     from interlock.config import Endpoint, InterlockConfig, RelayConfig
+    from interlock.git_substrate import GitSubstrate
     from interlock.keys import KeyRegistry
     from interlock.records import Keyring
     from interlock.telemetry import Metrics
@@ -41,6 +42,7 @@ __all__ = [
     "key_registry",
     "live_keyring",
     "open_anchor",
+    "open_git",
     "open_governor",
     "open_ledger",
     "open_receipts",
@@ -69,6 +71,8 @@ def open_substrate(
     measuring its waits into ``metrics``, its connections called
     ``application_name``."""
     dsn = database or config.engine.database or config.database
+    if config.git is not None:
+        return open_git(config, control=dsn or None)
     if config.substrate == "postgres":
         return PostgresSubstrate(
             dsn,
@@ -86,6 +90,30 @@ def open_substrate(
         tables=config.tables,
         max_stage_seconds=config.engine.max_stage_seconds,
         acknowledge_cascades=config.acknowledge_cascades,
+    )
+
+
+def open_git(config: InterlockConfig, *, control: str | None = None) -> GitSubstrate:
+    """The Git substrate ``[git]`` names, its control database ``control``
+    (the file's ``database`` unless given): its outbox, inbox and windows."""
+    from interlock.git_substrate import GitSubstrate
+
+    settings = config.git
+    if settings is None:
+        raise SubstrateConfigurationError('the file configures no [git]: substrate = "git"')
+    return GitSubstrate(
+        settings.repository,
+        branch=settings.branch,
+        classes=settings.classes,
+        workspace=settings.workspace,
+        owners=settings.owners,
+        hooks=settings.hooks,
+        control=control if control is not None else (config.database or None),
+        stage_root=settings.stage_root,
+        author=settings.author,
+        max_stage_seconds=config.engine.max_stage_seconds,
+        max_file_bytes=settings.max_file_bytes,
+        max_scan_bytes=settings.max_scan_bytes,
     )
 
 

@@ -9,6 +9,55 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.1.0] - Unreleased
+
+### Added
+
+- **`GitSubstrate` (`interlock.git_substrate`): a transactional substrate over a Git
+  branch.** A stage is a worktree of its own at the branch's head. Effects are statements
+  in the substrate's own language (`write`, `replace`, `delete`, `mode`, `patch`,
+  `expect-head`), with `:name` parameters. The repository's hooks run after each effect,
+  with a scrubbed environment and a timeout, and a plan may not write a hook's sources.
+- **The Git diff.** It is `git diff-index` of the staged worktree against the base. Each
+  path is one row: its class (`PathClass`, configurable globs) is the table, its owner is
+  the partition, and it records `blob_sha`, `mode`, line counts and `secret_markers`.
+  Every built-in checker reads it unchanged.
+- **The Git commit.** It is `git update-ref <branch> <new> <base>`, a compare-and-swap. A
+  push that lands while a stage is open commits nothing. The marker is the commit's
+  `Interlock-Stage` trailer, read by `resolve_intent`.
+- **Repairs on Git.** Savepoints are trees, so repair searches run on Git.
+- **`reconcile_git`.** It names every commit on the branch that no stage made, and
+  force-pushes.
+- **A control database for a Git stage** (`GitSubstrate(control=...)`). The outbox, the
+  inbox and rate windows' history are written in a SQLite stage under the same stage id.
+  The branch moves inside that transaction, after a redo record of it is on disk, so a
+  crash between the two commits is finished by recovery or by the next stage.
+- **A Git substrate in `interlock.toml`.** `substrate = "git"` with a `[git]` section
+  (repository, branch, workspace, owners, `[[git.classes]]`, `[[git.hooks]]`, stage root,
+  author, size limits), and `database` naming the SQLite control database. Its tables are
+  its path classes. `interlock install` sets up the control database and reads the
+  repository, `interlock check` prints the branch's head, `interlock reconcile-effects
+  --since <commit>` reconciles the branch, and `open_substrate`, `EscrowRuntime.from_config`
+  and the daemon's engines stage on it. A Git stage's default bound is 120 seconds.
+- **`SqliteSubstrate` gains what a control database needs.** `applied_elsewhere()` and
+  `path`, and private `_open` and `_commit` beneath `open` and `commit`, whose signatures
+  are unchanged.
+
+### Changed
+
+- **On Git, the agent is told about files, not rows.** Agent feedback carries the
+  substrate that measured the plan. On a repository it says files, path classes, owners
+  and "the branch moved", where SQL says rows, tables, tenants and "another writer holds
+  the rows". A live model refused for a code generator's 36 files read the SQL wording,
+  reasoned that the file must be backed by a database, and asked. Every other
+  substrate's feedback is unchanged, byte for byte.
+
+No wire format changes. ILOK1 records, ARC1 receipts and every verdict and hash are what
+they were; a Git stage's records and receipts are the same documents with other table
+names in them.
+
+## [1.0.4] - 2026-10-25
+
 ### Fixed
 
 - **`ColumnValueGuard` and `TenantDrawdownGuard` count each row once.** A column total

@@ -64,7 +64,7 @@ def test_the_database_comes_from_the_flag_then_the_environment_then_the_file(
     ("text", "match"),
     [
         ("substrate = ", "not valid TOML"),
-        ('substrate = "mysql"\n' + GOOD.split("\n", 2)[2], "'sqlite' or 'postgres'"),
+        ('substrate = "mysql"\n' + GOOD.split("\n", 2)[2], "'sqlite', 'postgres' or 'git'"),
         ('substrate = "sqlite"\n[[tables]]\nname = "t"\ncolumns = ["id"]\n', "no database"),
         ('database = "x.db"\n', "no \\[\\[tables\\]\\]"),
         ('database = "x.db"\ntables = [1]\n', "tables\\[0\\] is not a table"),

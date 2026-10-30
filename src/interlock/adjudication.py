@@ -44,7 +44,9 @@ class Adjudication:
         return self.verdict.admitted
 
     def feedback(self, *, committed: bool) -> AgentFeedback:
-        return agent_feedback(self.plan, self.hints, committed=committed)
+        return agent_feedback(
+            self.plan, self.hints, committed=committed, substrate=self.diff.substrate_id
+        )
 
     def refusal(self) -> Refusal:
         return Refusal(

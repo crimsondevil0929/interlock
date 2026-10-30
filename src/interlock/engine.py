@@ -519,7 +519,7 @@ class EscrowEngine:
                 )
         except InterlockError as exc:
             if exc.feedback is None:
-                exc.feedback = feedback_for_error(plan, exc)
+                exc.feedback = feedback_for_error(plan, exc, substrate=self._substrate.substrate_id)
             raise
         finally:
             self._reserving.discard(plan.plan_id)
@@ -802,7 +802,7 @@ class EscrowEngine:
             return self._repair(plan, max_trials=max_trials)
         except InterlockError as exc:
             if exc.feedback is None:
-                exc.feedback = feedback_for_error(plan, exc)
+                exc.feedback = feedback_for_error(plan, exc, substrate=self._substrate.substrate_id)
             raise
 
     def _repair(self, plan: EffectPlan, *, max_trials: int) -> Repair:

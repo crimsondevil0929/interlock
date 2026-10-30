@@ -25,7 +25,7 @@ import logging
 import re
 import sqlite3
 import uuid
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -466,6 +466,11 @@ class SqliteSubstrate:
         return self._outbox
 
     @property
+    def path(self) -> str:
+        """The database file."""
+        return self._path
+
+    @property
     def observed_tables(self) -> frozenset[str]:
         return frozenset(self._by_name)
 
@@ -522,6 +527,13 @@ class SqliteSubstrate:
         The connection is dedicated for the stage's life and is not returned to
         a pool mid-stage.
         """
+        return self._open(plan, uuid.uuid4())
+
+    def _open(self, plan: EffectPlan, stage_id: uuid.UUID) -> StageHandle:
+        """:meth:`open`, under ``stage_id``: what a substrate this database is
+        the control database of (:class:`~interlock.git_substrate.GitSubstrate`)
+        calls, so the outbox rows, markers and window history carry the id the
+        escrow chain records."""
         if self._handle is not None:
             raise StageConflictError(
                 f"substrate {self.substrate_id!r} already has stage {self._handle.stage_id} open"
@@ -555,7 +567,7 @@ class SqliteSubstrate:
 
         opened = datetime.now(UTC)
         handle = StageHandle(
-            stage_id=uuid.uuid4(),
+            stage_id=stage_id,
             plan_id=plan.plan_id,
             substrate_id=self.substrate_id,
             opened_at=opened,
@@ -674,6 +686,13 @@ class SqliteSubstrate:
             rows_affected=max(cursor.rowcount, 0),
             applied_at=datetime.now(UTC),
         )
+
+    def applied_elsewhere(self, handle: StageHandle, effect: Effect) -> None:
+        """Record a statement effect another substrate applied in this stage's
+        plan, as this database's control database: the requests after it then
+        wait for the ones it waited for (:class:`~interlock.outbound.EnqueueOrder`)."""
+        self._require(handle)
+        self._order.applied(effect.effect_id, effect.depends_on, request=False)
 
     def _enqueue(
         self, conn: sqlite3.Connection, handle: StageHandle, effect: Effect
@@ -907,6 +926,16 @@ class SqliteSubstrate:
         with the effects or not at all; and with it, what the plan adds to
         each rate window it was measured against.
         """
+        return self._commit(handle, None)
+
+    def _commit(
+        self, handle: StageHandle, prepare: Callable[[sqlite3.Connection], None] | None
+    ) -> CommitReceipt:
+        """:meth:`commit`, calling ``prepare`` with the stage's connection after
+        every row the commit writes and before ``COMMIT``, inside the
+        transaction. A substrate this database is the control database of
+        commits its own effects there; if ``prepare`` raises, nothing here
+        commits and the stage stays open for the caller to abort."""
         conn = self._require(handle)
         self._assert_live(handle)
         committed_at = datetime.now(UTC)
@@ -944,6 +973,8 @@ class SqliteSubstrate:
                         f"VALUES (?, ?, ?)",
                         (str(handle.stage_id), handle.plan_id, committed_at.isoformat()),
                     )
+                if prepare is not None:
+                    prepare(conn)
                 conn.execute("COMMIT")
         except sqlite3.Error as exc:
             raise StageError(f"commit failed: {exc}") from exc
