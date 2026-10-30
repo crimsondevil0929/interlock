@@ -185,7 +185,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.0.4"
+__version__ = "1.1.0"
 
 __all__ = [
     "AdmissionError",
