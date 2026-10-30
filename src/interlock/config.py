@@ -16,6 +16,7 @@ TOML, so the standard library reads it::
     primary_key = "id"
     columns = ["id", "tenant", "total"]
     tenant_column = "tenant"
+    # partitions = { patient = "patient_id" }  # more dimensions; each column in columns
 
     [[sinks]]                         # outbound requests; see docs/OUTBOX_DESIGN.md
     name = "mail"
@@ -79,7 +80,7 @@ time, whatever each plan alone may do; an engine takes them as
     name = "refunds_per_agent_day"    # what the agent a window refuses is told
     span_seconds = 86400              # it slides
     limit = "10000"                   # a decimal string, or an integer
-    per = "scope"                     # or "tenant", "global"
+    per = "scope"                     # or "tenant", "partition:patient", "global"
     measure = "request_sum"           # requests, request_sum, row_sum or plans
     sink = "payments"                 # requests, request_sum: a [[sinks]] name...
     operation = "refunds.create"      # ...and one of its operations
@@ -268,11 +269,11 @@ from interlock.git_substrate import COLUMNS, DEFAULT_CLASSES, FALLBACK_CLASS, Gi
 from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
 from interlock.outbound import (
     HTTP,
-    KINDS,
     NONE_POSSIBLE,
     OperationSpec,
     SinkRegistry,
     SinkSpec,
+    sink_kinds,
     typed_sink,
 )
 from interlock.records import Keyring
@@ -341,6 +342,8 @@ class Endpoint:
     :ivar secret_env: A typed sink's API key: the variable that holds it.
     :ivar stripe_version: The ``Stripe-Version`` a Stripe adapter pins.
     :ivar sandbox: A SendGrid adapter validates and sends nothing.
+    :ivar settings: An ``mcp`` sink's, or a registered kind's, own keys
+        (``command``): its adapter reads them (``relay_adapter``).
     """
 
     sink: str
@@ -351,6 +354,7 @@ class Endpoint:
     secret_env: str = ""
     stripe_version: str = ""
     sandbox: bool = False
+    settings: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -769,6 +773,13 @@ def load_config(
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ConfigError(f"tables[{index}] is not a table")
+        partitions = entry.get("partitions", {})
+        if not isinstance(partitions, dict) or not all(
+            isinstance(v, str) for v in partitions.values()
+        ):
+            raise ConfigError(
+                f"tables[{index}].partitions maps each partition dimension to its column"
+            )
         try:
             tables.append(
                 TableSpec(
@@ -776,6 +787,7 @@ def load_config(
                     primary_key=_string(entry, "primary_key", default="id"),
                     columns=_strings(entry, "columns"),
                     tenant_column=_string(entry, "tenant_column", default="") or None,
+                    partitions=partitions,
                 )
             )
         except ValueError as exc:
@@ -1533,7 +1545,17 @@ def _relay(raw: object, sinks: tuple[SinkSpec, ...], base: Path) -> RelayConfig 
 
 def _typed_endpoint(entry: Mapping[str, Any], sink: SinkSpec, where: str) -> Endpoint:
     """A Stripe or SendGrid sink's endpoint: the adapter knows its routes and
-    how to present its key; configuration says where the key is."""
+    how to present its key; configuration says where the key is. Any other
+    kind's (``mcp``, a registered one's): its keys, for its adapter."""
+    if sink.kind not in ("stripe", "sendgrid"):
+        return Endpoint(
+            sink=sink.name,
+            url="",
+            routes={},
+            header_env={},
+            kind=sink.kind,
+            settings={k: v for k, v in entry.items() if k != "sink"},
+        )
     for key in ("routes", "header_env"):
         if key in entry:
             raise ConfigError(
@@ -1584,14 +1606,16 @@ def _sinks(entries: object, base: Path) -> tuple[SinkSpec, ...]:
             if not isinstance(operations, list) or not operations:
                 raise ConfigError("lists no [[sinks.operations]]")
             kind = _string(entry, "type", default=HTTP)
-            if kind not in KINDS:
-                raise ConfigError(f"'type' is one of {', '.join(KINDS)}")
+            if kind not in sink_kinds():
+                raise ConfigError(f"'type' is one of {', '.join(sink_kinds())}")
+            typed = typed_sink(kind)
+            configured = typed is None or typed.CATALOG is None
             sinks.append(
                 SinkSpec(
                     _string(entry, "name"),
                     operations=tuple(
                         _operation(op, base, f"operations[{i}]")
-                        if kind == HTTP
+                        if configured
                         else _typed_operation(op, kind, f"operations[{i}]")
                         for i, op in enumerate(operations)
                     ),
@@ -1640,9 +1664,17 @@ def _operation(raw: object, base: Path, where: str) -> OperationSpec:
             _string(raw, "name"),
             compensation=_string(raw, "compensation", default=NONE_POSSIBLE),
             schema=schema,
+            hold=_hold(raw, where),
         )
     except ValueError as exc:
         raise ConfigError(f"{where}: {exc}") from exc
+
+
+def _hold(raw: Mapping[str, Any], where: str) -> bool:
+    hold = raw.get("hold", False)
+    if not isinstance(hold, bool):
+        raise ConfigError(f"{where}: 'hold' is true or false")
+    return hold
 
 
 def _typed_operation(raw: object, kind: str, where: str) -> OperationSpec:
@@ -1650,11 +1682,11 @@ def _typed_operation(raw: object, kind: str, where: str) -> OperationSpec:
     compensation are the kind's."""
     if not isinstance(raw, dict):
         raise ConfigError(f"{where} is not a table")
-    extra = sorted(set(raw) - {"name"})
+    extra = sorted(set(raw) - {"name", "hold"})
     if extra:
         raise ConfigError(
             f"{where}: a {kind} sink's operations bring their own schema and compensation; "
-            f"give only 'name', not {', '.join(extra)}"
+            f"give only 'name' and 'hold', not {', '.join(extra)}"
         )
     name = _string(raw, "name")
     catalog = typed_sink(kind).CATALOG
@@ -1663,7 +1695,7 @@ def _typed_operation(raw: object, kind: str, where: str) -> OperationSpec:
             f"{where}: {kind} has no operation {name!r}; it has {', '.join(sorted(catalog))}"
         )
     spec: OperationSpec = catalog[name]
-    return spec
+    return replace(spec, hold=_hold(raw, where))
 
 
 def _decimal(raw: Mapping[str, Any], key: str) -> Decimal:

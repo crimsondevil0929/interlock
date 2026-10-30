@@ -29,13 +29,18 @@ What each field is built from:
   salted row commitment over every measured row change, and a hash of the
   observed schema (the table specs and the foreign-key graph).
 - ``coverage``: the observed tables, whether the cascade check left no
-  acknowledged gap, whether writes outside them are refused, and every gap
-  the operator acknowledged, in words.
+  acknowledged gap, whether writes outside them are refused, every gap the
+  operator acknowledged, in words, and how strongly the effect was measured:
+  the substrate's class (``SubstrateCapabilities.measurement``), or
+  ``request-only`` for a plan whose only effect is the requests it commits.
 - ``decision``: the verdict hash, each checker with a digest of its
   configuration, the issuer's policy epoch, and ``repair_of``: the refused
   plan's receipt, when this plan is a repair of it.
 - ``cost``: the AgentGov transaction that settled the plan, when there is
-  one. The receipt is issued after it, anchored to the head it produced.
+  one. The receipt is issued after it, anchored to the head it produced. What
+  the plan consumed in each metered unit, and the transaction of that unit's
+  ledger that settled it (:mod:`interlock.meters`); and, for a request-only
+  plan, the sinks whose word its effect is.
 """
 
 from __future__ import annotations
@@ -49,6 +54,8 @@ from decimal import Decimal
 from typing import Any
 
 from agentgov.receipts import (
+    REQUEST_ONLY,
+    TRANSACTIONAL,
     ActionBinding,
     ActionReceipt,
     Anchors,
@@ -67,6 +74,7 @@ from agentgov.receipts import (
     Intent,
     Outcome,
     OutcomeStatus,
+    Quantity,
     ReceiptLog,
     RowChange,
     StatedFootprint,
@@ -78,6 +86,7 @@ from interlock.anchor import AnchorPoint
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowRecord
 from interlock.invariants import BlastRadius, InvariantChecker
+from interlock.meters import Metered
 from interlock.types import (
     INBOX_TARGET,
     OUTBOX_TARGET,
@@ -87,7 +96,7 @@ from interlock.types import (
     canonical_hash,
 )
 
-__all__ = ["ReceiptIssuer", "checker_records", "receipt_rows", "schema_hash"]
+__all__ = ["ReceiptIssuer", "checker_records", "measurement_of", "receipt_rows", "schema_hash"]
 
 _TEXT_LIMIT = 512
 
@@ -166,6 +175,7 @@ class ReceiptIssuer:
         repair_of: str | None = None,
         ledger_txn_ids: Iterable[str] = (),
         settled: Decimal = Decimal(0),
+        metered: Iterable[Metered] = (),
     ) -> ActionReceipt:
         """Build, sign and log the receipt for one adjudicated plan.
 
@@ -179,6 +189,7 @@ class ReceiptIssuer:
         report = getattr(substrate, "cascade_report", None)
         observed = sorted(getattr(substrate, "observed_tables", frozenset()))
         limits = [c.limit for c in checkers if isinstance(c, BlastRadius)]
+        measurement = measurement_of(substrate, diff)
         draft = ActionReceipt(
             receipt_id=receipt_id,
             issued_at=datetime.now(UTC),
@@ -222,6 +233,7 @@ class ReceiptIssuer:
                 cascade_closed=isinstance(report, CascadeReport) and report.closed,
                 authorizer_on=bool(getattr(substrate, "enforces_table_access", False)),
                 known_gaps=_gaps(substrate, report, len(diff.outbound)),
+                measurement=measurement,
             ),
             decision=Decision(
                 verdict_hash=verdict.content_hash(),
@@ -230,7 +242,22 @@ class ReceiptIssuer:
                 policy_epoch=self._epoch,
                 repair_of=repair_of,
             ),
-            cost=Cost(ledger_txn_ids=tuple(ledger_txn_ids), settled_usd=settled),
+            cost=Cost(
+                ledger_txn_ids=tuple(ledger_txn_ids),
+                settled_usd=settled,
+                quantities=tuple(
+                    Quantity(
+                        m.unit,
+                        m.amount,
+                        (m.transaction_id,) if m.transaction_id is not None else (),
+                    )
+                    for m in metered
+                ),
+                # The systems whose word a request-only effect is: its sinks.
+                served_by=tuple(sorted({o.sink for o in diff.outbound}))
+                if measurement == REQUEST_ONLY
+                else (),
+            ),
             outcome=Outcome(
                 status=OutcomeStatus.COMMITTED if committed else OutcomeStatus.REFUSED,
                 substrate_txid=substrate_txid if committed else None,
@@ -272,6 +299,17 @@ class ReceiptIssuer:
             attestation=attestation,
         )
         return self._log.issue(draft)
+
+
+def measurement_of(substrate: object, diff: EffectDiff) -> str:
+    """How strongly a plan's effect was measured: ``request-only`` when it
+    changed no row and its effect is the requests it commits, otherwise the
+    class the substrate declares (``transactional`` unless it says less)."""
+    if not diff.deltas and diff.outbound:
+        return REQUEST_ONLY
+    capabilities = getattr(substrate, "capabilities", None)
+    declared = getattr(capabilities, "measurement", TRANSACTIONAL)
+    return declared if isinstance(declared, str) else TRANSACTIONAL
 
 
 def receipt_rows(diff: EffectDiff) -> list[RowChange]:
@@ -342,8 +380,11 @@ def checker_records(checkers: Sequence[InvariantChecker]) -> tuple[CheckerRecord
 def schema_hash(substrate: object) -> str:
     """A digest of the schema the measurement assumed: the table specs, and
     the foreign-key graph when the cascade check read one."""
+    # A table's partitions beside its tenant only when it has some: a schema
+    # of single-tenant tables keeps the digest it always had.
     specs = [
         [spec.name, spec.primary_key, list(spec.columns), spec.tenant_column]
+        + ([dict(partitions)] if (partitions := getattr(spec, "partitions", None)) else [])
         for spec in getattr(substrate, "table_specs", ())
     ]
     report = getattr(substrate, "cascade_report", None)
@@ -370,7 +411,15 @@ def _config(checker: object) -> list[tuple[str, str]]:
         if slots
         else dict(getattr(checker, "__dict__", {}))
     )
-    return [(type(checker).__qualname__, ""), *sorted((k, _render(v)) for k, v in state.items())]
+    # A slot a checker gained after its first release (its UNSET names its
+    # value when the option is not used) is left out while it holds that
+    # value, so every configuration that does not use the option keeps the
+    # digest it always had, and so does every receipt that carries it.
+    unset: Mapping[str, Any] = getattr(type(checker), "UNSET", {})
+    return [
+        (type(checker).__qualname__, ""),
+        *sorted((k, _render(v)) for k, v in state.items() if not (k in unset and v == unset[k])),
+    ]
 
 
 def _render(value: object) -> str:

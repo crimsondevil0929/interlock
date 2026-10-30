@@ -24,6 +24,10 @@ nothing:
 An engine consumes a fact in a plan exactly once (:meth:`~interlock.engine.EscrowEngine.facts`,
 :meth:`~interlock.builder.PlanBuilder.consume`), and only after both
 attestations verify under ``[inbox.keys]`` (:func:`verify_fact`).
+
+A vendor that signs its own way is a source kind of its own: a package
+registers it (:func:`register_source_kind`, or the ``interlock.sources``
+entry point) with how to check its signature and read its events.
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ from interlock.types import InboundFact, _frozen, exact_number, field_path, outb
 __all__ = [
     "INBOUND_DOMAIN",
     "KINDS",
+    "SOURCE_ENTRY_POINTS",
     "FieldSpec",
     "InboundEvent",
     "InboundSource",
@@ -68,7 +73,9 @@ __all__ = [
     "event_hash",
     "inbox_genesis",
     "project",
+    "register_source_kind",
     "serve",
+    "source_kinds",
     "verify_fact",
     "verify_inbox",
 ]
@@ -81,6 +88,12 @@ for no ILOK1 record's, ARC1 document's or relay attestation's."""
 EVENT_VERSION: Final = "ILOK1-inbound-event"
 FACT_VERSION: Final = "ILOK1-inbound-fact"
 KINDS: Final = ("http", "stripe", "sendgrid")
+"""The source kinds Interlock ships, which a database's mirror records as
+themselves. It records a registered kind as ``http``; the source's
+configuration hash, beside it, names its kind."""
+SOURCE_ENTRY_POINTS: Final = "interlock.sources"
+"""The entry-point group a package registers a source kind under (the
+contract of :func:`register_source_kind`); the entry point's name is the kind."""
 DEFAULT_TOLERANCE: Final = timedelta(minutes=5)
 MAX_BODY: Final = 256 * 1024
 
@@ -223,9 +236,15 @@ class InboundSource:
     def __post_init__(self) -> None:
         if not _NAME.fullmatch(self.name):
             raise ValueError(f"an inbound source's name is a lowercase identifier: {self.name!r}")
-        if self.kind not in KINDS:
-            raise ValueError(f"source {self.name}: kind is one of {', '.join(KINDS)}")
-        if self.kind == "sendgrid":
+        if self.kind not in source_kinds():
+            raise ValueError(f"source {self.name}: kind is one of {', '.join(source_kinds())}")
+        typed = typed_source(self.kind)
+        if typed is not None:
+            credential = self.verification_key if typed.CREDENTIAL == "key" else self.secret_env
+            if not credential:
+                needed = "verification_key" if typed.CREDENTIAL == "key" else "secret_env"
+                raise ValueError(f"source {self.name}: a {self.kind} source needs its {needed}")
+        elif self.kind == "sendgrid":
             if not self.verification_key:
                 raise ValueError(f"source {self.name}: SendGrid's verification_key is needed")
             try:
@@ -253,7 +272,16 @@ class InboundSource:
             return STRIPE_FIELDS
         if self.kind == "sendgrid":
             return SENDGRID_FIELDS
+        typed = typed_source(self.kind)
+        if typed is not None:
+            fields: tuple[FieldSpec, ...] = tuple(typed.FIELDS)
+            return fields
         return self.fields
+
+    @property
+    def mirror_kind(self) -> str:
+        """The kind a database's mirror records (:data:`KINDS`)."""
+        return self.kind if self.kind in KINDS else "http"
 
     def config_hash(self) -> str:
         """A digest of everything the source admits, for the database's mirror."""
@@ -271,6 +299,74 @@ class InboundSource:
                 [[f.name, f.path, f.type] for f in self.projection()],
             ]
         )
+
+
+# --------------------------------------------------------------------------
+# source kinds a package registers
+# --------------------------------------------------------------------------
+
+_REGISTERED: dict[str, Any] = {}
+_PLUGINS_LOADED = False
+
+
+def register_source_kind(kind: str, typed: Any) -> None:
+    """Make ``kind`` an inbound source kind, defined by ``typed``: a module,
+    or any object, with
+
+    - ``CREDENTIAL``: ``"secret"`` (its signing secret, in the inbox's
+      environment, named by ``secret_env``) or ``"key"`` (a public key in
+      configuration, ``verification_key``);
+    - ``SIGNATURE_HEADERS``: the headers its signature travels in, kept with
+      each event for whoever holds the credential to check again;
+    - ``FIELDS``: its projection, :class:`FieldSpec` by name;
+    - ``verify(credential, headers, body, now, tolerance)``: the event id its
+      headers carry, if any, and when it was signed; raises :class:`Rejected`
+      unless the signature verifies within ``tolerance``;
+    - ``parse(document, header_id)``: the :class:`Parsed` events a verified
+      body holds; raises :class:`Rejected` (400) on any other shape.
+
+    A package registers its kinds under the ``interlock.sources`` entry point
+    (:data:`SOURCE_ENTRY_POINTS`) instead, found when a source first names one.
+
+    :raises ValueError: If ``kind`` is not a name, is a kind Interlock ships,
+        is registered to something else, or ``typed`` lacks part of the contract.
+    """
+    if not _NAME.fullmatch(kind) or kind in KINDS:
+        raise ValueError(f"{kind!r} is not a kind a package may register")
+    for name in ("CREDENTIAL", "SIGNATURE_HEADERS", "FIELDS", "verify", "parse"):
+        if not hasattr(typed, name):
+            raise ValueError(f"source kind {kind!r} defines no {name}")
+    if typed.CREDENTIAL not in ("secret", "key"):
+        raise ValueError(f"source kind {kind!r}: CREDENTIAL is 'secret' or 'key'")
+    if _REGISTERED.get(kind, typed) is not typed:
+        raise ValueError(f"source kind {kind!r} is registered")
+    _REGISTERED[kind] = typed
+
+
+def source_kinds() -> tuple[str, ...]:
+    """Every source kind: Interlock's own, then the registered ones."""
+    _load_plugins()
+    return (*KINDS, *sorted(_REGISTERED))
+
+
+def typed_source(kind: str) -> Any:
+    """The definition of a registered source kind, or ``None`` for
+    Interlock's own."""
+    if kind in KINDS:
+        return None
+    _load_plugins()
+    return _REGISTERED.get(kind)
+
+
+def _load_plugins() -> None:
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED:
+        return
+    _PLUGINS_LOADED = True
+    from importlib.metadata import entry_points
+
+    for point in entry_points(group=SOURCE_ENTRY_POINTS):
+        register_source_kind(point.name, point.load())
 
 
 # --------------------------------------------------------------------------
@@ -442,6 +538,10 @@ def parse_events(source: InboundSource, document: object, *, header_id: str | No
 
     :raises Rejected: (400) On a body that is not the vendor's shape.
     """
+    typed = typed_source(source.kind)
+    if typed is not None:
+        parsed: list[Parsed] = list(typed.parse(document, header_id))
+        return parsed
     if source.kind == "sendgrid":
         if not isinstance(document, list) or not document:
             raise Rejected(400, "a SendGrid batch is a non-empty array of events")
@@ -950,25 +1050,41 @@ class Inbox:
             return None, verify_sendgrid(
                 source.verification_key, headers, body, now, source.tolerance
             )
+        typed = typed_source(source.kind)
+        if typed is not None and typed.CREDENTIAL == "key":
+            found: tuple[str | None, datetime] = typed.verify(
+                source.verification_key, headers, body, now, source.tolerance
+            )
+            return found
         secret = self._secrets(source.secret_env)
         if not secret:
             raise Rejected(503, "the source's secret is not in the inbox's environment")
         if source.kind == "stripe":
             return None, verify_stripe(secret, headers, body, now, source.tolerance)
+        if typed is not None:
+            verified: tuple[str | None, datetime] = typed.verify(
+                secret, headers, body, now, source.tolerance
+            )
+            return verified
         return verify_standard(secret, headers, body, now, source.tolerance)
 
     @staticmethod
     def _signature_headers(source: InboundSource, headers: Mapping[str, str]) -> str:
         """The vendor's signature as received, for whoever holds the secret to
         check it again."""
-        names = {
-            "stripe": ("Stripe-Signature",),
-            "http": ("webhook-id", "webhook-timestamp", "webhook-signature"),
-            "sendgrid": (
-                "X-Twilio-Email-Event-Webhook-Signature",
-                "X-Twilio-Email-Event-Webhook-Timestamp",
-            ),
-        }[source.kind]
+        typed = typed_source(source.kind)
+        names = (
+            tuple(typed.SIGNATURE_HEADERS)
+            if typed is not None
+            else {
+                "stripe": ("Stripe-Signature",),
+                "http": ("webhook-id", "webhook-timestamp", "webhook-signature"),
+                "sendgrid": (
+                    "X-Twilio-Email-Event-Webhook-Signature",
+                    "X-Twilio-Email-Event-Webhook-Timestamp",
+                ),
+            }[source.kind]
+        )
         return _json({name: _header(headers, name) for name in names})
 
     def _match(self, event: InboundEvent) -> bool:

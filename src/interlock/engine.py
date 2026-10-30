@@ -52,6 +52,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from agentgov.core import Authorization, EntryType, LedgerEntry, SettlementClaim
+from agentgov.exceptions import AgentGovError
 
 from interlock.adjudication import Adjudication, adjudicate
 from interlock.anchor import AnchorPoint, JoinedCommit, LedgerAnchor
@@ -66,6 +67,7 @@ from interlock.exceptions import (
     ForbiddenStatementError,
     InboundFactError,
     InterlockError,
+    MeterExhaustedError,
     OutboundRequestError,
     PlanError,
     ScopeHaltedError,
@@ -76,6 +78,7 @@ from interlock.exceptions import (
 )
 from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedback_for_error
 from interlock.invariants import InvariantChecker
+from interlock.meters import Meter, MeterCheck, Metered
 from interlock.outbound import SinkRegistry
 from interlock.records import Keyring
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
@@ -218,9 +221,14 @@ class EscrowEngine:
         plan may consume an inbound fact only when both its attestations
         verify under one of them (``docs/EPIC5_DESIGN.md`` §2). Without it, a
         plan that consumes a fact is refused.
+    :param meters: What plans consume in other units, each conserved in a
+        ledger of its unit: held before a plan stages, checked, and settled
+        when it commits. A :class:`~interlock.meters.MeterCheck` is added to
+        ``checkers`` for each. See :mod:`interlock.meters`.
     :raises ValueError: If ``settle_cost`` is negative, ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`, two windows share a
-        name, or the substrate keeps no window history.
+        name, or the substrate keeps no window history, or two meters
+        share a unit.
     """
 
     __slots__ = (
@@ -231,6 +239,7 @@ class EscrowEngine:
         "_claims_lock",
         "_inbox",
         "_inflight",
+        "_meters",
         "_receipts",
         "_reserving",
         "_settle_cost",
@@ -251,6 +260,7 @@ class EscrowEngine:
         sinks: SinkRegistry | None = None,
         windows: Sequence[RateWindow] = (),
         inbox: Keyring | None = None,
+        meters: Sequence[Meter] = (),
     ) -> None:
         self._substrate = substrate
         self._sinks = sinks
@@ -266,7 +276,15 @@ class EscrowEngine:
                 f"substrate {substrate.substrate_id!r} keeps no window history, so a rate "
                 f"window could not be measured on it"
             )
-        self._checkers = tuple(checkers) + tuple(RateWindowCheck(w) for w in self._windows)
+        self._meters = tuple(meters)
+        units = [m.unit for m in self._meters]
+        if len(set(units)) != len(units):
+            raise ValueError(f"meters share a unit: {', '.join(sorted(units))}")
+        self._checkers = (
+            tuple(checkers)
+            + tuple(RateWindowCheck(w) for w in self._windows)
+            + tuple(MeterCheck(m) for m in self._meters)
+        )
         self._chain = chain if chain is not None else EscrowChain()
         if self._chain.read_only:
             raise ValueError(
@@ -283,6 +301,7 @@ class EscrowEngine:
                 f"{substrate.substrate_id!r} has none to join; use PostgresSubstrate"
             )
         self._anchor = anchor
+        self._check_holds(substrate, sinks)
         self._settle_cost = (
             settle_cost if isinstance(settle_cost, Decimal) else Decimal(settle_cost)
         )
@@ -292,6 +311,24 @@ class EscrowEngine:
         self._reserving: set[PlanId] = set()
         self._claims: set[PlanId] = set()
         self._claims_lock = threading.Lock()
+
+    @staticmethod
+    def _check_holds(substrate: ShadowSubstrate, sinks: SinkRegistry | None) -> None:
+        """Fail closed on a hold the database would not make: the outbox holds
+        a request only where its own mirror of the registry says to, so an
+        operation this engine's registry holds must be held there too."""
+        wanted = {(s.name, op) for s in sinks or () for op in s.held}
+        if not wanted:
+            return
+        reader = getattr(substrate, "held_operations", None)
+        mirrored = reader() if callable(reader) else {}
+        missing = sorted(f"{s}.{op}" for s, op in wanted if op not in mirrored.get(s, ()))
+        if missing:
+            raise SubstrateConfigurationError(
+                f"the registry holds {', '.join(missing)} for a warrant, and substrate "
+                f"{substrate.substrate_id!r}'s outbox does not: run `interlock install` with "
+                f"this registry, so the database holds what it holds"
+            )
 
     @property
     def chain(self) -> EscrowChain:
@@ -555,11 +592,17 @@ class EscrowEngine:
         # Claim and settle: the hold is placed before the stage opens, so the
         # stage's snapshot can see it, and a plan its scope cannot pay for is
         # refused before it stages anything.
-        reservation = self._reserve(plan, cost + quoted)
+        held = self._hold_meters(plan)
+        try:
+            reservation = self._reserve(plan, cost + quoted)
+        except BaseException:
+            self._release_meters(held)
+            raise
         try:
             handle = self._substrate.open(plan)
         except BaseException:
             self._release(reservation)
+            self._release_meters(held)
             raise
         outcomes: list[EffectOutcome] = []
         diff: EffectDiff | None = None
@@ -715,6 +758,7 @@ class EscrowEngine:
                 best_effort=True,
             )
             self._release(reservation)
+            self._release_meters(held)
             raise
         finally:
             self._inflight.discard(handle.stage_id)
@@ -732,6 +776,7 @@ class EscrowEngine:
             # its reservation when it has one).
             charge = cost + outbound_cost if committed else cost
             settlement = self._reverse_anchor(plan, head, charge, reservation)
+        metered = self._settle_meters(plan, held, diff, committed=committed, head=head)
         receipt = None
         if receipt_id is not None and judged is not None and terminal is not None:
             receipt = self._issue_receipt(
@@ -742,6 +787,7 @@ class EscrowEngine:
                 settlement=settlement,
                 txid=txid,
                 repair_of=repairs,
+                metered=metered,
             )
         return StageResult(
             plan=plan,
@@ -1113,6 +1159,7 @@ class EscrowEngine:
         settlement: LedgerEntry | None,
         txid: str | None = None,
         repair_of: str | None = None,
+        metered: Sequence[Metered] = (),
     ) -> ActionReceipt | None:
         """Issue the receipt, last, anchored to AgentGov's head as it is now.
 
@@ -1146,6 +1193,7 @@ class EscrowEngine:
                 repair_of=repair_of,
                 ledger_txn_ids=(str(settlement.transaction_id),) if settlement is not None else (),
                 settled=spent,
+                metered=metered,
             )
         except Exception:
             logger.warning(
@@ -1254,7 +1302,31 @@ class EscrowEngine:
             still_open = {r.plan_id for r in self._chain.unresolved_intents()} | self._reserving
             known = {r.plan_id for r in self._chain.records()}
             self._anchor.settle_pending(known - still_open)
+        if self._meters:
+            self._recover_meters()
         return tuple(resolved)
+
+    def _recover_meters(self) -> None:
+        """Settle the meter holds a crash left: a committed plan's whole (its
+        settlement never ran, and the hold is never less than it consumed), a
+        plan's that ended otherwise released, and a plan's that may still
+        commit, or that this engine is running, left alone."""
+        still_open = {r.plan_id for r in self._chain.unresolved_intents()} | self._reserving
+        records = list(self._chain.records())
+        committed = {r.plan_id for r in records if r.record_type is RecordType.COMMITTED}
+        ended = {r.plan_id for r in records} - committed - still_open
+        for meter in self._meters:
+            try:
+                settled = meter.recover(committed - still_open, ended)
+            except AgentGovError:
+                logger.warning(
+                    "the %s meter's holds could not be settled now; the next recovery will",
+                    meter.unit,
+                    exc_info=True,
+                )
+                continue
+            if settled:
+                logger.warning("recovered %d %s meter hold(s)", settled, meter.unit)
 
     def awaiting_recovery(self) -> int:
         """Commit intents :meth:`recover` could not settle yet: their marker
@@ -1422,6 +1494,67 @@ class EscrowEngine:
         total = sum((d.cost for d in diff.outbound), Decimal(0))
         assert total == quoted, (total, quoted)
         return total
+
+    def _hold_meters(self, plan: EffectPlan) -> list[tuple[Meter, Authorization]]:
+        """Hold what the plan may consume of each metered unit, before it
+        stages. A plan its scope cannot hold for is refused here, and the chain
+        records that it ended before staging."""
+        held: list[tuple[Meter, Authorization]] = []
+        for meter in self._meters:
+            try:
+                held.append((meter, meter.hold(plan)))
+            except MeterExhaustedError as exc:
+                self._release_meters(held)
+                self._record(
+                    RecordType.ABORTED,
+                    plan,
+                    plan.content_hash(),
+                    note=f"refused before staging: {exc}",
+                    best_effort=True,
+                )
+                raise
+        if held:
+            self._reserving.add(plan.plan_id)
+        return held
+
+    @staticmethod
+    def _release_meters(held: Sequence[tuple[Meter, Authorization]]) -> None:
+        for meter, authorization in held:
+            meter.release(authorization)
+
+    def _settle_meters(
+        self,
+        plan: EffectPlan,
+        held: Sequence[tuple[Meter, Authorization]],
+        diff: EffectDiff | None,
+        *,
+        committed: bool,
+        head: str,
+    ) -> tuple[Metered, ...]:
+        """After the stage: a committed plan's consumption captured against
+        each hold, the rest returned; any other plan's holds released. Runs
+        after the commit, so a failure degrades to an open hold, which
+        recovery settles."""
+        if not committed or diff is None:
+            self._release_meters(held)
+            return ()
+        found: list[Metered] = []
+        for meter, authorization in held:
+            consumed, _ = meter.consumed(plan, diff)
+            try:
+                entry = meter.settle(authorization, consumed, f"committed at escrow {head[:16]}")
+            except AgentGovError:
+                logger.warning(
+                    "the %s meter's hold for plan %s could not be settled now; it stays open "
+                    "and recovery settles it",
+                    meter.unit,
+                    plan.plan_id,
+                    exc_info=True,
+                )
+                continue
+            if entry is not None:
+                found.append(Metered(meter.unit, entry.amount, str(entry.transaction_id)))
+        return tuple(found)
 
     def _reserve(self, plan: EffectPlan, cost: Decimal) -> Authorization | None:
         """Place the plan's hold, in same-transaction mode, before it stages.

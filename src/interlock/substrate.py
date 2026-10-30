@@ -60,6 +60,7 @@ from interlock.sqlite_outbox import (
     TRACES,
     WINDOWS_TABLE,
     enqueue,
+    held_operations,
     now_us,
     outbox_installed,
     stage_requests,
@@ -67,6 +68,8 @@ from interlock.sqlite_outbox import (
 )
 from interlock.sqlite_outbox import WINDOWS_DDL as _WINDOWS_DDL
 from interlock.types import (
+    PARTITION,
+    TENANT,
     CommitReceipt,
     Effect,
     EffectDiff,
@@ -252,11 +255,16 @@ class TableSpec:
         one. It MUST also appear in ``columns``, because the tenant label is
         read back out of the captured image; the constructor enforces that. A
         table with no tenant column contributes nothing to tenant radius.
-    :raises ValueError: On an identifier that is not a plain SQL identifier, or
-        a ``tenant_column`` missing from ``columns``.
+    :param partitions: More partition dimensions, each the column carrying
+        its label, read back out of the captured image like the tenant's:
+        ``{"patient": "patient_id"}``. A ``"tenant"`` entry is the
+        ``tenant_column``. Every column must also appear in ``columns``.
+    :raises ValueError: On an identifier that is not a plain SQL identifier, a
+        dimension that is not a name, or a ``tenant_column`` or partition
+        column missing from ``columns``.
     """
 
-    __slots__ = ("columns", "name", "primary_key", "tenant_column")
+    __slots__ = ("columns", "name", "partitions", "primary_key", "tenant_column")
 
     def __init__(
         self,
@@ -265,10 +273,22 @@ class TableSpec:
         primary_key: str = "id",
         columns: Sequence[str],
         tenant_column: str | None = None,
+        partitions: Mapping[str, str] | None = None,
     ) -> None:
+        others = dict(partitions or {})
+        named = others.pop(TENANT, None)
+        if named is not None and tenant_column is not None and named != tenant_column:
+            raise ValueError(
+                f"table {name!r}: partitions names {named!r} as the tenant column, and "
+                f"tenant_column {tenant_column!r}"
+            )
+        tenant_column = tenant_column if tenant_column is not None else named
         tenant = [tenant_column] if tenant_column else []
-        for identifier in (name, primary_key, *columns, *tenant):
+        for identifier in (name, primary_key, *columns, *tenant, *others.values()):
             _assert_identifier(identifier)
+        for dimension in others:
+            if not isinstance(dimension, str) or not PARTITION.fullmatch(dimension):
+                raise ValueError(f"table {name!r}: {dimension!r} is not a partition dimension")
         if tenant_column is not None and tenant_column not in columns:
             # Without this, the tenant label is absent from every captured row
             # image, every RowDelta.tenant_id reads None, tenant_count is 0,
@@ -278,10 +298,32 @@ class TableSpec:
                 f"tenant_column {tenant_column!r} must also be listed in columns "
                 f"for table {name!r}, or tenant isolation cannot be measured"
             )
+        for dimension, column in others.items():
+            if column not in columns:
+                raise ValueError(
+                    f"partition {dimension}'s column {column!r} must also be listed in "
+                    f"columns for table {name!r}, or it cannot be measured"
+                )
         self.name = name
         self.primary_key = primary_key
         self.columns = tuple(columns)
         self.tenant_column = tenant_column
+        self.partitions: Mapping[str, str] = dict(sorted(others.items()))
+
+    def labels(self, image: Mapping[str, Any] | None) -> tuple[str | None, dict[str, str]]:
+        """The tenant and the other partition labels a captured image carries."""
+        if image is None:
+            return None, {}
+        tenant = None
+        if self.tenant_column is not None:
+            raw = image.get(self.tenant_column)
+            tenant = None if raw is None else str(raw)
+        found = {}
+        for dimension, column in self.partitions.items():
+            raw = image.get(column)
+            if raw is not None:
+                found[dimension] = str(raw)
+        return tenant, found
 
     def json_object(self, alias: str) -> str:
         """A ``json_object(...)`` expression over ``OLD`` or ``NEW``."""
@@ -469,6 +511,17 @@ class SqliteSubstrate:
     def path(self) -> str:
         """The database file."""
         return self._path
+
+    def held_operations(self) -> dict[str, tuple[str, ...]]:
+        """Each sink's operations the file's outbox holds for a warrant, as its
+        mirror of the registry records them (none without an outbox)."""
+        if not self._has_outbox():
+            return {}
+        conn = sqlite3.connect(f"file:{self._path}?mode=ro", uri=True)
+        try:
+            return held_operations(conn)
+        finally:
+            conn.close()
 
     @property
     def observed_tables(self) -> frozenset[str]:
@@ -773,12 +826,11 @@ class SqliteSubstrate:
             spec = self._by_name.get(table)
             before = _load(row["before"])
             after = _load(row["after"])
-            tenant: str | None = None
-            if spec is not None and spec.tenant_column is not None:
-                source = after if after is not None else before
-                if source is not None:
-                    raw = source.get(spec.tenant_column)
-                    tenant = None if raw is None else str(raw)
+            tenant, partitions = (
+                spec.labels(after if after is not None else before)
+                if spec is not None
+                else (None, {})
+            )
             deltas.append(
                 RowDelta(
                     table=table,
@@ -786,6 +838,7 @@ class SqliteSubstrate:
                     before=before,
                     after=after,
                     tenant_id=tenant,
+                    partitions=partitions,
                 )
             )
         return EffectDiff(

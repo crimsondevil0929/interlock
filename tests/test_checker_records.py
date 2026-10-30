@@ -48,6 +48,8 @@ PINNED = {
     ),
     "tenant_isolation": "153867730e32a368ced539179d47f62ef4ff1c2c8b9dbfca8566b09070eb05d3",
     "truncation_guard": "b4f9930e0a2c7afa8b44f2462828c4794801cc198d6590ff811957dca4c15abb",
+    # 1.2: a meter digests by its unit, measure and per-plan bound, never its ledger.
+    "meter:mme": "46c0c91b442e494a39d18f056f34c906bf3e79654ba41621c10e6d5da984e3dc",
     # These hold sets: in 1.0.2 each digested a different way in each process.
     "fact_agreement:charge.failed|charge.refunded|charge.updated.amount=refunds.amount": (
         "eb0dcfc9ffa5992e4946d0d3bd16477737e1da616ea6877a1e554b8657f4bae0"
@@ -78,7 +80,7 @@ def _digests_under(seed: str) -> dict[str, str]:
 
 def test_every_built_in_checker_digests_the_same_under_every_hash_seed() -> None:
     seen = {seed: _digests_under(seed) for seed in SEEDS}
-    assert len(seen["0"]) == len(checkers()) == 17
+    assert len(seen["0"]) == len(checkers()) == 18
     for seed, found in seen.items():
         assert found == seen["0"], f"PYTHONHASHSEED={seed} digests differently"
     assert seen["0"] == digests()

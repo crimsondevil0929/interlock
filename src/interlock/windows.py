@@ -7,10 +7,10 @@ per hour", "at most 10,000 of refunds per agent per day".
 
 A :class:`RateWindow` says what a plan adds (its *measure*: :class:`Requests`,
 :class:`RequestSum`, :class:`RowSum`, :class:`Plans`), whose history it adds to
-(*per* scope, tenant, or globally), over how long (*span*), and the most the
-window may hold (*limit*). Windows compose: one per tenant and one per scope
-together leave nothing to gain from spreading requests across tenants, which
-a plan declares itself.
+(*per* scope, tenant, another partition, or globally), over how long
+(*span*), and the most the window may hold (*limit*). Windows compose: one per
+tenant and one per scope together leave nothing to gain from spreading
+requests across tenants, which a plan declares itself.
 
 An engine configured with windows (``EscrowEngine(windows=...)``) measures what
 each plan adds from its diff, then has the substrate read the history of every
@@ -54,9 +54,12 @@ from typing import Final
 
 from interlock.feedback import FeedbackHint, Guidance
 from interlock.types import (
+    PARTITION,
+    TENANT,
     EffectDiff,
     EffectPlan,
     InvariantViolation,
+    OutboundDelta,
     Severity,
     exact_number,
     field_path,
@@ -79,7 +82,9 @@ __all__ = [
 
 PER: Final = ("scope", "tenant", "global")
 """Whose history a window keeps: each scope's (the agent's), each tenant's, or
-one for everything."""
+one for everything. ``"partition:<dimension>"`` keeps each label's of another
+partition dimension: ``"partition:patient"``."""
+PARTITION_PER: Final = "partition:"
 
 _NAME: Final = re.compile(r"[a-z][a-z0-9_]{0,62}")
 _ROWS: Final = ("inserted", "net")
@@ -99,6 +104,9 @@ class Requests:
         _require("sink", self.sink)
         if self.operation is not None:
             _require("operation", self.operation)
+
+    # Per partition, a request counts toward the label its ENQUEUE effect
+    # declares in that dimension (Effect.partitions).
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +181,10 @@ class RateWindow:
         ``Decimal`` or a decimal string; never a float.
     :param measure: What a plan adds.
     :param per: ``"scope"`` (the default): each agent's own history.
-        ``"tenant"``: each tenant's, across agents. ``"global"``: one history.
+        ``"tenant"``: each tenant's, across agents. ``"partition:<dimension>"``:
+        each label's of another dimension a ``TableSpec`` partitions by
+        (``"partition:patient"``): a row counts toward its own label, a
+        request toward the one its effect declares. ``"global"``: one history.
     :raises ValueError: On a name, span, limit, measure or ``per`` that is
         not one.
     """
@@ -201,8 +212,10 @@ class RateWindow:
             raise ValueError(f"window {name}: its span is at least a millisecond")
         if not isinstance(measure, Requests | RequestSum | RowSum | Plans):
             raise ValueError(f"window {name}: measure is Requests, RequestSum, RowSum or Plans")
-        if per not in PER:
-            raise ValueError(f"window {name}: per is one of {', '.join(PER)}")
+        if per not in PER and not _partitioned(per):
+            raise ValueError(
+                f"window {name}: per is one of {', '.join(PER)}, or partition:<dimension>"
+            )
         for field, value in (
             ("name", name),
             ("span", span),
@@ -221,17 +234,24 @@ class RateWindow:
         measure = self.measure
         added: dict[str, Decimal] = {}
         problems: list[str] = []
+        dimension = self.dimension
 
-        def add(tenant: str | None, amount: Decimal) -> None:
-            key = self.key(plan, tenant)
+        def add(label: str | None, amount: Decimal) -> None:
+            key = self.key(plan, label)
             added[key] = added.get(key, Decimal(0)) + amount
 
+        def of(request: OutboundDelta) -> str | None:
+            if dimension is None or dimension == TENANT:
+                return request.tenant_id
+            effect = next((e for e in plan.effects if e.effect_id == request.effect_id), None)
+            return None if effect is None else effect.partitions.get(dimension)
+
         if isinstance(measure, Plans):
-            if self.per == "tenant":
-                tenants = {d.tenant_id or "" for d in diff.deltas}
-                tenants |= {o.tenant_id or "" for o in diff.outbound}
-                for tenant in tenants or {""}:
-                    add(tenant, Decimal(1))
+            if dimension is not None:
+                labels = {d.partition(dimension) or "" for d in diff.deltas}
+                labels |= {of(o) or "" for o in diff.outbound}
+                for label in labels or {""}:
+                    add(label, Decimal(1))
             else:
                 add(None, Decimal(1))
         elif isinstance(measure, Requests | RequestSum):
@@ -241,7 +261,7 @@ class RateWindow:
                 ):
                     continue
                 if isinstance(measure, Requests):
-                    add(request.tenant_id, Decimal(1))
+                    add(of(request), Decimal(1))
                     continue
                 found, value = value_at(request.payload, field_path(measure.field))
                 number = exact_number(value) if found else None
@@ -251,7 +271,7 @@ class RateWindow:
                 elif number < 0:
                     problems.append(f"{what} carries a negative {measure.field}")
                 else:
-                    add(request.tenant_id, number)
+                    add(of(request), number)
         else:
             table = measure.table.lower()
             net: dict[str, Decimal] = {}
@@ -269,7 +289,7 @@ class RateWindow:
                             f"{measure.column}"
                         )
                     else:
-                        add(row.tenant_id, number)
+                        add(row.partition(dimension or TENANT), number)
                     continue
                 change = Decimal(0)
                 for image, sign in ((row.after, 1), (row.before, -1)):
@@ -285,27 +305,39 @@ class RateWindow:
                 else:
                     # Netted per key: a transfer between two of one key's
                     # rows adds nothing to it.
-                    key = self.key(plan, row.tenant_id)
+                    key = self.key(plan, row.partition(dimension or TENANT))
                     net[key] = net.get(key, Decimal(0)) + change
             for key, total in net.items():
                 if total > 0:
                     added[key] = added.get(key, Decimal(0)) + total
         return {k: v for k, v in added.items() if v > 0}, tuple(problems)
 
-    def key(self, plan: EffectPlan, tenant: str | None) -> str:
-        """Whose history something the plan adds belongs to."""
+    @property
+    def dimension(self) -> str | None:
+        """The partition dimension the window is per: the tenant, another, or
+        ``None`` for a window per scope or global."""
+        if self.per == "tenant":
+            return TENANT
+        if _partitioned(self.per):
+            return self.per.removeprefix(PARTITION_PER)
+        return None
+
+    def key(self, plan: EffectPlan, label: str | None) -> str:
+        """Whose history something the plan adds belongs to: the plan's scope,
+        or the label it carries in the window's dimension."""
         if self.per == "scope":
             return plan.scope_id
-        if self.per == "tenant":
-            return tenant or ""
+        if self.dimension is not None:
+            return label or ""
         return ""
 
     def whose(self, key: str) -> str:
         """``key``, said for the operator."""
         if self.per == "scope":
             return f"scope {key}"
-        if self.per == "tenant":
-            return f"tenant {key}" if key else "what names no tenant"
+        dimension = self.dimension
+        if dimension is not None:
+            return f"{dimension} {key}" if key else f"what names no {dimension}"
         return "everything"
 
 
@@ -419,8 +451,24 @@ class RateWindowCheck:
     ) -> FeedbackHint:
         # The window, never what it holds: its history is other plans'.
         key = violation.evidence.get("key", "")
-        tenants = (key,) if self._window.per == "tenant" and key else ()
-        return FeedbackHint(kind=Guidance.RATE_WINDOW, tenants=tenants, window=self._window.name)
+        dimension = self._window.dimension
+        tenants = (key,) if dimension is not None and key else ()
+        return FeedbackHint(
+            kind=Guidance.RATE_WINDOW,
+            tenants=tenants,
+            window=self._window.name,
+            dimension=dimension or TENANT,
+        )
+
+
+def _partitioned(per: str) -> bool:
+    """Whether ``per`` names another partition dimension than the tenant."""
+    dimension = per.removeprefix(PARTITION_PER)
+    return (
+        per.startswith(PARTITION_PER)
+        and PARTITION.fullmatch(dimension) is not None
+        and dimension != TENANT
+    )
 
 
 def _row_number(value: object) -> Decimal | None:
