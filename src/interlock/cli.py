@@ -3,7 +3,8 @@
 ``interlock install``            put Interlock's triggers into the database
 ``interlock check``              verify the setup, print the cascade check
 ``interlock reconcile-effects``  fail on any write to an observed table that no
-                                 escrow chain records
+                                 escrow chain records; on Git, any commit on
+                                 the branch since ``--since`` that no stage made
 ``interlock relay``              deliver committed outbound requests, until
                                  stopped (``--once``: until none is due),
                                  attesting each outcome with the relay's key
@@ -137,7 +138,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
         if args.command == "install":
             return _install(config, args, stream)
         if args.command == "reconcile-effects":
-            return _reconcile(config, args.chain, args.after, stream)
+            return _reconcile(config, args.chain, args.after, stream, since=args.since)
         if args.command == "inbox":
             return _inbox(config, args, stream)
         if args.command == "daemon":
@@ -391,6 +392,11 @@ def _parser() -> argparse.ArgumentParser:
                 default=0,
                 help="only logged writes numbered above this: a previous run's last entry",
             )
+            command.add_argument(
+                "--since",
+                help="Git: the commit the branch was at when the substrate took it over, or "
+                "when it last reconciled clean (required on Git)",
+            )
     return parser
 
 
@@ -446,6 +452,18 @@ def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> No
 
 def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
+    if config.git is not None:
+        from interlock.sqlite_outbox import install_sqlite_outbox
+
+        legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
+        print("installed: the outbox, the inbox, and WAL mode, in the control database", file=out)
+        for sink in config.sinks:
+            operations = ", ".join(op.name for op in sink.operations)
+            print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
+        for source in config.inbox.sources:
+            print(f"registered inbound source: {source.name} ({source.kind})", file=out)
+        _print_git(config, out)
+        return EXIT_OK, legacy
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import install_sqlite_outbox
 
@@ -1374,6 +1392,10 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
 
 
 def _check(config: InterlockConfig, out: TextIO) -> int:
+    if config.git is not None:
+        print(f"ok: git, {len(config.tables)} path class(es)", file=out)
+        _print_git(config, out)
+        return EXIT_OK
     if config.substrate == "postgres":
         report = PostgresSubstrate(
             config.database,
@@ -1388,14 +1410,33 @@ def _check(config: InterlockConfig, out: TextIO) -> int:
     return EXIT_OK
 
 
-def _reconcile(config: InterlockConfig, chains: Sequence[str], after: int, out: TextIO) -> int:
+def _reconcile(
+    config: InterlockConfig,
+    chains: Sequence[str],
+    after: int,
+    out: TextIO,
+    *,
+    since: str | None = None,
+) -> int:
     records: list[EscrowRecord] = []
     for path in chains:
         try:
             records.extend(EscrowChain.load(path).records())
         except OSError as exc:
             raise ChainIntegrityError(f"cannot read escrow chain {path}: {exc}") from exc
-    if config.substrate == "postgres":
+    if config.git is not None:
+        from interlock.git_substrate import reconcile_git
+        from interlock.wiring import open_git
+
+        if not since:
+            print(
+                "interlock: reconcile-effects on Git needs --since: the commit the branch was "
+                "at when the substrate took it over, or when it last reconciled clean",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        result = reconcile_git(open_git(config), records, since=since)
+    elif config.substrate == "postgres":
         import psycopg
 
         try:
@@ -1408,6 +1449,24 @@ def _reconcile(config: InterlockConfig, chains: Sequence[str], after: int, out: 
     for line in format_reconciliation(result):
         print(line, file=out)
     return EXIT_OK if result.clean else EXIT_FINDINGS
+
+
+def _print_git(config: InterlockConfig, out: TextIO) -> None:
+    """The repository a Git substrate stages on, read through it: the branch
+    and its head, the classes, the hooks and the control database."""
+    from interlock.wiring import open_git
+
+    substrate = open_git(config)
+    settings = config.git
+    assert settings is not None
+    print(f"repository: {substrate.repository}, {substrate.ref} at {substrate.head()}", file=out)
+    classes = ", ".join(c.name for c in settings.classes)
+    print(f"path classes: {classes}, other", file=out)
+    for hook in settings.hooks:
+        when = ", ".join(hook.when) or "every effect"
+        print(f"hook: {hook.name} ({' '.join(hook.argv)}), after {when}", file=out)
+    control = substrate.control or "none (no outbox, inbox or windows)"
+    print(f"control database: {control}", file=out)
 
 
 def _sqlite(config: InterlockConfig) -> SqliteSubstrate:

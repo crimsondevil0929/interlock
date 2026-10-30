@@ -1206,3 +1206,166 @@ def test_a_lost_race_tells_the_agent_the_branch_moved(repo: Repo) -> None:
     told = raised.value.feedback.render()
     assert "the branch moved after the plan was measured" in told
     assert "The same plan may succeed if resubmitted." in told
+
+
+# --------------------------------------------------------------------------
+# configured in interlock.toml, as SQLite and PostgreSQL are
+# --------------------------------------------------------------------------
+
+GIT_TOML = """\
+substrate = "git"
+database = "control.db"
+
+[git]
+repository = "origin.git"
+branch = "main"
+workspace = "acme"
+owners = [{ glob = "src/acme/clients/**", owner = "sdk-team" }]
+
+[[git.hooks]]
+name = "codegen"
+argv = ["PYTHON", "tools/codegen.py"]
+when = ["src/acme/api/schema.json"]
+sources = ["tools/codegen.py"]
+timeout_seconds = 30
+
+[[sinks]]
+name = "ci"
+cost_per_call = "0"
+
+[[sinks.operations]]
+name = "run"
+
+[[windows]]
+name = "lines_per_hour"
+span_seconds = 3600
+limit = "400"
+per = "global"
+measure = "row_sum"
+table = "src"
+column = "lines_added"
+rows = "net"
+""".replace("PYTHON", sys.executable.replace("\\", "/"))
+
+
+def write_config(repo: Repo, text: str = GIT_TOML) -> Path:
+    path = repo.root / "interlock.toml"
+    path.write_text(text)
+    return path
+
+
+def test_a_git_substrate_is_configured_in_interlock_toml(repo: Repo) -> None:
+    from interlock.config import git_tables, load_config
+
+    config = load_config(write_config(repo))
+    assert config.substrate == "git" and config.git is not None
+    assert config.git.repository == repo.root / "origin.git"
+    assert [h.name for h in config.git.hooks] == ["codegen"]
+    assert config.git.owners == (("src/acme/clients/**", "sdk-team"),)
+    assert [(t.name, t.primary_key, t.columns) for t in config.tables] == [
+        (t.name, t.primary_key, t.columns) for t in git_tables(DEFAULT_CLASSES)
+    ]
+    assert {t.name for t in config.tables} == {c.name for c in DEFAULT_CLASSES} | {"other"}
+    assert all(t.primary_key == "path" and "blob_sha" in t.columns for t in config.tables)
+    assert config.windows[0].name == "lines_per_hour"
+    assert config.engine.max_stage_seconds == 120.0
+
+
+@pytest.mark.parametrize(
+    ("text", "why"),
+    [
+        ('substrate = "git"\ndatabase = "c.db"\n', "needs a \\[git\\] section"),
+        (
+            'database = "c.db"\n[git]\nrepository = "r"\n'
+            '[[tables]]\nname = "t"\ncolumns = ["id"]\n',
+            "configures a Git substrate",
+        ),
+        (
+            'substrate = "git"\ndatabase = "c.db"\n[git]\nrepository = "r"\n'
+            '[[tables]]\nname = "t"\ncolumns = ["id"]\n',
+            "lists no \\[\\[tables\\]\\]",
+        ),
+        ('substrate = "git"\ndatabase = "c.db"\n[git]\nrepo = "r"\n', "unknown key"),
+        (
+            'substrate = "git"\ndatabase = "c.db"\n[git]\nrepository = "r"\n'
+            '[[git.classes]]\nname = "other"\npatterns = ["x"]\n',
+            "none is 'other'",
+        ),
+        (
+            'substrate = "git"\ndatabase = "c.db"\n[git]\nrepository = "r"\n'
+            '[[git.hooks]]\nname = "a"\nargv = ["x"]\n[[git.hooks]]\nname = "a"\nargv = ["y"]\n',
+            "named once",
+        ),
+        (
+            'substrate = "git"\ndatabase = "c.db"\n[git]\nrepository = "r"\n'
+            '[[git.hooks]]\nname = "a"\nargv = ["x"]\nsources = ["../x"]\n',
+            "git.hooks\\[0\\]",
+        ),
+        (
+            'substrate = "git"\ndatabase = "c.db"\n[git]\nrepository = "r"\n'
+            "[engine]\nworkers = 2\n",
+            "one worker",
+        ),
+        ('substrate = "svn"\ndatabase = "c.db"\n', "'sqlite', 'postgres' or 'git'"),
+    ],
+)
+def test_a_git_configuration_is_checked(tmp_path: Path, text: str, why: str) -> None:
+    from interlock.config import ConfigError, load_config
+
+    path = tmp_path / "interlock.toml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match=why):
+        load_config(path)
+
+
+def test_the_command_line_installs_checks_and_reconciles_a_repository(repo: Repo) -> None:
+    import io
+
+    from interlock.cli import main
+    from interlock.config import load_config
+    from interlock.runtime import EscrowRuntime
+
+    path = write_config(repo)
+    out = io.StringIO()
+    assert main(["install", "--config", str(path)], out=out) == 0
+    assert "the outbox, the inbox, and WAL mode, in the control database" in out.getvalue()
+    assert f"refs/heads/main at {repo.base}" in out.getvalue()
+    out = io.StringIO()
+    assert main(["check", "--config", str(path)], out=out) == 0
+    assert out.getvalue().startswith("ok: git, 8 path class(es)")
+    assert "hook: codegen" in out.getvalue()
+
+    chain = repo.root / "plans.chain"
+    config = load_config(path)
+    runtime = EscrowRuntime.from_config(
+        config, scope_id="agent", checkers=[BlastRadius(10)], chain_path=chain
+    )
+    try:
+        assert isinstance(runtime.engine._substrate, GitSubstrate)
+        result = runtime.execute(fix().build())
+        assert result.committed and result.diff is not None and len(result.diff.windows) == 1
+        refused = runtime.execute(
+            edit("src", "write 'src/acme/api/schema.json' :t", t='{"version": "2"}\n').build()
+        )
+        assert not refused.committed and refused.diff is not None
+        assert refused.diff.tenant_ids == {"acme", "sdk-team"}
+    finally:
+        runtime.close()
+
+    argv = ["reconcile-effects", "--config", str(path), "--chain", str(chain)]
+    with contextlib_redirect() as err:
+        assert main(argv, out=io.StringIO()) == 2
+    assert "needs --since" in err.getvalue()
+    out = io.StringIO()
+    assert main([*argv, "--since", repo.base], out=out) == 0
+    repo.push("docs/x.md", "x\n")
+    out = io.StringIO()
+    assert main([*argv, "--since", repo.base], out=out) == 1
+    assert "commit" in out.getvalue()
+
+
+def contextlib_redirect() -> Any:
+    import contextlib
+    import io
+
+    return contextlib.redirect_stderr(io.StringIO())

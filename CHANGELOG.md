@@ -32,6 +32,13 @@ Releases before 0.1.2 are described by their tags and commit history.
   inbox and rate windows' history are written in a SQLite stage under the same stage id.
   The branch moves inside that transaction, after a redo record of it is on disk, so a
   crash between the two commits is finished by recovery or by the next stage.
+- **A Git substrate in `interlock.toml`.** `substrate = "git"` with a `[git]` section
+  (repository, branch, workspace, owners, `[[git.classes]]`, `[[git.hooks]]`, stage root,
+  author, size limits), and `database` naming the SQLite control database. Its tables are
+  its path classes. `interlock install` sets up the control database and reads the
+  repository, `interlock check` prints the branch's head, `interlock reconcile-effects
+  --since <commit>` reconciles the branch, and `open_substrate`, `EscrowRuntime.from_config`
+  and the daemon's engines stage on it. A Git stage's default bound is 120 seconds.
 - **`SqliteSubstrate` gains what a control database needs.** `applied_elsewhere()` and
   `path`, and private `_open` and `_commit` beneath `open` and `commit`, whose signatures
   are unchanged.

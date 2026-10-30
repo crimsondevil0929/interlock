@@ -88,6 +88,36 @@ time, whatever each plan alone may do; an engine takes them as
     # column = "amount"               # ...and one of its columns
     # rows = "inserted"               # row_sum: or "net"
 
+A Git repository stages like a database (:mod:`interlock.git_substrate`):
+``substrate = "git"``, a ``[git]`` section, and ``database`` naming the SQLite
+control database that holds its outbox, inbox and window history (``interlock
+install`` sets it up). Its tables are its path classes, so it lists no
+``[[tables]]``; each has the columns ``path``, ``blob_sha``, ``mode``,
+``lines_added``, ``lines_deleted``, ``net_lines`` and ``secret_markers``::
+
+    substrate = "git"
+    database = "control.db"           # the control database: a SQLite file
+
+    [git]
+    repository = "billing-service.git"  # relative to this file; bare, or main not checked out
+    branch = "main"
+    workspace = "billing-service"     # the partition of every path no owner rule names
+    owners = [{ glob = "src/sdk/**", owner = "sdk-team" }]
+    # stage_root = "stages"           # stages' worktrees; in the Git directory by default
+    # author = { name = "interlock", email = "interlock@localhost" }
+
+    [[git.classes]]                   # replaces the default classes when given; first match wins
+    name = "workflows"
+    patterns = [".github/workflows/**"]
+
+    [[git.hooks]]                     # run in the stage's worktree after each effect
+    name = "codegen"
+    argv = ["python", "tools/codegen.py"]
+    when = ["src/billing/api/schema.json"]  # the paths that set it off; every effect when empty
+    sources = ["tools/codegen.py"]    # files it runs: a plan may not write them
+    timeout_seconds = 60
+    env = { CODEGEN_TARGET = "clients" }
+
 Relays sign every outcome they record (``docs/EPIC4_DESIGN.md`` §2); their
 public keys are registered for verification::
 
@@ -234,6 +264,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from interlock.git_substrate import COLUMNS, DEFAULT_CLASSES, FALLBACK_CLASS, GitHook, PathClass
 from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
 from interlock.outbound import (
     HTTP,
@@ -263,6 +294,7 @@ __all__ = [
     "DaemonConfig",
     "Endpoint",
     "EngineConfig",
+    "GitConfig",
     "InboxConfig",
     "InterlockConfig",
     "MetricsConfig",
@@ -272,6 +304,7 @@ __all__ = [
     "SettlerConfig",
     "SignerConfig",
     "VacuumConfig",
+    "git_tables",
     "load_config",
 ]
 
@@ -592,6 +625,32 @@ class InboxConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GitConfig:
+    """``[git]``: the repository a ``substrate = "git"`` stages on, as
+    :class:`~interlock.git_substrate.GitSubstrate` takes it."""
+
+    repository: Path
+    branch: str = "main"
+    classes: tuple[PathClass, ...] = DEFAULT_CLASSES
+    workspace: str | None = None
+    owners: tuple[tuple[str, str], ...] = ()
+    hooks: tuple[GitHook, ...] = ()
+    stage_root: Path | None = None
+    author: tuple[str, str] = ("interlock", "interlock@localhost")
+    max_file_bytes: int = 4 * 1024 * 1024
+    max_scan_bytes: int = 1024 * 1024
+
+
+def git_tables(classes: tuple[PathClass, ...]) -> tuple[TableSpec, ...]:
+    """A Git substrate's tables: one per path class and the fallback, keyed by
+    path, with the columns every path's image has."""
+    return tuple(
+        TableSpec(name, primary_key="path", columns=list(COLUMNS))
+        for name in (*(c.name for c in classes), FALLBACK_CLASS)
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class InterlockConfig:
     substrate: str
     database: str
@@ -627,6 +686,8 @@ class InterlockConfig:
     """``[signers.<name>]``: keys signing services hold, by name."""
     cluster: ClusterConfig | None = None
     """``[cluster]``: this daemon as a node of a cluster, or ``None`` alone."""
+    git: GitConfig | None = None
+    """``[git]``: the repository, when ``substrate = "git"``."""
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -686,17 +747,25 @@ def load_config(
         raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
 
     substrate = _string(raw, "substrate", default="sqlite")
-    if substrate not in ("sqlite", "postgres"):
-        raise ConfigError(f"substrate must be 'sqlite' or 'postgres', not {substrate!r}")
+    if substrate not in ("sqlite", "postgres", "git"):
+        raise ConfigError(f"substrate must be 'sqlite', 'postgres' or 'git', not {substrate!r}")
     url = database or os.environ.get(DATABASE_ENV) or _string(raw, "database", default="")
     if not url and require_database:
         raise ConfigError(
             f"no database: set 'database' in {path}, pass --database, or set {DATABASE_ENV}"
         )
+    git = _git(raw.get("git"), Path(path).parent, substrate)
     entries = raw.get("tables")
-    if not isinstance(entries, list) or not entries:
+    if git is not None:
+        if entries is not None:
+            raise ConfigError(
+                f"{path}: a Git substrate's tables are its path classes ([[git.classes]]), "
+                f"so it lists no [[tables]]"
+            )
+        entries = []
+    elif not isinstance(entries, list) or not entries:
         raise ConfigError(f"{path} lists no [[tables]]")
-    tables: list[TableSpec] = []
+    tables: list[TableSpec] = list(git_tables(git.classes)) if git is not None else []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ConfigError(f"tables[{index}] is not a table")
@@ -774,6 +843,115 @@ def load_config(
         metrics=_metrics(raw.get("metrics")),
         signers=signers,
         cluster=_cluster(raw.get("cluster"), substrate),
+        git=git,
+    )
+
+
+_GIT_KEYS = frozenset(
+    {
+        "repository",
+        "branch",
+        "classes",
+        "workspace",
+        "owners",
+        "hooks",
+        "stage_root",
+        "author",
+        "max_file_bytes",
+        "max_scan_bytes",
+    }
+)
+_HOOK_KEYS = frozenset({"name", "argv", "when", "sources", "env", "timeout_seconds"})
+
+
+def _git(raw: object, base: Path, substrate: str) -> GitConfig | None:
+    if raw is None:
+        if substrate == "git":
+            raise ConfigError('substrate = "git" needs a [git] section naming its repository')
+        return None
+    if substrate != "git":
+        raise ConfigError(f"[git] configures a Git substrate, and substrate is {substrate!r}")
+    if not isinstance(raw, dict):
+        raise ConfigError("'git' must be a table ([git])")
+    unknown = sorted(set(raw) - _GIT_KEYS)
+    if unknown:
+        raise ConfigError(f"[git]: unknown key(s) {', '.join(unknown)}")
+    classes: tuple[PathClass, ...] = DEFAULT_CLASSES
+    if "classes" in raw:
+        entries = raw["classes"]
+        if not isinstance(entries, list) or not entries:
+            raise ConfigError("[git]: classes are [[git.classes]] tables, at least one")
+        found: list[PathClass] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or set(entry) - {"name", "patterns"}:
+                raise ConfigError(f"git.classes[{index}]: a table of name and patterns")
+            try:
+                found.append(PathClass(_string(entry, "name"), tuple(_strings(entry, "patterns"))))
+            except ValueError as exc:
+                raise ConfigError(f"git.classes[{index}]: {exc}") from exc
+        classes = tuple(found)
+    names = [c.name for c in classes]
+    if len(set(names)) != len(names) or FALLBACK_CLASS in names:
+        raise ConfigError(
+            f"[git]: path classes are named once each, and none is {FALLBACK_CLASS!r}, the "
+            f"class of every path no pattern names"
+        )
+    owners: list[tuple[str, str]] = []
+    for index, entry in enumerate(raw.get("owners", [])):
+        if not isinstance(entry, dict) or set(entry) != {"glob", "owner"}:
+            raise ConfigError(f"git.owners[{index}]: a table of glob and owner")
+        owners.append((_string(entry, "glob"), _string(entry, "owner")))
+    hooks: list[GitHook] = []
+    hook_entries = raw.get("hooks", [])
+    if not isinstance(hook_entries, list):
+        raise ConfigError("[git]: hooks are [[git.hooks]] tables")
+    for index, entry in enumerate(hook_entries):
+        where = f"git.hooks[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where} is not a table")
+        unknown = sorted(set(entry) - _HOOK_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        env = entry.get("env", {})
+        if not isinstance(env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+        ):
+            raise ConfigError(f"{where}: env maps names to strings")
+        try:
+            hooks.append(
+                GitHook(
+                    _string(entry, "name"),
+                    tuple(_strings(entry, "argv")),
+                    when=tuple(_strings(entry, "when", required=False)),
+                    sources=tuple(_strings(entry, "sources", required=False)),
+                    env=dict(env),
+                    timeout=_seconds(entry, "timeout_seconds", 60.0),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    if len({h.name for h in hooks}) != len(hooks):
+        raise ConfigError("[git]: hooks are named once each")
+    author = raw.get("author", {"name": "interlock", "email": "interlock@localhost"})
+    if not isinstance(author, dict) or set(author) != {"name", "email"}:
+        raise ConfigError("[git]: author is a table of name and email")
+    stage_root = _string(raw, "stage_root", default="")
+    sizes = {key: _integer(raw, key, default) for key, default in (
+        ("max_file_bytes", 4 * 1024 * 1024), ("max_scan_bytes", 1024 * 1024)
+    )}  # fmt: skip
+    if min(sizes.values()) < 1:
+        raise ConfigError("[git]: max_file_bytes and max_scan_bytes are positive")
+    return GitConfig(
+        repository=base / _string(raw, "repository"),
+        branch=_string(raw, "branch", default="main"),
+        classes=classes,
+        workspace=_string(raw, "workspace", default="") or None,
+        owners=tuple(owners),
+        hooks=tuple(hooks),
+        stage_root=base / stage_root if stage_root else None,
+        author=(_string(author, "name"), _string(author, "email")),
+        max_file_bytes=sizes["max_file_bytes"],
+        max_scan_bytes=sizes["max_scan_bytes"],
     )
 
 
@@ -881,8 +1059,10 @@ _ENGINE_KEYS = frozenset(
 
 
 def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
+    # A Git stage checks a worktree out and runs hooks: its default bound is longer.
+    stage_seconds = 120.0 if substrate == "git" else 10.0
     if raw is None:
-        return EngineConfig()
+        return EngineConfig(max_stage_seconds=stage_seconds)
     if not isinstance(raw, dict):
         raise ConfigError("'engine' must be a table ([engine])")
     unknown = sorted(set(raw) - _ENGINE_KEYS)
@@ -892,10 +1072,10 @@ def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
     retries = _integer(raw, "conflict_retries", 16)
     if workers < 1 or retries < 0:
         raise ConfigError("[engine]: workers is at least 1, conflict_retries not negative")
-    if workers > 1 and substrate == "sqlite":
+    if workers > 1 and substrate in ("sqlite", "git"):
         raise ConfigError(
             "[engine]: SQLite admits one writer, and a stage holds the write lock for its "
-            "whole life: one worker"
+            "whole life (a Git stage, its control database's): one worker"
         )
     cost = _decimal(raw, "settle_cost")
     if cost < 0:
@@ -921,7 +1101,7 @@ def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
         ledger_schema=_string(raw, "ledger_schema", default="agentgov"),
         same_transaction=together,
         conflict_retries=retries,
-        max_stage_seconds=_seconds(raw, "max_stage_seconds", 10.0),
+        max_stage_seconds=_seconds(raw, "max_stage_seconds", stage_seconds),
         lock_timeout_seconds=_seconds(raw, "lock_timeout_seconds", 2.0),
         pool_timeout_seconds=(
             _seconds(raw, "pool_timeout_seconds", 2.0) if "pool_timeout_seconds" in raw else None

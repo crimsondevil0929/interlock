@@ -1095,6 +1095,33 @@ plan = (
 engine.execute(plan)
 ```
 
+Or configure it in `interlock.toml`, as SQLite and PostgreSQL are. `database` then names
+the control database, a SQLite file for the outbox, the inbox and window history (see
+below). `interlock install` sets it up, `interlock check` reads the branch's head through
+the substrate, and `EscrowRuntime.from_config`, the daemon and Fiduciary's service all stage
+on the repository:
+
+```toml
+substrate = "git"
+database = "control.db"
+
+[git]
+repository = "billing-service.git"   # relative to this file
+branch = "main"
+workspace = "billing-service"
+
+[[git.hooks]]
+name = "codegen"
+argv = ["python", "tools/codegen.py"]
+when = ["src/billing/api/schema.json"]
+sources = ["tools/codegen.py"]
+```
+
+The tables are the path classes, so a Git configuration lists no `[[tables]]`. A
+`[[windows]]` `row_sum` names a class and a column, such as `src` and `lines_added`. Give
+`[[git.classes]]` to replace the default classes. `interlock reconcile-effects --since
+<commit>` reconciles the branch.
+
 **What the checkers see.** Each changed path is one measured row:
 
 - the *table* is the path's class: `workflows` (`.github/workflows/**`), `governance`
@@ -1163,7 +1190,6 @@ holds the commit.
   Moving a checked-out branch would leave that worktree behind, so the substrate refuses.
 - A commit that a force-push later removes from the branch reads as not committed to
   recovery, unless a control database recorded it. Reconciliation names the rewrite.
-- `interlock.toml` cannot name a Git substrate yet. Build one in code.
 
 ## Outbound requests: the transactional outbox
 
