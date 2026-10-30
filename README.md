@@ -1065,16 +1065,33 @@ from interlock.git_substrate import GitHook, GitSubstrate
 repo = GitSubstrate(
     "/srv/git/billing-service.git",
     branch="main",
-    hooks=[GitHook("codegen", ("python", "tools/codegen.py"),
-                   when=("src/billing/api/schema.json",), sources=("tools/codegen.py",))],
+    hooks=[
+        GitHook(
+            "codegen",
+            ("python", "tools/codegen.py"),
+            when=("src/billing/api/schema.json",),
+            sources=("tools/codegen.py",),
+        )
+    ],
 )
-engine = EscrowEngine(repo, checkers=[
-    BlastRadius(12), TableAllowlist(["src", "tests", "docs"]), NoDelete(),
-])
-plan = PlanBuilder("repo-agent").update(
-    table="src", statement="replace :path :old :new", stated_rows=1,
-    parameters={"path": "src/billing/invoice.py", "old": "x * 1", "new": "round(x, 2)"},
-).build()
+engine = EscrowEngine(
+    repo,
+    checkers=[
+        BlastRadius(12),
+        TableAllowlist(["src", "tests", "docs"]),
+        NoDelete(),
+    ],
+)
+plan = (
+    PlanBuilder("repo-agent")
+    .update(
+        table="src",
+        statement="replace :path :old :new",
+        stated_rows=1,
+        parameters={"path": "src/billing/invoice.py", "old": "x * 1", "new": "round(x, 2)"},
+    )
+    .build()
+)
 engine.execute(plan)
 ```
 
