@@ -9,6 +9,64 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+### 1.2.0: any partition, any unit, any sink, and honest receipts
+
+Upgrades from 1.1.0 in place. Requires `interlock-agentgov>=1.1.0`, for units and ARC1
+1.3. A configuration that uses none of what follows keeps every plan, diff, verdict and
+schema hash, every checker's configuration digest, and every sink's configuration hash it
+had: each new field enters a hash only when it is set.
+
+### Added
+
+- **Partition dimensions beyond the tenant.** `TableSpec(partitions={"patient":
+  "patient_id"})` (a `"tenant"` entry is the `tenant_column`; `[[tables]] partitions` in
+  `interlock.toml`) labels every captured row in each dimension: `RowDelta.partitions`,
+  `EffectDiff.partition_ids(dimension)`, `partition_column_totals`. An effect declares its
+  own labels (`Effect.partitions`, `PlanBuilder.insert(..., partitions=...)`).
+  `TenantIsolation(dimension="patient")` (named `partition_isolation:patient`) holds a plan
+  to one patient's chart while another instance holds it to one facility, with `declared`
+  as before; a rate window keeps each label's history with `per = "partition:patient"` (a
+  request counts toward the label its effect declares). Feedback names only the labels the
+  plan itself declares in that dimension.
+- **Value guards both ways.** `ColumnValueGuard(max_rise_fraction=...)` and
+  `TenantDrawdownGuard(max_rise_fraction=..., dimension=...)` refuse a rise, a dose read in
+  micrograms for milligrams, a replica surge, as well as a fall; either bound or both. A
+  guard with a rise bound, or another dimension, reports totals at their own precision
+  (`0.125`, not `0.13`), and one configured as before reports as before, so its verdicts
+  are unchanged. Feedback: `value_rise`.
+- **Caps by any unit.** `PayloadAmountCap(maximum={"mg": "5"}, unit_field="unit")`:
+  `unit_field` reads a request's unit as `currency_field` reads its currency.
+- **Meters** (`interlock.meters`, `EscrowEngine(meters=...)`): what plans consume in a
+  unit (`mme`, `vcpu`, seats), conserved in an AgentGov ledger of that unit. Each plan holds
+  the meter's `per_plan` before it stages (an envelope with less refuses it there, quietly:
+  `MeterExhaustedError`, no breaker trip), is checked by `MeterCheck`, and settles what its
+  diff measured when it commits; a refused plan's hold is released, and recovery settles a
+  committed plan's hold whole. The receipt names each quantity and the transaction that
+  settled it.
+- **Honest receipts.** `SubstrateCapabilities.measurement` declares a driver's class, and
+  every receipt carries it (ARC1 1.3 `coverage.measurement`): `transactional` on SQLite,
+  PostgreSQL and Git, and `request-only` for a plan whose only effect is the requests it
+  commits, which then names its sinks in `cost.served_by`.
+- **Holding an operation for a warrant.** `OperationSpec(hold=True)` (`hold = true` on a
+  `[[sinks.operations]]` entry, of any sink, typed ones too): every request of it enters
+  the outbox held, with a `held` row in its delivery log written in the stage's own
+  transaction, even with its scope's breaker closed, and is delivered only once an
+  operator, or a warrant, releases it. Both outboxes mirror it (a `held` column on the sink
+  registry, added in place); the sink's configuration hash covers it only when set.
+- **MCP tools as a sink** (`interlock.mcp`, `type = "mcp"`): one operation per tool of an
+  upstream MCP server, with the schema the operator pins; a request is one `tools/call`.
+  At most once, always (`idempotency = "none"`, `unknown_outcome = "dead-letter"`, and no
+  other). `McpAdapter` takes any transport; `StdioServer` runs the server as the relay's
+  child (`[[relay.endpoints]] command = [...]`, `tools` where a tool's name is no
+  operation's). `mcp_sink` builds one in code.
+- **Sink and source kinds of a package's own.** `register_sink_kind` (or the
+  `interlock.sinks` entry point) adds a typed sink kind following the contract
+  `interlock.stripe` and `interlock.mcp` follow, `relay_adapter` included, so a FHIR server
+  or ServiceNow is configured from `interlock.toml`; `register_source_kind` (or
+  `interlock.sources`) adds an inbox source that signs its own way. A database's mirror
+  records such a kind as `http`, whose rules are none of its own; the configuration hash
+  beside it names the kind.
+
 ## [1.1.0] - 2026-10-30
 
 ### Added

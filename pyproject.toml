@@ -1,6 +1,6 @@
 [project]
 name = "interlock-escrow"
-version = "1.1.0"
+version = "1.2.0"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "interlock-agentgov>=1.0.0",
+    "interlock-agentgov>=1.1.0",
 ]
 
 [project.scripts]
@@ -38,13 +38,13 @@ postgres = ["psycopg[binary]>=3.2"]
 # operator's records (interlock outbox release, compensate...), an inbox's
 # (interlock inbox serve, which also verifies SendGrid's ECDSA signatures).
 # Verifying any of them needs nothing extra.
-sign = ["interlock-agentgov[sign]>=1.0.0"]
+sign = ["interlock-agentgov[sign]>=1.1.0"]
 # Signing with an Ed25519 key held by AWS KMS (interlock.signers.AwsKmsSigner,
 # AgentGov's own): boto3, through AgentGov's extra.
-kms-aws = ["interlock-agentgov[kms-aws]>=1.0.0"]
+kms-aws = ["interlock-agentgov[kms-aws]>=1.1.0"]
 # AgentGov's OpenTelemetry metrics (agentgov.otel.OpenTelemetryMetrics), for a
 # governor Interlock anchors to.
-otel = ["interlock-agentgov[otel]>=1.0.0"]
+otel = ["interlock-agentgov[otel]>=1.1.0"]
 
 [build-system]
 requires = ["hatchling"]
