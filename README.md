@@ -1042,6 +1042,112 @@ role may call that writes elsewhere, an extension such as `dblink` that opens an
 connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
 or later; CI runs 16.
 
+## Git: the same guarantee on a branch
+
+`GitSubstrate` stages a plan on a Git branch with the guarantee the SQL substrates give:
+what was measured is exactly what committed, or nothing committed. It needs only the `git`
+command.
+
+- **Stage.** Each plan gets a worktree of its own at the branch's head, its *base*.
+- **Apply.** Effects edit files there. The repository's hooks run after each effect, the way
+  triggers run after a statement: a code generator, a formatter, a lockfile refresh.
+- **Measure.** Git diffs everything in the worktree against the base. A file a hook wrote is
+  measured exactly like a file the plan wrote.
+- **Commit.** The commit is `git update-ref <branch> <new> <base>`, a compare-and-swap. If
+  anything moved the branch while the plan was staged (a push, a merge, another stage), the
+  branch stays where it is and nothing commits.
+
+<!-- readme-test: skip reason="needs a bare Git repository; tests/test_git_substrate.py makes the same calls on one" -->
+```python
+from interlock import BlastRadius, EscrowEngine, NoDelete, PlanBuilder, TableAllowlist
+from interlock.git_substrate import GitHook, GitSubstrate
+
+repo = GitSubstrate(
+    "/srv/git/billing-service.git",
+    branch="main",
+    hooks=[GitHook("codegen", ("python", "tools/codegen.py"),
+                   when=("src/billing/api/schema.json",), sources=("tools/codegen.py",))],
+)
+engine = EscrowEngine(repo, checkers=[
+    BlastRadius(12), TableAllowlist(["src", "tests", "docs"]), NoDelete(),
+])
+plan = PlanBuilder("repo-agent").update(
+    table="src", statement="replace :path :old :new", stated_rows=1,
+    parameters={"path": "src/billing/invoice.py", "old": "x * 1", "new": "round(x, 2)"},
+).build()
+engine.execute(plan)
+```
+
+**What the checkers see.** Each changed path is one measured row:
+
+- the *table* is the path's class: `workflows` (`.github/workflows/**`), `governance`
+  (`CODEOWNERS`, `SECURITY.md`, `LICENSE`), `infra`, `deps` (`pyproject.toml`, `uv.lock`,
+  `package-lock.json` and their kin), `tests`, `src`, `docs`, and `other` for any path no
+  rule names. The globs are configurable (`PathClass`).
+- the *primary key* is the path;
+- the *partition* is the repository, or the owner a rule names for the path.
+
+Each row records `path`, `blob_sha`, `mode`, `lines_added`, `lines_deleted`, `net_lines`
+and `secret_markers`. The last is how many credential-shaped strings the change adds: cloud
+and package-registry tokens, private keys, a CI workflow reading a secret, and long
+high-entropy strings. Only the count is kept, never the text.
+
+So every built-in checker works unchanged:
+
+- `TableAllowlist` keeps a plan out of workflow files;
+- `NoDelete` refuses a deleted test;
+- `BlastRadius` and `StatedFootprint` catch the 35 files a code generator rewrote after a
+  one-line edit;
+- `FactAgreement` holds a dependency change to CI's signed result for exactly the bytes
+  being written.
+
+**Statements.** A statement is one operation, with `:parameters` or `'quoted'` literals.
+That means a tool binding can pin it the way it pins SQL:
+
+| Statement | Does |
+|---|---|
+| `write :path :text` | creates or replaces a file |
+| `replace :path :old :new` | replaces the one occurrence of `old` (it fails on none, or on more than one) |
+| `delete :path` | removes a file |
+| `mode :path :mode` | sets `100644` or `100755` |
+| `patch :diff` | applies a unified diff (no renames, links or submodules) |
+| `expect-head :commit` | refuses unless the branch is at that commit |
+
+`expect-head` pins a plan to the commit its approvers reviewed. A warrant over such a plan
+commits onto that exact commit or not at all.
+
+A path is refused if it is absolute, has a `..` component, reaches into `.git`, or passes
+through a symbolic link. A plan may not write a file a hook runs (`GitHook.sources`).
+
+**Recovery and reconciliation.**
+
+- Each commit carries the trailer `Interlock-Stage: <stage id>`. `resolve_intent` reads the
+  branch's history for it, so a crash between the commit intent and its record is settled
+  exactly.
+- Savepoints are trees, so `EscrowEngine.repair` searches sub-plans on Git as it does on
+  SQL.
+- `reconcile_git(substrate, records, since=...)` names every commit on the branch that no
+  stage made, and a force-push that rewrote the branch.
+
+**The control database.** Rate windows, the outbox and the inbox need a transactional home
+that Git does not have. Pass `control=` a SQLite file that `interlock install` set up. A
+stage then writes its requests, the facts it consumes and its window history there, and
+the branch moves inside that transaction, just before it commits. A redo record is written
+to disk before the branch moves. If the process dies between the two commits, the next
+stage or `EscrowEngine.recover()` finishes the database's half, exactly when the branch
+holds the commit.
+
+**Limits.**
+
+- A hook is operator code. It runs in the stage's worktree, with a timeout and a scrubbed
+  environment (no variable of the process reaches it but `PATH`), and it can reach anything
+  the process can.
+- Point the substrate at a bare repository, or at a branch no worktree has checked out.
+  Moving a checked-out branch would leave that worktree behind, so the substrate refuses.
+- A commit that a force-push later removes from the branch reads as not committed to
+  recovery, unless a control database recorded it. Reconciliation names the rewrite.
+- `interlock.toml` cannot name a Git substrate yet. Build one in code.
+
 ## Outbound requests: the transactional outbox
 
 An email, a refund through a payment API, a webhook: a plan often has to call something
