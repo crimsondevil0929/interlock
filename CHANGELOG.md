@@ -36,6 +36,15 @@ Releases before 0.1.2 are described by their tags and commit history.
   `path`, and private `_open` and `_commit` beneath `open` and `commit`, whose signatures
   are unchanged.
 
+### Changed
+
+- **On Git, the agent is told about files, not rows.** Agent feedback carries the
+  substrate that measured the plan. On a repository it says files, path classes, owners
+  and "the branch moved", where SQL says rows, tables, tenants and "another writer holds
+  the rows". A live model refused for a code generator's 36 files read the SQL wording,
+  reasoned that the file must be backed by a database, and asked. Every other
+  substrate's feedback is unchanged, byte for byte.
+
 No wire format changes. ILOK1 records, ARC1 receipts and every verdict and hash are what
 they were; a Git stage's records and receipts are the same documents with other table
 names in them.
