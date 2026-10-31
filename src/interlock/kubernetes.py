@@ -47,6 +47,7 @@ replacement is in the diff.
 **Statements**, one operation each, with ``:parameters`` or ``'literals'``::
 
     scale <table> :namespace :name :replicas
+    set <table> :namespace :name :path :value       one field, at a dotted path, to a value
     merge-patch <table> :namespace :name :patch     a JSON merge patch (an object)
     apply <table> :manifest                         create or replace the whole object
     delete <table> :namespace :name
@@ -135,6 +136,7 @@ FINGERPRINT: Final = "fingerprint"
 
 VERBS: Final = {
     "scale": ("namespace", "name", "replicas"),
+    "set": ("namespace", "name", "path", "value"),
     "merge-patch": ("namespace", "name", "patch"),
     "apply": ("manifest",),
     "delete": ("namespace", "name"),
@@ -143,6 +145,8 @@ VERBS: Final = {
 """Each verb of the statement language, and its arguments in order."""
 
 _IDENTIFIER: Final = re.compile(r"[a-z][a-z0-9_]*")
+_FIELD: Final = re.compile(r"(spec|metadata\.(labels|annotations))(\.[A-Za-z0-9_/.-]+)+")
+"""A path ``set`` may write: under ``spec``, or a label or annotation."""
 _NAME: Final = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 _BOOKKEEPING: Final = ("resourceVersion", "generation", "uid", "creationTimestamp", "managedFields")
 _SUFFIXES: Final = {
@@ -660,9 +664,17 @@ class KubernetesSubstrate:
     def held_operations(self) -> dict[str, tuple[str, ...]]:
         return {} if self._control is None else self._control.held_operations()
 
-    def transaction_id(self, handle: StageHandle) -> str:
+    def transaction_id(self, handle: StageHandle) -> str | None:
         """``kubernetes:<stage id>``: what the cluster's audit log echoes, in
-        the annotation every write carries."""
+        the annotation every write carries. ``None`` for a stage that writes
+        no object (its effect is its requests): the cluster never sees it."""
+        stage = self._stage
+        if (
+            stage is not None
+            and stage.handle.stage_id == handle.stage_id
+            and not self._writes(stage)
+        ):
+            return None
         return f"kubernetes:{handle.stage_id}"
 
     # -- vetting ----------------------------------------------------------------
@@ -695,6 +707,14 @@ class KubernetesSubstrate:
                 return "scale takes a whole, non-negative number of replicas"
         if statement.verb == "merge-patch" and not isinstance(_json(bound["patch"]), dict):
             return "merge-patch takes a JSON object"
+        if statement.verb == "set":
+            path = bound["path"]
+            if not isinstance(path, str) or not _FIELD.fullmatch(path) or ".." in path:
+                return "set writes a path under spec, or a label or annotation"
+            if STAGE_ANNOTATION in path:
+                return "the stage marker is the substrate's to write"
+            if isinstance(bound["value"], Mapping | list | tuple):
+                return "set takes one value: a merge patch writes an object"
         return None
 
     def _names(self, kind: KubeKind, verb: str, bound: Mapping[str, object]) -> tuple[str, str]:
@@ -791,6 +811,8 @@ class KubernetesSubstrate:
                 changed = copy.deepcopy(current)
                 changed.setdefault("spec", {})["replicas"] = bound["replicas"]
                 obj.desired = changed
+            elif statement.verb == "set":
+                obj.desired = _with(current, str(bound["path"]), bound["value"], where)
             else:
                 patch = _json(bound["patch"])
                 obj.desired = _merge(current, patch)
@@ -1085,7 +1107,7 @@ class KubernetesSubstrate:
             committed_at=datetime.now(UTC),
             diff_hash="",
             verdict_hash="",
-            substrate_txn_id=self.transaction_id(handle),
+            substrate_txn_id=f"kubernetes:{handle.stage_id}" if writes else None,
         )
 
     def _apply_all(self, stage: _Stage, writes: Sequence[_Object]) -> None:
@@ -1395,6 +1417,31 @@ def _json(value: object) -> object:
     if isinstance(value, Mapping):
         return _thaw(value)
     return value
+
+
+def _with(document: Mapping[str, Any], path: str, value: object, where: str) -> dict[str, Any]:
+    """``document`` with the field at ``path`` set to ``value``: a missing
+    object on the way is created; a list index must exist."""
+    found = copy.deepcopy(dict(document))
+    current: Any = found
+    parts = path.split(".")
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        if isinstance(current, list):
+            if not part.isdigit() or int(part) >= len(current):
+                raise StageError(f"{where}: {path} names no item {part} of a list")
+            if last:
+                current[int(part)] = value
+            else:
+                current = current[int(part)]
+        elif isinstance(current, dict):
+            if last:
+                current[part] = value
+            else:
+                current = current.setdefault(part, {})
+        else:
+            raise StageError(f"{where}: {path} passes through a value, not an object")
+    return found
 
 
 def _thaw(value: Any) -> Any:

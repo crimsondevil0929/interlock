@@ -528,6 +528,55 @@ def test_an_unchanged_object_is_no_row(cluster: LoopbackCluster, tmp_path: Path)
     assert [e["verb"] for e in cluster.audit_events() if "dryRun" not in e["requestURI"]] == []
 
 
+def test_set_writes_one_field(cluster: LoopbackCluster, tmp_path: Path) -> None:
+    storage = (
+        "set statefulsets :a :b 'spec.volumeClaimTemplates.0.spec.resources.requests.storage' :v",
+        {"a": NS, "b": "orders-pg", "v": "750Gi"},
+        "statefulsets",
+    )
+    result = engine(substrate(cluster, tmp_path), tmp_path, NoDelete(()), BlastRadius(10)).execute(
+        plan(storage)
+    )
+    assert [d.operation for d in measured(result).deltas] == ["delete", "insert"]
+    label = (
+        "set deployments :a :b 'metadata.labels.tier' :v",
+        {"a": NS, "b": "checkout", "v": "web"},
+        "deployments",
+    )
+    assert engine(substrate(cluster, tmp_path / "l"), tmp_path / "l").execute(plan(label)).committed
+    live = cluster.get("deployments", NS, "checkout")
+    assert live is not None and live["metadata"]["labels"]["tier"] == "web"
+    sub = substrate(cluster, tmp_path / "v")
+    for path, value, message in [
+        ("status.replicas", 1, "under spec"),
+        ("spec..x", 1, "under spec"),
+        ("metadata.annotations.interlock.io/stage-id", "x", "marker"),
+        ("spec.replicas", {"a": 1}, "one value"),
+    ]:
+        (effect,) = plan(
+            (
+                "set deployments :a :b :p :v",
+                {"a": NS, "b": "api", "p": path, "v": value},
+                "deployments",
+            )
+        ).effects
+        assert message in str(sub.reject_reason(effect))
+    for path, message in [
+        ("spec.template.spec.containers.5.image", "no item"),
+        ("spec.replicas.x", "passes through"),
+    ]:
+        with pytest.raises(StageError, match=message):
+            engine(substrate(cluster, tmp_path / path), tmp_path).execute(
+                plan(
+                    (
+                        "set deployments :a :b :p :v",
+                        {"a": NS, "b": "api", "p": path, "v": "x"},
+                        "deployments",
+                    )
+                )
+            )
+
+
 def test_two_effects_on_one_object_compose(cluster: LoopbackCluster, tmp_path: Path) -> None:
     patch = (
         "merge-patch deployments :a :b :p",
