@@ -331,7 +331,7 @@ def _engines(
 ) -> EnginePool:
     from interlock.chain import EscrowChain
     from interlock.engine import EscrowEngine
-    from interlock.wiring import live_keyring, open_anchor, open_substrate
+    from interlock.wiring import live_keyring, open_anchor, open_sensors, open_substrate
 
     settings = config.engine
 
@@ -364,6 +364,7 @@ def _engines(
                 # An inbox key registered while the engine runs verifies the
                 # facts it attests (docs/EPIC8_DESIGN.md §3).
                 inbox=live_keyring(config, "inbox"),
+                sensors=open_sensors(config),
             )
         except BaseException:
             close()

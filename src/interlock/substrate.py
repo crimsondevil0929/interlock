@@ -678,6 +678,11 @@ class SqliteSubstrate:
         :param effect: The effect to vet.
         :returns: A refusal reason, or ``None`` when the effect may be staged.
         """
+        if effect.kind is EffectKind.APPLY:
+            return (
+                "an apply effect is in a substrate's own statement language (a manifest, "
+                "an input), and this one stages SQL: give it an insert, update or delete"
+            )
         verb = leading_verb(effect.statement)
         if verb in FORBIDDEN_VERBS:
             return (

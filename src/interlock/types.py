@@ -17,6 +17,7 @@ the same answer.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import re
@@ -149,6 +150,12 @@ class EffectKind(Enum):
 
     Defined but not implemented as of v0.1.0: nothing reads this kind.
     """
+
+    APPLY = "apply"
+    """An effect in the substrate's own statement language, not SQL: a
+    Kubernetes manifest or patch, a Terraform input (1.3.0). What it does is
+    never read from its kind: the substrate measures it, and the checkers judge
+    the measured diff. A SQL substrate refuses it."""
 
 
 class StageState(Enum):
@@ -700,6 +707,11 @@ class EffectDiff:
         diff's hash covers it and a verdict replays from the diff alone.
     :ivar facts: The inbound facts the stage consumed, read back from the
         database (:class:`InboundFact`).
+    :ivar unknowns: The values the substrate could not measure before
+        applying (:class:`UnknownValue`): a plan-bound substrate's "known
+        after apply" (1.3.0).
+    :ivar sensors: The analyzers' signed results on this diff
+        (:class:`SensorFact`), each bound to :meth:`measured_hash` (1.3.0).
     """
 
     plan_id: PlanId
@@ -711,6 +723,8 @@ class EffectDiff:
     outbound: tuple[OutboundDelta, ...] = ()
     windows: tuple[WindowMeasure, ...] = ()
     facts: tuple[InboundFact, ...] = ()
+    unknowns: tuple[UnknownValue, ...] = ()
+    sensors: tuple[SensorFact, ...] = ()
 
     def window(self, name: str, key: str) -> WindowMeasure | None:
         """The measure of window ``name`` for ``key``, if the stage took one."""
@@ -902,7 +916,23 @@ class EffectDiff:
                     ],
                 ]
             )
+        # And what could not be measured, and what the analyzers signed:
+        # each only when present, so every diff before 1.3.0 keeps its hash.
+        if self.unknowns:
+            fields.append(
+                [
+                    "unknowns",
+                    sorted([u.table, u.primary_key, u.column] for u in self.unknowns),
+                ]
+            )
+        if self.sensors:
+            fields.append(["sensors", sorted(f.digest() for f in self.sensors)])
         return canonical_hash(fields)
+
+    def measured_hash(self) -> str:
+        """The hash of what the substrate measured, without the analyzers'
+        facts about it: the ``subject`` a :class:`SensorFact` binds."""
+        return dataclasses.replace(self, sensors=()).content_hash()
 
 
 _NUMERAL: Final = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?", re.ASCII)
@@ -996,6 +1026,130 @@ def _as_decimal(value: object) -> Decimal:
 
 
 @dataclass(frozen=True, slots=True)
+class UnknownValue:
+    """A value a plan-bound substrate could not measure before applying: a
+    Terraform attribute "known after apply" (1.3.0). A gap in the measurement,
+    which ``TruncationGuard`` refuses unless the column is acknowledged."""
+
+    table: str
+    primary_key: str
+    column: str
+
+
+SENSOR_FORMAT: Final = "interlock-sensor-fact/1"
+"""What a sensor fact's signed message names itself (:class:`SensorFact`)."""
+
+
+@dataclass(frozen=True, slots=True)
+class SensorFact:
+    """An analyzer's signed result on one measured diff (1.3.0).
+
+    An analyzer (a schema or policy check, a scanner, a test run) cannot run
+    inside a checker, which must stay a pure function of the plan and the diff.
+    It runs beside the stage instead, on the diff the stage measured, and signs
+    what it found. The fact binds that diff by its hash (``subject``, the
+    diff's :meth:`EffectDiff.measured_hash`), so a fact about another diff, or
+    a fact replayed onto this one after the diff changed, is no fact about it.
+    ``SensorAttestation`` verifies the signature with the keys a mandate pins.
+
+    :ivar sensor: The analyzer's registered name.
+    :ivar subject: The measured diff's hash.
+    :ivar verdict: ``"pass"`` or ``"fail"``.
+    :ivar findings: How many problems it found.
+    :ivar detail: SHA-256 of its full report, which stays with the operator.
+    :ivar issued_at: When it signed, ISO-8601 UTC.
+    :ivar alg: The signature's algorithm (``ed25519`` or ``hmac-sha256``).
+    :ivar key_id: The signing key's id.
+    :ivar signature: Hex.
+    """
+
+    sensor: str
+    subject: str
+    verdict: str
+    findings: int
+    detail: str
+    issued_at: str
+    alg: str
+    key_id: str
+    signature: str
+
+    def message(self) -> bytes:
+        """The canonical bytes the signature covers."""
+        return canonical_bytes(
+            {
+                "format": SENSOR_FORMAT,
+                "sensor": self.sensor,
+                "subject": self.subject,
+                "verdict": self.verdict,
+                "findings": self.findings,
+                "detail": self.detail,
+                "issued_at": self.issued_at,
+            }
+        )
+
+    def digest(self) -> str:
+        """SHA-256 of the fact as signed, with its signature: what a verdict's
+        evidence and a diff's hash name it by."""
+        return hashlib.sha256(
+            self.message() + b"\n" + f"{self.alg}:{self.key_id}:{self.signature}".encode()
+        ).hexdigest()
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "sensor": self.sensor,
+            "subject": self.subject,
+            "verdict": self.verdict,
+            "findings": self.findings,
+            "detail": self.detail,
+            "issued_at": self.issued_at,
+            "alg": self.alg,
+            "key_id": self.key_id,
+            "signature": self.signature,
+        }
+
+    @classmethod
+    def from_json(cls, raw: object) -> SensorFact:
+        """:raises ValueError: On anything but the nine members, well formed."""
+        names = (
+            "sensor",
+            "subject",
+            "verdict",
+            "findings",
+            "detail",
+            "issued_at",
+            "alg",
+            "key_id",
+            "signature",
+        )
+        if not isinstance(raw, Mapping) or sorted(raw) != sorted(names):
+            raise ValueError(f"a sensor fact is an object of {', '.join(names)}")
+        findings = raw["findings"]
+        if isinstance(findings, bool) or not isinstance(findings, int) or findings < 0:
+            raise ValueError("a sensor fact's findings is a count")
+        texts = {n: raw[n] for n in names if n != "findings"}
+        if not all(isinstance(v, str) and v for v in texts.values()):
+            raise ValueError("a sensor fact's members other than findings are text")
+        if raw["verdict"] not in ("pass", "fail"):
+            raise ValueError("a sensor fact's verdict is pass or fail")
+        if not _HEX64.fullmatch(raw["subject"]) or not _HEX64.fullmatch(raw["detail"]):
+            raise ValueError("a sensor fact's subject and detail are SHA-256 hex digests")
+        return cls(
+            sensor=raw["sensor"],
+            subject=raw["subject"],
+            verdict=raw["verdict"],
+            findings=findings,
+            detail=raw["detail"],
+            issued_at=raw["issued_at"],
+            alg=raw["alg"],
+            key_id=raw["key_id"],
+            signature=raw["signature"],
+        )
+
+
+_HEX64: Final = re.compile(r"[0-9a-f]{64}")
+
+
+@dataclass(frozen=True, slots=True)
 class InvariantViolation:
     invariant: str
     severity: Severity
@@ -1062,6 +1216,12 @@ class SubstrateCapabilities:
     labels it: ``transactional`` (what was measured is what commits),
     ``plan-bound``, ``predicted`` or ``request-only``. Every receipt of a plan
     it stages carries it."""
+    plan_bound: bool = False
+    """Class P (1.3.0): what was measured is the plan that will be applied, and
+    the apply refuses if the system moved since (a ``resourceVersion``, a
+    state serial). The system cannot roll a partial apply back, so the driver
+    writes its undo down before applying (:mod:`interlock.planbound`), and
+    undoes a partial apply itself."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -452,6 +452,8 @@ def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> No
 
 def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
+    if config.plan_bound:
+        return _install_plan_bound(config, out)
     if config.git is not None:
         from interlock.sqlite_outbox import install_sqlite_outbox
 
@@ -1392,6 +1394,13 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
 
 
 def _check(config: InterlockConfig, out: TextIO) -> int:
+    if config.plan_bound:
+        print(
+            f"ok: {config.substrate} (plan-bound), {len(config.tables)} observed table(s)",
+            file=out,
+        )
+        _print_plan_bound(config, out)
+        return EXIT_OK
     if config.git is not None:
         print(f"ok: git, {len(config.tables)} path class(es)", file=out)
         _print_git(config, out)
@@ -1418,6 +1427,15 @@ def _reconcile(
     *,
     since: str | None = None,
 ) -> int:
+    if config.plan_bound:
+        print(
+            f"interlock: reconcile-effects reads a database's journal; on {config.substrate}, "
+            f"reconcile the system's own audit log against the receipts instead: "
+            f"agentgov reconcile-actions <receipts> <audit log>"
+            + (" --format k8s-audit-jsonl" if config.kubernetes is not None else ""),
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
     records: list[EscrowRecord] = []
     for path in chains:
         try:
@@ -1449,6 +1467,50 @@ def _reconcile(
     for line in format_reconciliation(result):
         print(line, file=out)
     return EXIT_OK if result.clean else EXIT_FINDINGS
+
+
+def _install_plan_bound(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
+    """A plan-bound substrate has nothing to install in the system it stages
+    on; its control database, when it has one, gets the outbox and inbox."""
+    legacy = None
+    if config.kubernetes is not None and config.database:
+        from interlock.sqlite_outbox import install_sqlite_outbox
+
+        legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
+        print("installed: the outbox, the inbox, and WAL mode, in the control database", file=out)
+        for sink in config.sinks:
+            operations = ", ".join(op.name for op in sink.operations)
+            print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
+        for source in config.inbox.sources:
+            print(f"registered inbound source: {source.name} ({source.kind})", file=out)
+    _print_plan_bound(config, out)
+    return EXIT_OK, legacy
+
+
+def _print_plan_bound(config: InterlockConfig, out: TextIO) -> None:
+    """What a plan-bound substrate stages on: the cluster or configuration,
+    its tables, and where its undos are written."""
+    if config.kubernetes is not None:
+        settings = config.kubernetes
+        print(f"cluster: {settings.server}", file=out)
+        for kind in settings.kinds:
+            replace = ", replaced on an immutable change" if kind.replace_on_immutable else ""
+            print(f"kind: {kind.api_version} {kind.kind} as table {kind.table}{replace}", file=out)
+        namespaces = ", ".join(settings.namespaces) or "any"
+        print(f"namespaces: {namespaces}", file=out)
+        print(f"undo journal: {settings.journal}", file=out)
+        print(
+            f"control database: {config.database or 'none (no outbox, inbox or windows)'}", file=out
+        )
+    elif config.terraform is not None:
+        tf = config.terraform
+        print(f"configuration: {tf.directory} ({' '.join(tf.executable)})", file=out)
+        for resource in tf.resources:
+            print(f"resource: {resource.type} as table {resource.table}", file=out)
+        print("resource: any other type, as table resources", file=out)
+        print(f"undo journal: {tf.journal}", file=out)
+    for sensor in config.sensors:
+        print(f"sensor: {sensor.name} ({' '.join(sensor.argv)})", file=out)
 
 
 def _print_git(config: InterlockConfig, out: TextIO) -> None:

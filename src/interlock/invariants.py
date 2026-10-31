@@ -17,7 +17,7 @@ which the untrusted agent sets. Each says so in its own docstring.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import ClassVar, Final, Protocol, runtime_checkable
 
@@ -617,35 +617,82 @@ def _moves(
 
 
 class TruncationGuard:
-    """Refuse a diff that hit the row cap.
+    """Refuse a diff that hit the row cap, or holds a value no one measured.
 
     A truncated diff is a prefix of the real delta. Every other checker here
     reads it as if it were complete, so this one blocks first rather than
     letting them pass on a partial measurement.
+
+    A plan-bound substrate's diff can also hold values that are only known
+    after the apply (a Terraform attribute the provider computes): a gap in
+    the measurement of the same kind. Each such value blocks too, unless its
+    column is acknowledged, as ``acknowledge_cascades`` acknowledges a
+    measured gap (1.3.0).
+
+    :param acknowledged_unknown: ``"<table>.<column>"`` names whose
+        not-yet-known values the operator accepts unmeasured.
     """
+
+    __slots__ = ("_acknowledged",)
+
+    UNSET: ClassVar[Mapping[str, object]] = {"_acknowledged": frozenset()}
+
+    def __init__(self, acknowledged_unknown: Iterable[str] = ()) -> None:
+        self._acknowledged = frozenset(acknowledged_unknown)
 
     @property
     def name(self) -> str:
         return "truncation_guard"
 
+    @property
+    def acknowledged_unknown(self) -> frozenset[str]:
+        return self._acknowledged
+
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
-        if not diff.truncated:
+        if diff.truncated:
+            return (
+                InvariantViolation(
+                    invariant=self.name,
+                    severity=Severity.BLOCKING,
+                    message=(
+                        "diff exceeded the row cap and is incomplete; refusing to adjudicate a "
+                        "sample"
+                    ),
+                    evidence={"measured_rows": str(diff.blast_radius)},
+                ),
+            )
+        unmeasured = sorted(
+            {
+                (u.table, u.primary_key, u.column)
+                for u in diff.unknowns
+                if f"{u.table}.{u.column}" not in self._acknowledged
+            }
+        )
+        if not unmeasured:
             return ()
+        table, key, column = unmeasured[0]
         return (
             InvariantViolation(
                 invariant=self.name,
                 severity=Severity.BLOCKING,
                 message=(
-                    "diff exceeded the row cap and is incomplete; refusing to adjudicate a sample"
+                    f"{len(unmeasured)} value(s) are known only after the apply, so the diff "
+                    f"does not measure them: {table}.{column} of {key} first. Refusing to "
+                    f"adjudicate what was not measured"
                 ),
-                evidence={"measured_rows": str(diff.blast_radius)},
+                evidence={
+                    "unknown": str(len(unmeasured)),
+                    "first": f"{table}.{column}",
+                },
             ),
         )
 
     def hint(
         self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
     ) -> FeedbackHint:
-        return FeedbackHint(kind=Guidance.TRUNCATED, measured=diff.blast_radius)
+        if diff.truncated:
+            return FeedbackHint(kind=Guidance.TRUNCATED, measured=diff.blast_radius)
+        return FeedbackHint(kind=Guidance.OPERATOR)
 
 
 class StatedFootprint:

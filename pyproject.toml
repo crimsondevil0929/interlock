@@ -1,6 +1,6 @@
 [project]
 name = "interlock-escrow"
-version = "1.2.0"
+version = "1.3.0"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -94,12 +94,18 @@ ignore = ["S101"]
 # secrets they make up, which name nothing real (S105, S106).
 "tests/**/*.py" = ["S101", "S105", "S106", "S608"]
 "tests/test_git_substrate.py" = ["S101", "S105", "S106", "S603", "S607", "S608"]
+# The plan-bound substrates' tests run the stand-in commands and call the
+# loopback API server they start themselves (1.3.0).
+"tests/test_terraform.py" = ["S101", "S105", "S106", "S603", "S607", "S608"]
+"tests/test_kubernetes.py" = ["S101", "S105", "S106", "S310", "S608"]
 # The capture triggers interpolate table and column names because SQL has no
 # parameter binding for identifiers in DDL. Every identifier is validated by
 # substrate._assert_identifier at TableSpec construction and comes from
 # operator configuration, never from the agent.
 "src/interlock/substrate.py" = ["S608"]
 "src/interlock/git_substrate.py" = ["S608"]
+# A control stage's redo: its own module-constant table names, every value bound.
+"src/interlock/control.py" = ["S608"]
 # The same, for the PostgreSQL install DDL and catalog queries: identifiers are
 # validated TableSpec names, and the rest is constant SQL joined together.
 "src/interlock/postgres.py" = ["S608"]

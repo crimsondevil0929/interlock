@@ -74,7 +74,6 @@ substrate refuses to.
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import json
 import logging
@@ -93,6 +92,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from interlock.chain import EscrowRecord
+from interlock.control import capture, durable_write, replay
 from interlock.exceptions import (
     CommitUnsettledError,
     ForbiddenStatementError,
@@ -104,10 +104,8 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
 )
-from interlock.inbox_sql import SQLITE_CONSUMED
 from interlock.reconcile import Reconciliation, UnmediatedWrite, _stage_findings
-from interlock.sqlite_outbox import OUTBOX, STATE, TRACES, WINDOWS_TABLE
-from interlock.substrate import _MARKER_TABLE, STAGE_JOURNAL_TABLE, SqliteSubstrate
+from interlock.substrate import SqliteSubstrate
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -1349,47 +1347,21 @@ class GitSubstrate:
 
     # -- the redo record ------------------------------------------------------
 
-    _REDO_TABLES: Final = (
-        (_MARKER_TABLE, "stage_id = :stage"),
-        (OUTBOX, "stage_id = :stage"),
-        (STATE, f"message_id IN (SELECT message_id FROM {OUTBOX} WHERE stage_id = :stage)"),
-        (TRACES, f"message_id IN (SELECT message_id FROM {OUTBOX} WHERE stage_id = :stage)"),
-        (SQLITE_CONSUMED, "stage_id = :stage"),
-        (WINDOWS_TABLE, "stage_id = :stage"),
-        (STAGE_JOURNAL_TABLE, "stage_id = :stage"),
-    )
-    """What a control stage writes, in the order a redo writes it again."""
-
     def _redo_path(self, stage_id: uuid.UUID) -> Path:
         return self._common / "interlock" / "redo" / f"{stage_id}.json"
 
     def _write_redo(self, stage: _Stage, new: str, conn: sqlite3.Connection) -> Path:
         """Every row the control stage holds, on disk before the branch moves."""
-        tables: dict[str, list[dict[str, Any]]] = {}
-        for table, where in self._REDO_TABLES:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
-            ).fetchone()
-            if exists is None:
-                continue
-            cursor = conn.execute(
-                f"SELECT * FROM main.{table} WHERE {where}",
-                {"stage": str(stage.handle.stage_id)},
-            )
-            columns = [c[0] for c in cursor.description]
-            rows = [dict(zip(columns, map(_jsonable, row), strict=True)) for row in cursor]
-            if rows:
-                tables[table] = rows
         record = {
             "stage_id": str(stage.handle.stage_id),
             "ref": self._ref,
             "base": stage.base,
             "commit": new,
-            "tables": tables,
+            "tables": capture(conn, stage.handle.stage_id),
         }
         path = self._redo_path(stage.handle.stage_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _durable_write(path, json.dumps(record, sort_keys=True).encode("utf-8"))
+        durable_write(path, json.dumps(record, sort_keys=True).encode("utf-8"))
         return path
 
     def _settle_redo(self, *, only: uuid.UUID | None = None) -> bool | None:
@@ -1427,38 +1399,12 @@ class GitSubstrate:
     def _redo(self, record: Mapping[str, Any]) -> None:
         """Write a redo record's rows, once: nothing, when its marker is there."""
         assert self._control is not None
-        path = self._control.path
-        try:
-            conn = sqlite3.connect(path, isolation_level=None, timeout=self._stage_seconds)
-        except sqlite3.Error as exc:
-            raise SubstrateUnavailableError(f"cannot open {path}: {exc}") from exc
-        try:
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("BEGIN IMMEDIATE")
-            present = conn.execute(
-                f"SELECT 1 FROM main.{_MARKER_TABLE} WHERE stage_id = ?",
-                (str(record["stage_id"]),),
-            ).fetchone()
-            if present is None:
-                for table, _ in self._REDO_TABLES:
-                    for row in record["tables"].get(table, ()):
-                        columns = sorted(row)
-                        conn.execute(
-                            f"INSERT INTO main.{table} ({', '.join(columns)}) "
-                            f"VALUES ({', '.join('?' for _ in columns)})",
-                            [_from_json(row[c]) for c in columns],
-                        )
-            conn.execute("COMMIT")
-        except sqlite3.Error as exc:
-            with contextlib.suppress(sqlite3.Error):
-                conn.execute("ROLLBACK")
-            raise StageError(
-                f"stage {record['stage_id']}: its commit is on the branch and its control "
-                f"rows could not be written again: {exc}"
-            ) from exc
-        finally:
-            conn.close()
+        replay(
+            self._control.path,
+            str(record["stage_id"]),
+            record["tables"],
+            timeout=self._stage_seconds,
+        )
 
     # -- savepoints -----------------------------------------------------------
 
@@ -1608,33 +1554,6 @@ def _numstat_paths(output: bytes) -> list[str]:
         for record in output.split(b"\0")
         if record.count(b"\t") >= 2
     ]
-
-
-def _jsonable(value: object) -> object:
-    if isinstance(value, bytes):
-        return {"b64": base64.b64encode(value).decode("ascii")}
-    return value
-
-
-def _from_json(value: object) -> object:
-    if isinstance(value, dict) and set(value) == {"b64"}:
-        return base64.b64decode(str(value["b64"]))
-    return value
-
-
-def _durable_write(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` so it is on disk, whole, when this returns."""
-    temporary = path.with_suffix(".tmp")
-    with open(temporary, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    descriptor = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 # --------------------------------------------------------------------------

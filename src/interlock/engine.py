@@ -63,6 +63,7 @@ from interlock.exceptions import (
     AdmissionError,
     AnchorError,
     CommitUnsettledError,
+    CompensatedError,
     CyclicPlanError,
     ForbiddenStatementError,
     InboundFactError,
@@ -82,6 +83,7 @@ from interlock.meters import Meter, MeterCheck, Metered
 from interlock.outbound import SinkRegistry
 from interlock.records import Keyring
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
+from interlock.sensors import Sensor, sense
 from interlock.substrate import ShadowSubstrate, _verb_reason
 from interlock.trace import require_traceparent
 from interlock.types import (
@@ -136,6 +138,11 @@ _SETTLEMENT_CLAIMED = "; settlement claimed"
 inside the stage's own transaction, so it commits with the effects or not at
 all, and its spend will name this record. Precedes the marker suffix, which
 recovery reads."""
+
+_UNDO = "; undo "
+"""Infix on a ``COMMIT_INTENT`` note: the SHA-256 of the undo a plan-bound
+substrate wrote down before applying (:mod:`interlock.planbound`). Precedes the
+marker suffix, which recovery reads."""
 
 _SAVEPOINT = "ilok_repair"
 """The savepoint a repair search returns to between candidates."""
@@ -225,6 +232,10 @@ class EscrowEngine:
         ledger of its unit: held before a plan stages, checked, and settled
         when it commits. A :class:`~interlock.meters.MeterCheck` is added to
         ``checkers`` for each. See :mod:`interlock.meters`.
+    :param sensors: Analyzers run on each measured diff before it is judged
+        (1.3.0): each signs a fact about the diff, which a
+        :class:`~interlock.sensors.SensorAttestation` checker may require. See
+        :mod:`interlock.sensors`.
     :raises ValueError: If ``settle_cost`` is negative, ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`, two windows share a
         name, or the substrate keeps no window history, or two meters
@@ -242,6 +253,7 @@ class EscrowEngine:
         "_meters",
         "_receipts",
         "_reserving",
+        "_sensors",
         "_settle_cost",
         "_sinks",
         "_substrate",
@@ -261,8 +273,13 @@ class EscrowEngine:
         windows: Sequence[RateWindow] = (),
         inbox: Keyring | None = None,
         meters: Sequence[Meter] = (),
+        sensors: Sequence[Sensor] = (),
     ) -> None:
         self._substrate = substrate
+        self._sensors = tuple(sensors)
+        named = [s.name for s in self._sensors]
+        if len(set(named)) != len(named):
+            raise ValueError(f"sensors share a name: {', '.join(sorted(named))}")
         self._sinks = sinks
         self._inbox = inbox
         self._receipts = receipts
@@ -635,8 +652,12 @@ class EscrowEngine:
                 diff.content_hash(),
                 stage=handle.stage_id,
                 note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)"
-                + (f", {len(diff.windows)} window key(s)" if diff.windows else ""),
+                + (f", {len(diff.windows)} window key(s)" if diff.windows else "")
+                + (f", {len(diff.unknowns)} unknown value(s)" if diff.unknowns else ""),
             )
+            # The analyzers read the diff as measured, and sign what they
+            # found about it; the verdict judges the diff with their facts.
+            diff = sense(self._sensors, plan, diff)
             # What the commit will charge for: the requests the stage wrote,
             # which must be exactly the ones the plan declared, at the price
             # the hold was placed for.
@@ -689,6 +710,10 @@ class EscrowEngine:
                     # on disk and the chain says the plan never got that far.
                     armed = bool(getattr(self._substrate, "commit_markers", False))
                     txid = _transaction_id(self._substrate, handle)
+                    # A plan-bound substrate cannot roll a partial apply
+                    # back: it writes its undo down first, and the intent
+                    # names it, before the first write goes out.
+                    undo = _write_undo(self._substrate, handle)
                     self._inflight.add(handle.stage_id)
                     intent = self._record(
                         RecordType.COMMIT_INTENT,
@@ -698,6 +723,7 @@ class EscrowEngine:
                         note=f"about to commit {diff.blast_radius} rows"
                         + (f"{_TXID}{txid}" if txid else "")
                         + (f"{_OUTBOUND}{len(diff.outbound)}" if diff.outbound else "")
+                        + (f"{_UNDO}{undo}" if undo else "")
                         + (_SETTLEMENT_CLAIMED if ledger is not None else "")
                         + (_MARKER_ARMED if armed else ""),
                     )
@@ -709,7 +735,13 @@ class EscrowEngine:
                             intent.record_hash, cost=cost + outbound_cost, reservation=reservation
                         )
                     try:
-                        self._substrate.commit(handle)
+                        landed = self._substrate.commit(handle)
+                        # A substrate that names its commit only once it is
+                        # made (Git's new commit) names it in the receipt, so a
+                        # system of record that echoes it ties back (1.3.0).
+                        named = getattr(landed, "substrate_txn_id", None)
+                        if txid is None and isinstance(named, str) and named:
+                            txid = named
                     except CommitUnsettledError as lost:
                         # The COMMIT went out and no answer came back. The
                         # marker says what the server did; it returns only
@@ -741,6 +773,22 @@ class EscrowEngine:
                 note=f"scope halted: {exc}{stamp if judged is not None else ''}",
                 best_effort=True,
             )
+        except CompensatedError as exc:
+            # A plan-bound commit applied part of the plan, failed, and was
+            # put back from its undo: nothing of it is left applied.
+            self._substrate.abort(handle)
+            self._record(
+                RecordType.COMPENSATED,
+                plan,
+                diff.content_hash() if diff is not None else plan.content_hash(),
+                stage=handle.stage_id,
+                note=f"partial apply undone: {exc.restored} of {exc.applied} object(s) "
+                f"restored from undo {exc.undo[:16]}",
+                best_effort=True,
+            )
+            self._release(reservation)
+            self._release_meters(held)
+            raise
         except Exception as exc:
             if committed or isinstance(exc, CommitUnsettledError):
                 # The effects are durable, and only the record of them failed;
@@ -1272,6 +1320,26 @@ class EscrowEngine:
                 )
                 continue
             point = self._observe(best_effort=True)
+            undone = _compensated(self._substrate, stage_id) if not outcome else None
+            if undone is not None:
+                record = self._chain.append(
+                    RecordType.COMPENSATED,
+                    plan_id=intent.plan_id,
+                    payload_hash=intent.payload_hash,
+                    stage_id=stage_id,
+                    anchored=point.anchored,
+                    agentgov_head_hash=point.head_hash,
+                    agentgov_sequence=point.sequence,
+                    note=f"recovered: the apply stopped part way and was undone from undo "
+                    f"{undone[:16]} (intent {intent.sequence})",
+                )
+                logger.warning(
+                    "recovered commit intent for plan %s (stage %s): partial apply undone",
+                    intent.plan_id,
+                    stage_id,
+                )
+                resolved.append(record)
+                continue
             record = self._chain.append(
                 RecordType.COMMITTED if outcome else RecordType.ABORTED,
                 plan_id=intent.plan_id,
@@ -1404,6 +1472,17 @@ class EscrowEngine:
         if outcome is None:
             raise lost
         if not outcome:
+            undone = _compensated(self._substrate, stage_id)
+            if undone is not None:
+                # A plan-bound apply that stopped part way, put back from its
+                # undo: nothing of it is left applied.
+                raise CompensatedError(
+                    f"stage {stage_id}: the apply stopped part way, and was undone from undo "
+                    f"{undone[:16]}",
+                    applied=0,
+                    restored=0,
+                    undo=undone,
+                ) from lost
             raise StageError(
                 f"commit failed: the connection was lost and stage {stage_id} left no "
                 f"commit marker; the server rolled it back"
@@ -1665,6 +1744,24 @@ def _transaction_id(substrate: ShadowSubstrate, handle: StageHandle) -> str | No
         return None
     value = reader(handle)
     return str(value) if value else None
+
+
+def _write_undo(substrate: ShadowSubstrate, handle: StageHandle) -> str | None:
+    """The digest of the undo a plan-bound substrate wrote for the stage."""
+    writer = getattr(substrate, "write_undo", None)
+    if not callable(writer):
+        return None
+    digest = writer(handle)
+    return str(digest) if digest else None
+
+
+def _compensated(substrate: ShadowSubstrate, stage_id: uuid.UUID) -> str | None:
+    """The undo's digest, when recovery put the stage's partial apply back."""
+    reader = getattr(substrate, "compensated", None)
+    if not callable(reader):
+        return None
+    digest = reader(stage_id)
+    return str(digest) if digest else None
 
 
 def _recorded_txid(note: str) -> str | None:
