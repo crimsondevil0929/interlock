@@ -9,7 +9,9 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-### 1.3.0: plan-bound substrates, sensor facts, and pinned checker packs
+## [1.3.0] - 2026-10-31
+
+Plan-bound substrates, sensor facts, and pinned checker packs.
 
 Kubernetes and Terraform as substrates, staged class P: what was measured is the plan that
 is applied, on the state measured, with an undo written down first. Upgrades from 1.2.0 in
