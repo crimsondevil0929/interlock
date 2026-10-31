@@ -34,6 +34,10 @@ had: each new field enters a hash only when it is set.
   guard with a rise bound, or another dimension, reports totals at their own precision
   (`0.125`, not `0.13`), and one configured as before reports as before, so its verdicts
   are unchanged. Feedback: `value_rise`.
+- **One agreement over several operations.** `CrossEffectAgreement(..., also=(...))` holds a
+  quantity to its rows whichever of the sink's operations carries it: a medication order,
+  and the same order on a held Schedule II operation. Its name joins the operations with
+  `|`. A rule without `also` keeps its name, its messages and its checker digest.
 - **Caps by any unit.** `PayloadAmountCap(maximum={"mg": "5"}, unit_field="unit")`:
   `unit_field` reads a request's unit as `currency_field` reads its currency.
 - **Meters** (`interlock.meters`, `EscrowEngine(meters=...)`): what plans consume in a

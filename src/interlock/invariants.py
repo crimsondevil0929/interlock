@@ -756,6 +756,10 @@ class CrossEffectAgreement:
 
     :param sink: The requests this rule applies to: this sink's...
     :param operation: ...calls of this operation.
+    :param also: ...and of these operations of the same sink: one quantity
+        that travels by more than one call (an order, and the same order on a
+        held operation) is held to its rows whichever call carries it. Added
+        in 1.2.0; a rule without it keeps its digest.
     :param field: The payload field, a dotted path: ``"amount"``,
         ``"refund.amount"``, ``"lines.0.amount"``.
     :param table: The rows the field must agree with: this table's...
@@ -785,7 +789,18 @@ class CrossEffectAgreement:
     :raises ValueError: On an unknown measure, or an empty name or key.
     """
 
-    __slots__ = ("_column", "_field", "_key", "_measure", "_operation", "_path", "_sink", "_table")
+    __slots__ = (
+        "_also",
+        "_column",
+        "_field",
+        "_key",
+        "_measure",
+        "_operation",
+        "_path",
+        "_sink",
+        "_table",
+    )
+    UNSET: ClassVar[Mapping[str, object]] = {"_also": ()}
 
     def __init__(
         self,
@@ -797,16 +812,22 @@ class CrossEffectAgreement:
         column: str,
         measure: str = "inserted",
         key: tuple[str, str] | None = None,
+        also: Sequence[str] = (),
     ) -> None:
+        if isinstance(also, str):
+            raise ValueError("also is a sequence of operations, not one")
+        operations = (operation, *also)
         for label, value in (
             ("sink", sink),
-            ("operation", operation),
+            *(("operation", o) for o in operations),
             ("field", field),
             ("table", table),
             ("column", column),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"CrossEffectAgreement needs a {label}")
+        if len(set(operations)) != len(operations):
+            raise ValueError("CrossEffectAgreement names each operation once")
         if measure not in _MEASURES:
             raise ValueError(f"measure is one of {', '.join(_MEASURES)}, not {measure!r}")
         if key is not None and (
@@ -815,6 +836,7 @@ class CrossEffectAgreement:
             raise ValueError("key is a (payload_field, column) pair")
         self._sink = sink
         self._operation = operation
+        self._also = tuple(also)
         self._field = field
         self._path = _path(field)
         self._table = table
@@ -823,15 +845,25 @@ class CrossEffectAgreement:
         self._key = key
 
     @property
+    def _operations(self) -> tuple[str, ...]:
+        return (self._operation, *self._also)
+
+    @property
+    def _calls(self) -> str:
+        """The requests, in a message: ``sink.op``, or ``sink.a or sink.b``."""
+        return " or ".join(f"{self._sink}.{o}" for o in self._operations)
+
+    @property
     def name(self) -> str:
+        # One operation reads as it always has; several, as "a|b".
         return (
-            f"cross_effect_agreement:{self._sink}.{self._operation}.{self._field}"
+            f"cross_effect_agreement:{self._sink}.{'|'.join(self._operations)}.{self._field}"
             f"={self._table}.{self._column}"
         )
 
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
         requests = [
-            o for o in diff.outbound if o.sink == self._sink and o.operation == self._operation
+            o for o in diff.outbound if o.sink == self._sink and o.operation in self._operations
         ]
         table = self._table.lower()
         rows = [
@@ -853,7 +885,7 @@ class CrossEffectAgreement:
                 if scalar is None:
                     problems.append(
                         (
-                            f"a {self._sink}.{self._operation} request has no {self._key[0]} "
+                            f"a {self._calls} request has no {self._key[0]} "
                             f"to pair it with {self._table} rows",
                             {"effect": request.effect_id},
                         )
@@ -881,7 +913,7 @@ class CrossEffectAgreement:
                 message=message,
                 evidence={
                     "sink": self._sink,
-                    "operation": self._operation,
+                    "operation": "|".join(self._operations),
                     "field": self._field,
                     "rows": f"{self._table}.{self._column}",
                     "measure": self._measure,
@@ -903,15 +935,14 @@ class CrossEffectAgreement:
             return [
                 (
                     f"the plan wrote {self._table} rows{where} with no "
-                    f"{self._sink}.{self._operation} request to match them",
+                    f"{self._calls} request to match them",
                     evidence,
                 )
             ]
         if not rows:
             return [
                 (
-                    f"a {self._sink}.{self._operation} request{where} has no {self._table} "
-                    f"rows to agree with",
+                    f"a {self._calls} request{where} has no {self._table} rows to agree with",
                     evidence,
                 )
             ]
@@ -924,8 +955,7 @@ class CrossEffectAgreement:
             if number is None:
                 return [
                     (
-                        f"a {self._sink}.{self._operation} request{where} carries no number "
-                        f"at {self._field}",
+                        f"a {self._calls} request{where} carries no number at {self._field}",
                         {**evidence, "effect": request.effect_id},
                     )
                 ]
@@ -945,7 +975,7 @@ class CrossEffectAgreement:
             return []
         return [
             (
-                f"{self._sink}.{self._operation} asks for {requested} at {self._field}{where}; "
+                f"{self._calls} asks for {requested} at {self._field}{where}; "
                 f"the plan's {self._table} rows record {measured} "
                 f"({'inserted' if self._measure == 'inserted' else 'net change'})",
                 {**evidence, "requested": str(requested), "measured": str(measured)},
@@ -1003,7 +1033,7 @@ class CrossEffectAgreement:
                 # Values are not echoed: a recipient or an account is data.
                 return [
                     (
-                        f"a {self._sink}.{self._operation} request{where} carries a "
+                        f"a {self._calls} request{where} carries a "
                         f"{self._field} other than the {self._column} its {self._table} rows "
                         f"hold",
                         {**evidence, "effect": request.effect_id},
