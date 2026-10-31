@@ -1294,14 +1294,20 @@ cluster = KubernetesSubstrate(
     journal="/var/lib/interlock/undo",
     kinds=[
         KubeKind(
-            "deployments", "deployments", "Deployment", group="apps",
+            "deployments",
+            "deployments",
+            "Deployment",
+            group="apps",
             columns={
                 "replicas": "spec.replicas",
                 "vcpu": "spec.replicas * spec.template.spec.containers.0.resources.requests.cpu",
             },
         ),
         KubeKind(
-            "statefulsets", "statefulsets", "StatefulSet", group="apps",
+            "statefulsets",
+            "statefulsets",
+            "StatefulSet",
+            group="apps",
             columns={"storage": "spec.volumeClaimTemplates.0.spec.resources.requests.storage"},
             replace_on_immutable=True,
         ),
