@@ -955,6 +955,36 @@ technical one. It means v1 gives a hard guarantee on transactional SQL and an
 explicitly weaker, at-least-once, compensation-backed guarantee everywhere else,
 rather than a uniform guarantee that is quietly false at the edges.
 
+## 4.5 Plan-bound substrates (added in 1.3.0)
+
+A Kubernetes cluster and a Terraform configuration are neither a transaction nor
+an email. They cannot roll back, but they can be measured exactly and written on
+a condition: a `resourceVersion`, a state serial. Interlock stages them as
+*plan-bound* (class P): what was measured is the plan that is applied, on the
+state it was measured on.
+
+- **E4-6.** A plan-bound substrate MUST measure with the system's own planner:
+  the API server's dry run, admission included; Terraform's saved plan. A change
+  the planner cannot measure (a webhook declaring side effects, refused a dry
+  run) MUST NOT stage. A value the planner cannot know before the apply MUST be
+  named in the diff (`UnknownValue`), and is refused unless acknowledged.
+- **E4-7.** The commit MUST apply exactly what was measured, conditional on the
+  state measured, and MUST fail closed, applying nothing, when the state moved.
+- **E4-8.** The undo (the before image of every object the commit will write,
+  or the inputs before the plan) MUST be written durably **before** the first
+  write, and its digest named in the stage's `COMMIT_INTENT` (the undo before
+  the do, as E4-3). A partial apply MUST be put back from it and recorded
+  `COMPENSATED`; one that cannot be put back MUST leave the intent open.
+- **E4-9.** Every object written MUST carry the stage's marker, which recovery
+  reads, and which the system's own audit log echoes. Recovery MUST NOT read an
+  object that is neither as written nor as it was as either.
+- **E4-10.** Every receipt of a plan-bound stage MUST say
+  `coverage.measurement = "plan-bound"` (ARC1 1.3).
+
+An undo restores configuration, not data: a database a forced replacement
+destroyed comes back empty. That is why a replacement is measured as the
+deletion it is, and refused by `NoDelete` before anything is applied.
+
 ---
 
 # 5. Architecture of `interlock` 0.5.0
@@ -1203,6 +1233,11 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-3: the undo written down before the do | Implemented | The compensation is part of the request, hashed into the plan at admission and committed in its outbox row | `test_outbound`, `test_operators` |
 | E4-4: compensations in reverse topological order | Implemented | `Operator.compensate` | `test_operators` |
 | E4-5: a stale compensation is a decision | Implemented | Past its original's deadline, only with `late=True`, signed | `test_operators` |
+| E4-6: measured by the system's own planner; the unmeasurable never stages | Implemented (1.3.0) | `KubernetesSubstrate` (`?dryRun=All`; a side-effecting webhook refuses the stage), `TerraformSubstrate` (`plan -out`, `show -json`; `UnknownValue`, `TruncationGuard(acknowledged_unknown=)`) | `test_kubernetes`, `test_terraform` |
+| E4-7: applied as measured, on the state measured | Implemented (1.3.0) | `resourceVersion` on every write (`409` fails closed), a landing checked against its measure; the state's serial and lineage checked, the saved plan applied, a stale plan a conflict | `test_kubernetes`, `test_terraform` |
+| E4-8: the undo written down first; a partial apply put back | Implemented (1.3.0) | `planbound.UndoJournal`, `; undo <sha256>` in `COMMIT_INTENT`, `CompensatedError`, `RecordType.COMPENSATED` | `test_kubernetes`, `test_terraform` |
+| E4-9: a marker on every object, read by recovery | Implemented (1.3.0) | `interlock.io/stage-id`; the `interlock_stage_id` output; `resolve_intent`, `compensated` | `test_kubernetes`, `test_terraform` |
+| E4-10: plan-bound receipts | Implemented (1.3.0) | `SubstrateCapabilities(measurement="plan-bound", plan_bound=True)` | `test_kubernetes` |
 
 ## Beyond sections 1 to 4
 
@@ -1226,6 +1261,9 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | No sensitive value in a hash: canaries through the daemon on both stores, every hash input recorded, every column crawled | `scripts/security_audit.py` | `test_security_audit` |
 | Several daemons on one database (PostgreSQL): a node's lock held for its life and refused to a second process; one node leading each role at a time; a node gone losing its locks, its roles and its leases as the database ends its session, and its other sessions as the nodes that survive fence it; each node settling its own plans; every session that holds what others wait for bounded; recovery waiting out a predecessor's transactions | `cluster`, `supervisor`, `daemon`, `outbox_sql`, `settlement`, `wiring` | `test_cluster`, `test_takeover`, `test_cluster_daemon`, `test_settlement`, `test_inbox`, `test_engine`, the soak (a node killed, a node frozen) |
 | Checked repair, refusal feedback, budgeted recovery, extension quotes | `repair`, `feedback`, `recovery`, `extension` | `test_repair`, `test_feedback`, `test_recovery`, `test_extension` |
+| Sensor facts (1.3.0): analyzers sign facts bound to the measured diff's hash; a pure checker requires a clean one under a pinned key | `sensors` | `test_sensors` |
+| Pinned checker packs (1.3.0): a pack's code loaded only as pinned by module, version and digest | `checker_packs` | `test_checker_packs` |
+| Loopback stand-ins (1.3.0): a Kubernetes API server with admission webhooks and an audit log; a `terraform` command | `sim.kubernetes`, `sim.terraform` | `test_kubernetes`, `test_terraform` |
 
 ## Partial
 
