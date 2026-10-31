@@ -313,8 +313,8 @@ orders = TableSpec(
     partitions={"tenant": "facility_id", "patient": "patient_id"},
 )
 checkers = [
-    TenantIsolation(1, declared=True),                        # one facility
-    TenantIsolation(1, declared=True, dimension="patient"),   # and one patient's chart
+    TenantIsolation(1, declared=True),  # one facility
+    TenantIsolation(1, declared=True, dimension="patient"),  # and one patient's chart
     ColumnValueGuard("med_orders", "mme_per_day", max_rise_fraction=0),
     TenantDrawdownGuard("med_orders", "mme_per_day", max_rise_fraction=0.5, dimension="patient"),
 ]
