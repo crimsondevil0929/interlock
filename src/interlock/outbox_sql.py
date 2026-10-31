@@ -311,6 +311,10 @@ BEGIN
     END IF;
 END
 $upgrade$;
+
+-- Held operations (interlock 1.2): a request of one enters the outbox held,
+-- for a warrant to release. None, for every sink installed before.
+ALTER TABLE interlock.sinks ADD COLUMN IF NOT EXISTS held text[] NOT NULL DEFAULT '{}';
 """
 
 STAGE_OUTBOX_FUNCTIONS: Final = r"""
@@ -440,6 +444,7 @@ DECLARE
     sink_seconds integer;
     sink_cost text;
     sink_kind text;
+    sink_held text[];
     problem text;
     bytes bytea := pg_catalog.convert_to(p_payload, 'UTF8');
     -- One instant: not_after is exactly its window past enqueued_at.
@@ -457,8 +462,9 @@ BEGIN
         RAISE EXCEPTION 'interlock: an outbound request needs the scope that pays for it'
             USING ERRCODE = 'IL002';
     END IF;
-    SELECT k.operations, k.max_payload_bytes, k.not_after_seconds, k.cost_per_call, k.kind
-      INTO sink_ops, sink_bytes, sink_seconds, sink_cost, sink_kind
+    SELECT k.operations, k.max_payload_bytes, k.not_after_seconds, k.cost_per_call, k.kind,
+           k.held
+      INTO sink_ops, sink_bytes, sink_seconds, sink_cost, sink_kind, sink_held
       FROM interlock.sinks k
      WHERE k.name = p_sink AND k.enabled;
     IF sink_ops IS NULL THEN
@@ -518,6 +524,14 @@ BEGIN
         interlock.outbox_genesis(p_message, stage, plan, p_scope, p_effect, p_sink, p_operation,
                                  p_idempotency_key, p_payload_hash)
     );
+    -- Held for a warrant: it enters the outbox held, and its log says why, in
+    -- the stage's own transaction. Only a release sends it.
+    IF p_operation = ANY (coalesce(sink_held, '{}')) THEN
+        PERFORM interlock.outbox_log(
+            p_message, NULL, 'held', 'outbox', NULL, NULL,
+            p_sink || '.' || p_operation || ' is held for a warrant', 'held');
+        PERFORM interlock.outbox_settle(p_message, 'held', 'held for a warrant');
+    END IF;
 END
 $fn$;
 

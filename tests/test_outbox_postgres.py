@@ -156,6 +156,7 @@ def test_install_mirrors_the_registry_without_endpoints_or_credentials(pg: Pg) -
             "unknown_outcome": sink.unknown_outcome,
             "config_hash": sink.config_hash(),
             "enabled": True,
+            "held": list(sink.held),
         }
         for sink in TEST_SINKS
     ]
@@ -221,8 +222,11 @@ OPERATOR_CALLS = (
 def test_each_role_holds_exactly_its_part(pg: Pg) -> None:
     with role(pg, "il_relay") as relay, role(pg, "il_audit") as audit:
         reinstall(pg, relay_roles=[relay], audit_roles=[audit])
-        # The stage writes the outbox only through enqueue(), with its token.
-        assert privileges(pg, pg.role) == {t: set() for t in OUTBOX_TABLES}
+        # The stage writes the outbox only through enqueue(), with its token,
+        # and reads the registry: what it holds for a warrant (1.2).
+        assert privileges(pg, pg.role) == {
+            t: {"SELECT"} if t == "sinks" else set() for t in OUTBOX_TABLES
+        }
         assert may_execute(pg, pg.role, ENQUEUE)
         assert may_execute(pg, pg.role, "interlock.stage_outbox(bigint)")
         assert not any(may_execute(pg, pg.role, f) for f in RELAY_CALLS + OPERATOR_CALLS)

@@ -268,9 +268,9 @@ blocking violation: fail closed.
 | Checker | Bounds |
 |---|---|
 | `BlastRadius` | captured mutations in one plan |
-| `TenantIsolation` | distinct tenants one plan may span; with `declared=True`, the tenants its effects declare |
-| `ColumnValueGuard` | fall in a column total, table-wide |
-| `TenantDrawdownGuard` | fall in a column total, **per tenant** |
+| `TenantIsolation` | distinct tenants one plan may span; with `declared=True`, the tenants its effects declare; with `dimension=`, any other partition (a patient, an account) |
+| `ColumnValueGuard` | fall, or rise, in a column total, table-wide |
+| `TenantDrawdownGuard` | fall, or rise, in a column total, **per tenant**, or per any other partition |
 | `NoDelete` | deletions outside granted tables |
 | `NoSchemaChange` | effects declared as DDL |
 | `TruncationGuard` | a diff that hit the row cap |
@@ -278,7 +278,7 @@ blocking violation: fail closed.
 | `CrossEffectAgreement` | an outbound request against the rows it rides with ([outbox](#outbound-requests-the-transactional-outbox)) |
 | `SinkAllowlist` | the sinks and operations a plan may call |
 | `OutboundCount` | the requests one plan may enqueue, in all or per sink |
-| `PayloadAmountCap` | a payload amount, per request, per tenant or per plan, per currency |
+| `PayloadAmountCap` | a payload amount, per request, per tenant or per plan, per currency or any unit |
 | `RecipientAllowlist` | where a request may send: email domains and addresses, https hosts, per tenant |
 | `OutboundTenantIsolation` | the tenants one plan's requests may span |
 | `FactAgreement` | a write against the inbound fact it must follow ([inbox](#inbound-facts-the-zero-trust-inbox)) |
@@ -297,6 +297,36 @@ amount moves that sum by 0%, so a table-scoped guard passes it — with a tenant
 wiped. Grouping by tenant first is the only way to see it.
 Column totals are `Decimal`, computed through `Decimal(str(value))`, so a
 guard permitting a 30% drawdown does not admit 30.000000000000004%.
+
+### Partitions beyond the tenant, and guards that watch a rise
+
+A hospital partitions by facility *and* by patient; a cloud by account and environment. A
+table can name more dimensions than its tenant, each a column read back out of the
+captured row, and a plan can be held to one label of each at once:
+
+```python
+from interlock import ColumnValueGuard, TableSpec, TenantDrawdownGuard, TenantIsolation
+
+orders = TableSpec(
+    "med_orders",
+    columns=["id", "facility_id", "patient_id", "drug", "mme_per_day", "status"],
+    partitions={"tenant": "facility_id", "patient": "patient_id"},
+)
+checkers = [
+    TenantIsolation(1, declared=True),  # one facility
+    TenantIsolation(1, declared=True, dimension="patient"),  # and one patient's chart
+    ColumnValueGuard("med_orders", "mme_per_day", max_rise_fraction=0),
+    TenantDrawdownGuard("med_orders", "mme_per_day", max_rise_fraction=0.5, dimension="patient"),
+]
+```
+
+An effect declares its labels (`PlanBuilder.update(..., tenant_id="f-1",
+partitions={"patient": "p-1182"})`), and the agent is told only the ones it declared. Outside
+finance the dangerous direction is often up: a dose, a replica count, a role grant. A guard
+can bound a rise as well as a fall, and one with a rise bound reports the totals at their
+own precision, `0.125` rather than `0.13`. A guard configured as before reports, and
+decides, exactly as before. A rate window can keep each patient's history too:
+`per="partition:patient"`.
 
 Every threshold in `default_checkers` is an uncalibrated placeholder. Measure
 your own diffs and set the limits from the measurement.
@@ -534,6 +564,33 @@ history. The agent is told which window refused it, never what the window holds:
 `[[windows]]` in `interlock.toml` configures them, checked against `[[sinks]]` and
 `[[tables]]`, for `EscrowEngine(windows=config.windows)`.
 
+### Meters: conserving a unit across plans
+
+A window bounds what plans add up to over a span. A meter conserves it the way AgentGov
+conserves money: a dose in morphine milligram equivalents, capacity in vCPUs, seats, held
+in an AgentGov ledger of that unit, whose envelopes are delegated down a tree of scopes.
+Five agents working one envelope cannot each spend what is left of it:
+
+<!-- readme-test: skip reason="continues the partitions example, with a clinical database" -->
+```python
+from agentgov import BudgetManager, Unit
+from interlock import EscrowEngine, Meter, RowSum, SqliteSubstrate
+
+mme = BudgetManager.open_sqlite("mme.db", unit=Unit("mme"))
+engine = EscrowEngine(
+    SqliteSubstrate("ward.db", tables=[orders]),
+    checkers=checkers,
+    meters=[Meter(mme, RowSum("med_orders", "mme_per_day"), per_plan="90")],
+)
+```
+
+Each plan holds `per_plan` on its scope before it stages, and is refused there, quietly
+and with nothing staged, when the envelope has less. It is checked against `per_plan`, and
+when it commits it settles what its diff measured; the rest of the hold comes back. A
+refused plan's hold is released, and recovery settles a committed plan's hold whole, which
+never under-counts. Its receipt names what it consumed and the transaction that settled
+it.
+
 ## AgentGov integration
 
 Interlock imports [`agentgov`](https://github.com/crimsondevil0929/agentgov) as a
@@ -723,11 +780,18 @@ What goes into one:
   change, from which one row can be disclosed later without the rest; and a hash of the
   observed schema, foreign keys included.
 - **Coverage:** the observed tables, and every gap in words: an acknowledged cascade, a
-  substrate that did not read the foreign keys or does not refuse unobserved tables.
+  substrate that did not read the foreign keys or does not refuse unobserved tables. And
+  how strongly the effect was measured, when it was measured short of a transaction: a
+  plan whose only effect is the requests it commits says only the request was measured.
 - **Decision:** the verdict hash, each checker with a digest of its configuration, the
   issuer's policy epoch, and, for a repair, the refused plan's receipt as `repair_of`.
 - **Cost:** the AgentGov transaction that settled the plan. The receipt is issued last,
   after the reverse anchor, so agentgov's verifier can check the cost against the ledger.
+
+A product that serves many tenants from one store can hand each tenant its own receipts:
+`ReceiptIssuer(log, tenants="declared")` names only the tenants a plan declares, and
+counts any others its diff reached, so a refused plan still says how far it went without
+saying into whose rows.
 
 The receipt and the escrow chain name each other: the stage's terminal record carries
 the receipt id, and the receipt's `anchors.escrow` names that record by sequence and
@@ -1419,6 +1483,43 @@ secret_env = "SENDGRID_API_KEY"
   resolve. Every email carries its message id and key in `custom_args`.
 - `tests/test_relay_crash.py` drives both through the relay's kill matrix, on both stores:
   a charge is made once and an email is never sent twice.
+
+### MCP tools, and holding an operation for a warrant
+
+An MCP tool that writes, behind a sink of type `mcp`, is governed like any request: the
+plan is measured and judged, the call is committed to the outbox, and the relay makes it
+as one `tools/call`. MCP has no idempotency key, so an `mcp` sink is always at most once:
+a call whose outcome is unknown is never made again, and goes to an operator. Some
+operations should never run on an agent's word alone. Mark them `hold = true`, on any
+sink, and every request of them enters the outbox held, even with the breaker closed,
+until an operator or a warrant releases it:
+
+```toml
+[[sinks]]
+name = "crm"
+type = "mcp"
+
+[[sinks.operations]]
+name = "close_ticket"
+schema = "schemas/close_ticket.json"  # the input schema you pin, not the server's of the day
+hold = true
+
+[[relay.endpoints]]
+sink = "crm"
+command = ["crm-mcp-server", "--stdio"]
+```
+
+The receipt of a plan whose only effect is such a request says so: it was measured only
+as the request, and names the sink that carries its effect.
+
+### Sinks and sources of your own
+
+A FHIR server, ServiceNow or a cloud's API can be a typed sink of its own, configured from
+`interlock.toml` like Stripe: a package registers its kind with `register_sink_kind`, or
+under the `interlock.sinks` entry point, following the contract `interlock.stripe` and
+`interlock.mcp` follow (its operations or none, its idempotency, its payload rules, and its
+relay adapter). A vendor whose webhooks sign their own way is an inbox source kind,
+through `register_source_kind` or `interlock.sources`.
 
 ### On SQLite
 

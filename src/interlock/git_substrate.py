@@ -724,6 +724,10 @@ class GitSubstrate:
         """The control database's path, when there is one."""
         return None if self._control is None else self._control.path
 
+    def held_operations(self) -> dict[str, tuple[str, ...]]:
+        """The control database's held operations (its outbox's)."""
+        return {} if self._control is None else self._control.held_operations()
+
     def head(self) -> str:
         """The commit the branch is at now.
 

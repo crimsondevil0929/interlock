@@ -234,7 +234,8 @@ _SCHEMA_TEMPLATE: Final = (
         backoff_cap_ms    INTEGER NOT NULL CHECK (backoff_cap_ms >= backoff_base_ms),
         unknown_outcome   TEXT NOT NULL CHECK (unknown_outcome IN ('redeliver', 'dead-letter')),
         config_hash       TEXT NOT NULL,
-        enabled           INTEGER NOT NULL DEFAULT 1
+        enabled           INTEGER NOT NULL DEFAULT 1,
+        held              TEXT NOT NULL DEFAULT '[]'
     )""",
     f"""CREATE TABLE IF NOT EXISTS main.{OUTBOX} (
         message_id      TEXT PRIMARY KEY,
@@ -640,6 +641,17 @@ def installed_version(conn: sqlite3.Connection) -> int:
     return 7 if REVOCATIONS in tables else 6
 
 
+def held_operations(conn: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
+    """Each enabled sink's operations held for a warrant, as this file's mirror
+    of the registry records them: none, for an outbox installed before held
+    operations (an engine that holds one refuses to run on it)."""
+    try:
+        rows = conn.execute(f"SELECT name, held FROM {SINKS} WHERE enabled = 1").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {str(name): tuple(json.loads(held)) for name, held in rows if held != "[]"}
+
+
 def outbox_installed(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?, ?)",
@@ -685,6 +697,10 @@ def install_sqlite_outbox(
                 conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             for statement in _SCHEMA:
                 conn.execute(statement)
+            if "held" not in {str(c[1]) for c in conn.execute(f"PRAGMA table_info({SINKS})")}:
+                # The operations held for a warrant (1.2): none, for every sink
+                # installed before.
+                conn.execute(f"ALTER TABLE {SINKS} ADD COLUMN held TEXT NOT NULL DEFAULT '[]'")
             if conn.execute(f"SELECT 1 FROM {EPOCHS} WHERE version = '4'").fetchone() is None:
                 # Version 4 is being installed: the rows written before the
                 # proof their kind now carries are the legacy set, recorded
@@ -707,8 +723,8 @@ def install_sqlite_outbox(
                 conn.execute(
                     f"INSERT INTO {SINKS} (name, kind, operations, cost_per_call, idempotency, "
                     f"max_payload_bytes, not_after_seconds, max_attempts, backoff_base_ms, "
-                    f"backoff_cap_ms, unknown_outcome, config_hash, enabled) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
+                    f"backoff_cap_ms, unknown_outcome, config_hash, enabled, held) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) "
                     f"ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, "
                     f"operations = excluded.operations, cost_per_call = excluded.cost_per_call, "
                     f"idempotency = excluded.idempotency, "
@@ -718,10 +734,10 @@ def install_sqlite_outbox(
                     f"backoff_base_ms = excluded.backoff_base_ms, "
                     f"backoff_cap_ms = excluded.backoff_cap_ms, "
                     f"unknown_outcome = excluded.unknown_outcome, "
-                    f"config_hash = excluded.config_hash, enabled = 1",
+                    f"config_hash = excluded.config_hash, enabled = 1, held = excluded.held",
                     (
                         sink.name,
-                        sink.kind,
+                        sink.mirror_kind,
                         json.dumps([op.name for op in sink.operations]),
                         str(sink.cost_per_call),
                         sink.idempotency,
@@ -732,6 +748,7 @@ def install_sqlite_outbox(
                         milliseconds(sink.backoff_cap),
                         sink.unknown_outcome,
                         sink.config_hash(),
+                        json.dumps(list(sink.held)),
                     ),
                 )
             conn.execute(
@@ -762,7 +779,7 @@ def _install_sources(conn: sqlite3.Connection, sources: Sequence[InboundSource])
             f"INSERT INTO {SQLITE_SOURCES} (name, kind, config_hash, enabled, log_seq, log_head) "
             f"VALUES (?, ?, ?, 1, 0, ?) ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, "
             f"config_hash = excluded.config_hash, enabled = 1",
-            (source.name, source.kind, source.config_hash(), inbox_genesis(source.name)),
+            (source.name, source.mirror_kind, source.config_hash(), inbox_genesis(source.name)),
         )
     conn.execute(
         f"UPDATE {SQLITE_SOURCES} SET enabled = 0 "
@@ -790,6 +807,73 @@ def _legacy(conn: sqlite3.Connection) -> LegacySet | None:
 # --------------------------------------------------------------------------
 # The stage's side: written in the stage's own transaction
 # --------------------------------------------------------------------------
+
+
+def _append_log(
+    conn: sqlite3.Connection,
+    message: str,
+    attempt: int | None,
+    event: str,
+    actor: str,
+    *,
+    state_after: str | None,
+    detail: str | None = None,
+    status: int | None = None,
+    digest: str | None = None,
+    remote_ref: str | None = None,
+    authority: str | None = None,
+    attestation: str | None = None,
+) -> str:
+    """Append one row to a message's delivery log, linked to its head: its
+    hash is what the trigger recomputes. Returns that hash."""
+    head = conn.execute(
+        f"SELECT log_seq, log_head FROM {STATE} WHERE message_id = ?", (message,)
+    ).fetchone()
+    seq = int(head[0]) + 1
+    at = instant_text(now_us())
+    actor = (actor or "?")[:200]
+    digest = None if digest is None else digest[:128]
+    detail = None if detail is None else detail[:1000]
+    remote_ref = None if remote_ref is None else remote_ref[:255]
+    digest_ = event_hash(
+        str(head[1]),
+        uuid.UUID(message),
+        seq,
+        attempt,
+        event,
+        actor,
+        at,
+        status,
+        digest,
+        detail,
+        state_after,
+        remote_ref,
+        authority,
+        attestation,
+    )
+    conn.execute(
+        f"INSERT INTO {LOG} (message_id, seq, attempt, event, actor, at, status_code, "
+        f"response_digest, detail, state_after, remote_ref, authority, attestation, "
+        f"prev_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            message,
+            seq,
+            attempt,
+            event,
+            actor,
+            at,
+            status,
+            digest,
+            detail,
+            state_after,
+            remote_ref,
+            authority,
+            attestation,
+            str(head[1]),
+            digest_,
+        ),
+    )
+    return digest_
 
 
 def enqueue(
@@ -930,6 +1014,23 @@ def enqueue(
             enqueued,
         ),
     )
+    if request.operation in held_operations(conn).get(request.sink, ()):
+        # Held for a warrant: it enters the outbox held, and its log says why,
+        # in the stage's own transaction. Only a release sends it.
+        register(conn)
+        _append_log(
+            conn,
+            str(message_id),
+            None,
+            "held",
+            "outbox",
+            state_after="held",
+            detail=f"{request.sink}.{request.operation} is held for a warrant",
+        )
+        conn.execute(
+            f"UPDATE {STATE} SET state = 'held', reason = ? WHERE message_id = ?",
+            ("held for a warrant", str(message_id)),
+        )
     return message_id
 
 
@@ -1193,54 +1294,20 @@ class SqliteOutboxStore:
         authority: str | None = None,
         attestation: str | None = None,
     ) -> str:
-        head = conn.execute(
-            f"SELECT log_seq, log_head FROM {STATE} WHERE message_id = ?", (message,)
-        ).fetchone()
-        seq = int(head[0]) + 1
-        at = instant_text(now_us())
-        actor = (actor or "?")[:200]
-        digest = None if digest is None else digest[:128]
-        detail = None if detail is None else detail[:1000]
-        remote_ref = None if remote_ref is None else remote_ref[:255]
-        digest_ = event_hash(
-            str(head[1]),
-            uuid.UUID(message),
-            seq,
+        return _append_log(
+            conn,
+            message,
             attempt,
             event,
             actor,
-            at,
-            status,
-            digest,
-            detail,
-            state_after,
-            remote_ref,
-            authority,
-            attestation,
+            state_after=state_after,
+            detail=detail,
+            status=status,
+            digest=digest,
+            remote_ref=remote_ref,
+            authority=authority,
+            attestation=attestation,
         )
-        conn.execute(
-            f"INSERT INTO {LOG} (message_id, seq, attempt, event, actor, at, status_code, "
-            f"response_digest, detail, state_after, remote_ref, authority, attestation, "
-            f"prev_hash, event_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                message,
-                seq,
-                attempt,
-                event,
-                actor,
-                at,
-                status,
-                digest,
-                detail,
-                state_after,
-                remote_ref,
-                authority,
-                attestation,
-                str(head[1]),
-                digest_,
-            ),
-        )
-        return digest_
 
     def _settle(
         self,

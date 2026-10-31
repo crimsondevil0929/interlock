@@ -17,10 +17,13 @@ anything is staged (``docs/OUTBOX_DESIGN.md`` §3):
 - only a compensation holds a placeholder, ``{"$bind": "delivered.id"}``: the
   id of what its original created, bound when the compensation is executed
   (``interlock outbox compensate``). A request the relay sends is concrete;
-- a typed sink (``stripe``, ``sendgrid``: :mod:`interlock.stripe`,
-  :mod:`interlock.sendgrid`) adds its own rules: its operations and their
-  schemas are its own, and a Stripe charge carries the refund that undoes
-  exactly it.
+- a typed sink (``stripe``, ``sendgrid``, ``mcp``: :mod:`interlock.stripe`,
+  :mod:`interlock.sendgrid`, :mod:`interlock.mcp`; or a kind a package
+  registers, :func:`register_sink_kind`) adds its own rules: its operations
+  and their schemas are its own, and a Stripe charge carries the refund that
+  undoes exactly it;
+- a request of an operation the operator marks ``hold`` enters the outbox
+  held, and is delivered only once a warrant releases it.
 
 Endpoints and credentials are relay configuration. Nothing here holds either.
 
@@ -39,7 +42,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -51,16 +54,20 @@ __all__ = [
     "DEAD_LETTER",
     "HTTP",
     "KINDS",
+    "MIRRORED_KINDS",
     "NONE_POSSIBLE",
     "PLACEHOLDER",
     "REDELIVER",
+    "SINK_ENTRY_POINTS",
     "EnqueueOrder",
     "OperationSpec",
     "SinkRegistry",
     "SinkSpec",
     "bind",
     "placeholders",
+    "register_sink_kind",
     "schema_problems",
+    "sink_kinds",
     "typed_sink",
 ]
 
@@ -75,7 +82,16 @@ undo. The declaration is part of the sink's configuration hash."""
 
 HTTP: Final = "http"
 """The generic sink: JSON over HTTP, operations and schemas from configuration."""
-KINDS: Final = (HTTP, "stripe", "sendgrid")
+KINDS: Final = (HTTP, "stripe", "sendgrid", "mcp")
+"""The kinds Interlock ships. A package adds its own (:func:`register_sink_kind`)."""
+MIRRORED_KINDS: Final = (HTTP, "stripe", "sendgrid")
+"""The kinds a database's mirror of the registry records as themselves: the
+ones whose rules the database applies a second time. It records any other
+kind as ``http``, a kind it applies no rule of its own to; the sink's
+configuration hash, beside it, still names its kind."""
+SINK_ENTRY_POINTS: Final = "interlock.sinks"
+"""The entry-point group a package registers a typed sink kind under (the
+contract of :func:`register_sink_kind`); the entry point's name is the kind."""
 
 PLACEHOLDER: Final = "delivered.id"
 """What ``{"$bind": "delivered.id"}`` stands for in a compensation: the id of
@@ -139,11 +155,17 @@ class OperationSpec:
     :ivar compensation: The name of the operation that undoes this one, which
         every request must then carry as its ``compensation``; or
         :data:`NONE_POSSIBLE`, the operator's declaration that nothing can.
+    :ivar hold: Every request of the operation enters the outbox held, even
+        with its scope's breaker closed: delivered only once an operator, or a
+        warrant, releases it. For what should never run on an agent's word
+        alone: closing an incident, terminating an account, a Schedule II
+        order.
     """
 
     name: str
     compensation: str = NONE_POSSIBLE
     schema: Mapping[str, Any] | None = None
+    hold: bool = False
 
     def __post_init__(self) -> None:
         if not _OPERATION.match(self.name):
@@ -177,12 +199,14 @@ class SinkSpec:
         mid-call): ``"redeliver"`` with the same idempotency key, at least
         once; or ``"dead-letter"``, at most once, for an operator to resolve.
         A sink without idempotency duplicates on redelivery.
-    :ivar kind: ``"http"``, or a typed sink: ``"stripe"``, ``"sendgrid"``. A
-        typed sink's operations are the kind's own, schemas included
+    :ivar kind: ``"http"``, or a typed sink: ``"stripe"``, ``"sendgrid"``,
+        ``"mcp"``, or a kind a package registers. A typed sink's operations are
+        the kind's own, schemas included
         (:func:`interlock.stripe.stripe_sink`,
-        :func:`interlock.sendgrid.sendgrid_sink`), and so are its idempotency
-        (Stripe honours keys; SendGrid has none) and, unless given, its
-        ``unknown_outcome`` (SendGrid: ``"dead-letter"``).
+        :func:`interlock.sendgrid.sendgrid_sink`), unless the kind takes them
+        from configuration (an MCP server's tools); and so are its idempotency
+        (Stripe honours keys; SendGrid and MCP have none) and, unless given,
+        its ``unknown_outcome`` (SendGrid: ``"dead-letter"``; MCP: always).
 
     ``idempotency`` and ``unknown_outcome`` left empty take the kind's.
     """
@@ -205,8 +229,8 @@ class SinkSpec:
     def __post_init__(self) -> None:
         if not _NAME.match(self.name):
             raise ValueError(f"sink name {self.name!r} is not a plain lowercase identifier")
-        if self.kind not in KINDS:
-            raise ValueError(f"sink {self.name!r}: kind is one of {', '.join(KINDS)}")
+        if self.kind not in sink_kinds():
+            raise ValueError(f"sink {self.name!r}: kind is one of {', '.join(sink_kinds())}")
         typed = typed_sink(self.kind)
         if not self.idempotency:
             object.__setattr__(
@@ -217,17 +241,25 @@ class SinkSpec:
                 self, "unknown_outcome", REDELIVER if typed is None else typed.UNKNOWN_OUTCOME
             )
         if typed is not None:
-            for op in self.operations:
-                if typed.CATALOG.get(op.name) != op:
+            catalog = typed.CATALOG
+            for op in self.operations if catalog is not None else ():
+                # Holding is the operator's choice, of any operation.
+                if catalog.get(op.name) != replace(op, hold=False):
                     raise ValueError(
                         f"sink {self.name!r}: a {self.kind} sink's operations are "
-                        f"{self.kind}'s own ({', '.join(sorted(typed.CATALOG))}), with their "
+                        f"{self.kind}'s own ({', '.join(sorted(catalog))}), with their "
                         f"schemas; {op.name!r} is not one of them as {self.kind} defines it"
                     )
             if self.idempotency != typed.IDEMPOTENCY:
                 raise ValueError(
                     f"sink {self.name!r}: a {self.kind} sink's idempotency is "
                     f"{typed.IDEMPOTENCY!r}: that is what {self.kind} does"
+                )
+            allowed = getattr(typed, "UNKNOWN_OUTCOMES", (REDELIVER, DEAD_LETTER))
+            if self.unknown_outcome not in allowed:
+                raise ValueError(
+                    f"sink {self.name!r}: a {self.kind} sink's unknown outcome is "
+                    f"{' or '.join(map(repr, allowed))}: a call made twice acts twice"
                 )
         if not self.operations:
             raise ValueError(f"sink {self.name!r} registers no operations")
@@ -270,6 +302,17 @@ class SinkSpec:
     def operation(self, name: str) -> OperationSpec | None:
         return self._by_name.get(name)
 
+    @property
+    def held(self) -> tuple[str, ...]:
+        """The operations whose requests enter the outbox held."""
+        return tuple(sorted(op.name for op in self.operations if op.hold))
+
+    @property
+    def mirror_kind(self) -> str:
+        """The kind a database's mirror of the registry records
+        (:data:`MIRRORED_KINDS`)."""
+        return self.kind if self.kind in MIRRORED_KINDS else HTTP
+
     def config_hash(self) -> str:
         """A digest of everything the sink permits, for the database's mirror
         of the registry and for the receipts of plans that use it."""
@@ -293,6 +336,9 @@ class SinkSpec:
                         None
                         if op.schema is None
                         else json.dumps(op.schema, sort_keys=True, separators=(",", ":")),
+                        # Only when held, so every sink hashed before holds
+                        # keeps its hash.
+                        *(("hold",) if op.hold else ()),
                     ]
                     for op in self.operations
                 ),
@@ -488,9 +534,63 @@ def bind(value: Any, remote_ref: str) -> Any:
     return value
 
 
+_REGISTERED: dict[str, Any] = {}
+_PLUGINS_LOADED = False
+
+
+def register_sink_kind(kind: str, typed: Any) -> None:
+    """Make ``kind`` a typed sink kind, defined by ``typed``: a module, or any
+    object, with the contract :mod:`interlock.stripe` and
+    :mod:`interlock.mcp` follow:
+
+    - ``CATALOG``: each operation's :class:`OperationSpec`, by name; or
+      ``None`` when the operations come from configuration;
+    - ``IDEMPOTENCY``: ``"header"`` or ``"none"``; and ``UNKNOWN_OUTCOME``,
+      the default; optionally ``UNKNOWN_OUTCOMES``, the ones allowed;
+    - ``payload_problem(operation, payload)`` and
+      ``compensation_problem(operation, payload, compensation)``: what is
+      wrong with a request, or ``None``;
+    - ``relay_adapter(endpoint)``: the relay's
+      :class:`~interlock.relay.SinkAdapter` for a ``[[relay.endpoints]]``
+      entry, whose ``settings`` hold its own keys.
+
+    A package registers its kinds under the ``interlock.sinks`` entry point
+    (:data:`SINK_ENTRY_POINTS`) instead, found when a sink first names one.
+
+    :raises ValueError: If ``kind`` is not a name, is a kind Interlock ships,
+        or is registered to something else.
+    """
+    if not _NAME.match(kind) or kind in KINDS:
+        raise ValueError(f"{kind!r} is not a kind a package may register")
+    for name in ("CATALOG", "IDEMPOTENCY", "UNKNOWN_OUTCOME", "payload_problem"):
+        if not hasattr(typed, name):
+            raise ValueError(f"sink kind {kind!r} defines no {name}")
+    if _REGISTERED.get(kind, typed) is not typed:
+        raise ValueError(f"sink kind {kind!r} is registered")
+    _REGISTERED[kind] = typed
+
+
+def sink_kinds() -> tuple[str, ...]:
+    """Every sink kind: Interlock's own, then the registered ones."""
+    _load_plugins()
+    return (*KINDS, *sorted(_REGISTERED))
+
+
+def _load_plugins() -> None:
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED:
+        return
+    _PLUGINS_LOADED = True
+    from importlib.metadata import entry_points
+
+    for point in entry_points(group=SINK_ENTRY_POINTS):
+        register_sink_kind(point.name, point.load())
+
+
 def typed_sink(kind: str) -> Any:
     """The module that defines a typed sink kind (:mod:`interlock.stripe`,
-    :mod:`interlock.sendgrid`), or ``None`` for ``http``."""
+    :mod:`interlock.sendgrid`, :mod:`interlock.mcp`, or a registered kind's),
+    or ``None`` for ``http``, and for a kind nobody defines."""
     if kind == "stripe":
         from interlock import stripe
 
@@ -499,7 +599,14 @@ def typed_sink(kind: str) -> Any:
         from interlock import sendgrid
 
         return sendgrid
-    return None
+    if kind == "mcp":
+        import interlock.mcp
+
+        return interlock.mcp
+    if kind == HTTP:
+        return None
+    _load_plugins()
+    return _REGISTERED.get(kind)
 
 
 def _credential_field(value: Any, path: str) -> str | None:

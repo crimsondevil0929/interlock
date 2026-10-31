@@ -27,7 +27,7 @@ import ipaddress
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Final
+from typing import ClassVar, Final
 from urllib.parse import urlsplit
 
 from interlock.feedback import FeedbackHint, Guidance
@@ -295,13 +295,17 @@ class PayloadAmountCap:
     :param operation: ...calls of this operation.
     :param field: The amount, a dotted path into the payload.
     :param maximum: The cap: a number (an integer, a ``Decimal`` or a decimal
-        string), or a map from currency code to cap, read at
-        ``currency_field``. A request in a currency the map lacks is refused.
+        string), or a map from currency code, or any unit's code (``mg``,
+        ``vcpu``, ``gib``), to cap, read at ``currency_field``. A request in a
+        unit the map lacks is refused.
     :param per: ``"request"``: each request's amount; ``"tenant"``: the sum
         of the plan's requests for each tenant; ``"plan"``: the sum of them
-        all. Sums are per currency.
+        all. Sums are per unit.
     :param currency_field: Where a request names its currency; needed with a
         map, and compared case-folded (ISO 4217 codes are case-insensitive).
+    :param unit_field: The same, for a cap by unit: a request naming its unit
+        (``{"dose": "5", "unit": "mg"}``). Give one of the two; with this one,
+        refusals say "unit".
 
     A request whose amount is missing, not a plain number, or negative refuses
     the plan: no negative entry can net a sum under the cap. Units are the
@@ -311,7 +315,18 @@ class PayloadAmountCap:
         without ``currency_field``.
     """
 
-    __slots__ = ("_caps", "_currency", "_field", "_operation", "_path", "_per", "_sink")
+    __slots__ = (
+        "_caps",
+        "_currency",
+        "_field",
+        "_operation",
+        "_path",
+        "_per",
+        "_sink",
+        "_units",
+    )
+
+    UNSET: ClassVar[Mapping[str, object]] = {"_units": False}
 
     def __init__(
         self,
@@ -322,15 +337,22 @@ class PayloadAmountCap:
         maximum: Decimal | int | str | Mapping[str, Decimal | int | str],
         per: str = "request",
         currency_field: str | None = None,
+        unit_field: str | None = None,
     ) -> None:
         if per not in _PER:
             raise ValueError(f"per is one of {', '.join(_PER)}, not {per!r}")
         if not field.strip():
             raise ValueError("PayloadAmountCap needs a field")
+        if currency_field is not None and unit_field is not None:
+            raise ValueError("a cap reads its unit at currency_field or unit_field, not both")
+        self._units = unit_field is not None
+        currency_field = unit_field if unit_field is not None else currency_field
         caps: dict[str | None, Decimal] = {}
         if isinstance(maximum, Mapping):
             if currency_field is None:
-                raise ValueError("a cap by currency needs currency_field")
+                raise ValueError(
+                    "a cap by currency, or by unit, needs currency_field or unit_field"
+                )
             for currency, cap in maximum.items():
                 caps[currency.lower()] = self._cap(cap)
         else:
@@ -382,7 +404,8 @@ class PayloadAmountCap:
                     found.append(
                         _violation(
                             self.name,
-                            f"request {request.effect_id} names no currency this cap covers",
+                            f"request {request.effect_id} names no "
+                            f"{'unit' if self._units else 'currency'} this cap covers",
                             **where,
                         )
                     )

@@ -780,6 +780,9 @@ def install(
         for role in roles:
             conn.execute(f"GRANT USAGE ON SCHEMA interlock TO {role}")
             conn.execute(f"GRANT SELECT ON interlock.installation TO {role}")
+            # What the registry holds for a warrant: names and operations, no
+            # endpoint and no credential, so an engine can check it holds them.
+            conn.execute(f"GRANT SELECT ON interlock.sinks TO {role}")
             for signature in _STAGE_FUNCTIONS:
                 conn.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {role}")
         for role in auditors:
@@ -823,8 +826,8 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
         conn.execute(
             "INSERT INTO interlock.sinks (name, kind, operations, cost_per_call, idempotency, "
             "max_payload_bytes, not_after_seconds, max_attempts, backoff_base_ms, "
-            "backoff_cap_ms, unknown_outcome, config_hash, enabled) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true) "
+            "backoff_cap_ms, unknown_outcome, config_hash, enabled, held) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s) "
             "ON CONFLICT (name) DO UPDATE SET kind = EXCLUDED.kind, "
             "operations = EXCLUDED.operations, cost_per_call = EXCLUDED.cost_per_call, "
             "idempotency = EXCLUDED.idempotency, "
@@ -834,10 +837,10 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
             "backoff_base_ms = EXCLUDED.backoff_base_ms, "
             "backoff_cap_ms = EXCLUDED.backoff_cap_ms, "
             "unknown_outcome = EXCLUDED.unknown_outcome, "
-            "config_hash = EXCLUDED.config_hash, enabled = true",
+            "config_hash = EXCLUDED.config_hash, enabled = true, held = EXCLUDED.held",
             (
                 sink.name,
-                sink.kind,
+                sink.mirror_kind,
                 [op.name for op in sink.operations],
                 str(sink.cost_per_call),
                 sink.idempotency,
@@ -848,6 +851,7 @@ def _install_sinks(conn: psycopg.Connection[Any], sinks: Sequence[SinkSpec]) -> 
                 _milliseconds(sink.backoff_cap),
                 sink.unknown_outcome,
                 sink.config_hash(),
+                list(sink.held),
             ),
         )
     conn.execute(
@@ -865,7 +869,7 @@ def _install_sources(conn: psycopg.Connection[Any], sources: Sequence[InboundSou
             "INSERT INTO interlock.inbox_sources (name, kind, config_hash, enabled, log_seq, "
             "log_head) VALUES (%s, %s, %s, true, 0, %s) ON CONFLICT (name) DO UPDATE SET "
             "kind = EXCLUDED.kind, config_hash = EXCLUDED.config_hash, enabled = true",
-            (source.name, source.kind, source.config_hash(), inbox_genesis(source.name)),
+            (source.name, source.mirror_kind, source.config_hash(), inbox_genesis(source.name)),
         )
     conn.execute(
         "UPDATE interlock.inbox_sources SET enabled = false WHERE NOT (name = ANY (%s))",
@@ -1059,6 +1063,32 @@ class PostgresSubstrate:
     def enforces_table_access(self) -> bool:
         """Whether a write outside the observed tables is refused."""
         return self._enforce
+
+    def held_operations(self) -> dict[str, tuple[str, ...]]:
+        """Each sink's operations the outbox holds for a warrant, as
+        ``interlock.sinks`` records them: none for an outbox installed before
+        held operations, or none at all.
+
+        :raises SubstrateConfigurationError: If this role may not read the
+            registry: one ``interlock install`` granted before held operations.
+        """
+        import psycopg
+
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT name, held FROM interlock.sinks WHERE enabled"
+                ).fetchall()
+        except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
+            return {}
+        except psycopg.errors.InsufficientPrivilege as exc:
+            raise SubstrateConfigurationError(
+                "this role may not read interlock.sinks, so it cannot see what the outbox "
+                "holds for a warrant: run `interlock install` to grant it"
+            ) from exc
+        except psycopg.Error as exc:
+            raise SubstrateUnavailableError(f"cannot read the sink registry: {exc}") from exc
+        return {str(name): tuple(held) for name, held in rows if held}
 
     def connection(self, handle: StageHandle) -> psycopg.Connection[Any]:
         """The open stage's connection, for a governor to join its transaction.
@@ -1377,12 +1407,11 @@ class PostgresSubstrate:
             spec = self._by_name.get(str(table).lower())
             before = _load(raw_before)
             after = _load(raw_after)
-            tenant: str | None = None
-            if spec is not None and spec.tenant_column is not None:
-                source = after if after is not None else before
-                if source is not None:
-                    raw = source.get(spec.tenant_column)
-                    tenant = None if raw is None else str(raw)
+            tenant, partitions = (
+                spec.labels(after if after is not None else before)
+                if spec is not None
+                else (None, {})
+            )
             deltas.append(
                 RowDelta(
                     table=str(table),
@@ -1390,6 +1419,7 @@ class PostgresSubstrate:
                     before=before,
                     after=after,
                     tenant_id=tenant,
+                    partitions=partitions,
                 )
             )
         return EffectDiff(

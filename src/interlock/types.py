@@ -40,6 +40,8 @@ __all__ = [
     "INBOX_TARGET",
     "MAX_NOT_AFTER",
     "OUTBOX_TARGET",
+    "PARTITION",
+    "TENANT",
     "CommitReceipt",
     "Compensation",
     "Effect",
@@ -61,6 +63,7 @@ __all__ = [
     "Verdict",
     "WindowMeasure",
     "canonical_hash",
+    "check_partitions",
     "iso",
     "outbound_key",
 ]
@@ -73,6 +76,33 @@ AUDIT_VERSION: Final = "ILOK1"
 chain can never be replayed as a record of the other."""
 
 GENESIS_HASH: Final = "0" * 64
+
+TENANT: Final = "tenant"
+"""The default partition dimension: the one ``tenant_id``, ``TableSpec.tenant_column``
+and every per-tenant check have always meant."""
+PARTITION: Final = re.compile(r"[a-z][a-z0-9_]{0,31}")
+"""A partition dimension's name: ``tenant``, ``patient``, ``facility``,
+``environment``, ``account``."""
+
+
+def check_partitions(partitions: Mapping[str, object], what: str) -> dict[str, str]:
+    """``partitions`` as a plain mapping of dimension to label, each label text.
+
+    The tenant is not one of them: it is ``tenant_id``.
+
+    :raises PlanError: On a dimension that is not a name, ``tenant``, or a
+        label that is not text.
+    """
+    found: dict[str, str] = {}
+    for dimension, label in partitions.items():
+        if not isinstance(dimension, str) or not PARTITION.fullmatch(dimension):
+            raise PlanError(f"{what}: {dimension!r} is not a partition dimension")
+        if dimension == TENANT:
+            raise PlanError(f"{what}: the tenant is tenant_id, not a partition")
+        if not isinstance(label, str) or not label:
+            raise PlanError(f"{what}: partition {dimension} is labeled {label!r}, not text")
+        found[dimension] = label
+    return dict(sorted(found.items()))
 
 
 def iso(moment: datetime) -> str:
@@ -315,6 +345,9 @@ class Effect:
         optional: an agent that omits it disables ``StatedFootprint``.
     :ivar request: For an ``ENQUEUE`` effect, the outbound request it
         proposes, in place of a statement. ``None`` for every other kind.
+    :ivar partitions: The labels the effect declares beside its tenant, by
+        dimension (``{"patient": "p-1182"}``): what
+        ``TenantIsolation(dimension=..., declared=True)`` holds its rows to.
     :raises PlanError: If ``statement`` is empty or whitespace-only. Nothing
         downstream (``reject_reason``, the leading-verb check) rejects a
         statement with no verb at all, so an empty one used to stage,
@@ -336,8 +369,13 @@ class Effect:
     compensation: Compensation | None = None
     stated_rows: int | None = None
     request: OutboundRequest | None = None
+    partitions: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.partitions:
+            object.__setattr__(
+                self, "partitions", check_partitions(self.partitions, f"effect {self.effect_id!r}")
+            )
         if self.kind is EffectKind.ENQUEUE:
             problems = [
                 problem
@@ -376,6 +414,11 @@ class Effect:
                 f"effect from the plan if doing nothing is what you mean."
             )
 
+    def partition(self, dimension: str) -> str | None:
+        """The label the effect declares in ``dimension``: its tenant for
+        :data:`TENANT`."""
+        return self.tenant_id if dimension == TENANT else self.partitions.get(dimension)
+
     @property
     def table(self) -> str:
         """The bare table name, with the substrate prefix stripped."""
@@ -401,6 +444,10 @@ class Effect:
         # Only when set, so every effect hashed before the outbox keeps its hash.
         if self.request is not None:
             fields.append(["request", self.request.content_hash()])
+        # Likewise the partitions beside the tenant: an effect that declares
+        # none keeps the hash it always had.
+        if self.partitions:
+            fields.append(["partitions", sorted(self.partitions.items())])
         return canonical_hash(fields)
 
 
@@ -511,6 +558,10 @@ class RowDelta:
     """One row's before and after image.
 
     ``before is None`` is an insert. ``after is None`` is a delete.
+
+    :ivar tenant_id: The row's tenant, read from ``TableSpec.tenant_column``.
+    :ivar partitions: Its labels in the table's other partition dimensions,
+        read from ``TableSpec.partitions``: ``{"patient": "p-1182"}``.
     """
 
     table: str
@@ -518,6 +569,11 @@ class RowDelta:
     before: Mapping[str, Any] | None
     after: Mapping[str, Any] | None
     tenant_id: str | None = None
+    partitions: Mapping[str, str] = field(default_factory=dict)
+
+    def partition(self, dimension: str) -> str | None:
+        """The row's label in ``dimension``: its tenant for :data:`TENANT`."""
+        return self.tenant_id if dimension == TENANT else self.partitions.get(dimension)
 
     @property
     def operation(self) -> str:
@@ -687,6 +743,14 @@ class EffectDiff:
     def tenant_ids(self) -> frozenset[str]:
         return frozenset(d.tenant_id for d in self.deltas if d.tenant_id is not None)
 
+    def partition_ids(self, dimension: str) -> frozenset[str]:
+        """The labels the rows carry in ``dimension``: :attr:`tenant_ids` for
+        :data:`TENANT`."""
+        if dimension == TENANT:
+            return self.tenant_ids
+        found = (d.partitions.get(dimension) for d in self.deltas)
+        return frozenset(label for label in found if label is not None)
+
     @property
     def tenant_count(self) -> int:
         """Distinct tenants touched, as a radius axis independent of row count.
@@ -738,7 +802,14 @@ class EffectDiff:
         return [(images[0], images[-1]) for images in rows.values()]
 
     def tenant_column_totals(self, table: str, column: str) -> dict[str, tuple[Decimal, Decimal]]:
-        """As :meth:`column_total`, but grouped by tenant.
+        """:meth:`partition_column_totals` by tenant."""
+        return self.partition_column_totals(table, column, TENANT)
+
+    def partition_column_totals(
+        self, table: str, column: str, dimension: str
+    ) -> dict[str, tuple[Decimal, Decimal]]:
+        """As :meth:`column_total`, but grouped by partition: by tenant for
+        :data:`TENANT`.
 
         The whole-table total is the wrong denominator on a multi-tenant
         substrate: draining one tenant completely is a small fraction of a
@@ -746,26 +817,29 @@ class EffectDiff:
         wipe. Rows whose tenant could not be read group under ``""``.
 
         Each row counts once, as in :meth:`column_total`: its value before the
-        plan under the tenant its first image was read as, its value after
-        under the tenant its last image was read as.
+        plan under the label its first image was read as, its value after
+        under the label its last image was read as.
 
-        :returns: ``{tenant_id: (before_total, after_total)}``.
+        :returns: ``{label: (before_total, after_total)}``.
         """
         totals: dict[str, tuple[Decimal, Decimal]] = {}
         for first, last in self._net(table):
             if first.before is not None:
-                tenant = first.tenant_id or ""
-                before, after = totals.get(tenant, (Decimal(0), Decimal(0)))
-                totals[tenant] = (before + _as_decimal(first.before.get(column)), after)
+                label = first.partition(dimension) or ""
+                before, after = totals.get(label, (Decimal(0), Decimal(0)))
+                totals[label] = (before + _as_decimal(first.before.get(column)), after)
             if last.after is not None:
-                tenant = last.tenant_id or ""
-                before, after = totals.get(tenant, (Decimal(0), Decimal(0)))
-                totals[tenant] = (before, after + _as_decimal(last.after.get(column)))
+                label = last.partition(dimension) or ""
+                before, after = totals.get(label, (Decimal(0), Decimal(0)))
+                totals[label] = (before, after + _as_decimal(last.after.get(column)))
         return totals
 
     def content_hash(self) -> str:
+        # A row's partitions beside its tenant are hashed only when it has
+        # some, so a diff of single-tenant rows keeps the hash it always had.
         rows = [
             [d.table, d.primary_key, d.operation, d.before, d.after, d.tenant_id]
+            + ([dict(sorted(d.partitions.items()))] if d.partitions else [])
             for d in sorted(self.deltas, key=lambda d: (d.table, d.primary_key, d.operation))
         ]
         fields: list[object] = [self.plan_id, self.substrate_id, self.truncated, rows]
@@ -983,6 +1057,11 @@ class SubstrateCapabilities:
     outbound: bool = False
     """Stages ``ENQUEUE`` effects into a transactional outbox, committed with
     the rest of the stage."""
+    measurement: str = "transactional"
+    """How strongly the driver measures what a plan changes, as ARC1 1.3
+    labels it: ``transactional`` (what was measured is what commits),
+    ``plan-bound``, ``predicted`` or ``request-only``. Every receipt of a plan
+    it stages carries it."""
 
 
 @dataclass(frozen=True, slots=True)

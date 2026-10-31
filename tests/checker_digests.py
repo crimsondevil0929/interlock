@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
+from agentgov import BudgetManager, Unit
+
 from interlock.invariants import (
     BUILT_IN_CHECKERS,
     BlastRadius,
@@ -26,6 +28,7 @@ from interlock.invariants import (
     TenantIsolation,
     TruncationGuard,
 )
+from interlock.meters import Meter, MeterCheck
 from interlock.outbound_checks import (
     OutboundCount,
     OutboundTenantIsolation,
@@ -35,7 +38,13 @@ from interlock.outbound_checks import (
 )
 from interlock.receipts import checker_records
 from interlock.types import Severity
-from interlock.windows import RateWindow, RateWindowCheck, Requests
+from interlock.windows import RateWindow, RateWindowCheck, Requests, RowSum
+
+
+def _ledger() -> BudgetManager:
+    """A ledger of the meter's unit: the policy's digest names the unit, never
+    the ledger."""
+    return BudgetManager(unit=Unit("mme"))
 
 
 def checkers() -> tuple[InvariantChecker, ...]:
@@ -72,6 +81,7 @@ def checkers() -> tuple[InvariantChecker, ...]:
         ),
         OutboundTenantIsolation(fields={"stripe": "metadata.tenant", "mail": "tenant"}),
         RateWindowCheck(RateWindow("w", timedelta(hours=1), 10, Requests("stripe"))),
+        MeterCheck(Meter(_ledger(), RowSum("orders", "total"), "60")),
         BlastRadius(8),
         TenantIsolation(2, declared=True),
         TableAllowlist(["orders", "refunds", "customers", "ledger", "items"]),

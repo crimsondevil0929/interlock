@@ -41,7 +41,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Final
 
@@ -50,6 +50,7 @@ from interlock.exceptions import (
     ForbiddenStatementError,
     InboundFactError,
     InterlockError,
+    MeterExhaustedError,
     OutboundRequestError,
     PlanError,
     ScopeHaltedError,
@@ -60,7 +61,15 @@ from interlock.exceptions import (
     SubstrateUnavailableError,
     UncompensatableEffectError,
 )
-from interlock.types import EffectDiff, EffectPlan, InvariantViolation, Severity, Verdict
+from interlock.types import (
+    PARTITION,
+    TENANT,
+    EffectDiff,
+    EffectPlan,
+    InvariantViolation,
+    Severity,
+    Verdict,
+)
 
 __all__ = [
     "BUCKETS",
@@ -110,6 +119,7 @@ class Guidance(StrEnum):
     TABLE_SCOPE = "table_scope"
     NO_DELETE = "no_delete"
     VALUE_DROP = "value_drop"
+    VALUE_RISE = "value_rise"
     TENANT_DRAWDOWN = "tenant_drawdown"
     TRUNCATED = "truncated"
     STATED_FOOTPRINT = "stated_footprint"
@@ -132,6 +142,9 @@ class Guidance(StrEnum):
     OUTBOUND_AGREEMENT = "outbound_agreement"
     # Raised by a checker over the measured diff and its windows' history.
     RATE_WINDOW = "rate_window"
+    # Raised by a meter's check, and before staging by its ledger.
+    METER = "meter"
+    METER_BUDGET = "meter_budget"
     # Raised by a checker over the outbound requests (docs/OUTBOX_DESIGN.md §5.2).
     OUTBOUND_SCOPE = "outbound_scope"
     OUTBOUND_COUNT = "outbound_count"
@@ -151,9 +164,12 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.TABLE_SCOPE: "table_allowlist",
     Guidance.NO_DELETE: "no_delete",
     Guidance.VALUE_DROP: "column_value_guard",
+    Guidance.VALUE_RISE: "column_value_guard",
     Guidance.TENANT_DRAWDOWN: "tenant_drawdown_guard",
     Guidance.TRUNCATED: "truncation_guard",
     Guidance.STATED_FOOTPRINT: "stated_footprint",
+    Guidance.METER: "meter",
+    Guidance.METER_BUDGET: "meter",
     Guidance.SCHEMA_CHANGE: "no_schema_change",
     Guidance.OPERATOR: "operator_constraint",
     Guidance.STATEMENT_KIND: "statement_kind",
@@ -208,6 +224,9 @@ class FeedbackHint:
         only from the built-in rate-window check, and only as an identifier.
     :ivar sinks: Sinks involved. Kept only where the plan's own requests name
         them.
+    :ivar dimension: The partition dimension ``tenants`` are labels of: the
+        tenant, or another (``patient``). Labels are kept only where the plan
+        declares them in that dimension. Built-in checkers only.
     """
 
     kind: Guidance
@@ -219,6 +238,7 @@ class FeedbackHint:
     percent: int | None = None
     window: str = ""
     sinks: tuple[str, ...] = ()
+    dimension: str = TENANT
 
 
 # --------------------------------------------------------------------------
@@ -250,6 +270,9 @@ class ConstraintFeedback:
     substrate: str = ""
     """The substrate that measured the plan, when its nouns are not SQL's: on
     ``git`` a row is a file and a table is a path class."""
+    dimension: str = ""
+    """The partition dimension ``tenants`` are labels of, when it is not the
+    tenant: ``patient``."""
 
     @property
     def constraint(self) -> str:
@@ -266,6 +289,8 @@ class ConstraintFeedback:
             named["sinks"] = list(self.sinks)
         if self.substrate:
             named["substrate"] = self.substrate
+        if self.dimension:
+            named["dimension"] = self.dimension
         return {
             "constraint": self.constraint,
             "guidance": self.guidance.value,
@@ -347,13 +372,50 @@ def _percent(c: ConstraintFeedback) -> str:
     return f"the {c.percent}% allowed" if c.percent is not None else "what is allowed"
 
 
+def _whom(c: ConstraintFeedback) -> str:
+    if not c.dimension:
+        if c.tenants:
+            return f"tenant {', '.join(c.tenants)}"
+        return "a tenant outside the plan's declared tenants"
+    if c.tenants:
+        return f"{c.dimension} {', '.join(c.tenants)}"
+    return f"a {c.dimension} outside the plan's declared {c.dimension}"
+
+
 def _drawdown(c: ConstraintFeedback) -> str:
-    whom = (
-        f"tenant {', '.join(c.tenants)}"
-        if c.tenants
-        else "a tenant outside the plan's declared tenants"
+    return f"the plan lowers {_column(c)} by more than {_percent(c)} for {_whom(c)}."
+
+
+def _rise(c: ConstraintFeedback) -> str:
+    whom = f" for {_whom(c)}" if c.dimension or c.tenants else ""
+    return f"the plan raises {_column(c)} by more than {_percent(c)}{whom}."
+
+
+def _scope(c: ConstraintFeedback) -> str:
+    if not c.dimension:
+        return (
+            f"the plan changed rows of more tenants than allowed "
+            f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. "
+            f"Confine every statement to its declared tenants."
+        )
+    return (
+        f"the plan changed rows spanning more {c.dimension} partitions than allowed "
+        f"(at most {c.limit or 'a set number'}); its declared {c.dimension} is "
+        f"{_tenants(c)}. Confine every statement to its declared {c.dimension}."
     )
-    return f"the plan lowers {_column(c)} by more than {_percent(c)} for {whom}."
+
+
+def _undeclared(c: ConstraintFeedback) -> str:
+    if not c.dimension:
+        return (
+            f"the plan changed rows of a tenant it does not declare; its declared tenants are "
+            f"{_tenants(c)}. Confine every statement to its declared tenants."
+        )
+    return (
+        f"the plan changed rows of a {c.dimension} it does not declare; its declared "
+        f"{c.dimension} is {_tenants(c)}. Confine every statement to its declared "
+        f"{c.dimension}."
+    )
 
 
 _TEMPLATES: Final[Mapping[Guidance, Any]] = {
@@ -361,15 +423,8 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"the plan changed {c.measured or 'too many'} rows; the limit is "
         f"{c.limit or 'lower'}. Narrow the statements' WHERE clauses or split the work."
     ),
-    Guidance.TENANT_SCOPE: lambda c: (
-        f"the plan changed rows of more tenants than allowed "
-        f"(at most {c.limit or 'a set number'}); its declared tenants are {_tenants(c)}. "
-        f"Confine every statement to its declared tenants."
-    ),
-    Guidance.UNDECLARED_TENANT: lambda c: (
-        f"the plan changed rows of a tenant it does not declare; its declared tenants are "
-        f"{_tenants(c)}. Confine every statement to its declared tenants."
-    ),
+    Guidance.TENANT_SCOPE: _scope,
+    Guidance.UNDECLARED_TENANT: _undeclared,
     Guidance.TABLE_SCOPE: lambda c: (
         f"the plan changed rows in {_tables(c)}, which it may not write."
     ),
@@ -377,6 +432,7 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"the plan deletes rows from {_tables(c)}, where deletes are not allowed."
     ),
     Guidance.VALUE_DROP: lambda c: f"the plan lowers {_column(c)} by more than {_percent(c)}.",
+    Guidance.VALUE_RISE: _rise,
     Guidance.TENANT_DRAWDOWN: _drawdown,
     Guidance.TRUNCATED: lambda c: (
         f"the plan changed more rows than can be measured ({c.measured or 'too many'}). "
@@ -423,8 +479,16 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     Guidance.RATE_WINDOW: lambda c: (
         f"the plan would take {'rate window ' + c.window if c.window else 'a rate window'} "
         f"past its limit"
-        + (f" for tenant {', '.join(c.tenants)}" if c.tenants else "")
+        + (f" for {c.dimension or 'tenant'} {', '.join(c.tenants)}" if c.tenants else "")
         + ". The window slides: what earlier plans added stops counting as it ages."
+    ),
+    Guidance.METER: lambda c: (
+        f"the plan consumes more {c.window or 'of a metered unit'} than one plan may. "
+        f"Split the work."
+    ),
+    Guidance.METER_BUDGET: lambda c: (
+        f"the agent's {c.window + ' ' if c.window else ''}budget cannot cover another plan; "
+        f"nothing was staged."
     ),
     Guidance.OUTBOUND_SCOPE: lambda c: (
         f"a request to {_sinks(c)} uses a sink or operation this plan may not call."
@@ -577,15 +641,30 @@ class _Scope:
     tenants: frozenset[str]
     sinks: frozenset[str] = frozenset()
     """The sinks the plan's own requests name."""
+    partitions: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    """The labels the plan's effects declare in each other dimension."""
 
     @classmethod
     def of(cls, plan: EffectPlan) -> _Scope:
         tables: dict[str, str] = {}
+        partitions: dict[str, set[str]] = {}
         for effect in plan.effects:
             tables.setdefault(effect.table.lower(), effect.table)
+            for dimension, label in effect.partitions.items():
+                partitions.setdefault(dimension, set()).add(label)
         tenants = frozenset(e.tenant_id for e in plan.effects if e.tenant_id is not None)
         sinks = frozenset(e.request.sink for e in plan.effects if e.request is not None)
-        return cls(tables=tables, tenants=tenants, sinks=sinks)
+        return cls(
+            tables=tables,
+            tenants=tenants,
+            sinks=sinks,
+            partitions={d: frozenset(labels) for d, labels in partitions.items()},
+        )
+
+    def declared(self, dimension: str) -> frozenset[str]:
+        if dimension == TENANT:
+            return self.tenants
+        return self.partitions.get(dimension, frozenset())
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,10 +697,16 @@ def sanitize(
             withheld_tables = True
         elif known not in tables:
             tables.append(known)
+    # Another dimension only from a built-in checker, and only as a name: its
+    # labels are then held to the plan's own declared labels in it.
+    dimension = TENANT
+    if trusted and isinstance(hint.dimension, str) and PARTITION.fullmatch(hint.dimension):
+        dimension = hint.dimension
+    declared = scope.declared(dimension)
     tenants: list[str] = []
     withheld_tenants = False
     for tenant in hint.tenants:
-        if tenant in scope.tenants:
+        if tenant in declared:
             if tenant not in tenants:
                 tenants.append(tenant)
         else:
@@ -647,8 +732,9 @@ def sanitize(
             percent = hint.percent
         # A window's name only for a window's guidance, from the built-in
         # check: anything else could spell data as a "name".
+        # A meter's unit likewise, for a meter's guidance.
         if (
-            kind is Guidance.RATE_WINDOW
+            kind in (Guidance.RATE_WINDOW, Guidance.METER, Guidance.METER_BUDGET)
             and isinstance(hint.window, str)
             and _IDENTIFIER.fullmatch(hint.window)
         ):
@@ -670,6 +756,7 @@ def sanitize(
         window=window,
         sinks=sinks,
         substrate=substrate if substrate in _NOUNS else "",
+        dimension="" if dimension == TENANT else dimension,
     )
 
 
@@ -732,7 +819,12 @@ def feedback_for_error(
     blocking = True
     retryable = False
     hint: FeedbackHint
-    if isinstance(error, InboundFactError):
+    trusted = False
+    if isinstance(error, MeterExhaustedError):
+        # The unit is the engine's configuration, named by its own exception.
+        hint = FeedbackHint(kind=Guidance.METER_BUDGET, window=error.unit)
+        trusted = True
+    elif isinstance(error, InboundFactError):
         hint = FeedbackHint(kind=Guidance.INBOUND_FACT)
     elif isinstance(error, ForbiddenStatementError):
         kind = _REASON_GUIDANCE.get(error.reason, Guidance.STATEMENT_KIND)
@@ -760,6 +852,8 @@ def feedback_for_error(
         hint = FeedbackHint(kind=Guidance.UNAVAILABLE)
     return AgentFeedback(
         outcome="error",
-        constraints=(sanitize(hint, plan, blocking=blocking, trusted=False, substrate=substrate),),
+        constraints=(
+            sanitize(hint, plan, blocking=blocking, trusted=trusted, substrate=substrate),
+        ),
         retryable=retryable,
     )

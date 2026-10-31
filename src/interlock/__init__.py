@@ -66,6 +66,7 @@ from interlock.exceptions import (
     InboundFactError,
     InterlockError,
     LedgerUnverifiedError,
+    MeterExhaustedError,
     OutboundRequestError,
     PlanError,
     PoolExhaustedError,
@@ -92,7 +93,14 @@ from interlock.extension import (
     Spend,
 )
 from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEvidence, Refusal
-from interlock.inbox import InboundSource, Inbox, InboxServer, verify_fact, verify_inbox
+from interlock.inbox import (
+    InboundSource,
+    Inbox,
+    InboxServer,
+    register_source_kind,
+    verify_fact,
+    verify_inbox,
+)
 from interlock.invariants import (
     BlastRadius,
     ColumnValueGuard,
@@ -108,7 +116,9 @@ from interlock.invariants import (
     TruncationGuard,
     default_checkers,
 )
-from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec
+from interlock.mcp import McpAdapter, StdioServer, mcp_sink
+from interlock.meters import Meter, MeterCheck
+from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec, register_sink_kind
 from interlock.outbound_checks import (
     OutboundCount,
     OutboundTenantIsolation,
@@ -185,7 +195,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "AdmissionError",
@@ -243,6 +253,10 @@ __all__ = [
     "LedgerAnchor",
     "LedgerBreaker",
     "LedgerUnverifiedError",
+    "McpAdapter",
+    "Meter",
+    "MeterCheck",
+    "MeterExhaustedError",
     "Metrics",
     "MetricsService",
     "Milestones",
@@ -309,6 +323,7 @@ __all__ = [
     "StageResult",
     "StageState",
     "StatedFootprint",
+    "StdioServer",
     "SubstrateConfigurationError",
     "SubstrateUnavailableError",
     "SupervisorStoppedError",
@@ -332,10 +347,13 @@ __all__ = [
     "child_traceparent",
     "default_checkers",
     "load_application",
+    "mcp_sink",
     "new_effect_id",
     "new_plan_id",
     "new_traceparent",
     "parse_traceparent",
+    "register_sink_kind",
+    "register_source_kind",
     "retry_delay",
     "verify_archive",
     "verify_delivery_log",

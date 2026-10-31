@@ -414,3 +414,52 @@ def test_a_refund_row_with_no_call_is_refused(outbox: Outbox) -> None:
     (blocked,) = result.verdict.blocking
     assert "with no payments.refund request" in blocked.message
     assert refunds(outbox) == {}
+
+
+# -- one quantity on more than one operation (1.2.0) ---------------------------------------
+
+ORDERS = CrossEffectAgreement(
+    "payments",
+    "refund",
+    field="amount",
+    table="refunds",
+    column="amount",
+    also=("refund_held",),
+)
+
+
+def test_a_rule_over_several_operations_holds_whichever_call_carries_the_quantity() -> None:
+    held = request("50.00", operation="refund_held")
+    assert violations(ORDERS, diff(row(1, "50.00"), outbound=(held,))) == ()
+    # the held call disagreeing is named, by either operation's name
+    (found,) = violations(
+        ORDERS, diff(row(1, "50.00"), outbound=(request("5000.00", operation="refund_held"),))
+    )
+    assert "payments.refund or payments.refund_held asks for 5000.00" in found.message
+    assert found.evidence["operation"] == "refund|refund_held"
+    # both calls together are held to the rows together
+    both = (request("20.00"), request("30.00", operation="refund_held", effect="pay2"))
+    assert violations(ORDERS, diff(row(1, "50.00"), outbound=both)) == ()
+    # a call of another operation is no part of it: the rows go unmatched
+    (lone,) = violations(ORDERS, diff(row(1, "50.00"), outbound=(request(operation="charge"),)))
+    assert "with no payments.refund or payments.refund_held request" in lone.message
+    # the rule over one operation alone refuses the held call's rows
+    assert violations(REFUND, diff(row(1, "50.00"), outbound=(held,)))
+
+
+def test_several_operations_are_named_and_one_keeps_its_name_and_digest() -> None:
+    assert ORDERS.name == "cross_effect_agreement:payments.refund|refund_held.amount=refunds.amount"
+    assert REFUND.name == "cross_effect_agreement:payments.refund.amount=refunds.amount"
+    plain = CrossEffectAgreement(
+        "payments", "refund", field="amount", table="refunds", column="amount", also=()
+    )
+    assert checker_records([plain]) == checker_records([REFUND])
+    assert checker_records([ORDERS])[0].config_hash != checker_records([REFUND])[0].config_hash
+    with pytest.raises(ValueError, match="names each operation once"):
+        CrossEffectAgreement(
+            "payments", "refund", field="a", table="t", column="c", also=["refund"]
+        )
+    with pytest.raises(ValueError, match="not one"):
+        CrossEffectAgreement("payments", "refund", field="a", table="t", column="c", also="x")
+    with pytest.raises(ValueError, match="needs a operation"):
+        CrossEffectAgreement("payments", "refund", field="a", table="t", column="c", also=[" "])

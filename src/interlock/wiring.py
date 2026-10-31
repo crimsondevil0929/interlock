@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from interlock.anchor import LedgerAnchor
 from interlock.config import INBOX_DATABASE_ENV, is_dsn
 from interlock.exceptions import SubstrateConfigurationError, SubstrateUnavailableError
+from interlock.outbound import typed_sink
 from interlock.postgres import PostgresSubstrate
 from interlock.receipts import ReceiptIssuer
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate
@@ -359,6 +360,18 @@ def relay_adapter(endpoint: Endpoint) -> Any:
             base_url=endpoint.url or SENDGRID_API,
             sandbox=endpoint.sandbox,
         )
+    typed = typed_sink(endpoint.kind)
+    if typed is not None:
+        # An mcp sink's, or a registered kind's: its own adapter, from its keys.
+        make = getattr(typed, "relay_adapter", None)
+        if make is None:
+            raise SubstrateConfigurationError(
+                f"sink {endpoint.sink}: kind {endpoint.kind} has no relay adapter"
+            )
+        try:
+            return make(endpoint)
+        except ValueError as exc:
+            raise SubstrateConfigurationError(str(exc)) from exc
     from interlock.adapters import HttpAdapter
 
     return HttpAdapter(

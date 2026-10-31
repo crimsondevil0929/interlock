@@ -228,6 +228,19 @@ class ScopeHaltedError(AdmissionError):
     """
 
 
+class MeterExhaustedError(AdmissionError):
+    """A plan's scope cannot hold what one plan may consume of a metered unit
+    (:mod:`interlock.meters`): too little left of its envelope, halted, or not
+    in the unit's ledger. Raised before anything is staged.
+
+    :ivar unit: The unit's code.
+    """
+
+    def __init__(self, message: str, *, unit: str) -> None:
+        super().__init__(message)
+        self.unit = unit
+
+
 # -- the evidence is unusable ----------------------------------------------
 
 

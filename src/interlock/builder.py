@@ -138,6 +138,7 @@ class PlanBuilder:
         independent: bool = False,
         reversible: bool = True,
         compensation: Compensation | None = None,
+        partitions: Mapping[str, str] | None = None,
     ) -> PlanBuilder:
         """Append one effect.
 
@@ -150,6 +151,9 @@ class PlanBuilder:
             previously added effect, making a plan sequential by default.
         :param independent: Declare no ordering constraint at all, overriding
             the sequential default. Mutually exclusive with ``after``.
+        :param partitions: The labels the effect declares beside its tenant
+            (``{"patient": "p-1182"}``), which ``TenantIsolation(dimension=...,
+            declared=True)`` holds its rows to.
         :raises PlanError: On an unnamed placeholder, or on ``after`` naming an
             effect this builder has not seen.
         """
@@ -171,6 +175,7 @@ class PlanBuilder:
                 reversible=reversible,
                 compensation=compensation,
                 stated_rows=stated_rows,
+                partitions=dict(partitions or {}),
             )
         )
         return self
@@ -199,6 +204,7 @@ class PlanBuilder:
         effect_id: EffectId | None = None,
         after: Sequence[EffectId] | None = None,
         independent: bool = False,
+        partitions: Mapping[str, str] | None = None,
     ) -> PlanBuilder:
         """Append an outbound request: a call to an external system, made by
         the relay after the plan commits, never by the agent.
@@ -215,6 +221,8 @@ class PlanBuilder:
             operation has one.
         :param after: As for :meth:`add`. Dependencies order delivery: this
             request waits for every earlier request it depends on.
+        :param partitions: As for :meth:`add`: a window per partition counts
+            the request toward these labels.
         :raises PlanError: On a payload outside the canonical domain.
         """
         request = OutboundRequest(
@@ -237,6 +245,7 @@ class PlanBuilder:
                 # request's compensation, governed by the sink registry.
                 reversible=False,
                 request=request,
+                partitions=dict(partitions or {}),
             )
         )
         return self
