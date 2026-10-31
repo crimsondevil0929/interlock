@@ -9,12 +9,13 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-### 1.2.0: any partition, any unit, any sink, and honest receipts
+## [1.2.0] - 2026-10-31
 
-Upgrades from 1.1.0 in place. Requires `interlock-agentgov>=1.1.0`, for units and ARC1
-1.3. A configuration that uses none of what follows keeps every plan, diff, verdict and
-schema hash, every checker's configuration digest, and every sink's configuration hash it
-had: each new field enters a hash only when it is set.
+Any partition, any unit, any sink, and honest receipts. Upgrades from 1.1.0 in place.
+Requires `interlock-agentgov>=1.1.0`, for units and ARC1 1.3. A configuration that uses
+none of what follows keeps every plan, diff, verdict and schema hash, every checker's
+configuration digest, and every sink's configuration hash it had: each new field enters a
+hash only when it is set.
 
 ### Added
 

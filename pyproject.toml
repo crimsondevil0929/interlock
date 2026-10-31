@@ -132,11 +132,6 @@ warn_redundant_casts = true
 show_error_codes = true
 
 # Explicitly tell the build system where the module is
-[tool.uv.sources]
-# Until interlock-agentgov 1.1.0 is on PyPI: the commit this release is built against
-# (crimsondevil0929/agentgov, feat/units-and-measurement). Remove before tagging, and relock.
-interlock-agentgov = { git = "https://github.com/crimsondevil0929/agentgov", rev = "9a42d2af55f59c95b88aa39f661839a452be6090" }
-
 [tool.uv_build]
 packages = ["src/interlock"]
 
