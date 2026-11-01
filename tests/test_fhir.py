@@ -178,7 +178,7 @@ def literal(document: Any) -> str:
 def create(bed: str = "4A", drug: str = "acetaminophen", dose: int = 650) -> tuple[Any, ...]:
     return (
         EffectKind.INSERT,
-        f"create medicationrequests {literal(TEMPLATE)}",
+        f"create medicationrequests {literal(TEMPLATE)} :bed :drug :dose :mme",
         {"bed": bed, "drug": drug, "dose": dose, "mme": 0},
         "medicationrequests",
         "void medicationrequests",
@@ -186,9 +186,10 @@ def create(bed: str = "4A", drug: str = "acetaminophen", dose: int = 650) -> tup
 
 
 def patch(order_id: str, change: dict[str, Any], **parameters: Any) -> tuple[Any, ...]:
+    listed = "".join(f" :{name}" for name in sorted(parameters))
     return (
         EffectKind.UPDATE,
-        f"patch medicationrequests :id {literal(change)}",
+        f"patch medicationrequests :id {literal(change)}{listed}",
         {"id": order_id, **parameters},
         "medicationrequests",
         "restore medicationrequests",
@@ -246,6 +247,7 @@ def test_statements_parse_each_verb_and_refuse_anything_else() -> None:
     assert found.bind({"id": "7"}) == {"id": "7", "patch": '{"status": "stopped"}'}
     assert parse_statement("create tasks :resource").verb == "create"
     assert parse_statement("expect-version tasks :a 'it''s'").arguments[1] == ("'", "it's")
+    assert parse_statement("create tasks '{}' :a :b").binds == ("a", "b")
     for bad, message in [
         ("delete medicationrequests :id", "verbs"),
         ("patch", "verb, a table"),
@@ -254,6 +256,8 @@ def test_statements_parse_each_verb_and_refuse_anything_else() -> None:
         ("patch medicationrequests :id 'open", "not closed"),
         ("patch medicationrequests : :b", "parameter"),
         ("patch medicationrequests ;", "unexpected"),
+        ("create tasks '{}' 'x'", "lists the :parameters"),
+        ("expect-version tasks :a :b :c", "takes"),
     ]:
         with pytest.raises(ValueError, match=message):
             parse_statement(bad)
@@ -387,7 +391,7 @@ def test_each_effect_declares_the_undo_its_verb_takes(
     )
     for document, message in [
         ({"id": "x"}, "may not set id"),
-        ({"status": ":missing"}, "not bound"),
+        ({"status": ":missing"}, "does not list after it"),
         ([1], "a JSON object"),
     ]:
         assert message in str(
@@ -403,7 +407,13 @@ def test_each_effect_declares_the_undo_its_verb_takes(
         )
     assert "may not change meta" in str(why(patch("1", {"meta": {"tag": []}})))
     assert "a JSON merge patch" in str(why(patch("1", [1])))  # type: ignore[arg-type]
-    assert "not bound" in str(why(patch("1", {"status": ":gone"})))
+    kind, statement, parameters, table, undo = patch("1", {"status": ":gone"}, gone=None)
+    parameters.pop("gone")
+    assert "not bound" in str(why((kind, statement, parameters, table, undo)))
+    kind, statement, parameters, table, undo = patch("1", {"status": "on-hold"})
+    assert "which its template does not bind" in str(
+        why((kind, statement + " :extra", {**parameters, "extra": 1}, table, undo))
+    )
     assert "not a FHIR resource id" in str(why(patch("bad id!", {"status": "x"})))
     assert "text or a whole number" in str(why(patch(True, {"status": "x"})))  # type: ignore[arg-type]
     enqueue = PlanBuilder("s").enqueue(sink="pharmacy", operation="x", payload={}).build()
@@ -679,7 +689,7 @@ def test_a_conditional_reference_must_find_exactly_one(
         with pytest.raises(StageError, match=message):
             engine(substrate(server, tmp_path), tmp_path).execute(plan(create(bed=bed)))
     odd = dict(TEMPLATE, subject={"reference": "Patient?unknown=1"})
-    statement = f"create medicationrequests {literal(odd)}"
+    statement = f"create medicationrequests {literal(odd)} :bed :drug :dose :mme"
     with pytest.raises(StageError, match="cannot search"):
         engine(substrate(server, tmp_path), tmp_path).execute(
             plan(
@@ -693,7 +703,7 @@ def test_a_conditional_reference_must_find_exactly_one(
             )
         )
     lowered = dict(TEMPLATE, subject={"reference": "patient?x=1"})
-    statement = f"create medicationrequests {literal(lowered)}"
+    statement = f"create medicationrequests {literal(lowered)} :bed :drug :dose :mme"
     with pytest.raises(StageError, match="not a conditional reference"):
         engine(substrate(server, tmp_path), tmp_path).execute(
             plan(
@@ -715,7 +725,7 @@ def test_what_a_stage_may_reach(server: LoopbackFhirServer, tmp_path: Path) -> N
         engine(substrate(server, tmp_path, patients=[OTHER]), tmp_path).execute(plan(stop("1")))
     orphan = dict(TEMPLATE)
     orphan.pop("subject")
-    statement = f"create medicationrequests {literal(orphan)}"
+    statement = f"create medicationrequests {literal(orphan)} :bed :drug :dose :mme"
     with pytest.raises(StageError, match="names no patient"):
         engine(substrate(server, tmp_path), tmp_path).execute(
             plan(

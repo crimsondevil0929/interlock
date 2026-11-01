@@ -1308,7 +1308,7 @@ def test_a_git_substrate_is_configured_in_interlock_toml(repo: Repo) -> None:
         ),
         (
             'substrate = "svn"\ndatabase = "c.db"\n',
-            "'sqlite', 'postgres', 'git', 'kubernetes' or 'terraform'",
+            "'sqlite', 'postgres', 'git', 'kubernetes', 'terraform' or 'fhir'",
         ),
     ],
 )

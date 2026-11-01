@@ -55,10 +55,11 @@ Each resource is one :class:`~interlock.types.RowDelta`:
 
 **Statements**, one operation each; a template is a JSON literal in which a
 string value ``":name"`` is replaced, whole, by that parameter (and a query
-value of a conditional reference likewise)::
+value of a conditional reference likewise). The parameters a template binds
+are listed after it, exactly, so a reader sees them outside the literal::
 
-    create <table> '<resource template>'
-    patch <table> :id '<merge patch template>'
+    create <table> '<resource template>' [:name ...]
+    patch <table> :id '<merge patch template>' [:name ...]
     expect-version <table> :id :version
 
 **Compensations**: the substrate cannot roll back
@@ -370,11 +371,13 @@ def fhir_tables(types: Sequence[FhirType]) -> tuple[TableSpec, ...]:
 @dataclass(frozen=True, slots=True)
 class FhirStatement:
     """A parsed statement: its verb, its table, and each argument, a
-    parameter name (``(":", name)``) or a literal (``("'", text)``)."""
+    parameter name (``(":", name)``) or a literal (``("'", text)``); and the
+    parameters its template binds, as listed after it."""
 
     verb: str
     table: str
     arguments: tuple[tuple[str, str], ...]
+    binds: tuple[str, ...] = ()
 
     def bind(self, parameters: Mapping[str, object]) -> dict[str, object]:
         """Each argument's value, by the name the verb gives it.
@@ -445,9 +448,49 @@ def parse_statement(statement: str) -> FhirStatement:
     arguments = tokens[2:]
     if any(kind == "word" for kind, _ in arguments):
         raise ValueError("an argument is a :parameter or a 'literal'")
-    if len(arguments) != len(VERBS[verb]):
+    takes = len(VERBS[verb])
+    listed = arguments[takes:]
+    if len(arguments) < takes or (verb == "expect-version" and listed):
         raise ValueError(f"{verb} takes {' '.join(':' + a for a in VERBS[verb])}")
-    return FhirStatement(verb, table, tuple(arguments))
+    if any(kind != ":" for kind, _ in listed):
+        raise ValueError("after its template, a statement lists the :parameters it binds")
+    return FhirStatement(verb, table, tuple(arguments[:takes]), tuple(n for _, n in listed))
+
+
+def _bound_by(template: Any) -> set[str]:
+    """Every parameter a template binds: whole ``":name"`` values, and the
+    query values of its conditional references."""
+    if isinstance(template, Mapping):
+        found: set[str] = set()
+        for key, value in template.items():
+            if key == "reference" and isinstance(value, str) and "?" in value:
+                query = value.partition("?")[2]
+                for _, given in parse_qsl(query, keep_blank_values=True):
+                    whole = _PLACEHOLDER.fullmatch(given)
+                    if whole is not None:
+                        found.add(whole.group(1))
+            else:
+                found |= _bound_by(value)
+        return found
+    if isinstance(template, list):
+        return {n for v in template for n in _bound_by(v)}
+    if isinstance(template, str):
+        whole = _PLACEHOLDER.fullmatch(template)
+        return {whole.group(1)} if whole is not None else set()
+    return set()
+
+
+def _listed(statement: FhirStatement, template: Any) -> str | None:
+    """Why the parameters a statement lists are not the ones its template
+    binds, or ``None``."""
+    used, listed = _bound_by(template), set(statement.binds)
+    if used - listed:
+        names = ", ".join(":" + n for n in sorted(used - listed))
+        return f"the template binds {names}, which the statement does not list after it"
+    if listed - used:
+        names = ", ".join(":" + n for n in sorted(listed - used))
+        return f"the statement lists {names}, which its template does not bind"
+    return None
 
 
 def parse_compensation(statement: str) -> tuple[str, str]:
@@ -890,6 +933,9 @@ class FhirSubstrate:
             set_here = sorted(k for k in _PROTECTED if k in template and k != "resourceType")
             if set_here:
                 return f"a template may not set {', '.join(set_here)}: the substrate writes them"
+            listed = _listed(statement, template)
+            if listed is not None:
+                return listed
             try:
                 _fill(template, effect.parameters)
             except ValueError as exc:
@@ -907,6 +953,9 @@ class FhirSubstrate:
             touched = sorted(k for k in _PROTECTED if k in patch)
             if touched:
                 return f"a patch may not change {', '.join(touched)}: the substrate writes them"
+            listed = _listed(statement, patch)
+            if listed is not None:
+                return listed
             try:
                 _fill(patch, effect.parameters)
             except ValueError as exc:
