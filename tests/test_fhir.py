@@ -633,6 +633,29 @@ def test_someone_elses_change_is_named_and_never_put_back(
     assert kept["meta"]["source"] == "#bedside-17"
 
 
+def test_a_write_someone_else_wrote_again_is_left_for_an_operator(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    sub = substrate(server, tmp_path)
+    original = sub._discrepancies
+
+    def nurse_edits_the_written_order(stage: Any) -> list[str]:
+        edited = server.get("MedicationRequest", "2")
+        assert edited is not None
+        edited["note"] = [{"text": "held at the bedside"}]
+        server.write(edited, actor="Practitioner/rn-04", request_id="bedside-18")
+        sub._discrepancies = original  # type: ignore[method-assign]
+        return original(stage)
+
+    sub._discrepancies = nurse_edits_the_written_order  # type: ignore[method-assign]
+    run = engine(sub, tmp_path)
+    with pytest.raises(CommitUnsettledError, match="written again by another request"):
+        run.execute(plan(patch("2", {"status": "on-hold"})))
+    kept = server.get("MedicationRequest", "2")
+    assert kept is not None and kept["note"] == [{"text": "held at the bedside"}]
+    assert run.chain.records()[-1].record_type is RecordType.COMMIT_INTENT
+
+
 def test_a_later_write_that_fails_puts_the_earlier_ones_back(
     server: LoopbackFhirServer, tmp_path: Path
 ) -> None:

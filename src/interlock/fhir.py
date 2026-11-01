@@ -1480,8 +1480,12 @@ class FhirSubstrate:
         the resource, or when the server says the request that wrote it was
         one of the stage's (``meta.source``, ``#<stage id>``): a rule the
         write set off. Anything else changed since is someone else's, and is
-        never put back: it is named for a person instead. Each write is
-        conditional on the version read back. How many were put back.
+        never put back: it is named for a person instead. (A server that
+        names no request in ``meta.source`` has every change but the
+        stage's own writes put back by a person.) A resource the stage wrote
+        and another request wrote again is never put back either: the
+        put-back is then incomplete. Each write is conditional on the
+        version read back. How many were put back.
 
         :raises CommitUnsettledError: If any cannot be.
         """
@@ -1497,6 +1501,14 @@ class FhirSubstrate:
                 continue
             kind = self._types[key[0]]
             source = str((now.get("meta") or {}).get("source") or "")
+            if key in written and source and not source.endswith(ours):
+                # The stage wrote it, and another request wrote it since:
+                # putting it back would undo that one too. A person decides.
+                failures.append(
+                    f"{kind.resource_type}/{key[1]}: written again by another request since "
+                    f"the stage wrote it"
+                )
+                continue
             if key not in written and not source.endswith(ours):
                 stage.foreign.append(f"{kind.resource_type}/{key[1]}")
                 continue
