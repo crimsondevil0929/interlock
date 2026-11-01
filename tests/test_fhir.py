@@ -708,7 +708,17 @@ def test_expect_version_pins_the_plan_to_what_was_approved(
 def test_a_conditional_reference_must_find_exactly_one(
     server: LoopbackFhirServer, tmp_path: Path
 ) -> None:
-    for bed, message in (("9Z", "matches 0 resources"),):
+    server.seed(
+        {
+            "resourceType": "Encounter",
+            "id": "enc-3",
+            "status": "in-progress",
+            "subject": {"reference": f"Patient/{OTHER}"},
+            "location": [{"location": {"reference": "Location/4B"}}],
+            "serviceProvider": {"reference": "Organization/fac-north"},
+        }
+    )
+    for bed, message in (("9Z", "matches 0 resources"), ("4B", "matches 2 resources")):
         with pytest.raises(StageError, match=message):
             engine(substrate(server, tmp_path), tmp_path).execute(plan(create(bed=bed)))
     odd = dict(TEMPLATE, subject={"reference": "Patient?unknown=1"})
