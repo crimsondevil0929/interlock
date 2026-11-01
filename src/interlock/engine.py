@@ -780,10 +780,14 @@ class EscrowEngine:
             # nothing of it is left applied.
             self._substrate.abort(handle)
             if exc.discrepancies:
+                named = "; ".join(exc.discrepancies[:10]) + (
+                    f"; and {len(exc.discrepancies) - 10} more"
+                    if len(exc.discrepancies) > 10
+                    else ""
+                )
                 note = (
                     f"read-back not as predicted ({len(exc.discrepancies)} discrepancy(ies): "
-                    f"{'; '.join(exc.discrepancies)}); {exc.restored} resource(s) put back "
-                    f"from undo {exc.undo[:16]}"
+                    f"{named}); {exc.restored} resource(s) put back from undo {exc.undo[:16]}"
                 )
             else:
                 note = (

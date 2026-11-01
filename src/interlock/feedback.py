@@ -338,7 +338,7 @@ class AgentFeedback:
         head = {
             "committed": "The plan committed.",
             "refused": "The plan was refused and rolled back; nothing changed.",
-            "error": "The plan was not staged; nothing changed.",
+            "error": "The plan did not commit; nothing changed.",
             "compensated": "The plan was admitted and written, then put back; nothing of it "
             "stands.",
         }.get(self.outcome, "Nothing changed.")
