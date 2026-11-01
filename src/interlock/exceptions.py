@@ -203,6 +203,26 @@ class CommitUnsettledError(StageError):
     """
 
 
+class CompensatedError(StageError):
+    """A plan-bound commit applied part of the plan and failed, and the
+    substrate put back what it had applied, from the undo it wrote down before
+    applying (:mod:`interlock.planbound`).
+
+    Nothing of the plan is left applied. The chain records the stage as
+    ``COMPENSATED``. Retrying is safe: a new plan measures the system afresh.
+
+    :ivar applied: How many objects the commit had changed when it failed.
+    :ivar restored: How many of them the undo put back.
+    :ivar undo: The SHA-256 of the undo, as the commit intent named it.
+    """
+
+    def __init__(self, message: str, *, applied: int, restored: int, undo: str) -> None:
+        super().__init__(message)
+        self.applied = applied
+        self.restored = restored
+        self.undo = undo
+
+
 # -- an invariant said no ---------------------------------------------------
 
 

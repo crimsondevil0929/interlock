@@ -50,6 +50,7 @@ from interlock.anchor import AnchorPoint, LedgerAnchor
 from interlock.builder import PlanBuilder, new_effect_id, new_plan_id
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
+from interlock.checker_packs import CheckerPack, CheckerPackError, PackPin, load_pack, pack_digest
 from interlock.daemon import Application, build_supervisor, load_application
 from interlock.deliveries import verify_delivery_log
 from interlock.engine import EscrowEngine, StageResult
@@ -60,6 +61,7 @@ from interlock.exceptions import (
     ChainInUseError,
     CommitUnsettledError,
     CompactionRefusedError,
+    CompensatedError,
     CyclicPlanError,
     ExtensionError,
     ForbiddenStatementError,
@@ -116,6 +118,7 @@ from interlock.invariants import (
     TruncationGuard,
     default_checkers,
 )
+from interlock.kubernetes import KubeKind, KubernetesSubstrate
 from interlock.mcp import McpAdapter, StdioServer, mcp_sink
 from interlock.meters import Meter, MeterCheck
 from interlock.outbound import OperationSpec, SinkRegistry, SinkSpec, register_sink_kind
@@ -151,6 +154,7 @@ from interlock.relay import (
 )
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
 from interlock.runtime import EscrowRuntime
+from interlock.sensors import CommandSensor, FunctionSensor, SensorAttestation, sign_fact
 from interlock.settlement import SettlementReport, Settler, verify_settlements
 from interlock.signers import AwsKmsSigner, HttpRemoteSigner, RemoteSigner
 from interlock.substrate import ShadowSubstrate, SqliteSubstrate, TableSpec
@@ -167,6 +171,7 @@ from interlock.supervisor import (
     VacuumService,
 )
 from interlock.telemetry import Metrics
+from interlock.terraform import TerraformSubstrate, TfResource
 from interlock.trace import child_traceparent, new_traceparent, parse_traceparent
 from interlock.types import (
     Compensation,
@@ -180,8 +185,10 @@ from interlock.types import (
     OutboundRequest,
     PlanId,
     RowDelta,
+    SensorFact,
     Severity,
     StageState,
+    UnknownValue,
     Verdict,
     WindowMeasure,
 )
@@ -195,7 +202,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "AdmissionError",
@@ -211,9 +218,13 @@ __all__ = [
     "ChainInUseError",
     "ChainIntegrityError",
     "Channel",
+    "CheckerPack",
+    "CheckerPackError",
     "ColumnValueGuard",
+    "CommandSensor",
     "CommitUnsettledError",
     "CompactionRefusedError",
+    "CompensatedError",
     "Compensation",
     "ConstraintFeedback",
     "CrossEffectAgreement",
@@ -238,6 +249,7 @@ __all__ = [
     "ExtensionRequest",
     "FactAgreement",
     "ForbiddenStatementError",
+    "FunctionSensor",
     "HttpAdapter",
     "HttpRemoteSigner",
     "InboundFact",
@@ -250,6 +262,8 @@ __all__ = [
     "InterlockSupervisor",
     "InvariantChecker",
     "InvariantViolation",
+    "KubeKind",
+    "KubernetesSubstrate",
     "LedgerAnchor",
     "LedgerBreaker",
     "LedgerUnverifiedError",
@@ -269,6 +283,7 @@ __all__ = [
     "OutboundRequest",
     "OutboundRequestError",
     "OutboundTenantIsolation",
+    "PackPin",
     "PayloadAmountCap",
     "PlanBuilder",
     "PlanError",
@@ -303,6 +318,8 @@ __all__ = [
     "RowSum",
     "Rung",
     "ScopeHaltedError",
+    "SensorAttestation",
+    "SensorFact",
     "Service",
     "ServiceStatus",
     "SettlementReport",
@@ -331,11 +348,14 @@ __all__ = [
     "TableSpec",
     "TenantDrawdownGuard",
     "TenantIsolation",
+    "TerraformSubstrate",
+    "TfResource",
     "ToolRevokedError",
     "Trip",
     "TripKind",
     "TruncationGuard",
     "UncompensatableEffectError",
+    "UnknownValue",
     "Vacuum",
     "VacuumReport",
     "VacuumService",
@@ -347,14 +367,17 @@ __all__ = [
     "child_traceparent",
     "default_checkers",
     "load_application",
+    "load_pack",
     "mcp_sink",
     "new_effect_id",
     "new_plan_id",
     "new_traceparent",
+    "pack_digest",
     "parse_traceparent",
     "register_sink_kind",
     "register_source_kind",
     "retry_delay",
+    "sign_fact",
     "verify_archive",
     "verify_delivery_log",
     "verify_fact",

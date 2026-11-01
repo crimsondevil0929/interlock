@@ -1306,7 +1306,10 @@ def test_a_git_substrate_is_configured_in_interlock_toml(repo: Repo) -> None:
             "[engine]\nworkers = 2\n",
             "one worker",
         ),
-        ('substrate = "svn"\ndatabase = "c.db"\n', "'sqlite', 'postgres' or 'git'"),
+        (
+            'substrate = "svn"\ndatabase = "c.db"\n',
+            "'sqlite', 'postgres', 'git', 'kubernetes' or 'terraform'",
+        ),
     ],
 )
 def test_a_git_configuration_is_checked(tmp_path: Path, text: str, why: str) -> None:

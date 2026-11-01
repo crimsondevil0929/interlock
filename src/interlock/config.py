@@ -119,6 +119,54 @@ install`` sets it up). Its tables are its path classes, so it lists no
     timeout_seconds = 60
     env = { CODEGEN_TARGET = "clients" }
 
+A Kubernetes cluster stages plan-bound (:mod:`interlock.kubernetes`, 1.3.0):
+``substrate = "kubernetes"``, a ``[kubernetes]`` section, and, for an outbox,
+inbox or windows, ``database`` naming a SQLite control database. Its tables are
+its kinds, each with the columns ``object``, ``namespace``, ``fingerprint`` and
+those it names::
+
+    substrate = "kubernetes"
+    database = "control.db"           # optional: the control database
+
+    [kubernetes]
+    server = "https://10.0.0.1:6443"  # or http://127.0.0.1:<port>, for loopback only
+    token_file = "sa.token"           # the bearer token the stage acts with
+    ca_file = "ca.crt"
+    namespaces = ["prod-east", "staging"]  # the namespaces a plan may write; any when empty
+    journal = "journal"               # where undos are written down before each apply
+
+    [[kubernetes.kinds]]
+    table = "deployments"
+    plural = "deployments"
+    kind = "Deployment"
+    group = "apps"
+    # a column is a path, or a product of paths read as quantities
+    columns = { replicas = "spec.replicas", image = "spec.template.spec.containers.0.image" }
+    partitions = { account = "metadata.labels.account" }
+    replace_on_immutable = false      # true: an immutable change is a deletion and a creation
+
+Terraform or OpenTofu stages plan-bound too (:mod:`interlock.terraform`)::
+
+    substrate = "terraform"
+
+    [terraform]
+    directory = "infra"               # the configuration, initialized
+    executable = ["tofu"]             # or ["terraform"]
+    variables = ["instance_type", "nodes"]  # the inputs a plan may set; any when empty
+    journal = "journal"
+
+    [[terraform.resources]]
+    table = "db_instances"
+    type = "aws_db_instance"
+    columns = { instance_class = "instance_class", endpoint = "endpoint" }
+    tenant = "tags.env"
+
+Analyzers sign facts about each measured diff (:mod:`interlock.sensors`)::
+
+    [sensors.policy-check]
+    argv = ["policy-check", "--key", "/etc/policy-check/key"]
+    timeout_seconds = 30
+
 Relays sign every outcome they record (``docs/EPIC4_DESIGN.md`` §2); their
 public keys are registered for verification::
 
@@ -263,10 +311,11 @@ from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from interlock.git_substrate import COLUMNS, DEFAULT_CLASSES, FALLBACK_CLASS, GitHook, PathClass
 from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
+from interlock.kubernetes import KubeKind, kubernetes_tables
 from interlock.outbound import (
     HTTP,
     NONE_POSSIBLE,
@@ -278,6 +327,7 @@ from interlock.outbound import (
 )
 from interlock.records import Keyring
 from interlock.substrate import TableSpec
+from interlock.terraform import FALLBACK_TABLE, TfResource, terraform_tables
 from interlock.windows import Measure, Plans, RateWindow, Requests, RequestSum, RowSum
 
 if TYPE_CHECKING:
@@ -645,6 +695,54 @@ class GitConfig:
     max_scan_bytes: int = 1024 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class KubernetesConfig:
+    """``[kubernetes]``: the cluster a ``substrate = "kubernetes"`` stages on,
+    as :class:`~interlock.kubernetes.KubernetesSubstrate` takes it."""
+
+    server: str
+    kinds: tuple[KubeKind, ...]
+    journal: Path
+    namespaces: tuple[str, ...] = ()
+    token_file: Path | None = None
+    ca_file: Path | None = None
+    timeout_seconds: float = 15.0
+
+    def token(self) -> str | None:
+        """The bearer token, read from ``token_file``."""
+        if self.token_file is None:
+            return None
+        try:
+            return self.token_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"[kubernetes]: cannot read token_file: {exc}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class TerraformConfig:
+    """``[terraform]``: the configuration a ``substrate = "terraform"`` stages
+    on, as :class:`~interlock.terraform.TerraformSubstrate` takes it."""
+
+    directory: Path
+    resources: tuple[TfResource, ...]
+    journal: Path
+    executable: tuple[str, ...] = ("terraform",)
+    inputs: str = "interlock.tfvars.json"
+    variables: tuple[str, ...] = ()
+    workspace: str = "default"
+    timeout_seconds: float = 600.0
+
+
+@dataclass(frozen=True, slots=True)
+class SensorConfig:
+    """``[sensors.<name>]``: an analyzer run on each measured diff."""
+
+    name: str
+    argv: tuple[str, ...]
+    timeout_seconds: float = 30.0
+    env: Mapping[str, str] = field(default_factory=dict)
+
+
 def git_tables(classes: tuple[PathClass, ...]) -> tuple[TableSpec, ...]:
     """A Git substrate's tables: one per path class and the fallback, keyed by
     path, with the columns every path's image has."""
@@ -692,6 +790,23 @@ class InterlockConfig:
     """``[cluster]``: this daemon as a node of a cluster, or ``None`` alone."""
     git: GitConfig | None = None
     """``[git]``: the repository, when ``substrate = "git"``."""
+    kubernetes: KubernetesConfig | None = None
+    """``[kubernetes]``: the cluster, when ``substrate = "kubernetes"``."""
+    terraform: TerraformConfig | None = None
+    """``[terraform]``: the configuration, when ``substrate = "terraform"``."""
+    sensors: tuple[SensorConfig, ...] = ()
+    """``[sensors.<name>]``: the analyzers each measured diff is shown to."""
+
+    @property
+    def plan_bound(self) -> bool:
+        """Whether the substrate is Kubernetes or Terraform (class P)."""
+        return self.kubernetes is not None or self.terraform is not None
+
+    @property
+    def controlled(self) -> bool:
+        """Whether ``database`` is a control database beside the substrate
+        (Git, Kubernetes), rather than the substrate itself."""
+        return self.git is not None or self.kubernetes is not None
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -751,25 +866,44 @@ def load_config(
         raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
 
     substrate = _string(raw, "substrate", default="sqlite")
-    if substrate not in ("sqlite", "postgres", "git"):
-        raise ConfigError(f"substrate must be 'sqlite', 'postgres' or 'git', not {substrate!r}")
+    if substrate not in SUBSTRATES:
+        listed = ", ".join(repr(n) for n in SUBSTRATES[:-1])
+        raise ConfigError(f"substrate must be {listed} or {SUBSTRATES[-1]!r}, not {substrate!r}")
     url = database or os.environ.get(DATABASE_ENV) or _string(raw, "database", default="")
-    if not url and require_database:
+    # A Terraform substrate keeps nothing in a database: it has no control
+    # database, so it needs none.
+    if not url and require_database and substrate != "terraform":
         raise ConfigError(
             f"no database: set 'database' in {path}, pass --database, or set {DATABASE_ENV}"
         )
     git = _git(raw.get("git"), Path(path).parent, substrate)
+    kubernetes = _kubernetes(raw.get("kubernetes"), Path(path).parent, substrate)
+    terraform = _terraform(raw.get("terraform"), Path(path).parent, substrate)
     entries = raw.get("tables")
-    if git is not None:
+    tables: list[TableSpec] = []
+    if git is not None or kubernetes is not None or terraform is not None:
         if entries is not None:
             raise ConfigError(
-                f"{path}: a Git substrate's tables are its path classes ([[git.classes]]), "
-                f"so it lists no [[tables]]"
+                f"{path}: a {substrate} substrate's tables are its "
+                + (
+                    "path classes ([[git.classes]])"
+                    if git is not None
+                    else "kinds ([[kubernetes.kinds]])"
+                    if kubernetes is not None
+                    else "resource types ([[terraform.resources]])"
+                )
+                + ", so it lists no [[tables]]"
             )
         entries = []
+        if git is not None:
+            tables = list(git_tables(git.classes))
+        elif kubernetes is not None:
+            tables = list(kubernetes_tables(kubernetes.kinds))
+        else:
+            assert terraform is not None
+            tables = list(terraform_tables(terraform.resources))
     elif not isinstance(entries, list) or not entries:
         raise ConfigError(f"{path} lists no [[tables]]")
-    tables: list[TableSpec] = list(git_tables(git.classes)) if git is not None else []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ConfigError(f"tables[{index}] is not a table")
@@ -856,7 +990,200 @@ def load_config(
         signers=signers,
         cluster=_cluster(raw.get("cluster"), substrate),
         git=git,
+        kubernetes=kubernetes,
+        terraform=terraform,
+        sensors=_sensors(raw.get("sensors")),
     )
+
+
+SUBSTRATES: Final = ("sqlite", "postgres", "git", "kubernetes", "terraform")
+"""What ``substrate`` may name."""
+
+_KUBE_KEYS = frozenset(
+    {"server", "kinds", "journal", "namespaces", "token_file", "ca_file", "timeout_seconds"}
+)
+_KIND_KEYS = frozenset(
+    {"table", "plural", "kind", "group", "version", "columns", "partitions", "replace_on_immutable"}
+)
+_TF_KEYS = frozenset(
+    {
+        "directory",
+        "resources",
+        "journal",
+        "executable",
+        "inputs",
+        "variables",
+        "workspace",
+        "timeout_seconds",
+    }
+)
+_RESOURCE_KEYS = frozenset({"table", "type", "columns", "tenant", "partitions"})
+
+
+def _paths(raw: object, where: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) and v for k, v in raw.items()
+    ):
+        raise ConfigError(f"{where} maps each name to a path, as text")
+    return dict(raw)
+
+
+def _section(raw: object, name: str, substrate: str) -> dict[str, Any] | None:
+    if raw is None:
+        if substrate == name:
+            raise ConfigError(f'substrate = "{name}" needs a [{name}] section')
+        return None
+    if substrate != name:
+        raise ConfigError(f"[{name}] configures a {name} substrate, and substrate is {substrate!r}")
+    if not isinstance(raw, dict):
+        raise ConfigError(f"'{name}' must be a table ([{name}])")
+    return raw
+
+
+def _timeout(raw: Mapping[str, Any], where: str, default: float) -> float:
+    value = raw.get("timeout_seconds", default)
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        raise ConfigError(f"{where}: timeout_seconds is a positive number")
+    return float(value)
+
+
+def _kubernetes(raw: object, base: Path, substrate: str) -> KubernetesConfig | None:
+    section = _section(raw, "kubernetes", substrate)
+    if section is None:
+        return None
+    unknown = sorted(set(section) - _KUBE_KEYS)
+    if unknown:
+        raise ConfigError(f"[kubernetes]: unknown key(s) {', '.join(unknown)}")
+    entries = section.get("kinds")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("[kubernetes]: kinds are [[kubernetes.kinds]] tables, at least one")
+    kinds = []
+    for index, entry in enumerate(entries):
+        where = f"kubernetes.kinds[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: a table")
+        unknown = sorted(set(entry) - _KIND_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        replace = entry.get("replace_on_immutable", False)
+        if not isinstance(replace, bool):
+            raise ConfigError(f"{where}: replace_on_immutable is true or false")
+        try:
+            kinds.append(
+                KubeKind(
+                    _string(entry, "table"),
+                    _string(entry, "plural"),
+                    _string(entry, "kind"),
+                    group=_string(entry, "group", default=""),
+                    version=_string(entry, "version", default="v1"),
+                    columns=_paths(entry.get("columns"), f"{where}.columns"),
+                    partitions=_paths(entry.get("partitions"), f"{where}.partitions"),
+                    replace_on_immutable=replace,
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    if len({k.table for k in kinds}) != len(kinds):
+        raise ConfigError("[kubernetes]: each kind is its own table")
+    token = _string(section, "token_file", default="")
+    ca = _string(section, "ca_file", default="")
+    return KubernetesConfig(
+        server=_string(section, "server"),
+        kinds=tuple(kinds),
+        journal=base / _string(section, "journal", default="interlock-journal"),
+        namespaces=tuple(_strings(section, "namespaces", required=False)),
+        token_file=base / token if token else None,
+        ca_file=base / ca if ca else None,
+        timeout_seconds=_timeout(section, "[kubernetes]", 15.0),
+    )
+
+
+def _terraform(raw: object, base: Path, substrate: str) -> TerraformConfig | None:
+    section = _section(raw, "terraform", substrate)
+    if section is None:
+        return None
+    unknown = sorted(set(section) - _TF_KEYS)
+    if unknown:
+        raise ConfigError(f"[terraform]: unknown key(s) {', '.join(unknown)}")
+    entries = section.get("resources")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("[terraform]: resources are [[terraform.resources]] tables, at least one")
+    resources = []
+    for index, entry in enumerate(entries):
+        where = f"terraform.resources[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: a table")
+        unknown = sorted(set(entry) - _RESOURCE_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        try:
+            resources.append(
+                TfResource(
+                    _string(entry, "table"),
+                    _string(entry, "type"),
+                    columns=_paths(entry.get("columns"), f"{where}.columns"),
+                    tenant=_string(entry, "tenant", default="") or None,
+                    partitions=_paths(entry.get("partitions"), f"{where}.partitions"),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    tables = [r.table for r in resources]
+    if len(set(tables)) != len(tables) or FALLBACK_TABLE in tables:
+        raise ConfigError(
+            f"[terraform]: each resource type is its own table, and none is {FALLBACK_TABLE!r}, "
+            f"the table of every type no resource names"
+        )
+    if len({r.type for r in resources}) != len(resources):
+        raise ConfigError("[terraform]: each resource type is observed once")
+    executable = section.get("executable", ["terraform"])
+    if isinstance(executable, str):
+        executable = [executable]
+    if (
+        not isinstance(executable, list)
+        or not executable
+        or not all(isinstance(a, str) and a for a in executable)
+    ):
+        raise ConfigError("[terraform]: executable is a command, as a list of words")
+    return TerraformConfig(
+        directory=base / _string(section, "directory"),
+        resources=tuple(resources),
+        journal=base / _string(section, "journal", default="interlock-journal"),
+        executable=tuple(executable),
+        inputs=_string(section, "inputs", default="interlock.tfvars.json"),
+        variables=tuple(_strings(section, "variables", required=False)),
+        workspace=_string(section, "workspace", default="default"),
+        timeout_seconds=_timeout(section, "[terraform]", 600.0),
+    )
+
+
+def _sensors(raw: object) -> tuple[SensorConfig, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise ConfigError("'sensors' must be a table of [sensors.<name>] tables")
+    found = []
+    for name, entry in sorted(raw.items()):
+        where = f"[sensors.{name}]"
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", name):
+            raise ConfigError(f"{where}: a sensor is named by lowercase letters, digits, - and _")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: a table")
+        unknown = sorted(set(entry) - {"argv", "timeout_seconds", "env"})
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        argv = entry.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+            raise ConfigError(f"{where}: argv is the command, as a list of words")
+        env = entry.get("env", {})
+        if not isinstance(env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+        ):
+            raise ConfigError(f"{where}: env maps names to text")
+        found.append(SensorConfig(name, tuple(argv), _timeout(entry, where, 30.0), dict(env)))
+    return tuple(found)
 
 
 _GIT_KEYS = frozenset(
@@ -1072,7 +1399,7 @@ _ENGINE_KEYS = frozenset(
 
 def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
     # A Git stage checks a worktree out and runs hooks: its default bound is longer.
-    stage_seconds = 120.0 if substrate == "git" else 10.0
+    stage_seconds = {"git": 120.0, "kubernetes": 120.0, "terraform": 900.0}.get(substrate, 10.0)
     if raw is None:
         return EngineConfig(max_stage_seconds=stage_seconds)
     if not isinstance(raw, dict):
@@ -1084,7 +1411,7 @@ def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
     retries = _integer(raw, "conflict_retries", 16)
     if workers < 1 or retries < 0:
         raise ConfigError("[engine]: workers is at least 1, conflict_retries not negative")
-    if workers > 1 and substrate in ("sqlite", "git"):
+    if workers > 1 and substrate in ("sqlite", "git", "kubernetes", "terraform"):
         raise ConfigError(
             "[engine]: SQLite admits one writer, and a stage holds the write lock for its "
             "whole life (a Git stage, its control database's): one worker"

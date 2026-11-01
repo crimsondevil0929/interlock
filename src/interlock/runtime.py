@@ -56,6 +56,7 @@ from interlock.windows import RateWindow
 
 if TYPE_CHECKING:
     from interlock.config import InterlockConfig
+    from interlock.sensors import Sensor
 
 __all__ = ["EscrowRuntime"]
 
@@ -147,6 +148,7 @@ class EscrowRuntime:
         sinks: SinkRegistry | None = None,
         windows: Sequence[RateWindow] = (),
         inbox: Keyring | None = None,
+        sensors: Sequence[Sensor] = (),
     ) -> None:
         if (db_path is None) == (substrate is None):
             raise ValueError("an EscrowRuntime stages on a SQLite db_path or a substrate: one")
@@ -204,6 +206,7 @@ class EscrowRuntime:
                     sinks=sinks,
                     windows=windows,
                     inbox=inbox,
+                    sensors=sensors,
                 )
                 self._recovered = self._engine.recover() if chain_path is not None else ()
             except BaseException:
@@ -234,7 +237,13 @@ class EscrowRuntime:
         :param database: Overrides the stage role's connection.
         :param chain_path: Overrides ``[engine] chain``.
         """
-        from interlock.wiring import open_anchor, open_governor, open_receipts, open_substrate
+        from interlock.wiring import (
+            open_anchor,
+            open_governor,
+            open_receipts,
+            open_sensors,
+            open_substrate,
+        )
 
         closers: list[Callable[[], None]] = []
         try:
@@ -257,6 +266,7 @@ class EscrowRuntime:
                 sinks=config.sink_registry() if config.sinks else None,
                 windows=config.windows,
                 inbox=config.inbox_keyring(),
+                sensors=open_sensors(config),
             )
         except BaseException:
             for close in reversed(closers):

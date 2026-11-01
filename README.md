@@ -1255,6 +1255,112 @@ holds the commit.
 - A commit that a force-push later removes from the branch reads as not committed to
   recovery, unless a control database recorded it. Reconciliation names the rewrite.
 
+## Kubernetes and Terraform: plan-bound
+
+A cluster and a Terraform configuration cannot be staged in a transaction and rolled back.
+They can be measured exactly, though, and the change applied on the condition that nothing
+moved. Interlock calls that *plan-bound*: what was measured is the plan that is applied, on
+the state it was measured on, and a partial failure is put back from an undo written down
+before the first write. Every receipt of such a plan says `coverage.measurement =
+"plan-bound"`, never `transactional`.
+
+`KubernetesSubstrate` measures with the API server's own dry run:
+
+- **Stage.** Each effect reads its object live, with its `resourceVersion`, and changes it as
+  its statement says: `scale`, `set` (one field), `merge-patch`, `apply` (a whole manifest),
+  `delete`, or `expect-version` (pin the version approvers saw).
+- **Measure.** The changed object goes to the API server with `?dryRun=All`. Defaults, every
+  mutating admission webhook and every validating one run as on a real write, and what comes
+  back is the after image. A webhook that turns 6 replicas into 60 is measured as 60. A
+  webhook declaring side effects makes the API server refuse the dry run, so a change whose
+  admission cannot be measured never stages.
+- **Forced replacements.** A change to an immutable field is refused, or, on a kind marked
+  `replace_on_immutable` (a GitOps sync with `Replace=true`), measured as the deletion and
+  creation the sync would do. `NoDelete` sees the deletion.
+- **Commit.** Each object is written on the version measured, with the annotation
+  `interlock.io/stage-id`. If anything wrote it since, the API server answers
+  `409 Conflict` and nothing is applied. An object that lands other than measured, or a
+  write that fails part way, is put back from the undo, and the stage is `COMPENSATED`.
+
+<!-- readme-test: skip reason="needs a cluster; tests/test_kubernetes.py makes the same calls on interlock.sim.kubernetes" -->
+```python
+from interlock import BlastRadius, EscrowEngine, KubeKind, KubernetesSubstrate, NoDelete
+
+cluster = KubernetesSubstrate(
+    "https://10.0.0.1:6443",
+    token=open("/var/run/secrets/remediator/token").read().strip(),
+    ca_file="/var/run/secrets/remediator/ca.crt",
+    namespaces=["prod-east"],
+    journal="/var/lib/interlock/undo",
+    kinds=[
+        KubeKind(
+            "deployments",
+            "deployments",
+            "Deployment",
+            group="apps",
+            columns={
+                "replicas": "spec.replicas",
+                "vcpu": "spec.replicas * spec.template.spec.containers.0.resources.requests.cpu",
+            },
+        ),
+        KubeKind(
+            "statefulsets",
+            "statefulsets",
+            "StatefulSet",
+            group="apps",
+            columns={"storage": "spec.volumeClaimTemplates.0.spec.resources.requests.storage"},
+            replace_on_immutable=True,
+        ),
+    ],
+)
+engine = EscrowEngine(cluster, checkers=[BlastRadius(20), NoDelete(())])
+```
+
+`TerraformSubstrate` (Terraform or OpenTofu) measures with a saved plan. Effects `set` input
+variables; the stage runs `plan -out` and reads `show -json`. Each entry of
+`resource_changes` is a row of its resource type's table (`TfResource`): a replacement is a
+deletion and an insertion, and a resource of a type no table names is measured in
+`resources`. An observed attribute the provider knows only after the apply is an
+`UnknownValue`, which `TruncationGuard` refuses unless that column is acknowledged
+(`TruncationGuard(acknowledged_unknown={"db_instances.endpoint"})`). The commit checks the
+state's `serial` and `lineage` and applies exactly the saved plan; the stage's id reaches the
+state as the `interlock_stage_id` output, which the configuration declares.
+
+Both are configured in `interlock.toml` (`substrate = "kubernetes"` with `[kubernetes]` and
+`[[kubernetes.kinds]]`, `substrate = "terraform"` with `[terraform]` and
+`[[terraform.resources]]`). `interlock.sim` has a loopback API server, with webhooks called
+over HTTP and an audit log, and a stand-in `terraform` command: CI stages class P with no
+cloud credentials.
+
+### Sensor facts: an analyzer's word on the exact diff
+
+A checker is a pure function of the plan and the diff, so it cannot call a policy engine, a
+scanner or a test suite. A *sensor* can. The engine shows each measured diff to its sensors
+(`EscrowEngine(sensors=...)`), and each signs a `SensorFact` with its own key: its verdict,
+its findings, the digest of its report, and the hash of the diff it read. The pure
+`SensorAttestation` checker then requires a clean fact from a key the policy pins. A fact
+about another diff, or one signed by another key, is no fact.
+
+<!-- readme-test: skip reason="needs an analyzer command; tests/test_sensors.py runs one" -->
+```python
+from interlock import CommandSensor, EscrowEngine, SensorAttestation
+
+policy = CommandSensor("policy-check", ["policy-check", "--key", "/etc/policy-check/key"])
+engine = EscrowEngine(
+    cluster,
+    checkers=[SensorAttestation("policy-check", ["ed25519:3b6a27bc..."])],
+    sensors=[policy],
+)
+```
+
+### Pinned checker packs
+
+A domain whose invariant cannot be composed from the built-in checkers ships a pack: a
+module naming `PACK_VERSION` and `CHECKERS`. `load_pack(PackPin(module, version, digest))`
+loads it only if the code installed is exactly the code pinned (the digest covers every file
+of the package), and says which it is otherwise: not installed, another version, or
+tampered.
+
 ## Outbound requests: the transactional outbox
 
 An email, a refund through a payment API, a webhook: a plan often has to call something

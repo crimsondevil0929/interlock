@@ -1157,6 +1157,11 @@ class PostgresSubstrate:
         """
         if effect.kind is EffectKind.ENQUEUE:
             return None
+        if effect.kind is EffectKind.APPLY:
+            return (
+                "an apply effect is in a substrate's own statement language (a manifest, "
+                "an input), and PostgreSQL stages SQL: give it an insert, update or delete"
+            )
         verb = leading_verb(effect.statement)
         if verb in STAGEABLE_VERBS:
             return None

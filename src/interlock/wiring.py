@@ -28,8 +28,11 @@ if TYPE_CHECKING:
     from interlock.config import Endpoint, InterlockConfig, RelayConfig
     from interlock.git_substrate import GitSubstrate
     from interlock.keys import KeyRegistry
+    from interlock.kubernetes import KubernetesSubstrate
     from interlock.records import Keyring
+    from interlock.sensors import CommandSensor
     from interlock.telemetry import Metrics
+    from interlock.terraform import TerraformSubstrate
 
 __all__ = [
     "ALONE",
@@ -45,10 +48,13 @@ __all__ = [
     "open_anchor",
     "open_git",
     "open_governor",
+    "open_kubernetes",
     "open_ledger",
     "open_receipts",
+    "open_sensors",
     "open_signer",
     "open_substrate",
+    "open_terraform",
     "operator_signer",
     "relay_adapter",
     "relay_adapters",
@@ -74,6 +80,10 @@ def open_substrate(
     dsn = database or config.engine.database or config.database
     if config.git is not None:
         return open_git(config, control=dsn or None)
+    if config.kubernetes is not None:
+        return open_kubernetes(config, control=dsn or None)
+    if config.terraform is not None:
+        return open_terraform(config)
     if config.substrate == "postgres":
         return PostgresSubstrate(
             dsn,
@@ -115,6 +125,60 @@ def open_git(config: InterlockConfig, *, control: str | None = None) -> GitSubst
         max_stage_seconds=config.engine.max_stage_seconds,
         max_file_bytes=settings.max_file_bytes,
         max_scan_bytes=settings.max_scan_bytes,
+    )
+
+
+def open_kubernetes(config: InterlockConfig, *, control: str | None = None) -> KubernetesSubstrate:
+    """The Kubernetes substrate ``[kubernetes]`` names, with its control
+    database ``control`` (the file's ``database`` unless given), if any."""
+    from interlock.kubernetes import KubernetesSubstrate
+
+    settings = config.kubernetes
+    if settings is None:
+        raise SubstrateConfigurationError(
+            'the file configures no [kubernetes]: substrate = "kubernetes"'
+        )
+    return KubernetesSubstrate(
+        settings.server,
+        kinds=settings.kinds,
+        journal=settings.journal,
+        namespaces=settings.namespaces,
+        token=settings.token(),
+        ca_file=None if settings.ca_file is None else str(settings.ca_file),
+        control=control if control is not None else (config.database or None),
+        timeout=settings.timeout_seconds,
+        max_stage_seconds=config.engine.max_stage_seconds,
+    )
+
+
+def open_terraform(config: InterlockConfig) -> TerraformSubstrate:
+    """The Terraform substrate ``[terraform]`` names."""
+    from interlock.terraform import TerraformSubstrate
+
+    settings = config.terraform
+    if settings is None:
+        raise SubstrateConfigurationError(
+            'the file configures no [terraform]: substrate = "terraform"'
+        )
+    return TerraformSubstrate(
+        settings.directory,
+        resources=settings.resources,
+        journal=settings.journal,
+        executable=settings.executable,
+        inputs=settings.inputs,
+        variables=settings.variables,
+        workspace=settings.workspace,
+        timeout=settings.timeout_seconds,
+        max_stage_seconds=config.engine.max_stage_seconds,
+    )
+
+
+def open_sensors(config: InterlockConfig) -> tuple[CommandSensor, ...]:
+    """The analyzers ``[sensors.<name>]`` names, each run as its own process."""
+    from interlock.sensors import CommandSensor
+
+    return tuple(
+        CommandSensor(s.name, s.argv, timeout=s.timeout_seconds, env=s.env) for s in config.sensors
     )
 
 

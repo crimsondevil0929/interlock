@@ -9,6 +9,80 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-31
+
+Plan-bound substrates, sensor facts, and pinned checker packs.
+
+Kubernetes and Terraform as substrates, staged class P: what was measured is the plan that
+is applied, on the state measured, with an undo written down first. Upgrades from 1.2.0 in
+place, and requires nothing new: every plan, diff, verdict, schema, checker and receipt
+hash a configuration that uses none of what follows wrote before is unchanged.
+
+### Added
+
+- **The `apply` effect kind** (`EffectKind.APPLY`): an effect in the substrate's own
+  statement language, a manifest or an input, never SQL. What it does is never read from
+  its kind: the substrate measures it, and the checkers judge the measured diff. SQLite and
+  PostgreSQL refuse it at admission.
+- **Plan-bound substrates** (`interlock.planbound`, `SubstrateCapabilities.plan_bound`).
+  A substrate that cannot roll back writes the before images of what it will change to an
+  undo journal before the first write; the engine names the undo's SHA-256 in the stage's
+  `COMMIT_INTENT`. A commit that fails part way is put back from the undo and recorded
+  `COMPENSATED` (`CompensatedError`); one whose undo fails too stays open for recovery,
+  which reads each object's stage marker: all written is `COMMITTED`, none is `ABORTED`,
+  part is put back and `COMPENSATED`. An object that is neither as written nor as it was
+  is left for an operator. Every receipt says `coverage.measurement = "plan-bound"`.
+- **`KubernetesSubstrate`** (`interlock.kubernetes`, `substrate = "kubernetes"`). Each
+  kind (`KubeKind`) is a table; each object a row keyed `<namespace>/<name>`, its tenant
+  the namespace, its columns paths or products of quantities (`vcpu` = replicas x CPU
+  request), and a `fingerprint` of the whole object. An effect reads the object live, with
+  its `resourceVersion`, changes it as its statement says (`scale`, `set`, `merge-patch`,
+  `apply`, `delete`, `expect-version`), and sends it with `?dryRun=All`: the after image is
+  the API server's, with every mutating webhook and default applied. A webhook declaring
+  side effects makes the API server refuse the dry run, and the stage with it. A change to
+  an immutable field is refused, or, on a kind marked `replace_on_immutable` (a GitOps
+  `Replace=true` sync), measured as a deletion and a creation, which `NoDelete` sees. The
+  commit writes each object on the version measured (`409 Conflict` fails closed), with
+  the `interlock.io/stage-id` annotation, and checks that it landed as measured. A control
+  database holds the outbox, the inbox and the windows, redone after a crash as Git's is.
+- **`TerraformSubstrate`** (`interlock.terraform`, `substrate = "terraform"`, for
+  Terraform or OpenTofu). Effects `set` input variables; the stage runs `plan -out` and
+  reads `show -json`: each `resource_changes` entry is a row of its type's table
+  (`TfResource`), a replacement a deletion and an insertion, and a resource of an
+  unobserved type a row of `resources`. An observed attribute known only after the apply
+  is an `UnknownValue`. The commit checks the state's `serial` and `lineage` and applies
+  the saved plan (a stale one is a conflict, never compensated); the stage's id reaches
+  the state as the `interlock_stage_id` output. A partial apply is followed by an apply of
+  the previous inputs.
+- **Loopback stand-ins** (`interlock.sim`): a Kubernetes API server with admission
+  webhooks called over HTTP (`AdmissionReview`), dry runs, `resourceVersion`
+  preconditions, immutable fields, bearer tokens, an `audit.k8s.io` log and injected
+  faults; and a `terraform` command over a local model, in the real plan JSON format. CI
+  and `fiduciary demo` stage class P with no cloud credentials.
+- **Sensor facts** (`interlock.sensors`). An analyzer (a policy engine, a scanner, a test
+  run) runs beside the stage on the diff it measured, and signs a `SensorFact`: its
+  verdict, its findings and its report's digest, bound to the diff's `measured_hash()`.
+  `EscrowEngine(sensors=...)` runs each (`CommandSensor`, its own process holding its own
+  key; `FunctionSensor`, in process) and attaches the facts; the pure
+  `SensorAttestation(sensor, keys)` checker requires a clean one, signed by a pinned key,
+  about this very diff. `[sensors.<name>]` in `interlock.toml`.
+- **Pinned checker packs** (`interlock.checker_packs`): a module naming `PACK_VERSION`
+  and `CHECKERS`, loaded only if the code installed matches the digest pinned
+  (`load_pack(PackPin(module, version, digest))`); missing, another version and tampered
+  are refused by name.
+- **`TruncationGuard(acknowledged_unknown=...)`** refuses a value known only after the
+  apply unless its `<table>.<column>` is acknowledged. Its digest is unchanged when unused.
+- **A receipt names the commit a substrate made** when the substrate names it only at
+  commit: a Git substrate's receipts now carry the commit's id, so a code host's audit log
+  of pushes reconciles against them.
+- `interlock check` and `install` describe a plan-bound substrate; `reconcile-effects`
+  points to the system's own audit log instead.
+
+### Changed
+
+- `interlock.control` holds the control database's redo, which the Git substrate now
+  shares with the Kubernetes substrate.
+
 ## [1.2.0] - 2026-10-31
 
 Any partition, any unit, any sink, and honest receipts. Upgrades from 1.1.0 in place.
