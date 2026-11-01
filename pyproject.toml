@@ -151,4 +151,4 @@ include = ["interlock*"]
 [tool.uv.sources]
 # Until interlock-agentgov 1.2.0 is on PyPI: the commit this release is built against
 # (crimsondevil0929/agentgov, feat/wave3-reconcile). Remove before tagging, and relock.
-interlock-agentgov = { git = "https://github.com/crimsondevil0929/agentgov", rev = "736a2da1b21619667ac7f5d955240027956e29e5" }
+interlock-agentgov = { git = "https://github.com/crimsondevil0929/agentgov", rev = "a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7" }

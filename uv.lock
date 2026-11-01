@@ -600,7 +600,7 @@ wheels = [
 [[package]]
 name = "interlock-agentgov"
 version = "1.2.0"
-source = { git = "https://github.com/crimsondevil0929/agentgov?rev=736a2da1b21619667ac7f5d955240027956e29e5#736a2da1b21619667ac7f5d955240027956e29e5" }
+source = { git = "https://github.com/crimsondevil0929/agentgov?rev=a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7#a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7" }
 
 [package.optional-dependencies]
 kms-aws = [
@@ -649,10 +649,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "interlock-agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=736a2da1b21619667ac7f5d955240027956e29e5" },
-    { name = "interlock-agentgov", extras = ["kms-aws"], marker = "extra == 'kms-aws'", git = "https://github.com/crimsondevil0929/agentgov?rev=736a2da1b21619667ac7f5d955240027956e29e5" },
-    { name = "interlock-agentgov", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/crimsondevil0929/agentgov?rev=736a2da1b21619667ac7f5d955240027956e29e5" },
-    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", git = "https://github.com/crimsondevil0929/agentgov?rev=736a2da1b21619667ac7f5d955240027956e29e5" },
+    { name = "interlock-agentgov", git = "https://github.com/crimsondevil0929/agentgov?rev=a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7" },
+    { name = "interlock-agentgov", extras = ["kms-aws"], marker = "extra == 'kms-aws'", git = "https://github.com/crimsondevil0929/agentgov?rev=a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7" },
+    { name = "interlock-agentgov", extras = ["otel"], marker = "extra == 'otel'", git = "https://github.com/crimsondevil0929/agentgov?rev=a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7" },
+    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", git = "https://github.com/crimsondevil0929/agentgov?rev=a3eb8046f1ce0a754a9ab341fa9ceb21ba7fa6e7" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres", "sign", "kms-aws", "otel"]
