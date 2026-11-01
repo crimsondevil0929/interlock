@@ -169,6 +169,9 @@ class StageState(Enum):
     COMMITTED = "committed"
     ABORTED = "aborted"
     ORPHANED = "orphaned"
+    COMPENSATED = "compensated"
+    """Written, and put back from the undo written first (1.4.0): a write that
+    failed part way, or a read-back that was not the prediction."""
 
 
 class Severity(Enum):
@@ -1222,6 +1225,12 @@ class SubstrateCapabilities:
     state serial). The system cannot roll a partial apply back, so the driver
     writes its undo down before applying (:mod:`interlock.planbound`), and
     undoes a partial apply itself."""
+    predicted: bool = False
+    """Class V (1.4.0): the system can neither stage nor dry-run a write, so
+    the driver reads the before image and its version, predicts the after
+    image, writes its undo down, writes on the version read, and reads the
+    result back against the prediction (:mod:`interlock.predicted`). A
+    difference is put back from the undo, never accepted."""
 
 
 @dataclass(frozen=True, slots=True)

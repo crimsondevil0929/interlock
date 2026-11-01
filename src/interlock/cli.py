@@ -452,7 +452,7 @@ def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> No
 
 def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
-    if config.plan_bound:
+    if config.plan_bound or config.predicted:
         return _install_plan_bound(config, out)
     if config.git is not None:
         from interlock.sqlite_outbox import install_sqlite_outbox
@@ -1394,9 +1394,10 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
 
 
 def _check(config: InterlockConfig, out: TextIO) -> int:
-    if config.plan_bound:
+    if config.plan_bound or config.predicted:
+        measured = "plan-bound" if config.plan_bound else "predicted"
         print(
-            f"ok: {config.substrate} (plan-bound), {len(config.tables)} observed table(s)",
+            f"ok: {config.substrate} ({measured}), {len(config.tables)} observed table(s)",
             file=out,
         )
         _print_plan_bound(config, out)
@@ -1427,12 +1428,13 @@ def _reconcile(
     *,
     since: str | None = None,
 ) -> int:
-    if config.plan_bound:
+    if config.plan_bound or config.predicted:
+        formats = {"kubernetes": " --format k8s-audit-jsonl", "fhir": " --format fhir-auditevent"}
         print(
             f"interlock: reconcile-effects reads a database's journal; on {config.substrate}, "
             f"reconcile the system's own audit log against the receipts instead: "
             f"agentgov reconcile-actions <receipts> <audit log>"
-            + (" --format k8s-audit-jsonl" if config.kubernetes is not None else ""),
+            + formats.get(config.substrate, ""),
             file=sys.stderr,
         )
         return EXIT_USAGE
@@ -1470,10 +1472,11 @@ def _reconcile(
 
 
 def _install_plan_bound(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
-    """A plan-bound substrate has nothing to install in the system it stages
-    on; its control database, when it has one, gets the outbox and inbox."""
+    """A plan-bound or predicted substrate has nothing to install in the
+    system it stages on; its control database, when it has one, gets the
+    outbox and inbox."""
     legacy = None
-    if config.kubernetes is not None and config.database:
+    if (config.kubernetes is not None or config.fhir is not None) and config.database:
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
@@ -1499,6 +1502,20 @@ def _print_plan_bound(config: InterlockConfig, out: TextIO) -> None:
         namespaces = ", ".join(settings.namespaces) or "any"
         print(f"namespaces: {namespaces}", file=out)
         print(f"undo journal: {settings.journal}", file=out)
+        print(
+            f"control database: {config.database or 'none (no outbox, inbox or windows)'}", file=out
+        )
+    elif config.fhir is not None:
+        settings_fhir = config.fhir
+        print(f"FHIR server: {settings_fhir.server}", file=out)
+        for observed in settings_fhir.types:
+            print(
+                f"type: {observed.resource_type} as table {observed.table}, in the chart of "
+                f"{observed.tenant}; undone by {observed.void_status} when created",
+                file=out,
+            )
+        print(f"patients: {', '.join(settings_fhir.patients) or 'any'}", file=out)
+        print(f"undo journal: {settings_fhir.journal}", file=out)
         print(
             f"control database: {config.database or 'none (no outbox, inbox or windows)'}", file=out
         )

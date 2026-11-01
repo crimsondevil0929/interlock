@@ -145,6 +145,31 @@ those it names::
     partitions = { account = "metadata.labels.account" }
     replace_on_immutable = false      # true: an immutable change is a deletion and a creation
 
+A FHIR R4 server stages predicted and verified (:mod:`interlock.fhir`,
+1.4.0): ``substrate = "fhir"``, a ``[fhir]`` section, and, for an outbox, inbox
+or windows, ``database`` naming a SQLite control database. Its tables are its
+resource types, each with the columns ``id``, ``patient``, ``fingerprint`` and
+those it names::
+
+    substrate = "fhir"
+    database = "control.db"           # optional: the control database
+
+    [fhir]
+    server = "https://ehr.example.org/fhir"  # or http://127.0.0.1:<port>/fhir, loopback only
+    token_file = "agent.token"        # the bearer token the stage acts with
+    ca_file = "ca.crt"
+    patients = []                     # the patients a plan may write; any when empty
+    journal = "journal"               # where undos are written down before each write
+
+    [[fhir.types]]
+    table = "medicationrequests"
+    type = "MedicationRequest"
+    columns = { status = "status", drug = "medicationCodeableConcept.text" }
+    partitions = { facility = "dispenseRequest.performer.reference" }
+    tenant = "subject.reference"      # the reference to the patient whose chart it is in
+    compartment = "patient"           # the search parameter that finds a patient's resources
+    void_status = "entered-in-error"  # what marks a created one void, its undo
+
 Terraform or OpenTofu stages plan-bound too (:mod:`interlock.terraform`)::
 
     substrate = "terraform"
@@ -313,6 +338,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+from interlock.fhir import FhirType, fhir_tables
 from interlock.git_substrate import COLUMNS, DEFAULT_CLASSES, FALLBACK_CLASS, GitHook, PathClass
 from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
 from interlock.kubernetes import KubeKind, kubernetes_tables
@@ -719,6 +745,29 @@ class KubernetesConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FhirConfig:
+    """``[fhir]``: the server a ``substrate = "fhir"`` stages on, as
+    :class:`~interlock.fhir.FhirSubstrate` takes it (1.4.0)."""
+
+    server: str
+    types: tuple[FhirType, ...]
+    journal: Path
+    patients: tuple[str, ...] = ()
+    token_file: Path | None = None
+    ca_file: Path | None = None
+    timeout_seconds: float = 15.0
+
+    def token(self) -> str | None:
+        """The bearer token, read from ``token_file``."""
+        if self.token_file is None:
+            return None
+        try:
+            return self.token_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"[fhir]: cannot read token_file: {exc}") from exc
+
+
+@dataclass(frozen=True, slots=True)
 class TerraformConfig:
     """``[terraform]``: the configuration a ``substrate = "terraform"`` stages
     on, as :class:`~interlock.terraform.TerraformSubstrate` takes it."""
@@ -796,6 +845,8 @@ class InterlockConfig:
     """``[terraform]``: the configuration, when ``substrate = "terraform"``."""
     sensors: tuple[SensorConfig, ...] = ()
     """``[sensors.<name>]``: the analyzers each measured diff is shown to."""
+    fhir: FhirConfig | None = None
+    """``[fhir]``: the server, when ``substrate = "fhir"`` (1.4.0)."""
 
     @property
     def plan_bound(self) -> bool:
@@ -803,10 +854,15 @@ class InterlockConfig:
         return self.kubernetes is not None or self.terraform is not None
 
     @property
+    def predicted(self) -> bool:
+        """Whether the substrate is a FHIR server (class V, 1.4.0)."""
+        return self.fhir is not None
+
+    @property
     def controlled(self) -> bool:
         """Whether ``database`` is a control database beside the substrate
-        (Git, Kubernetes), rather than the substrate itself."""
-        return self.git is not None or self.kubernetes is not None
+        (Git, Kubernetes, a FHIR server), rather than the substrate itself."""
+        return self.git is not None or self.kubernetes is not None or self.fhir is not None
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -879,9 +935,10 @@ def load_config(
     git = _git(raw.get("git"), Path(path).parent, substrate)
     kubernetes = _kubernetes(raw.get("kubernetes"), Path(path).parent, substrate)
     terraform = _terraform(raw.get("terraform"), Path(path).parent, substrate)
+    fhir = _fhir(raw.get("fhir"), Path(path).parent, substrate)
     entries = raw.get("tables")
     tables: list[TableSpec] = []
-    if git is not None or kubernetes is not None or terraform is not None:
+    if git is not None or kubernetes is not None or terraform is not None or fhir is not None:
         if entries is not None:
             raise ConfigError(
                 f"{path}: a {substrate} substrate's tables are its "
@@ -890,6 +947,8 @@ def load_config(
                     if git is not None
                     else "kinds ([[kubernetes.kinds]])"
                     if kubernetes is not None
+                    else "resource types ([[fhir.types]])"
+                    if fhir is not None
                     else "resource types ([[terraform.resources]])"
                 )
                 + ", so it lists no [[tables]]"
@@ -899,6 +958,8 @@ def load_config(
             tables = list(git_tables(git.classes))
         elif kubernetes is not None:
             tables = list(kubernetes_tables(kubernetes.kinds))
+        elif fhir is not None:
+            tables = list(fhir_tables(fhir.types))
         else:
             assert terraform is not None
             tables = list(terraform_tables(terraform.resources))
@@ -993,10 +1054,11 @@ def load_config(
         kubernetes=kubernetes,
         terraform=terraform,
         sensors=_sensors(raw.get("sensors")),
+        fhir=fhir,
     )
 
 
-SUBSTRATES: Final = ("sqlite", "postgres", "git", "kubernetes", "terraform")
+SUBSTRATES: Final = ("sqlite", "postgres", "git", "kubernetes", "terraform", "fhir")
 """What ``substrate`` may name."""
 
 _KUBE_KEYS = frozenset(
@@ -1004,6 +1066,12 @@ _KUBE_KEYS = frozenset(
 )
 _KIND_KEYS = frozenset(
     {"table", "plural", "kind", "group", "version", "columns", "partitions", "replace_on_immutable"}
+)
+_FHIR_KEYS = frozenset(
+    {"server", "types", "journal", "patients", "token_file", "ca_file", "timeout_seconds"}
+)
+_FHIR_TYPE_KEYS = frozenset(
+    {"table", "type", "columns", "partitions", "tenant", "compartment", "void_status"}
 )
 _TF_KEYS = frozenset(
     {
@@ -1097,6 +1165,55 @@ def _kubernetes(raw: object, base: Path, substrate: str) -> KubernetesConfig | N
         token_file=base / token if token else None,
         ca_file=base / ca if ca else None,
         timeout_seconds=_timeout(section, "[kubernetes]", 15.0),
+    )
+
+
+def _fhir(raw: object, base: Path, substrate: str) -> FhirConfig | None:
+    section = _section(raw, "fhir", substrate)
+    if section is None:
+        return None
+    unknown = sorted(set(section) - _FHIR_KEYS)
+    if unknown:
+        raise ConfigError(f"[fhir]: unknown key(s) {', '.join(unknown)}")
+    entries = section.get("types")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("[fhir]: types are [[fhir.types]] tables, at least one")
+    types = []
+    for index, entry in enumerate(entries):
+        where = f"fhir.types[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: a table")
+        unknown = sorted(set(entry) - _FHIR_TYPE_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        try:
+            types.append(
+                FhirType(
+                    _string(entry, "table"),
+                    _string(entry, "type"),
+                    columns=_paths(entry.get("columns"), f"{where}.columns"),
+                    partitions=_paths(entry.get("partitions"), f"{where}.partitions"),
+                    tenant=_string(entry, "tenant", default="subject.reference"),
+                    compartment=_string(entry, "compartment", default="patient"),
+                    void_status=_string(entry, "void_status", default="entered-in-error"),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    if len({t.table for t in types}) != len(types):
+        raise ConfigError("[fhir]: each type is its own table")
+    if len({t.resource_type for t in types}) != len(types):
+        raise ConfigError("[fhir]: each resource type is one table")
+    token = _string(section, "token_file", default="")
+    ca = _string(section, "ca_file", default="")
+    return FhirConfig(
+        server=_string(section, "server"),
+        types=tuple(types),
+        journal=base / _string(section, "journal", default="interlock-journal"),
+        patients=tuple(_strings(section, "patients", required=False)),
+        token_file=base / token if token else None,
+        ca_file=base / ca if ca else None,
+        timeout_seconds=_timeout(section, "[fhir]", 15.0),
     )
 
 
@@ -1399,7 +1516,9 @@ _ENGINE_KEYS = frozenset(
 
 def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
     # A Git stage checks a worktree out and runs hooks: its default bound is longer.
-    stage_seconds = {"git": 120.0, "kubernetes": 120.0, "terraform": 900.0}.get(substrate, 10.0)
+    stage_seconds = {"git": 120.0, "kubernetes": 120.0, "terraform": 900.0, "fhir": 120.0}.get(
+        substrate, 10.0
+    )
     if raw is None:
         return EngineConfig(max_stage_seconds=stage_seconds)
     if not isinstance(raw, dict):
@@ -1411,7 +1530,7 @@ def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
     retries = _integer(raw, "conflict_retries", 16)
     if workers < 1 or retries < 0:
         raise ConfigError("[engine]: workers is at least 1, conflict_retries not negative")
-    if workers > 1 and substrate in ("sqlite", "git", "kubernetes", "terraform"):
+    if workers > 1 and substrate in ("sqlite", "git", "kubernetes", "terraform", "fhir"):
         raise ConfigError(
             "[engine]: SQLite admits one writer, and a stage holds the write lock for its "
             "whole life (a Git stage, its control database's): one worker"

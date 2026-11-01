@@ -184,8 +184,12 @@ class ReceiptIssuer:
         ledger_txn_ids: Iterable[str] = (),
         settled: Decimal = Decimal(0),
         metered: Iterable[Metered] = (),
+        compensated: bool = False,
     ) -> ActionReceipt:
         """Build, sign and log the receipt for one adjudicated plan.
+
+        :param compensated: The plan was written and put back (1.4.0): its
+            outcome is ``compensated`` (ARC1 1.4), naming ``substrate_txid``.
 
         :raises agentgov.exceptions.ReceiptError: If the log refuses it.
         """
@@ -272,8 +276,12 @@ class ReceiptIssuer:
                 else (),
             ),
             outcome=Outcome(
-                status=OutcomeStatus.COMMITTED if committed else OutcomeStatus.REFUSED,
-                substrate_txid=substrate_txid if committed else None,
+                status=OutcomeStatus.COMPENSATED
+                if compensated
+                else OutcomeStatus.COMMITTED
+                if committed
+                else OutcomeStatus.REFUSED,
+                substrate_txid=substrate_txid if committed or compensated else None,
             ),
             anchors=Anchors(
                 agentgov=(

@@ -95,6 +95,7 @@ from interlock.extension import (
     Spend,
 )
 from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEvidence, Refusal
+from interlock.fhir import FhirSubstrate, FhirType
 from interlock.inbox import (
     InboundSource,
     Inbox,
@@ -202,7 +203,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 __all__ = [
     "AdmissionError",
@@ -248,6 +249,8 @@ __all__ = [
     "ExtensionGrant",
     "ExtensionRequest",
     "FactAgreement",
+    "FhirSubstrate",
+    "FhirType",
     "ForbiddenStatementError",
     "FunctionSensor",
     "HttpAdapter",

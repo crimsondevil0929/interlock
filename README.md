@@ -1332,6 +1332,72 @@ Both are configured in `interlock.toml` (`substrate = "kubernetes"` with `[kuber
 over HTTP and an audit log, and a stand-in `terraform` command: CI stages class P with no
 cloud credentials.
 
+## FHIR servers: predicted and verified
+
+A FHIR server (an EHR's API) can neither hold a transaction open nor dry-run a write. What
+it does have is a version on every resource and conditional writes. Interlock calls the
+guarantee it builds from them *predicted and verified*: what was judged is a prediction,
+made true by a write on the version read and held to it by a read-back. Every receipt of
+such a plan says `coverage.measurement = "predicted"`.
+
+`FhirSubstrate`:
+
+- **Stage.** Each effect reads what it reaches live, with its `meta.versionId`, and the
+  first time a stage reaches a patient it reads that patient's whole chart (every observed
+  type, `[type]?patient=<id>`). `create` builds a resource from a template whose
+  `":name"` values are the effect's parameters; each conditional reference
+  (`Encounter?location=:bed&status=in-progress`) is resolved by a search that must find
+  exactly one. `patch` applies a JSON merge patch. `expect-version` pins a version.
+- **Judge.** The prediction is the diff: every checker, partition and window judges it
+  before anything is written, so an order that resolves to the wrong patient is refused
+  before the server sees it.
+- **Undo first.** Each effect declares its undo (`void <table>` for a create, `restore
+  <table>` for a patch). The undo journal gets every before image, and the charts as read,
+  before the first write. A created record is undone by marking it `entered-in-error`, never
+  by deleting it.
+- **Write.** The charts are read again; anything that moved since the stage read it (a
+  clinician's edit while the plan waited for a warrant) refuses the commit, and nothing is
+  written. Each update carries `If-Match`, so a change in the last instant answers
+  `412 Precondition Failed`. Every write carries the stage's id, in `meta.tag` and in
+  `X-Request-Id`, which the server's `AuditEvent` log records.
+- **Read back.** The charts are read once more and held to the prediction. A difference (a
+  rule on the server that stopped the encounter's other orders, a dose it rewrote) is
+  never accepted: everything the write changed is put back, the discrepancies are named,
+  and the stage is `COMPENSATED`, its receipt's outcome `compensated` (ARC1 1.4), so
+  `agentgov reconcile-actions --format fhir-auditevent` ties the write and its undo to it.
+
+<!-- readme-test: skip reason="needs a FHIR server; tests/test_fhir.py makes the same calls on interlock.sim.fhir" -->
+```python
+from interlock import BlastRadius, EscrowEngine, FhirSubstrate, FhirType, TenantIsolation
+
+ehr = FhirSubstrate(
+    "https://ehr.example.org/fhir",
+    token=open("/var/run/secrets/med-rec/token").read().strip(),
+    journal="/var/lib/interlock/undo",
+    control="/var/lib/interlock/control.db",
+    types=[
+        FhirType(
+            "medicationrequests",
+            "MedicationRequest",
+            columns={
+                "status": "status",
+                "dose_mg": "dosageInstruction.0.doseAndRate.0.doseQuantity.value",
+            },
+            partitions={"facility": "dispenseRequest.performer.reference"},
+        ),
+        FhirType("tasks", "Task", columns={"status": "status"}, tenant="for.reference"),
+    ],
+)
+engine = EscrowEngine(ehr, checkers=[BlastRadius(12), TenantIsolation(declared=True)])
+```
+
+Configured in `interlock.toml` as `substrate = "fhir"` with `[fhir]` and `[[fhir.types]]`.
+`interlock.sim.fhir` is a loopback FHIR R4 server (versions, `If-Match`, search with
+`_has`, rules that write as the server, and an `AuditEvent` log): CI stages class V with
+no EHR. What class V cannot do is see a server rule before the write: that is caught by the
+read-back and undone, not refused before it, and the receipt says so by its class. The
+server must allow client-assigned ids, so a create is predicted exactly.
+
 ### Sensor facts: an analyzer's word on the exact diff
 
 A checker is a pure function of the plan and the diff, so it cannot call a policy engine, a

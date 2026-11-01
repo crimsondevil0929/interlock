@@ -211,16 +211,38 @@ class CompensatedError(StageError):
     Nothing of the plan is left applied. The chain records the stage as
     ``COMPENSATED``. Retrying is safe: a new plan measures the system afresh.
 
+    A class V (predicted) commit raises it too when what it read back was not
+    what it predicted (1.4.0): every discrepancy is named, and everything the
+    write changed was put back.
+
     :ivar applied: How many objects the commit had changed when it failed.
     :ivar restored: How many of them the undo put back.
     :ivar undo: The SHA-256 of the undo, as the commit intent named it.
+    :ivar discrepancies: What the read-back found that the prediction did not
+        say, each in words (1.4.0); empty for a write that failed part way.
+    :ivar receipt: The receipt the engine issued for the stage, outcome
+        ``compensated`` (ARC1 1.4), once it has (1.4.0).
+    :ivar result: The stage's :class:`~interlock.engine.StageResult`, state
+        ``COMPENSATED``, with the diff and verdict the plan was admitted on
+        (1.4.0): what an operator's view of the call shows.
     """
 
-    def __init__(self, message: str, *, applied: int, restored: int, undo: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        applied: int,
+        restored: int,
+        undo: str,
+        discrepancies: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.applied = applied
         self.restored = restored
         self.undo = undo
+        self.discrepancies = discrepancies
+        self.receipt: object | None = None
+        self.result: object | None = None
 
 
 # -- an invariant said no ---------------------------------------------------
