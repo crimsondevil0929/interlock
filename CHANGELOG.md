@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.4.0] - unreleased
+## [1.4.0] - 2026-11-01
 
 Class V: a FHIR server, staged predicted and verified. Upgrades from 1.3.0 in place, with
 nothing to do; requires AgentGov 1.2.0 (ARC1 1.4). Every chain, receipt and vector written
