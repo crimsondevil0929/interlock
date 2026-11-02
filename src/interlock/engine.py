@@ -775,19 +775,61 @@ class EscrowEngine:
             )
         except CompensatedError as exc:
             # A plan-bound commit applied part of the plan, failed, and was
-            # put back from its undo: nothing of it is left applied.
+            # put back from its undo; or a predicted one read back other than
+            # it predicted, and everything it wrote was put back (1.4.0):
+            # nothing of it is left applied.
             self._substrate.abort(handle)
-            self._record(
+            if exc.discrepancies:
+                named = "; ".join(exc.discrepancies[:10]) + (
+                    f"; and {len(exc.discrepancies) - 10} more"
+                    if len(exc.discrepancies) > 10
+                    else ""
+                )
+                note = (
+                    f"read-back not as predicted ({len(exc.discrepancies)} discrepancy(ies): "
+                    f"{named}); {exc.restored} resource(s) put back from undo {exc.undo[:16]}"
+                )
+            else:
+                note = (
+                    f"partial apply undone: {exc.restored} of {exc.applied} object(s) "
+                    f"restored from undo {exc.undo[:16]}"
+                )
+            undone = self._record(
                 RecordType.COMPENSATED,
                 plan,
                 diff.content_hash() if diff is not None else plan.content_hash(),
                 stage=handle.stage_id,
-                note=f"partial apply undone: {exc.restored} of {exc.applied} object(s) "
-                f"restored from undo {exc.undo[:16]}",
+                note=note,
                 best_effort=True,
             )
             self._release(reservation)
             self._release_meters(held)
+            # Its writes reached the system, and so did their undo: the
+            # receipt says compensated (ARC1 1.4), naming the id both carried,
+            # so the system's own log ties to it.
+            if receipt_id is not None and judged is not None and undone is not None:
+                exc.receipt = self._issue_receipt(
+                    receipt_id,
+                    judged,
+                    committed=False,
+                    terminal=undone,
+                    settlement=None,
+                    txid=txid,
+                    repair_of=repairs,
+                    compensated=True,
+                )
+            exc.result = StageResult(
+                plan=plan,
+                state=StageState.COMPENSATED,
+                diff=diff,
+                verdict=verdict,
+                outcomes=tuple(outcomes),
+                chain_head=self._chain.head_hash,
+                anchored_to="",
+                committed=False,
+                feedback=feedback_for_error(plan, exc, substrate=self._substrate.substrate_id),
+                receipt=_receipt_of(exc.receipt),
+            )
             raise
         except Exception as exc:
             if committed or isinstance(exc, CommitUnsettledError):
@@ -1208,6 +1250,7 @@ class EscrowEngine:
         txid: str | None = None,
         repair_of: str | None = None,
         metered: Sequence[Metered] = (),
+        compensated: bool = False,
     ) -> ActionReceipt | None:
         """Issue the receipt, last, anchored to AgentGov's head as it is now.
 
@@ -1242,6 +1285,7 @@ class EscrowEngine:
                 ledger_txn_ids=(str(settlement.transaction_id),) if settlement is not None else (),
                 settled=spent,
                 metered=metered,
+                compensated=compensated,
             )
         except Exception:
             logger.warning(
@@ -1744,6 +1788,13 @@ def _transaction_id(substrate: ShadowSubstrate, handle: StageHandle) -> str | No
         return None
     value = reader(handle)
     return str(value) if value else None
+
+
+def _receipt_of(found: object) -> ActionReceipt | None:
+    """A receipt the engine issued, as one: the error holds it untyped."""
+    from agentgov.receipts import ActionReceipt
+
+    return found if isinstance(found, ActionReceipt) else None
 
 
 def _write_undo(substrate: ShadowSubstrate, handle: StageHandle) -> str | None:

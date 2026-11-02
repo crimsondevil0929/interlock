@@ -9,6 +9,51 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-01
+
+Class V: a FHIR server, staged predicted and verified. Upgrades from 1.3.0 in place, with
+nothing to do; requires AgentGov 1.2.0 (ARC1 1.4). Every chain, receipt and vector written
+before keeps its bytes.
+
+### Added
+
+- **`FhirSubstrate`** (`interlock.fhir`, ESCROW_SPEC §4.6, E4-11 to E4-15): each effect
+  reads what it reaches with its `meta.versionId`, and the patient's whole chart the first
+  time a stage reaches it; `create` builds a resource from a template (`":name"` values,
+  conditional references resolved by a search that must find exactly one), `patch` applies
+  a JSON merge patch, `expect-version` pins a version. The prediction is the diff every
+  checker judges. The undo (before images, and the charts as read) is written before the
+  first write; the charts are read again before writing, and anything moved refuses the
+  commit; each update carries `If-Match`, so `412` is a conflict; the charts are read back
+  and held to the prediction, and a difference is put back (a created record marked
+  `entered-in-error`, never deleted), the stage `COMPENSATED`. Every write carries the
+  stage's id in `meta.tag` and `X-Request-Id`; the receipt's transaction id is
+  `fhir:<stage id>`. `requires_compensation`: each effect declares its undo, `void
+  <table>` or `restore <table>`.
+- **`interlock.sim.fhir.LoopbackFhirServer`**: a FHIR R4 server on loopback, with
+  versions, weak ETags, `If-Match` (`412`), search with reference and `_has` parameters
+  (an unknown parameter refused, never ignored), update as create, no `DELETE`, rules that
+  write as the server (`ehr-rules`) with the request that set them off, bearer tokens,
+  faults, and an `AuditEvent` log as NDJSON.
+- **`SubstrateCapabilities.predicted`** and `interlock.predicted` (`PREDICTED`): the
+  class V contract.
+- **A compensated stage is receipted.** A plan-bound or predicted stage put back from its
+  undo now gets a receipt whose outcome is `compensated` (ARC1 1.4), naming the transaction
+  id its writes and their put-back carried, so a system's audit log does not show them as
+  phantoms. `CompensatedError.receipt` holds it; `CompensatedError.discrepancies` names what
+  a read-back found.
+- **`substrate = "fhir"`** in `interlock.toml`: `[fhir]` (`server`, `token_file`,
+  `ca_file`, `patients`, `journal`, `timeout_seconds`) and `[[fhir.types]]` (`table`,
+  `type`, `columns`, `partitions`, `tenant`, `compartment`, `void_status`);
+  `wiring.open_fhir`; `interlock install` and `check` print the server, its types and its
+  control database; `reconcile-effects` points to `agentgov reconcile-actions --format
+  fhir-auditevent`.
+
+### Changed
+
+- `COMPENSATED` records of a read-back name each discrepancy.
+- The floor on `interlock-agentgov` is 1.2.0, for the `compensated` outcome.
+
 ## [1.3.0] - 2026-10-31
 
 Plan-bound substrates, sensor facts, and pinned checker packs.

@@ -599,11 +599,11 @@ wheels = [
 
 [[package]]
 name = "interlock-agentgov"
-version = "1.1.0"
+version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/39/7b/ab9bf347d16499799a876ec142fb7986ecc755bf9cca5c580c45ad2518fe/interlock_agentgov-1.1.0.tar.gz", hash = "sha256:e4ddfd2f9cd050067419357d281a73bb4c969908641c9f379d3f48f2d31d6317", size = 1048586, upload-time = "2026-10-31T07:08:43.816Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/0d/ccb42d4c91c0c788476606d48c9a21afa58e7357892af891b2d03d36428a/interlock_agentgov-1.2.0.tar.gz", hash = "sha256:e7e79519023c9b09a839a5b6484ecb1fcbc8e8609ff8c0f995e23943a838890d", size = 1060059, upload-time = "2026-11-02T06:08:09.612Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3c/20/db6bc47fc29adb2ddcdb01ada3944aff57498fa35076654b48c2a077d37b/interlock_agentgov-1.1.0-py3-none-any.whl", hash = "sha256:f4c063a7e0ee07ee2fd5df7fd4fa7474c29a74013aa1a0548dc4c57546d1b1f3", size = 320457, upload-time = "2026-10-31T07:08:41.671Z" },
+    { url = "https://files.pythonhosted.org/packages/90/94/f95a25a26fb0789f7a15686d97f25db1621ae3b59d4f4d34e0779e869090/interlock_agentgov-1.2.0-py3-none-any.whl", hash = "sha256:8d6a2f722e9ca1438f4d76188a7bb18a507879861469fd7fc9fc55a427267970", size = 323728, upload-time = "2026-11-02T06:08:07.534Z" },
 ]
 
 [package.optional-dependencies]
@@ -619,7 +619,7 @@ sign = [
 
 [[package]]
 name = "interlock-escrow"
-version = "1.2.0"
+version = "1.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "interlock-agentgov" },
@@ -653,10 +653,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "interlock-agentgov", specifier = ">=1.1.0" },
-    { name = "interlock-agentgov", extras = ["kms-aws"], marker = "extra == 'kms-aws'", specifier = ">=1.1.0" },
-    { name = "interlock-agentgov", extras = ["otel"], marker = "extra == 'otel'", specifier = ">=1.1.0" },
-    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", specifier = ">=1.1.0" },
+    { name = "interlock-agentgov", specifier = ">=1.2.0" },
+    { name = "interlock-agentgov", extras = ["kms-aws"], marker = "extra == 'kms-aws'", specifier = ">=1.2.0" },
+    { name = "interlock-agentgov", extras = ["otel"], marker = "extra == 'otel'", specifier = ">=1.2.0" },
+    { name = "interlock-agentgov", extras = ["sign"], marker = "extra == 'sign'", specifier = ">=1.2.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
 provides-extras = ["postgres", "sign", "kms-aws", "otel"]

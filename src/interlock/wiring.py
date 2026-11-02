@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from agentgov import BudgetManager
 
     from interlock.config import Endpoint, InterlockConfig, RelayConfig
+    from interlock.fhir import FhirSubstrate
     from interlock.git_substrate import GitSubstrate
     from interlock.keys import KeyRegistry
     from interlock.kubernetes import KubernetesSubstrate
@@ -46,6 +47,7 @@ __all__ = [
     "key_registry",
     "live_keyring",
     "open_anchor",
+    "open_fhir",
     "open_git",
     "open_governor",
     "open_kubernetes",
@@ -84,6 +86,8 @@ def open_substrate(
         return open_kubernetes(config, control=dsn or None)
     if config.terraform is not None:
         return open_terraform(config)
+    if config.fhir is not None:
+        return open_fhir(config, control=dsn or None)
     if config.substrate == "postgres":
         return PostgresSubstrate(
             dsn,
@@ -143,6 +147,27 @@ def open_kubernetes(config: InterlockConfig, *, control: str | None = None) -> K
         kinds=settings.kinds,
         journal=settings.journal,
         namespaces=settings.namespaces,
+        token=settings.token(),
+        ca_file=None if settings.ca_file is None else str(settings.ca_file),
+        control=control if control is not None else (config.database or None),
+        timeout=settings.timeout_seconds,
+        max_stage_seconds=config.engine.max_stage_seconds,
+    )
+
+
+def open_fhir(config: InterlockConfig, *, control: str | None = None) -> FhirSubstrate:
+    """The FHIR substrate ``[fhir]`` names, with its control database
+    ``control`` (the file's ``database`` unless given), if any (1.4.0)."""
+    from interlock.fhir import FhirSubstrate
+
+    settings = config.fhir
+    if settings is None:
+        raise SubstrateConfigurationError('the file configures no [fhir]: substrate = "fhir"')
+    return FhirSubstrate(
+        settings.server,
+        types=settings.types,
+        journal=settings.journal,
+        patients=settings.patients,
         token=settings.token(),
         ca_file=None if settings.ca_file is None else str(settings.ca_file),
         control=control if control is not None else (config.database or None),

@@ -46,6 +46,7 @@ from enum import StrEnum
 from typing import Any, Final
 
 from interlock.exceptions import (
+    CompensatedError,
     CyclicPlanError,
     ForbiddenStatementError,
     InboundFactError,
@@ -135,6 +136,9 @@ class Guidance(StrEnum):
     MALFORMED_PLAN = "malformed_plan"
     CONFLICT = "conflict"
     EXPIRED = "expired"
+    READ_BACK = "read_back"
+    """Written, then put back (1.4.0): ``measured`` counts what a read-back
+    found the prediction did not say; none, a write that failed part way."""
     SCOPE_HALTED = "scope_halted"
     UNAVAILABLE = "unavailable"
     OUTBOUND_REQUEST = "outbound_request"
@@ -181,6 +185,7 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.MALFORMED_PLAN: "malformed_plan",
     Guidance.CONFLICT: "write_conflict",
     Guidance.EXPIRED: "stage_expired",
+    Guidance.READ_BACK: "put_back",
     Guidance.SCOPE_HALTED: "scope_halted",
     Guidance.UNAVAILABLE: "unavailable",
     Guidance.OUTBOUND_REQUEST: "outbound_request",
@@ -312,8 +317,9 @@ class ConstraintFeedback:
 class AgentFeedback:
     """Everything the agent may be told about what happened to its plan.
 
-    :ivar outcome: ``"committed"``, ``"refused"``, or ``"error"`` when the
-        plan never reached adjudication.
+    :ivar outcome: ``"committed"``, ``"refused"``, ``"error"`` when the
+        plan never reached adjudication, or ``"compensated"`` when it was
+        admitted, written, and put back (1.4.0).
     :ivar retryable: Whether resubmitting the same plan unchanged may
         succeed: a write conflict, an expired stage, an unavailable
         database. A refusal by a constraint is never retryable unchanged.
@@ -332,7 +338,9 @@ class AgentFeedback:
         head = {
             "committed": "The plan committed.",
             "refused": "The plan was refused and rolled back; nothing changed.",
-            "error": "The plan was not staged; nothing changed.",
+            "error": "The plan did not commit; nothing changed.",
+            "compensated": "The plan was admitted and written, then put back; nothing of it "
+            "stands.",
         }.get(self.outcome, "Nothing changed.")
         lines = [head, *(f"- {c.render()}" for c in self.constraints)]
         if self.retryable:
@@ -466,6 +474,13 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     Guidance.MALFORMED_PLAN: lambda c: "the plan is malformed and was not staged.",
     Guidance.CONFLICT: lambda c: "another writer holds the rows the plan needs.",
     Guidance.EXPIRED: lambda c: "the plan took longer than a stage allows. Split the work.",
+    Guidance.READ_BACK: lambda c: (
+        f"after the write, the system held {c.measured} change(s) the plan did not predict; "
+        f"everything the write changed was put back, and nothing of the plan stands."
+        if c.measured
+        else "a write failed part way; what was written was put back, and nothing of the "
+        "plan stands."
+    ),
     Guidance.SCOPE_HALTED: lambda c: "the agent's scope is halted; no plan will be staged.",
     Guidance.UNAVAILABLE: lambda c: "the database could not be reached.",
     Guidance.OUTBOUND_REQUEST: lambda c: (
@@ -570,7 +585,54 @@ _GIT: Final[Mapping[Guidance, Any]] = {
     Guidance.UNAVAILABLE: lambda c: "the repository could not be reached.",
 }
 
-_NOUNS: Final[Mapping[str, Mapping[Guidance, Any]]] = {"git": _GIT}
+_FHIR: Final[Mapping[Guidance, Any]] = {
+    Guidance.ROW_LIMIT: lambda c: (
+        f"the plan changes {c.measured or 'too many'} records; the limit is "
+        f"{c.limit or 'lower'}. Change fewer records, or split the work."
+    ),
+    Guidance.TENANT_SCOPE: lambda c: (
+        f"the plan reaches the charts of more patients than allowed "
+        f"(at most {c.limit or 'a set number'}); the session's chart is {_tenants(c)}. "
+        f"Confine the plan to the session's own chart."
+    ),
+    Guidance.UNDECLARED_TENANT: lambda c: (
+        f"the plan writes to the chart of a patient other than the session's; the session's "
+        f"chart is {_tenants(c)}. A bed or an order may belong to another patient: confine "
+        f"the plan to the session's own chart."
+    ),
+    Guidance.TABLE_SCOPE: lambda c: (
+        f"the plan writes records of type {_tables(c, fallback='a type it does not name')}, "
+        f"which it may not write."
+    ),
+    Guidance.STATED_FOOTPRINT: lambda c: (
+        f"the plan stated {c.limit or 'a number of'} record(s); the EHR's records predict "
+        f"{c.measured or 'more'}."
+    ),
+    Guidance.STATEMENT_KIND: lambda c: (
+        "a write is not one this EHR stages: create from a template, patch an order, or pin "
+        "its version, each declaring how it is undone."
+    ),
+    Guidance.STATEMENT_FAILED: lambda c: (
+        "the EHR could not stage the write: a record that is not there, or a bed, encounter "
+        "or order that does not resolve to exactly one record."
+    ),
+    Guidance.CONFLICT: lambda c: (
+        "the chart changed after the plan read it (someone else edited the record): nothing "
+        "was written. Read the chart again before planning."
+    ),
+    Guidance.UNAVAILABLE: lambda c: "the EHR could not be reached.",
+    Guidance.READ_BACK: lambda c: (
+        f"the EHR changed {c.measured} record(s) the plan did not touch when it was written "
+        f"(a rule on the EHR, not this plan): the read-back caught it, every record the "
+        f"write changed was put back, and nothing of the plan stands. The same call would "
+        f"do the same: ask a pharmacist."
+        if c.measured
+        else "a write failed part way; what was written was put back, and nothing of the "
+        "plan stands."
+    ),
+}
+
+_NOUNS: Final[Mapping[str, Mapping[Guidance, Any]]] = {"git": _GIT, "fhir": _FHIR}
 """Each substrate whose nouns are not SQL's, and the templates it says them in.
 A kind it does not name keeps the SQL template."""
 
@@ -839,6 +901,11 @@ def feedback_for_error(
     elif isinstance(error, StageConflictError):
         hint = FeedbackHint(kind=Guidance.CONFLICT)
         retryable = True
+    elif isinstance(error, CompensatedError):
+        found = len(error.discrepancies)
+        hint = FeedbackHint(kind=Guidance.READ_BACK, measured=found or None)
+        trusted = True  # a count the substrate made, never a value
+        retryable = not found
     elif isinstance(error, StageExpiredError):
         hint = FeedbackHint(kind=Guidance.EXPIRED)
     elif isinstance(error, SubstrateUnavailableError | SubstrateConfigurationError):
@@ -851,7 +918,7 @@ def feedback_for_error(
     else:
         hint = FeedbackHint(kind=Guidance.UNAVAILABLE)
     return AgentFeedback(
-        outcome="error",
+        outcome="compensated" if isinstance(error, CompensatedError) else "error",
         constraints=(
             sanitize(hint, plan, blocking=blocking, trusted=trusted, substrate=substrate),
         ),

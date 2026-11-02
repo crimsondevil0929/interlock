@@ -985,6 +985,45 @@ An undo restores configuration, not data: a database a forced replacement
 destroyed comes back empty. That is why a replacement is measured as the
 deletion it is, and refused by `NoDelete` before anything is applied.
 
+## 4.6 Predicted and verified substrates (added in 1.4.0)
+
+A FHIR server, or a SaaS API, can neither hold a transaction open nor dry-run a
+write. What it can do is answer a read with a version, and refuse a write
+conditional on a version that has moved. Interlock stages it as *predicted and
+verified* (class V): what was judged is a prediction, made true by a
+conditional write and held to it by a read-back.
+
+- **E4-11.** A predicted substrate MUST read the before image of every resource
+  a plan reaches, with its version, and the scope it is verified over (a
+  patient's chart), and MUST predict the after image from the operation's
+  semantics alone: the prediction is the diff every checker judges. A
+  reference it cannot resolve to exactly one resource MUST NOT stage.
+- **E4-12.** The undo (the before image of every resource the commit writes,
+  and the scope as read) MUST be written durably before the first write, its
+  digest named in the stage's `COMMIT_INTENT`, as E4-8. The undo of a created
+  record MUST mark it void (FHIR's `entered-in-error`); it MUST NOT delete it.
+  Each effect MUST declare which undo it takes (`requires_compensation`).
+- **E4-13.** The commit MUST fail closed, writing nothing, when the scope moved
+  since it was read, and every update MUST be conditional on the version read
+  (`If-Match`): a `409` or `412` on the first write is a conflict, on a later
+  one a partial write put back.
+- **E4-14.** After writing, the substrate MUST read the scope back and compare
+  it with the prediction: every written resource as predicted, every other as
+  read. A difference MUST NOT be accepted: everything the write changed MUST
+  be put back, conditional on the version read back, the discrepancies named,
+  and the stage recorded `COMPENSATED`, its receipt's outcome `compensated`
+  (ARC1 1.4) and naming the id its writes and their put-back carried. A
+  put-back that cannot complete MUST leave the intent open.
+- **E4-15.** Every receipt of a predicted stage MUST say
+  `coverage.measurement = "predicted"` (ARC1 1.3), and every write MUST carry
+  the stage's id, as a marker recovery reads and an identifier the system's
+  audit log records.
+
+What a server does on a write that it was never asked to measure (a rule that
+stops a whole encounter's orders) is caught after the write and undone, never
+refused before it. That is the difference between class V and class P, and why
+the receipt names its class.
+
 ---
 
 # 5. Architecture of `interlock` 0.5.0
@@ -1238,6 +1277,11 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-8: the undo written down first; a partial apply put back | Implemented (1.3.0) | `planbound.UndoJournal`, `; undo <sha256>` in `COMMIT_INTENT`, `CompensatedError`, `RecordType.COMPENSATED` | `test_kubernetes`, `test_terraform` |
 | E4-9: a marker on every object, read by recovery | Implemented (1.3.0) | `interlock.io/stage-id`; the `interlock_stage_id` output; `resolve_intent`, `compensated` | `test_kubernetes`, `test_terraform` |
 | E4-10: plan-bound receipts | Implemented (1.3.0) | `SubstrateCapabilities(measurement="plan-bound", plan_bound=True)` | `test_kubernetes` |
+| E4-11: read before, predicted from the operation; a reference resolved to exactly one | Implemented (1.4.0) | `FhirSubstrate` (`create` templates with conditional references, `patch` as a merge patch; the patient's compartment read at first touch) | `test_fhir` |
+| E4-12: the undo first; a created record voided, never deleted; each effect declares its undo | Implemented (1.4.0) | `planbound.UndoJournal`; `void <table>`, `restore <table>`; `SubstrateCapabilities(requires_compensation=True)` | `test_fhir` |
+| E4-13: nothing written when the scope moved; every update on the version read | Implemented (1.4.0) | the scope read again before the first write; `If-Match: W/"<versionId>"`, `412` a conflict | `test_fhir` |
+| E4-14: read back against the prediction; a difference put back and receipted `compensated` | Implemented (1.4.0) | `CompensatedError(discrepancies=)`, `RecordType.COMPENSATED`, `OutcomeStatus.COMPENSATED` (agentgov 1.2.0) | `test_fhir` |
+| E4-15: predicted receipts; the stage's id on every write | Implemented (1.4.0) | `SubstrateCapabilities(measurement="predicted", predicted=True)`; `meta.tag` and `X-Request-Id` | `test_fhir` |
 
 ## Beyond sections 1 to 4
 
