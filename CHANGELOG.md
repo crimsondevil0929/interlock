@@ -30,7 +30,9 @@ stand-ins could not.
   closed with `409` on a healthy cluster. On a `409` the substrate now reads the
   object again and takes its new version when only its status or that
   bookkeeping moved; a change to its content is still a conflict, and what lands
-  is still checked against the measure (E4-7 amended).
+  is still checked against the measure, by the same content, so a new
+  Deployment's first revision stamped between the dry run and the write is no
+  difference (E4-7 amended).
 - **FHIR: a refused write was put back over the edit that refused it.** When a
   later write was refused on its version (someone else had written the resource),
   the put-back restored every planned write, landed or not, and so overwrote the

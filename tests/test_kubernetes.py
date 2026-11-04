@@ -633,13 +633,14 @@ def test_a_cluster_that_moved_fails_closed(cluster: LoopbackCluster, tmp_path: P
     assert records[-1].record_type is RecordType.ABORTED
 
 
-def _controller_touch(cluster: LoopbackCluster, name: str) -> None:
+def _controller_touch(cluster: LoopbackCluster, name: str, revision: str = "2") -> None:
     """What a deployment controller does all the time on a live cluster:
     write status and its revision annotation, which bumps resourceVersion."""
     current = cluster.get("deployments", NS, name)
     assert current is not None
     current["status"] = {"observedGeneration": 1, "readyReplicas": 3}
-    current["metadata"].setdefault("annotations", {})["deployment.kubernetes.io/revision"] = "2"
+    annotations = current["metadata"].setdefault("annotations", {})
+    annotations["deployment.kubernetes.io/revision"] = revision
     cluster.seed("deployments", current)
 
 
@@ -672,6 +673,28 @@ def test_a_controllers_own_writes_are_not_a_conflict(
     live = cluster.get("deployments", NS, "checkout")
     assert live is not None and live["spec"]["replicas"] == 4
     assert live["metadata"]["annotations"]["deployment.kubernetes.io/revision"] == "2"
+
+
+def test_a_revision_the_controller_stamps_after_the_dry_run_lands_as_measured(
+    cluster: LoopbackCluster, tmp_path: Path
+) -> None:
+    """A deployment just created: the dry run measures it before its
+    controller stamps the first revision, and the write takes the stamped
+    version. What lands differs from what was measured only by the
+    controller's annotation, so it landed as measured (found on kind)."""
+    sub = substrate(cluster, tmp_path)
+    original = sub.commit
+
+    def raced(handle: Any) -> Any:
+        _controller_touch(cluster, "checkout", revision="7")
+        return original(handle)
+
+    sub.commit = raced  # type: ignore[method-assign]
+    result = engine(sub, tmp_path).execute(plan(scale("checkout", 4)))
+    assert result.committed
+    live = cluster.get("deployments", NS, "checkout")
+    assert live is not None and live["spec"]["replicas"] == 4
+    assert live["metadata"]["annotations"]["deployment.kubernetes.io/revision"] == "7"
 
 
 def test_a_content_change_while_measured_is_a_conflict(

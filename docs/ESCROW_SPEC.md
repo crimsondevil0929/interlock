@@ -983,7 +983,9 @@ state it was measured on.
   substrate MUST read the object again and MAY take its new version only when
   its content (its fingerprint, less the annotations its controller keeps) is
   unchanged; any other change is a conflict, as before. What lands is still
-  checked against what was measured.
+  checked against what was measured, by the same content: a controller that
+  stamps its revision between the dry run and the write (a new Deployment's
+  first) has not made the write land otherwise.
 - **E4-8.** The undo (the before image of every object the commit will write,
   or the inputs before the plan) MUST be written durably **before** the first
   write, and its digest named in the stage's `COMMIT_INTENT` (the undo before

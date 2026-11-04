@@ -313,6 +313,15 @@ def fingerprint(obj: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes(_canonical_safe(body))).hexdigest()
 
 
+def _as_landed(kind: KubeKind, obj: Mapping[str, Any]) -> dict[str, Any]:
+    """What a write is held to: the object's row, with its fingerprint read
+    as :func:`_content`. A controller stamping its revision between the dry
+    run and the write (a new deployment's first) is no difference."""
+    row = kind.image(obj)
+    row[FINGERPRINT] = _content(obj)
+    return row
+
+
 def _content(obj: Mapping[str, Any]) -> str:
     """What a plan is conditional on: the object's :func:`fingerprint`, less
     the annotations its controller keeps (:data:`_CONTROLLER_ANNOTATIONS`)."""
@@ -1202,7 +1211,7 @@ class KubernetesSubstrate:
                 ) from None
             applied.append(obj)
             if landed is not None and obj.measured is not None:
-                if obj.kind.image(landed) != obj.kind.image(obj.measured):
+                if _as_landed(obj.kind, landed) != _as_landed(obj.kind, obj.measured):
                     self._put_back(stage, applied, "it did not land as measured")
                     raise CompensatedError(
                         f"stage {stage.handle.stage_id}: {obj.kind.table} {obj.namespace}/"
