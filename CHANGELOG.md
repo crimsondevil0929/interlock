@@ -55,6 +55,10 @@ stand-ins could not.
   `_has` references resolved, a create read back as predicted, `versionId` on a
   conditional write, a stale `If-Match` (HAPI answers `409`, the specification
   `412`; either is a conflict), a create voided `entered-in-error`, recovery.
+- `tables = []` in `interlock.toml`, written out: a SQLite or PostgreSQL database
+  that observes no tables, whose plans only enqueue outbound requests (an MCP
+  server's write tools, as `fiduciary init --mcp` writes them). Leaving
+  `[[tables]]` out is still refused, as a likely mistake.
 - `scripts/kind-setup.sh`: prepares a kind cluster for those tests and prints
   their environment.
 - CI job `real-systems`: OpenTofu and kind pinned by checksum, HAPI FHIR

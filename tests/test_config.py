@@ -90,6 +90,22 @@ def test_a_malformed_file_names_what_is_wrong(
         load_config(write(tmp_path, text))
 
 
+def test_an_outbox_only_database_says_it_observes_no_tables(tmp_path: Path) -> None:
+    """``tables = []``, written out: plans that only enqueue requests (1.4.1).
+    Leaving tables out altogether is still a mistake the loader names."""
+    text = (
+        'substrate = "sqlite"\ndatabase = "app.db"\ntables = []\n'
+        '[[sinks]]\nname = "crm"\ntype = "mcp"\n'
+        'operations = [{ name = "close_ticket", hold = true }]\n'
+    )
+    config = load_config(write(tmp_path, text))
+    assert config.tables == () and config.sinks[0].kind == "mcp"
+    with pytest.raises(
+        ConfigError, match=r"lists no \[\[tables\]\] \(write tables = \[\] for none\)"
+    ):
+        load_config(write(tmp_path, 'substrate = "sqlite"\ndatabase = "app.db"\n'))
+
+
 def test_a_missing_file_is_a_config_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="cannot read"):
         load_config(tmp_path / "absent.toml")
