@@ -633,6 +633,65 @@ def test_a_cluster_that_moved_fails_closed(cluster: LoopbackCluster, tmp_path: P
     assert records[-1].record_type is RecordType.ABORTED
 
 
+def _controller_touch(cluster: LoopbackCluster, name: str) -> None:
+    """What a deployment controller does all the time on a live cluster:
+    write status and its revision annotation, which bumps resourceVersion."""
+    current = cluster.get("deployments", NS, name)
+    assert current is not None
+    current["status"] = {"observedGeneration": 1, "readyReplicas": 3}
+    current["metadata"].setdefault("annotations", {})["deployment.kubernetes.io/revision"] = "2"
+    cluster.seed("deployments", current)
+
+
+def test_a_controllers_own_writes_are_not_a_conflict(
+    cluster: LoopbackCluster, tmp_path: Path
+) -> None:
+    """Status, and a controller's revision annotation, moved between the read
+    and the dry run, and again before the commit: the content the plan
+    measured did not, so the stage takes the new version each time."""
+    sub = substrate(cluster, tmp_path)
+    dry_once = sub._dry_run_once
+    calls = {"n": 0}
+
+    def dry(stage: Any, obj: Any, where: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _controller_touch(cluster, "checkout")
+        dry_once(stage, obj, where)
+
+    original = sub.commit
+
+    def raced(handle: Any) -> Any:
+        _controller_touch(cluster, "checkout")
+        return original(handle)
+
+    sub._dry_run_once = dry  # type: ignore[method-assign]
+    sub.commit = raced  # type: ignore[method-assign]
+    result = engine(sub, tmp_path).execute(plan(scale("checkout", 4)))
+    assert result.committed and calls["n"] == 2
+    live = cluster.get("deployments", NS, "checkout")
+    assert live is not None and live["spec"]["replicas"] == 4
+    assert live["metadata"]["annotations"]["deployment.kubernetes.io/revision"] == "2"
+
+
+def test_a_content_change_while_measured_is_a_conflict(
+    cluster: LoopbackCluster, tmp_path: Path
+) -> None:
+    sub = substrate(cluster, tmp_path)
+    dry_once = sub._dry_run_once
+
+    def dry(stage: Any, obj: Any, where: str) -> None:
+        current = cluster.get("deployments", NS, "checkout")
+        assert current is not None
+        current["spec"]["replicas"] = 9
+        cluster.seed("deployments", current)
+        dry_once(stage, obj, where)
+
+    sub._dry_run_once = dry  # type: ignore[method-assign]
+    with pytest.raises(StageConflictError, match="changed while it was measured"):
+        engine(sub, tmp_path).execute(plan(scale("checkout", 4)))
+
+
 # -- a partial apply ------------------------------------------------------------
 
 

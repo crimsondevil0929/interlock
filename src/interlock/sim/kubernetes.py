@@ -6,7 +6,9 @@ protocol, with no cluster and no credentials:
 - namespaced resources under ``/api/v1`` and ``/apis/<group>/<version>``:
   ``GET`` (one or a list), ``POST``, ``PUT``, ``PATCH``
   (``application/merge-patch+json``) and ``DELETE``;
-- ``?dryRun=All``: the whole admission chain runs and nothing is stored;
+- ``?dryRun=All``: the whole admission chain runs and nothing is stored (a
+  ``DELETE`` with a body takes ``dryRun`` from its ``DeleteOptions``, as the
+  real API server does, and ignores the query);
 - optimistic concurrency: a ``PUT`` whose ``metadata.resourceVersion`` is not
   the stored one, and a ``DELETE`` whose ``preconditions`` do not hold, answer
   ``409 Conflict``;
@@ -440,6 +442,10 @@ class LoopbackCluster:
         key = (plural, namespace, name)
         current = self._objects.get(key)
         if method == "DELETE":
+            if document:
+                # As the real API server does: a DELETE with a body takes its
+                # options (dryRun among them) from the body, not the query.
+                dry = document.get("dryRun") == ["All"]
             if current is None:
                 raise _RefusedError(404, "NotFound", f'{plural} "{name}" not found')
             wanted = (document.get("preconditions") or {}).get("resourceVersion")

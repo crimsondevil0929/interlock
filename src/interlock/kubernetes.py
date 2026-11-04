@@ -149,6 +149,13 @@ _FIELD: Final = re.compile(r"(spec|metadata\.(labels|annotations))(\.[A-Za-z0-9_
 """A path ``set`` may write: under ``spec``, or a label or annotation."""
 _NAME: Final = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 _BOOKKEEPING: Final = ("resourceVersion", "generation", "uid", "creationTimestamp", "managedFields")
+_CONTROLLER_ANNOTATIONS: Final = frozenset({"deployment.kubernetes.io/revision"})
+"""Annotations a controller writes on the objects it manages, as it writes their
+status: a change to one is the cluster's bookkeeping, not a change to the
+object a plan measured."""
+_REBASES: Final = 3
+"""How many times a stage takes a newer version of an object whose content did
+not change (its status did, or a controller's bookkeeping) before it gives up."""
 _SUFFIXES: Final = {
     "m": Decimal("0.001"),
     "k": Decimal(1000),
@@ -304,6 +311,21 @@ def fingerprint(obj: Mapping[str, Any]) -> str:
         meta.pop("annotations", None)
     body["metadata"] = meta
     return hashlib.sha256(canonical_bytes(_canonical_safe(body))).hexdigest()
+
+
+def _content(obj: Mapping[str, Any]) -> str:
+    """What a plan is conditional on: the object's :func:`fingerprint`, less
+    the annotations its controller keeps (:data:`_CONTROLLER_ANNOTATIONS`)."""
+    body = copy.deepcopy(dict(obj))
+    meta = dict(body.get("metadata") or {})
+    annotations = {
+        k: v
+        for k, v in dict(meta.get("annotations") or {}).items()
+        if k not in _CONTROLLER_ANNOTATIONS
+    }
+    meta["annotations"] = annotations
+    body["metadata"] = meta
+    return fingerprint(body)
 
 
 def _canonical_safe(value: Any) -> Any:
@@ -477,6 +499,10 @@ class _Api:
         url = self._server + path + ("?dryRun=All" if dry else "")
         headers = {"Accept": "application/json"}
         data = None
+        if dry and body is not None and body.get("kind") == "DeleteOptions":
+            # A DELETE's options come from its body when it has one, and the
+            # query is then ignored: ?dryRun=All alone would delete for real.
+            body = {**body, "apiVersion": "v1", "dryRun": ["All"]}
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = (
@@ -860,7 +886,49 @@ class KubernetesSubstrate:
         body.pop("status", None)
         return body
 
+    def _rebased(self, obj: _Object) -> bool:
+        """After a ``409``: read ``obj`` again, and take its new version when
+        only its status or bookkeeping moved (a controller's own writes, which
+        bump ``resourceVersion`` all the time on a live cluster). Its desired
+        object keeps the controller's annotations as they now are. ``False``
+        when its content changed: the plan's conflict stands."""
+        if obj.live is None:
+            return False
+        try:
+            fresh = self._api.call("GET", obj.path())
+        except _ApiError:
+            return False
+        if _content(fresh) != _content(obj.live):
+            return False
+        obj.live = fresh
+        if obj.desired is not None:
+            carried = {
+                k: v
+                for k, v in dict((fresh.get("metadata") or {}).get("annotations") or {}).items()
+                if k in _CONTROLLER_ANNOTATIONS
+            }
+            meta = obj.desired.setdefault("metadata", {})
+            annotations = {
+                k: v
+                for k, v in dict(meta.get("annotations") or {}).items()
+                if k not in _CONTROLLER_ANNOTATIONS
+            }
+            meta["annotations"] = {**annotations, **carried}
+            if not meta["annotations"]:
+                meta.pop("annotations")
+        return True
+
     def _dry_run(self, stage: _Stage, obj: _Object, where: str) -> None:
+        for _ in range(_REBASES):
+            try:
+                self._dry_run_once(stage, obj, where)
+                return
+            except StageConflictError:
+                if not self._rebased(obj):
+                    raise
+        self._dry_run_once(stage, obj, where)
+
+    def _dry_run_once(self, stage: _Stage, obj: _Object, where: str) -> None:
         kind = obj.kind
         try:
             if obj.desired is None:
@@ -1115,7 +1183,7 @@ class KubernetesSubstrate:
         undo = stage.undo or ""
         for obj in writes:
             try:
-                landed = self._write(stage, obj)
+                landed = self._write_rebasing(stage, obj)
             except _ApiError as exc:
                 if not applied and exc.status == 409:
                     raise StageConflictError(
@@ -1145,6 +1213,18 @@ class KubernetesSubstrate:
                         restored=len(applied),
                         undo=undo,
                     )
+
+    def _write_rebasing(self, stage: _Stage, obj: _Object) -> dict[str, Any] | None:
+        """:meth:`_write`, taking a newer version of the object when only its
+        status or bookkeeping moved since it was measured (:meth:`_rebased`).
+        What lands is still compared with what was measured."""
+        for _ in range(_REBASES):
+            try:
+                return self._write(stage, obj)
+            except _ApiError as exc:
+                if exc.status != 409 or obj.replace or not self._rebased(obj):
+                    raise
+        return self._write(stage, obj)
 
     def _write(self, stage: _Stage, obj: _Object) -> dict[str, Any] | None:
         """One object's write, conditional on its measured version."""

@@ -9,6 +9,57 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.4.1] - unreleased
+
+The plan-bound and predicted substrates, run against the real systems for the
+first time: OpenTofu 1.13.2, a Kubernetes 1.37 cluster (kind) and HAPI FHIR 8.12.
+OpenTofu needed nothing. Kubernetes and FHIR each showed what the loopback
+stand-ins could not.
+
+### Fixed
+
+- **Kubernetes: measuring a forced replacement deleted the object.** A `DELETE`
+  whose body carries `DeleteOptions` takes its options from the body and ignores
+  `?dryRun=All` on the URL, so the dry-run delete of a `replace_on_immutable`
+  kind was real. The dry run now says `dryRun: ["All"]` in the body (E4-6
+  amended). The loopback API server now reads a `DELETE`'s options from its body,
+  as the real one does, so the unit suite catches this.
+- **Kubernetes: a controller's status write was taken for a conflict.** A
+  Deployment's controller writes its status, and its revision annotation,
+  continually; each moves `resourceVersion`, so a plan read a moment before failed
+  closed with `409` on a healthy cluster. On a `409` the substrate now reads the
+  object again and takes its new version when only its status or that
+  bookkeeping moved; a change to its content is still a conflict, and what lands
+  is still checked against the measure (E4-7 amended).
+- **FHIR: a refused write was put back over the edit that refused it.** When a
+  later write was refused on its version (someone else had written the resource),
+  the put-back restored every planned write, landed or not, and so overwrote the
+  other person's edit. Only the writes that landed are put back now, and a
+  resource written again since the stage's write (a version past the one its
+  write made) is left for a person, whether or not the server names requests in
+  `meta.source`, which HAPI FHIR does not by default (E4-14 amended). The
+  loopback FHIR server can now omit `meta.source` (`sources=False`), as HAPI does.
+
+### Added
+
+- `tests/test_real_tofu.py`, `tests/test_real_kubernetes.py`,
+  `tests/test_real_fhir.py`: each substrate against the real system, skipped
+  unless it is named (`INTERLOCK_TEST_TOFU`, `INTERLOCK_TEST_K8S_*`,
+  `INTERLOCK_TEST_FHIR_URL`), and required in CI (`INTERLOCK_REQUIRE_REAL=1`).
+  OpenTofu's own plans (`terraform_data`, no provider downloaded): a value known
+  only after the apply, a forced replacement, a stale saved plan, serial and
+  lineage, a resource postcondition stopping the apply part way, put back.
+  Kubernetes: a real `MutatingAdmissionPolicy` (x10) and
+  `ValidatingAdmissionPolicy`, defaults, `409` on `resourceVersion`, a partial
+  apply put back, an immutable field, recovery by the stage annotation. HAPI FHIR:
+  `_has` references resolved, a create read back as predicted, `versionId` on a
+  conditional write, a stale `If-Match` (HAPI answers `409`, the specification
+  `412`; either is a conflict), a create voided `entered-in-error`, recovery.
+- `scripts/kind-setup.sh`: prepares a kind cluster for those tests and prints
+  their environment.
+- CI job `real-systems`: OpenTofu and kind pinned by checksum, HAPI FHIR
+  `v8.12.0-2` as a service.
+
 ## [1.4.0] - 2026-11-01
 
 Class V: a FHIR server, staged predicted and verified. Upgrades from 1.3.0 in place, with

@@ -196,6 +196,9 @@ class LoopbackFhirServer:
     :param require_if_match: Refuse an update that names no version
         (``428 Precondition Required``), as a server that demands
         version-aware updates does.
+    :param sources: Record the request that wrote each version in
+        ``meta.source``. ``False`` is HAPI FHIR's default: no version says
+        which request wrote it.
     """
 
     def __init__(
@@ -214,12 +217,14 @@ class LoopbackFhirServer:
         rules: Iterable[Rule] = (),
         search: Mapping[str, Mapping[str, str]] = SEARCH,
         require_if_match: bool = False,
+        sources: bool = True,
     ) -> None:
         self._types = frozenset(types)
         self._tokens = dict(tokens or {})
         self._rules = list(rules)
         self._search = {t: dict(search.get(t, {})) for t in self._types}
         self._require_if_match = require_if_match
+        self._sources = sources
         self._resources: dict[tuple[str, str], list[JSON]] = {}
         self._ids = itertools.count(1)
         self._audits = itertools.count(1)
@@ -448,7 +453,8 @@ class LoopbackFhirServer:
         versions = self._resources.setdefault(key, [])
         before = copy.deepcopy(versions[-1]) if versions else None
         stored = self._stamp(copy.deepcopy(document), len(versions) + 1)
-        stored["meta"]["source"] = f"#{request_id or f'srv-{next(self._ids)}'}"
+        if self._sources:
+            stored["meta"]["source"] = f"#{request_id or f'srv-{next(self._ids)}'}"
         versions.append(stored)
         method = "PUT" if before is not None else "POST"
         self._log(kind, key[1], method, actor, request_id, stored, 200 if before else 201)

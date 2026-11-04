@@ -968,8 +968,22 @@ state it was measured on.
   the planner cannot measure (a webhook declaring side effects, refused a dry
   run) MUST NOT stage. A value the planner cannot know before the apply MUST be
   named in the diff (`UnknownValue`), and is refused unless acknowledged.
+  *Amended in 1.4.1:* a dry run MUST NOT write. A Kubernetes `DELETE` that
+  carries `DeleteOptions` takes its options from that body and ignores
+  `?dryRun=All` on the URL, so its dry run MUST say `dryRun: ["All"]` in the
+  body too. (Before 1.4.1 measuring a forced replacement deleted the object on
+  a real API server; the loopback stand-in honoured the query, and now behaves
+  as the real server does.)
 - **E4-7.** The commit MUST apply exactly what was measured, conditional on the
   state measured, and MUST fail closed, applying nothing, when the state moved.
+  *Amended in 1.4.1:* the state is the object's content, not its version alone.
+  On a live cluster a controller writes an object's status (and, for a
+  Deployment, its revision annotation) continually, and each such write moves
+  its `resourceVersion`. When a dry run or a write is answered `409`, the
+  substrate MUST read the object again and MAY take its new version only when
+  its content (its fingerprint, less the annotations its controller keeps) is
+  unchanged; any other change is a conflict, as before. What lands is still
+  checked against what was measured.
 - **E4-8.** The undo (the before image of every object the commit will write,
   or the inputs before the plan) MUST be written durably **before** the first
   write, and its digest named in the stage's `COMMIT_INTENT` (the undo before
@@ -1013,7 +1027,13 @@ conditional write and held to it by a read-back.
   be put back, conditional on the version read back, the discrepancies named,
   and the stage recorded `COMPENSATED`, its receipt's outcome `compensated`
   (ARC1 1.4) and naming the id its writes and their put-back carried. A
-  put-back that cannot complete MUST leave the intent open.
+  put-back that cannot complete MUST leave the intent open. *Amended in 1.4.1:*
+  only what the stage wrote is its own to put back: a write the server refused
+  did not land, and MUST NOT be put back over the version that refused it. A
+  resource written again since the stage's write (a version past the one its
+  write made) is someone else's change, MUST NOT be put back, and leaves the
+  intent open for a person, whether or not the server names the request in
+  `meta.source` (HAPI FHIR does not, by default).
 - **E4-15.** Every receipt of a predicted stage MUST say
   `coverage.measurement = "predicted"` (ARC1 1.3), and every write MUST carry
   the stage's id, as a marker recovery reads and an identifier the system's
@@ -1272,15 +1292,15 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-3: the undo written down before the do | Implemented | The compensation is part of the request, hashed into the plan at admission and committed in its outbox row | `test_outbound`, `test_operators` |
 | E4-4: compensations in reverse topological order | Implemented | `Operator.compensate` | `test_operators` |
 | E4-5: a stale compensation is a decision | Implemented | Past its original's deadline, only with `late=True`, signed | `test_operators` |
-| E4-6: measured by the system's own planner; the unmeasurable never stages | Implemented (1.3.0) | `KubernetesSubstrate` (`?dryRun=All`; a side-effecting webhook refuses the stage), `TerraformSubstrate` (`plan -out`, `show -json`; `UnknownValue`, `TruncationGuard(acknowledged_unknown=)`) | `test_kubernetes`, `test_terraform` |
-| E4-7: applied as measured, on the state measured | Implemented (1.3.0) | `resourceVersion` on every write (`409` fails closed), a landing checked against its measure; the state's serial and lineage checked, the saved plan applied, a stale plan a conflict | `test_kubernetes`, `test_terraform` |
+| E4-6: measured by the system's own planner; the unmeasurable never stages | Implemented (1.3.0; a body-carried dry run, 1.4.1; against kind and OpenTofu, `test_real_kubernetes`, `test_real_tofu`) | `KubernetesSubstrate` (`?dryRun=All`; a side-effecting webhook refuses the stage), `TerraformSubstrate` (`plan -out`, `show -json`; `UnknownValue`, `TruncationGuard(acknowledged_unknown=)`) | `test_kubernetes`, `test_terraform` |
+| E4-7: applied as measured, on the state measured | Implemented (1.3.0; a controller's status writes are not a conflict, 1.4.1) | `resourceVersion` on every write (`409` fails closed), a landing checked against its measure; the state's serial and lineage checked, the saved plan applied, a stale plan a conflict | `test_kubernetes`, `test_terraform` |
 | E4-8: the undo written down first; a partial apply put back | Implemented (1.3.0) | `planbound.UndoJournal`, `; undo <sha256>` in `COMMIT_INTENT`, `CompensatedError`, `RecordType.COMPENSATED` | `test_kubernetes`, `test_terraform` |
 | E4-9: a marker on every object, read by recovery | Implemented (1.3.0) | `interlock.io/stage-id`; the `interlock_stage_id` output; `resolve_intent`, `compensated` | `test_kubernetes`, `test_terraform` |
 | E4-10: plan-bound receipts | Implemented (1.3.0) | `SubstrateCapabilities(measurement="plan-bound", plan_bound=True)` | `test_kubernetes` |
 | E4-11: read before, predicted from the operation; a reference resolved to exactly one | Implemented (1.4.0) | `FhirSubstrate` (`create` templates with conditional references, `patch` as a merge patch; the patient's compartment read at first touch) | `test_fhir` |
 | E4-12: the undo first; a created record voided, never deleted; each effect declares its undo | Implemented (1.4.0) | `planbound.UndoJournal`; `void <table>`, `restore <table>`; `SubstrateCapabilities(requires_compensation=True)` | `test_fhir` |
 | E4-13: nothing written when the scope moved; every update on the version read | Implemented (1.4.0) | the scope read again before the first write; `If-Match: W/"<versionId>"`, `412` a conflict | `test_fhir` |
-| E4-14: read back against the prediction; a difference put back and receipted `compensated` | Implemented (1.4.0) | `CompensatedError(discrepancies=)`, `RecordType.COMPENSATED`, `OutcomeStatus.COMPENSATED` (agentgov 1.2.0) | `test_fhir` |
+| E4-14: read back against the prediction; a difference put back and receipted `compensated` | Implemented (1.4.0; only what landed is put back, 1.4.1; against HAPI FHIR, `test_real_fhir`) | `CompensatedError(discrepancies=)`, `RecordType.COMPENSATED`, `OutcomeStatus.COMPENSATED` (agentgov 1.2.0) | `test_fhir` |
 | E4-15: predicted receipts; the stage's id on every write | Implemented (1.4.0) | `SubstrateCapabilities(measurement="predicted", predicted=True)`; `meta.tag` and `X-Request-Id` | `test_fhir` |
 
 ## Beyond sections 1 to 4

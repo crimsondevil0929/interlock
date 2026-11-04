@@ -1427,6 +1427,34 @@ loads it only if the code installed is exactly the code pinned (the digest cover
 of the package), and says which it is otherwise: not installed, another version, or
 tampered.
 
+### Tested against the real systems
+
+The loopback stand-ins in `interlock.sim` make the unit tests fast and let them inject
+faults. CI also runs each substrate against the real system:
+
+- the OpenTofu CLI (1.13.2), with plans of its built-in `terraform_data`, so no provider is
+  downloaded;
+- a Kubernetes 1.37 cluster (kind), where a `MutatingAdmissionPolicy` multiplies replicas
+  by ten and a `ValidatingAdmissionPolicy` sets a ceiling;
+- HAPI FHIR (8.12), the reference open-source FHIR server.
+
+Run them locally by naming each system:
+
+```
+INTERLOCK_TEST_TOFU=$(command -v tofu) uv run pytest tests/test_real_tofu.py
+kind create cluster --name interlock && eval "$(scripts/kind-setup.sh kind-interlock)"
+uv run pytest tests/test_real_kubernetes.py
+docker run -d -p 8091:8080 hapiproject/hapi:v8.12.0-2
+INTERLOCK_TEST_FHIR_URL=http://localhost:8091/fhir uv run pytest tests/test_real_fhir.py
+```
+
+The first run against them found three bugs that the stand-ins could not show. All are
+fixed in 1.4.1:
+
+- A Kubernetes dry-run delete was real when the request had a body.
+- A controller's status writes on a healthy cluster were taken for conflicts.
+- A refused FHIR write was put back over the edit that refused it.
+
 ## Outbound requests: the transactional outbox
 
 An email, a refund through a payment API, a webhook: a plan often has to call something
