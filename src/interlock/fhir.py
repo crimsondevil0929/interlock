@@ -733,6 +733,9 @@ class _Resource:
     desired: dict[str, Any] | None = None
     staged: bool = False
     effects: list[str] = field(default_factory=list)
+    written: str | None = None
+    """The version the stage's own write made, as the server answered it:
+    a later version is someone else's, whatever ``meta.source`` says."""
 
     @property
     def key(self) -> tuple[str, str]:
@@ -1348,19 +1351,22 @@ class FhirSubstrate:
         for obj in writes:
             assert obj.desired is not None
             try:
-                self._api.call(
+                landed = self._api.call(
                     "PUT",
                     obj.path(),
                     self._marked(stage, obj.desired),
                     headers=self._headers(stage.handle.stage_id, obj.version),
                 )
+                obj.written = _version(landed)
             except _FhirError as exc:
                 if not applied and exc.conflict:
                     raise StageConflictError(
                         f"{obj.kind.resource_type}/{obj.resource_id} changed after it was "
                         f"measured (HTTP {exc.status}): nothing was written: {exc.message}"
                     ) from None
-                self._put_back(stage, exc.message)
+                # The refused write did not land (a conditional write either
+                # lands whole or not at all): only what did is put back.
+                self._put_back(stage, exc.message, applied)
                 raise CompensatedError(
                     f"stage {stage.handle.stage_id}: writing {obj.kind.resource_type}/"
                     f"{obj.resource_id} failed (HTTP {exc.status}: {exc.message}); every "
@@ -1372,7 +1378,7 @@ class FhirSubstrate:
             applied.append(obj)
         found = self._discrepancies(stage)
         if found:
-            restored = self._put_back(stage, "the read-back was not the prediction")
+            restored = self._put_back(stage, "the read-back was not the prediction", applied)
             left = (
                 f"; {len(stage.foreign)} change(s) another request made "
                 f"({', '.join(stage.foreign)}) were left as they are, for a person to review"
@@ -1474,24 +1480,26 @@ class FhirSubstrate:
                     )
         return found
 
-    def _put_back(self, stage: _Stage, why: str) -> int:
+    def _put_back(self, stage: _Stage, why: str, applied: Sequence[_Resource]) -> int:
         """Put back everything the stage's writes changed, as it was read: a
         created resource marked void. A change is the stage's when it wrote
-        the resource, or when the server says the request that wrote it was
-        one of the stage's (``meta.source``, ``#<stage id>``): a rule the
+        the resource (``applied``: the writes that landed, never one the
+        server refused), or when the server says the request that wrote it
+        was one of the stage's (``meta.source``, ``#<stage id>``): a rule the
         write set off. Anything else changed since is someone else's, and is
         never put back: it is named for a person instead. (A server that
         names no request in ``meta.source`` has every change but the
         stage's own writes put back by a person.) A resource the stage wrote
-        and another request wrote again is never put back either: the
-        put-back is then incomplete. Each write is conditional on the
-        version read back. How many were put back.
+        and another request wrote again (a version past the one its write
+        made, or another request in ``meta.source``) is never put back
+        either: the put-back is then incomplete. Each write is conditional
+        on the version read back. How many were put back.
 
         :raises CommitUnsettledError: If any cannot be.
         """
         before = self._before(stage)
         current = self._now(stage)
-        written = {o.key for o in self._writes(stage)}
+        written = {o.key: o.written for o in applied}
         ours = f"#{stage.handle.stage_id}"
         failures = []
         restored = 0
@@ -1501,7 +1509,8 @@ class FhirSubstrate:
                 continue
             kind = self._types[key[0]]
             source = str((now.get("meta") or {}).get("source") or "")
-            if key in written and source and not source.endswith(ours):
+            rewritten = written.get(key) is not None and _version(now) != written[key]
+            if key in written and not source.endswith(ours) and (rewritten or source):
                 # The stage wrote it, and another request wrote it since:
                 # putting it back would undo that one too. A person decides.
                 failures.append(

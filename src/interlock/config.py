@@ -963,8 +963,13 @@ def load_config(
         else:
             assert terraform is not None
             tables = list(terraform_tables(terraform.resources))
+    elif entries == []:
+        # Written out, `tables = []` says this database observes no tables: its
+        # plans only enqueue outbound requests (an MCP server's write tools,
+        # say), and a row a plan writes is in no table it may touch (1.4.1).
+        pass
     elif not isinstance(entries, list) or not entries:
-        raise ConfigError(f"{path} lists no [[tables]]")
+        raise ConfigError(f"{path} lists no [[tables]] (write tables = [] for none)")
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ConfigError(f"tables[{index}] is not a table")

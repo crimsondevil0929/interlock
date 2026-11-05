@@ -672,6 +672,55 @@ def test_a_later_write_that_fails_puts_the_earlier_ones_back(
     assert statuses(server) == {"1": "active", "2": "active", "3": "active"}
 
 
+def test_a_refused_write_is_never_put_back_over_someone_elses(tmp_path: Path) -> None:
+    """On a server that does not say which request wrote a version (HAPI's
+    default), the first write lands; a pharmacist then edits the second
+    resource, and the stage's write to it is refused on its version. Only
+    the first is put back: the pharmacist's edit stands. (Found on HAPI FHIR:
+    the put-back once restored every planned write, landed or not.)"""
+    server = LoopbackFhirServer(tokens={TOKEN: AGENT}, sources=False)
+    server.start()
+    try:
+        server.seed({"resourceType": "Patient", "id": CHART})
+        for n in ("2", "3"):
+            server.seed(order(n, CHART, "metformin", 10, "enc-1"))
+        sub = substrate(server, tmp_path)
+        inner = sub._api
+        edits: list[str] = []
+
+        class _Pharmacist:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(inner, name)
+
+            def call(self, method: str, path: str, body: Any = None, **kwargs: Any) -> Any:
+                found = inner.call(method, path, body, **kwargs)
+                if method == "PUT" and path.endswith("/2") and not edits:
+                    edits.append(path)
+                    edited = server.get("MedicationRequest", "3")
+                    assert edited is not None
+                    edited["note"] = [{"text": "held by the pharmacist"}]
+                    server.write(edited, actor="Practitioner/rph-1")
+                return found
+
+            def read(self, resource_type: str, resource_id: str) -> Any:
+                return inner.read(resource_type, resource_id)
+
+            def search(self, query: str, *, limit: int) -> Any:
+                return inner.search(query, limit=limit)
+
+        sub._api = _Pharmacist()  # type: ignore[assignment]
+        with pytest.raises(CompensatedError, match="writing MedicationRequest/3 failed"):
+            engine(sub, tmp_path).execute(
+                plan(patch("2", {"status": "on-hold"}), patch("3", {"status": "on-hold"}))
+            )
+        assert statuses(server) == {"2": "active", "3": "active"}
+        kept = server.get("MedicationRequest", "3")
+        assert kept is not None and kept["note"] == [{"text": "held by the pharmacist"}]
+        assert "source" not in kept["meta"] and kept["meta"]["versionId"] == "2"
+    finally:
+        server.stop()
+
+
 def test_a_put_back_that_fails_leaves_the_intent_open(
     server: LoopbackFhirServer, tmp_path: Path
 ) -> None:
