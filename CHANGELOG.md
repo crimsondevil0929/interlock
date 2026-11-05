@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.4.1] - unreleased
+## [1.4.1] - 2026-11-04
 
 The plan-bound and predicted substrates, run against the real systems for the
 first time: OpenTofu 1.13.2, a Kubernetes 1.37 cluster (kind) and HAPI FHIR 8.12.
