@@ -61,6 +61,7 @@ from interlock.exceptions import (
 from interlock.feedback import (
     BUCKETS,
     AgentFeedback,
+    ConstraintFeedback,
     FeedbackHint,
     Guidance,
     bucket,
@@ -338,6 +339,29 @@ def test_table_allowlist_no_delete_truncation_and_ddl() -> None:
     ddl = plan_of(("orders", "acme"), kind=EffectKind.DDL)
     (c,) = feedback(ddl, [], [NoSchemaChange()]).constraints
     assert c.guidance is Guidance.SCHEMA_CHANGE
+
+
+def test_a_git_path_class_is_named_as_one() -> None:
+    def said(guidance: Guidance, *tables: str, withheld: bool = False) -> str:
+        return ConstraintFeedback(
+            guidance, True, tables=tables, withheld_tables=withheld, substrate="git"
+        ).render()
+
+    assert said(Guidance.TABLE_SCOPE, "workflows") == (
+        "table_allowlist: the plan changed files in the workflows path class, "
+        "which it may not write."
+    )
+    assert said(Guidance.TABLE_SCOPE, "deps", "workflows", withheld=True) == (
+        "table_allowlist: the plan changed files in the deps, workflows path classes and in "
+        "another path class, which it may not write."
+    )
+    assert said(Guidance.TABLE_SCOPE) == (
+        "table_allowlist: the plan changed files in a path class it may not write."
+    )
+    assert said(Guidance.NO_DELETE, "tests") == (
+        "no_delete: the plan deletes files from the tests path class, where deletes are not "
+        "allowed."
+    )
 
 
 def test_an_advisory_rides_on_a_committed_plan() -> None:

@@ -359,20 +359,31 @@ class AgentFeedback:
         }
 
 
-def _outside(c: ConstraintFeedback, *, did: str, kind: str) -> str:
+def _named(c: ConstraintFeedback, kind: str, *, labelled: bool) -> str:
+    """The tables ``c`` names, as a sentence says them: ``orders, refunds``, or,
+    where a bare name could be misread (a Git path class is not a directory),
+    ``the workflows path class``."""
+    named = ", ".join(c.tables)
+    if not labelled or not named:
+        return named
+    kinds = kind if len(c.tables) == 1 else kind + ("es" if kind.endswith("s") else "s")
+    return f"the {named} {kinds}"
+
+
+def _outside(c: ConstraintFeedback, *, did: str, kind: str, labelled: bool = False) -> str:
     """A write to tables the plan may not write. A table outside the plan's scope
     is not named to the agent (``withheld_tables``), so the sentence reads well
     either way: ``changed rows in orders, which it may not write``, ``changed
     rows in a table it may not write``."""
-    named = ", ".join(c.tables)
+    named = _named(c, kind, labelled=labelled)
     if not named:
         return f"the plan {did} a {kind} it may not write."
     other = f" and in another {kind}" if c.withheld_tables else ""
     return f"the plan {did} {named}{other}, which it may not write."
 
 
-def _no_delete(c: ConstraintFeedback, *, rows: str, kind: str) -> str:
-    named = ", ".join(c.tables)
+def _no_delete(c: ConstraintFeedback, *, rows: str, kind: str, labelled: bool = False) -> str:
+    named = _named(c, kind, labelled=labelled)
     if not named:
         return f"the plan deletes {rows} from a {kind} where deletes are not allowed."
     other = f" and from another {kind}" if c.withheld_tables else ""
@@ -579,8 +590,10 @@ _GIT: Final[Mapping[Guidance, Any]] = {
         f"the plan changed files of an owner it does not declare; its declared owners are "
         f"{_tenants(c)}. Confine the plan to the files its declared owners hold."
     ),
-    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="changed files in", kind="path class"),
-    Guidance.NO_DELETE: lambda c: _no_delete(c, rows="files", kind="path class"),
+    Guidance.TABLE_SCOPE: lambda c: _outside(
+        c, did="changed files in", kind="path class", labelled=True
+    ),
+    Guidance.NO_DELETE: lambda c: _no_delete(c, rows="files", kind="path class", labelled=True),
     Guidance.TRUNCATED: lambda c: (
         f"the plan changed more files than can be measured ({c.measured or 'too many'}). "
         f"Split the work."

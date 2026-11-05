@@ -1186,7 +1186,7 @@ def test_the_agent_is_told_about_files_not_rows(repo: Repo) -> None:
     assert "rows" not in told and "WHERE" not in told and "database" not in told
     workflow = built.execute(edit("workflows", "write '.github/workflows/release.yml' 'x'").build())
     assert workflow.feedback is not None
-    assert "files of class workflows, which it may not write" in workflow.feedback.render()
+    assert "files in the workflows path class, which it may not write" in workflow.feedback.render()
     assert workflow.feedback.to_json()["constraints"][0]["substrate"] == "git"
 
 

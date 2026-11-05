@@ -20,8 +20,9 @@ substrate that is set up wrong no longer reported as unreachable. Upgrades from
 - **A table, path class or resource type the plan may not write, when its name
   is withheld.** The feedback read "changed files of class a class it does not
   name, which it may not write". It now reads "changed files in a path class it
-  may not write", and "rows from orders and from another table" when one is
-  named and one is not. The same applies to deletes, and to a SQL statement that
+  may not write", or "changed files in the workflows path class" when the class
+  is named, and "rows from orders and from another table" when one is named and
+  one is not. The same applies to deletes, and to a SQL statement that
   writes an unobserved table.
 - **A substrate that is set up wrong.** A missing install, a stage role without
   its grants, or a stage role that could become a superuser was reported to the
@@ -36,6 +37,13 @@ substrate that is set up wrong no longer reported as unreachable. Upgrades from
   `stage_roles`, and run `interlock install` again.
 - **A write that was read back and put back** is described plainly: what
   changed, that it was put back, and that the system is as it was before.
+
+### Documentation
+
+- The README reads in plain sentences. The daemon's metrics, the Kubernetes
+  deployment and the soak's checks are lists, and the outbound section points
+  at `agentgov reconcile-actions` for checking a vendor's own log against the
+  delivery receipts.
 
 ## [1.4.1] - 2026-11-04
 
