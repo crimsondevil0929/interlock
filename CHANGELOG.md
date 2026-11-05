@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.4.2] - unreleased
+## [1.4.2] - 2026-11-05
 
 What an agent is told when a plan is refused, in plainer sentences, and a
 substrate that is set up wrong no longer reported as unreachable. Upgrades from
@@ -37,6 +37,11 @@ substrate that is set up wrong no longer reported as unreachable. Upgrades from
   `stage_roles`, and run `interlock install` again.
 - **A write that was read back and put back** is described plainly: what
   changed, that it was put back, and that the system is as it was before.
+
+### Changed
+
+- **Requires interlock-agentgov 1.3.0.** Its `reconcile-actions` reads Stripe's
+  and SendGrid's event exports, which the README's outbound section points at.
 
 ### Documentation
 

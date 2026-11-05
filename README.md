@@ -2480,7 +2480,7 @@ section listing implemented, partial and unimplemented requirements.
 
 ## Install
 
-`agentgov` comes from PyPI (`interlock-agentgov>=1.0.0`, ARC1 1.2), so a clone needs
+`agentgov` comes from PyPI (`interlock-agentgov>=1.3.0`, ARC1 1.4), so a clone needs
 nothing beside it:
 
 ```bash
