@@ -29,9 +29,9 @@ uv run python demo.py
 
 ## The stack: consequence control, under the gateway
 
-Gateways decide whether an agent may make a call. This stack decides whether the call's
-consequence may stand, and proves it to someone who trusts neither the agent nor the
-operator. It sits under an MCP or policy gateway, not in place of one.
+A gateway decides whether an agent may make a call. This stack decides whether what the
+call changed may be kept, and produces evidence for someone who trusts neither the agent
+nor the operator. It runs behind an MCP or policy gateway and doesn't replace it.
 
 | Layer | Package | The question it answers |
 |---|---|---|
@@ -50,13 +50,13 @@ catch it is between the effect being computed and the effect becoming durable.
 That position requires write-path credentials to the database the effects land in, which is
 why this runs inside the deployment rather than at the model provider.
 
-The demo is also a control for model quality: the agent loops zero times, costs $0.0012,
-and emits valid SQL on the first attempt. The damage is not a model-quality failure.
+The demo also rules out model quality as the cause. The agent doesn't loop, costs $0.0012
+and writes valid SQL on its first try. The damage isn't a model failure.
 
 **`demo.py` uses a scripted agent, not a live model.** `injected_plan` and the rest of
-Act 2's input are fixed `EffectPlan`s defined in `demo.py`; no model is called. This
-separates two questions: does escrow stop this plan, and would a real model produce it?
-The demo answers only the first. Current Claude models decline the injected instruction
+Act 2's input are fixed `EffectPlan`s defined in `demo.py`. No model is called. That keeps
+two questions apart: does Interlock stop this plan, and would a real model produce it? The
+demo answers only the first. Current Claude models decline the injected instruction
 shown above in several realistic phrasings. For runs against a real model, see
 [`scripts/live_gauntlet.py`](scripts/live_gauntlet.py): eight scenarios with a real
 `anthropic.Anthropic` client and governed spend. Its results are not reproducible, because
@@ -73,8 +73,8 @@ routinely different:
 | SQL `rowcount` | 1 row |
 | **Measured** | **2 rows across 2 tables** |
 
-An audit trigger that the plan does not mention doubled the footprint. Inspecting the plan
-or parsing the SQL cannot reveal that; reading the change back from the database does.
+An audit trigger that the plan doesn't mention doubled the footprint. Inspecting the plan
+or parsing the SQL can't show that. Reading the change back from the database does.
 
 ## Lifecycle
 
@@ -92,21 +92,21 @@ These properties hold by construction:
    forced to stable storage, before the substrate is told to commit, and `COMMITTED`
    after it returns, so a crash in that window leaves an intent with no terminal record
    after it.
-4. That crash is resolved exactly, not guessed. An intent says only that a commit was
-   *attempted*, so the substrate also writes a marker row, in `_interlock_commits`,
-   inside the stage's own transaction: it exists if and only if the effects do. On
+4. That crash is resolved exactly, without guessing. An intent only says a commit was
+   *attempted*, so the substrate also writes a marker row in `_interlock_commits`, inside
+   the stage's own transaction. The marker exists if and only if the effects do. On
    restart, `EscrowEngine.recover()` reads the marker for every intent a crashed process
    left open and appends `COMMITTED` or `ABORTED`, noted as recovered. `EscrowRuntime`
-   runs it at startup whenever it has a `chain_path`. An intent written before v0.1.2,
-   or by a substrate without markers, is left open and logged for an operator: its
-   marker's absence proves nothing. So is one the server has not decided yet (a client
-   that died mid-`COMMIT` leaves PostgreSQL still committing); a later `recover()`
-   resolves it.
-5. A commit whose answer is lost is resolved the same way, while the process lives. If
-   the connection drops with `COMMIT` in flight, the engine reads the marker at once:
-   the plan is reported committed if it landed, and rolled back only once the server has
-   ended the transaction without it. Until the server decides, `execute()` raises
-   `CommitUnsettledError` and writes no terminal record. Do not retry the plan then: the
+   runs it at startup whenever it has a `chain_path`. An intent written before v0.1.2, or
+   by a substrate without markers, is left open and logged for an operator, because a
+   missing marker proves nothing there. So is one the server hasn't decided yet: a client
+   that died mid-`COMMIT` leaves PostgreSQL still committing. A later `recover()` resolves
+   it.
+5. A commit whose answer is lost is resolved the same way while the process is alive. If
+   the connection drops with `COMMIT` in flight, the engine reads the marker at once. The
+   plan is reported committed if it landed, and rolled back only once the server has ended
+   the transaction without it. Until the server decides, `execute()` raises
+   `CommitUnsettledError` and writes no terminal record. Don't retry the plan then. The
    intent stays open, and `recover()` settles it.
 
 ## Quickstart
@@ -215,16 +215,15 @@ if not result.committed:
 `execute()` takes a per-plan `settle_cost=` that overrides the engine's
 default, because what a plan cost to produce is a property of the plan.
 
-**The chain file.** `EscrowChain(path)` resumes an existing file: every record is read
-and verified before the first append, so a restarted process continues the chain rather
-than starting a second one at sequence 1. One file has one writer. The chain claims
-`<path>.lock` for as long as it is open, and a second writer, in this process or
-another, gets `ChainInUseError`: two writers would fork the chain, and recovery would
-resolve one writer's in-flight commits as if it had died. `EscrowChain.load(path)`
-reads and verifies a live chain without claiming it, and cannot append. A final line
-left torn by a crash mid-append is cut off by the next writer, because that append
-never returned. Intents and outcomes are fsynced before `append` returns; pass
-`fsync=False` to give that up for speed.
+**The chain file.** `EscrowChain(path)` resumes an existing file. Every record is read and
+verified before the first append, so a restarted process continues the chain instead of
+starting a second one at sequence 1. One file has one writer. The chain claims
+`<path>.lock` for as long as it's open, and a second writer, in this process or another,
+gets `ChainInUseError`. Two writers would fork the chain, and recovery would treat one
+writer's in-flight commits as if it had died. `EscrowChain.load(path)` reads and verifies a
+live chain without claiming it, and can't append. If a crash tears the last line
+mid-append, the next writer cuts it off, because that append never returned. Intents and
+outcomes are fsynced before `append` returns. Pass `fsync=False` to trade that for speed.
 
 ### Typing
 
@@ -258,12 +257,12 @@ plan = EffectPlan(
 
 ### Invariants
 
-Checkers are pure functions of `(plan, diff)`. No I/O, no clock, no RNG, no
-model call. A checker that reads the world cannot be replayed, and a verdict
-that cannot be replayed is not evidence. Where a judgment genuinely needs a
-model, the model is a **sensor** whose output is passed in at configuration
-time, never consulted from inside `check`. A checker that raises becomes a
-blocking violation: fail closed.
+Checkers are pure functions of `(plan, diff)`: no I/O, no clock, no RNG, no model call. A
+checker that reads the outside world can't be replayed, and an auditor can't check a
+verdict that can't be replayed. When a judgment really needs a model, the model is a
+**sensor**: its output is passed in when the deployment is configured, and never consulted
+from inside `check`. A checker that raises counts as a blocking violation, so failures fail
+closed.
 
 | Checker | Bounds |
 |---|---|
@@ -283,12 +282,12 @@ blocking violation: fail closed.
 | `OutboundTenantIsolation` | the tenants one plan's requests may span |
 | `FactAgreement` | a write against the inbound fact it must follow ([inbox](#inbound-facts-the-zero-trust-inbox)) |
 
-`TenantIsolation(1)` counts tenants: a plan declared for `acme` that changes one row of
-`globex`, and none of its own, spans one tenant and passes. When an agent acts for one
+`TenantIsolation(1)` counts tenants. A plan declared for `acme` that changes one row of
+`globex` and none of its own spans one tenant, so it passes. When an agent acts for one
 tenant and the operator stamps every effect with it (`tenant_id=`, never the model's
-choice), pass `declared=True`: a row of any tenant the plan's effects do not declare is
-refused, one row as much as many, and the agent is told its own tenants and nothing of the
-other.
+choice), pass `declared=True`. Then any row of a tenant the plan's effects don't declare
+is refused, one row as much as many. The agent is told its own tenants and nothing about
+the other one.
 
 `TenantDrawdownGuard` exists because `ColumnValueGuard` sums the column across
 the whole diff, and a sum is the wrong denominator on a multi-tenant
@@ -300,9 +299,9 @@ guard permitting a 30% drawdown does not admit 30.000000000000004%.
 
 ### Partitions beyond the tenant, and guards that watch a rise
 
-A hospital partitions by facility *and* by patient; a cloud by account and environment. A
-table can name more dimensions than its tenant, each a column read back out of the
-captured row, and a plan can be held to one label of each at once:
+A hospital partitions by facility *and* by patient, and a cloud by account and
+environment. A table can name more dimensions than its tenant, each a column read back
+from the captured row, and a plan can be held to one label of each at once:
 
 ```python
 from interlock import ColumnValueGuard, TableSpec, TenantDrawdownGuard, TenantIsolation
@@ -322,10 +321,10 @@ checkers = [
 
 An effect declares its labels (`PlanBuilder.update(..., tenant_id="f-1",
 partitions={"patient": "p-1182"})`), and the agent is told only the ones it declared. Outside
-finance the dangerous direction is often up: a dose, a replica count, a role grant. A guard
-can bound a rise as well as a fall, and one with a rise bound reports the totals at their
-own precision, `0.125` rather than `0.13`. A guard configured as before reports, and
-decides, exactly as before. A rate window can keep each patient's history too:
+finance, the dangerous direction is often up: a dose, a replica count, a role grant. A guard
+can bound a rise as well as a fall. One with a rise bound reports totals at their own
+precision, `0.125` rather than `0.13`. A guard configured the old way reports and decides
+exactly as before. A rate window can also keep a history per patient, with
 `per="partition:patient"`.
 
 Every threshold in `default_checkers` is an uncalibrated placeholder. Measure
@@ -365,10 +364,10 @@ the write inside SQLite before it executes, and it surfaces as a
 
 ### Refusals: two audiences
 
-A refusal has two readers, and they must not get the same record. The operator
-needs everything: which tenants the plan reached, the exact totals, the checker's
-own message. The agent must get none of it. A guard's message is data about other
-tenants, and an injected agent reading refusals is reading a side channel.
+A refusal has two readers, and they can't get the same record. The operator needs
+everything: which tenants the plan reached, the exact totals, the checker's own message.
+The agent must get none of that. A guard's message contains data about other tenants, so
+an injected agent could use refusals as a side channel.
 
 So every result carries both. `StageResult.refusal.evidence` is the operator's
 record. `StageResult.feedback` (and `exc.feedback` on any error `execute` raises)
@@ -399,8 +398,8 @@ Feedback is built so that it cannot carry more than the agent already knew:
 - it names only tables the plan's effects name, and tenants they declare. Anything
   else is "a table the plan does not name", never named or counted;
 - row counts are buckets (`0`, `1`, `2-9`, `10-99`, `100-999`, `1000+`);
-- it carries no aggregate at all: no column total, no fraction of one. The only other
-  number is a built-in checker's configured limit, as a whole percentage;
+- it carries no aggregate at all, neither a column total nor a fraction of one. The only
+  other number is a built-in checker's configured limit, as a whole percentage;
 - its text comes from fixed templates, and its constraints come in a canonical order,
   never the order the violations came in.
 
@@ -415,12 +414,12 @@ byte-identical (see `tests/test_feedback.py`).
 
 ### Repair: the part that would pass
 
-A refused plan is often one step away from an acceptable one: nine corrections to one
-tenant's orders and a tenth that reaches another tenant. Refusing all ten is right;
-telling the agent which nine would pass turns a halt into finished work. `repair()`
-finds the largest part of a plan that would be admitted, by experiment. It stages the
-plan once and, inside that one stage, tries candidate sub-plans in savepoints: each is
-run, measured and adjudicated by the same checkers, then rolled back.
+A refused plan is often one step away from an acceptable one, for example nine corrections
+to one tenant's orders and a tenth that reaches another tenant. Refusing all ten is right.
+Telling the agent which nine would pass lets it finish the work. `repair()` finds the
+largest part of a plan that would be admitted, by trying it. It stages the plan once, and
+inside that stage it tries candidate sub-plans in savepoints. Each one is run, measured
+and adjudicated by the same checkers, then rolled back.
 
 ```python
 from interlock import EscrowRuntime, TableSpec, TenantIsolation
@@ -475,22 +474,22 @@ assert runtime.execute(repair.proposal).committed
 - **Exactly as proposed, and once.** A plan naming itself a repair is admitted only if
   this engine's chain holds a `REPAIR_PROPOSED` record with its exact content hash, and
   only until it has committed. A widened or forged "repair" is refused.
-- **No monotonicity assumed.** A debit alone fails a drawdown guard that the debit and
-  its balancing credit pass together. A search that dropped whatever fails on its own
-  would keep a lone credit; this one keeps both and drops only the step that is wrong.
-- **Runnable candidates, largest first.** A step is kept only with everything it
-  depends on. The whole plan is tried, then every such sub-plan one step smaller, and
-  so on, later steps dropped first within a size; the first admitted one is a largest,
-  and `repair.exhaustive` says so. `max_trials` (default 32) bounds the search; when it
-  runs out, a greedy pass keeps each of the plan's independent parts (the connected
-  components of its dependency graph), then each step, whose addition is admitted, which
-  is sound but may not be largest. Parts first, because steps a rule admits only together
-  (a row and the request it rides with) are each refused alone. The stage's time bound
-  ends the search too.
-- **Explained without leaking.** Each dropped step says why, from its own trial, adding it
-  back with the dropped steps that depend on it: the constraints that refused it,
-  sanitized like every other feedback, a dropped dependency, or a statement the substrate
-  refuses outright.
+- **No monotonicity assumed.** A debit alone fails a drawdown guard that the debit and its
+  balancing credit pass together. A search that dropped whatever fails on its own would
+  keep a lone credit. This one keeps both, and drops only the step that's wrong.
+- **Runnable candidates, largest first.** A step is kept only with everything it depends
+  on. The whole plan is tried first, then every such sub-plan one step smaller, and so on,
+  dropping later steps first within each size. The first one admitted is a largest, and
+  `repair.exhaustive` says so. `max_trials` (default 32) bounds the search. When it runs
+  out, a greedy pass keeps each of the plan's independent parts (the connected components
+  of its dependency graph), then each step, as long as adding it is admitted. That result
+  is sound but may not be the largest. Parts go first because steps a rule admits only
+  together, such as a row and the request that goes with it, are each refused alone. The
+  stage's time bound also ends the search.
+- **Explained without leaking.** Each dropped step says why, from its own trial with the
+  dropped steps that depend on it added back. The reason is the constraints that refused
+  it (sanitized like all other feedback), a dropped dependency, or a statement the
+  substrate refuses outright.
 
 Both substrates have savepoints. A repair's trials all run inside one stage, so the
 stage's locks are held for the whole search.
@@ -543,18 +542,19 @@ engine = EscrowEngine(
 ```
 
 A window counts requests (`Requests`), sums a payload amount (`RequestSum`) or a column
-over the plan's rows (`RowSum`, inserted or net), or counts plans (`Plans`), per scope,
-per tenant or globally, and slides: what a plan added stops counting a span after it
-committed. Pair a per-tenant window with a per-scope one: a request's tenant is the
-plan's to declare.
+over the plan's rows (`RowSum`, inserted or net), or counts plans (`Plans`). It can be kept
+per scope, per tenant or globally, and it slides: what a plan added stops counting one span
+after the plan committed. Pair a per-tenant window with a per-scope one, because the plan
+itself declares a request's tenant.
 
-Each plan is measured with the history of every window key it adds to, read with the key
-locked: on PostgreSQL a transaction-scoped advisory lock held to `COMMIT`, the history read
-on a second, `READ COMMITTED` connection; on SQLite the stage's own write lock. Plans
-racing into one window commit exactly up to its limit. The history and what the plan adds
-are part of the diff, so the verdict replays from it; what the plan adds is written beside
-its commit marker, or not at all. Statements of a plan can neither read nor write window
-history. The agent is told which window refused it, never what the window holds:
+Each plan is measured with the history of every window key it adds to, read while the key
+is locked. On PostgreSQL that's a transaction-scoped advisory lock held until `COMMIT`, with
+the history read on a second `READ COMMITTED` connection. On SQLite it's the stage's own
+write lock. Plans racing into one window commit exactly up to its limit. The history and
+what the plan adds are part of the diff, so the verdict can be replayed from it. What the
+plan adds is written beside its commit marker, or not at all. A plan's statements can't
+read or write window history. The agent is told which window refused it, but never what
+the window holds:
 
 ```text
 - rate_window: the plan would take rate window mail_per_agent_hour past its limit. The
@@ -566,10 +566,11 @@ history. The agent is told which window refused it, never what the window holds:
 
 ### Meters: conserving a unit across plans
 
-A window bounds what plans add up to over a span. A meter conserves it the way AgentGov
-conserves money: a dose in morphine milligram equivalents, capacity in vCPUs, seats, held
-in an AgentGov ledger of that unit, whose envelopes are delegated down a tree of scopes.
-Five agents working one envelope cannot each spend what is left of it:
+A window bounds what plans add up to over a span of time. A meter conserves a quantity the
+way AgentGov conserves money. A dose in morphine milligram equivalents, capacity in vCPUs
+or a count of seats is held in an AgentGov ledger of that unit, whose envelopes are
+delegated down a tree of scopes. Five agents working from one envelope can't each spend
+what's left of it:
 
 <!-- readme-test: skip reason="continues the partitions example, with a clinical database" -->
 ```python
@@ -584,12 +585,12 @@ engine = EscrowEngine(
 )
 ```
 
-Each plan holds `per_plan` on its scope before it stages, and is refused there, quietly
-and with nothing staged, when the envelope has less. It is checked against `per_plan`, and
-when it commits it settles what its diff measured; the rest of the hold comes back. A
-refused plan's hold is released, and recovery settles a committed plan's hold whole, which
-never under-counts. Its receipt names what it consumed and the transaction that settled
-it.
+Each plan holds `per_plan` on its scope before it stages. If the envelope has less, the
+plan is refused right there, with nothing staged. The plan is checked against `per_plan`,
+and when it commits it settles what its diff measured, and the rest of the hold is
+returned. A refused plan's hold is released. Recovery settles a committed plan's whole
+hold, so it never under-counts. The receipt names what the plan consumed and the
+transaction that settled it.
 
 ## AgentGov integration
 
@@ -603,22 +604,22 @@ prove an upper bound on its own, because a record could name a stale head, so
 `verify_anchors()` additionally requires the observed AgentGov sequence to be
 non-decreasing across an append-only chain.
 
-**The breaker is read as it is now, immediately before commit.** Attached read-only
+**The breaker is read as it is right before commit.** When attached read-only
 (`audit_path=`, the separate-process deployment), Interlock refreshes its view of the
-governor before every record and before the pre-commit breaker check, verifying
-everything the governor wrote since, so a halt written after Interlock attached stops
-the commit. A view that fails verification refuses to operate. With a governed manager
-in the same process, the governor's own lock is held from that check through the
-substrate's commit, so a trip lands strictly before it (and the commit is refused) or
-strictly after it. Across processes no lock spans both databases: a trip the governor
-commits between the check and the commit cannot be excluded, and when one happens the
+governor before every record and before the pre-commit breaker check. It verifies
+everything the governor wrote since, so a halt written after Interlock attached still
+stops the commit. A view that fails verification refuses to operate. With a governed
+manager in the same process, the governor's own lock is held from that check through the
+substrate's commit, so a trip lands strictly before the commit (which is then refused) or
+strictly after it. Across processes no lock spans both databases. A trip the governor
+commits between the check and the commit can't be ruled out, and when one happens the
 `COMMITTED` record says so.
 
-Where Interlock is co-resident with a write-capable governor it also writes its own chain
-head into AgentGov's chain: into a zero-value `ANCHOR` entry, or, when the plan carries a
-cost, into the memo of the spend that settles it. `memo` is inside AgentGov's hash
-payload, so the reverse anchor cannot be altered without breaking AgentGov's own
-verification. The two chains then interlock in both directions.
+When Interlock runs in the same process as a write-capable governor, it also writes its own
+chain head into AgentGov's chain. It goes into a zero-value `ANCHOR` entry, or, when the
+plan has a cost, into the memo of the spend that settles it. `memo` is part of AgentGov's
+hash payload, so this reverse anchor can't be altered without breaking AgentGov's own
+verification. Each chain then vouches for the other.
 
 **Reverse anchoring is free.** `settle_cost` defaults to `"0"`, which writes a zero-value
 `ANCHOR` entry and charges nothing. Pass the plan's real cost and the anchor rides on the
@@ -664,11 +665,11 @@ in-flight side effects does not stop the effects.
 
 ### Settling with the commit: claim and settle (PostgreSQL)
 
-Across processes, the governed mode above leaves two gaps: a trip another process commits
-between the breaker check and the commit, and a crash between the commit and the reverse
-anchor, which leaves effects with no settlement. Both close when the ledger lives in the
-same PostgreSQL database as the observed tables (`BudgetManager.open_postgres`, agentgov
-v0.3):
+Across processes, the governed mode above leaves two gaps. Another process can commit a
+trip between the breaker check and the commit, and a crash between the commit and the
+reverse anchor leaves effects with no settlement. Both gaps close when the ledger lives in
+the same PostgreSQL database as the observed tables (`BudgetManager.open_postgres`,
+agentgov v0.3):
 
 <!-- readme-test: skip reason="needs a live PostgreSQL server" -->
 ```python
@@ -702,42 +703,43 @@ Each plan is settled in three steps:
 3. **Settle.** After the commit the claim is redeemed into AgentGov's chain: the hold's
    release and the spend, which names the plan's `COMMIT_INTENT` record.
 
-The claim reads nothing of the chain, so the stage's `REPEATABLE READ` snapshot, however
-many ledger commits old, conflicts with nothing: a busy ledger never stops a plan from
-committing. Measured with four engines racing for one account while a governor wrote the
-ledger back to back, every plan committed, and every retry was the engines' own race for
-the account's row, as many as with no ledger traffic at all.
+The claim doesn't read the chain, so the stage's `REPEATABLE READ` snapshot never
+conflicts, however many ledger commits old it is. A busy ledger never stops a plan from
+committing. In a test with four engines racing for one account while a governor wrote the
+ledger back to back, every plan committed. Every retry came from the engines' own race for
+the account's row, and there were as many as with no ledger traffic at all.
 
 No crash can leave effects without their claim, or a claim without its effects. A process
-that dies after its commit leaves the claim pending, and `recover()` books it (any
-governor may book any pending claim: one exists only for a stage that committed). A plan
-that did not commit leaves at most its hold, which `recover()` releases once the chain says
-the plan can no longer commit. `tests/test_crash_consistency.py` runs every kill point
-against this mode, including after the hold, mid-claim, and after the commit but before
-the claim is booked.
+that dies after its commit leaves the claim pending, and `recover()` books it. Any governor
+may book any pending claim, since one only exists for a stage that committed. A plan that
+didn't commit leaves at most its hold, which `recover()` releases once the chain shows the
+plan can no longer commit. `tests/test_crash_consistency.py` runs every kill point against
+this mode, including after the hold, mid-claim, and after the commit but before the claim
+is booked.
 
 - **The stage's role cannot write the ledger or claim anything.** It gets no privilege on
   the ledger's tables, only `EXECUTE` on one `SECURITY DEFINER` function that records a
   claim, and only with a token derived from a secret the role cannot read and from the
   transaction's own id. A statement in an agent's plan runs as that role, and can neither
   write the ledger, forge a claim, nor reuse a governor's token.
-- **Booked, a settlement stands whatever happened since.** A claim whose hold an operator
-  voided is booked as a spend on its own; one that overdraws the scope is booked and trips
-  the breaker. Its effects already happened.
+- **A booked settlement is kept, whatever happened since.** A claim whose hold an operator
+  voided is booked as a spend on its own. One that overdraws the scope is booked and trips
+  the breaker. Its effects have already happened.
 - **A refused plan is charged against its hold**, after its stage, as before, naming its
   terminal record. A plan whose stage fails releases its hold.
-- **A stage stuck in `COMMIT` holds the ledger** until the server decides: no governor can
-  write meanwhile, bounded by the stage's `lock_timeout`.
+- **A stage stuck in `COMMIT` holds the ledger** until the server decides. No governor can
+  write in the meantime, for at most the stage's `lock_timeout`.
 
 ## Fiduciary, the layer above
 
 [Fiduciary](https://github.com/crimsondevil0929/fiduciary)
 ([`interlock-fiduciary`](https://pypi.org/project/interlock-fiduciary/)) says who set the
 limits Interlock and AgentGov enforce, and who approved an exception. A principal's signed
-mandate compiles into Interlock's checkers and AgentGov's policies; what it does not allow
-goes to the principals as a ticket, and a quorum's warrant is executed once, through
-Interlock's operators and AgentGov's ledger; a lineage exports as an audit bundle anyone
-verifies offline. It uses Interlock's public API only, as Interlock uses AgentGov's.
+mandate compiles into Interlock's checkers and AgentGov's policies. Whatever it doesn't
+allow goes to the principals as a ticket, and a quorum's warrant is executed once, through
+Interlock's operators and AgentGov's ledger. A lineage exports as an audit bundle that
+anyone can verify offline. Fiduciary uses only Interlock's public API, as Interlock uses
+only AgentGov's.
 
 ## Receipts
 
@@ -775,14 +777,15 @@ What goes into one:
 
 - **Authority:** the AgentGov scope path when an anchor is attached, the trajectory, and
   a capability naming the observed tables and the tightest `BlastRadius` limit.
-- **Intent and effect:** the plan's content hash and stated footprint; the diff hash the
-  chain's `DIFF_COMPUTED` record carries; a salted commitment over every measured row
-  change, from which one row can be disclosed later without the rest; and a hash of the
-  observed schema, foreign keys included.
-- **Coverage:** the observed tables, and every gap in words: an acknowledged cascade, a
-  substrate that did not read the foreign keys or does not refuse unobserved tables. And
-  how strongly the effect was measured, when it was measured short of a transaction: a
-  plan whose only effect is the requests it commits says only the request was measured.
+- **Intent and effect:** the plan's content hash and stated footprint, the diff hash in
+  the chain's `DIFF_COMPUTED` record, a salted commitment over every measured row change
+  (one row can be disclosed later without the rest), and a hash of the observed schema,
+  foreign keys included.
+- **Coverage:** the observed tables, and every gap spelled out, such as an acknowledged
+  cascade, or a substrate that didn't read the foreign keys or doesn't refuse unobserved
+  tables. It also says how strongly the effect was measured when that was short of a
+  transaction. For a plan whose only effect is the requests it commits, it says only the
+  request was measured.
 - **Decision:** the verdict hash, each checker with a digest of its configuration, the
   issuer's policy epoch, and, for a repair, the refused plan's receipt as `repair_of`.
 - **Cost:** the AgentGov transaction that settled the plan. The receipt is issued last,
@@ -793,19 +796,19 @@ A product that serves many tenants from one store can hand each tenant its own r
 counts any others its diff reached, so a refused plan still says how far it went without
 saying into whose rows.
 
-The receipt and the escrow chain name each other: the stage's terminal record carries
-the receipt id, and the receipt's `anchors.escrow` names that record by sequence and
-hash. A receipt that cannot be issued after a commit is logged, not raised; the effects
-stand, and the terminal record names the receipt that should exist. An HMAC receipt
-verifies only for a holder of the key: for third parties, sign with agentgov's
+The receipt and the escrow chain point at each other. The stage's terminal record carries
+the receipt id, and the receipt's `anchors.escrow` names that record by sequence and hash.
+If a receipt can't be issued after a commit, the failure is logged rather than raised. The
+effects are kept, and the terminal record names the receipt that should exist. Only a
+holder of the key can verify an HMAC receipt. For third parties, sign with agentgov's
 `Ed25519Signer` (`agentgov[sign]`) and publish the public key.
 
 ## Recovery
 
-A halt is correct, and it used to be the end of the task. `RecoveryRuntime` gives a halted
-task a bounded way to finish instead: a few more model calls, each under tighter constraints
-than the one before, paid from a reserve set aside for it, and each recorded and signed
-before it is made.
+A halt is the right call, but it used to end the task. `RecoveryRuntime` gives a halted task
+a bounded way to finish: a few more model calls, each under tighter constraints than the
+one before, paid from a reserve set aside for it, and each recorded and signed before it's
+made.
 
 ```python
 from decimal import Decimal
@@ -877,64 +880,64 @@ print(governor.is_halted("support-agent"), len(records))  # True 4
 
 **The ladder** is fixed and deterministic, one rung per step: revoke the tool the halt
 names, then an operator directive from the policy's allowlist, then a lower token ceiling,
-then guidance in fixed words. Constraints come before conversation. Each step takes the
-first rung that can still do something for this kind of halt, and tightening only
-accumulates: a revoked tool stays revoked and the ceiling stays down. When no rung is left,
-or `max_steps` is reached, `recover()` raises `RecoveryExhaustedError` and the halt stands.
-The same halts always take the same steps. A refused plan is left to guidance by default,
-so the agent can correct it; its guidance is the refusal's sanitized feedback, or a repair's
-(see [Repair](#repair-the-part-that-would-pass)).
+then guidance in fixed words. Constraints come before any conversation. Each step takes the
+first rung that can still help with this kind of halt, and tightening only accumulates: a
+revoked tool stays revoked and the ceiling stays down. When no rung is left, or
+`max_steps` is reached, `recover()` raises `RecoveryExhaustedError` and the halt remains in
+force. The same halts always take the same steps. A refused plan goes straight to guidance
+by default, so the agent can correct it. The guidance is the refusal's sanitized feedback,
+or a repair's (see [Repair](#repair-the-part-that-would-pass)).
 
 **History is never edited.** A step returns the transcript it was given, as the same
-objects, with messages appended: error results for tool calls the halt stopped, then the
-rung's notice. The system prompt and the tool definitions are never touched. On Claude
+objects, with messages appended: first error results for the tool calls the halt stopped,
+then the rung's notice. The system prompt and the tool definitions are never touched. On Claude
 Opus 5, Opus 5.5, Opus 4.8, Fable and Mythos, a directive goes in an appended
 `{"role": "system"}` message and a revocation in a `tool_removal` block (beta
-`inline-tools-2026-09-15`, in `step.betas`), the operator channel a user
-turn cannot forge; `Channel.USER` uses user-turn notices for every other model. Either way,
+`inline-tools-2026-09-15`, in `step.betas`). That's the operator channel, which a user turn
+can't forge. `Channel.USER` uses user-turn notices for every other model. Either way,
 `check_tool()` refuses a revoked tool where the harness runs it. Each step checks that the
-transcript it is handed extends the one the last step returned, so an edit in between is
-refused, and its record pins the transcript before and after by a running hash
+transcript it's handed extends the one the last step returned, so an edit in between is
+refused. The step's record pins the transcript before and after it with a running hash
 (`transcript_head`).
 
-**A non-empty `step.betas` has to go through the beta endpoint**, not the plain one: with
-the `anthropic` Python SDK that is `client.beta.messages.create(..., betas=step.betas)`,
-never `client.messages.create(betas=...)` (which raises a plain `TypeError` — that
-constructor does not take a `betas` keyword at all). `step.betas` is empty under
-`Channel.USER`, so a harness that only ever runs on a `Channel.USER` model never needs the
-beta endpoint. `TOOL_CHANGES_BETA` (`interlock.recovery`) names the one exact string this
-release sends; treat it as a snapshot of Anthropic's current API surface, not a permanent
-constant — an audit against live traffic already caught it drifting once (see the
-docstring), and nothing here detects the next rename automatically.
+**A non-empty `step.betas` has to go through the beta endpoint.** With the `anthropic`
+Python SDK that's `client.beta.messages.create(..., betas=step.betas)`. Never call
+`client.messages.create(betas=...)`, which raises a plain `TypeError` because that method
+takes no `betas` keyword. `step.betas` is empty under `Channel.USER`, so a harness that only
+runs on `Channel.USER` models never needs the beta endpoint. `TOOL_CHANGES_BETA`
+(`interlock.recovery`) is the exact string this release sends. Treat it as a snapshot of
+Anthropic's API as it is today. An audit against live traffic has already caught it
+changing once (see the docstring), and nothing here detects the next rename automatically.
 
-**The reserve sits beside the scope, not under it.** A trip halts the tripped scope's
-whole subtree, and recovery exists for a tripped scope, so `{scope}/recovery` is carved out
-of the scope's own envelope (released to its parent and delegated from there). The halted
-scope stays halted; every call made during recovery is billed to the reserve, a step's
-through `recover()` and `settle()`, the task's own through `hold()` and `capture()`. A root
+**The reserve sits beside the scope, not under it.** A trip halts the tripped scope's whole
+subtree, and recovery exists for tripped scopes, so `{scope}/recovery` is carved out of the
+scope's own envelope: released to its parent and delegated from there. The halted scope
+stays halted. Every call made during recovery is billed to the reserve, a step's through
+`recover()` and `settle()`, and the task's own through `hold()` and `capture()`. A root
 scope's reserve is a new root funded from the treasury, or `RecoveryPolicy(funding=...)`
-names a scope to delegate it from. `close()` returns what is left to the parent.
+names a scope to delegate it from. `close()` returns whatever is left to the parent.
 
-**Every act is signed first.** Opening, each step, each settlement and the close are
-`RecordLog` entries: ILOK1, agentgov's canonical JSON under an `ILOK1/record/v1` signing
-prefix (or `ILOK1/record/v2` over its SHA-512, for a key service that limits what it
-signs, as ARC1 1.2's version 2 does), hash-linked, and anchored into the AgentGov ledger as `ANCHOR` entries, so
-`check_anchors()` catches a log truncated or rewritten after the fact. A step's record names
-the halt (and a refused plan's ARC1 receipt), the rung and exactly what it did, the hold
-that pays for it, the policy's digest, and the transcript before and after, and is written
-before the step is returned. Persist the log (`RecordLog(..., path=...)`): a runtime
-restarted over it adopts the recovery scope and replays what was revoked and lowered, so a
-restart never loosens a constraint. A recovery that was closed opens again only with
-`RecoveryRuntime(..., reopen=True)`: a fresh reserve, funded as the first was, on
-`{scope}/recovery/ext-N` (a delegated scope is funded once), the ladder begun again, and
-its opening record naming the close it follows. For a scope that hosts task after task.
+**Everything is signed before it happens.** The opening, each step, each settlement and the
+close are `RecordLog` entries. They use ILOK1, agentgov's canonical JSON under an
+`ILOK1/record/v1` signing prefix (or `ILOK1/record/v2` over its SHA-512, for a key service
+that limits what it signs, as ARC1 1.2's version 2 does). They're hash-linked and anchored
+into the AgentGov ledger as `ANCHOR` entries, so `check_anchors()` catches a log that was
+truncated or rewritten afterwards. A step's record names the halt (and a refused plan's
+ARC1 receipt), the rung and exactly what it did, the hold that pays for it, the policy's
+digest, and the transcript before and after. It's written before the step is returned.
+Persist the log (`RecordLog(..., path=...)`). A runtime restarted over it adopts the
+recovery scope and replays what was revoked and lowered, so a restart never loosens a
+constraint. A closed recovery opens again only with `RecoveryRuntime(..., reopen=True)`,
+for a scope that runs task after task. That gives a fresh reserve, funded like the first,
+on `{scope}/recovery/ext-N` (a delegated scope is funded once), starts the ladder again,
+and writes an opening record that names the close it follows.
 
 ## Extension quotes
 
-AgentGov's backstop is blunt on purpose: an authorization that would overdraw a scope
-trips its breaker, and so does a capture that spends it to zero. For a runaway loop that is
-the answer. For a task that is only more expensive than its envelope, it throws away the
-work done. `BudgetGuard.authorize()` asks first: when a call will not fit, it returns a
+AgentGov's backstop is blunt on purpose. An authorization that would overdraw a scope
+trips its breaker, and so does a capture that spends it to zero. That's the right answer
+for a runaway loop. For a task that just costs more than its envelope, it throws away the
+work done so far. `BudgetGuard.authorize()` asks first. When a call won't fit, it returns a
 signed `ExtensionRequest` instead of placing a hold that would trip the breaker.
 
 ```python
@@ -970,32 +973,34 @@ A quote has three parts, and is a signed `extension.quoted` record anchored in t
 - **Spend to date**, from the ledger: what the task's scopes (the scope, its recovery
   scope, its extensions) settled net of refunds, what they hold, and what is left.
 - **Proof of work**: with `BudgetGuard(receipts=...)`, the ARC1 receipts of the plans the
-  task committed and the rows they measurably changed, with a checkpoint the receipt log
+  task committed and the rows they measurably changed, plus a checkpoint the receipt log
   signed for the quote, so each receipt is provable by inclusion
-  (`log.bundle(log.index_of(id), checkpoint)`); the recovery steps it took; and any
-  milestones the harness declares, which are carried as declared, not proven.
-- **An estimated completion cost**, by a named method: cost per declared milestone times
-  those remaining, or with none declared, the call that did not fit; plus a margin,
-  rounded up to the cent. `requested` is that, less what the scope has left.
+  (`log.bundle(log.index_of(id), checkpoint)`). It also lists the recovery steps the task
+  took, and any milestones the harness declares, which are carried as declared and not
+  proven.
+- **An estimated completion cost**, by a named method: the cost per declared milestone
+  times the milestones remaining, or, with none declared, the cost of the call that didn't
+  fit. A margin is added, and the total rounded up to the cent. `requested` is that amount
+  minus what the scope has left.
 
-A quote is answered once, before it expires, by the guard that issued it: `grant()` or
-`decline()`, each a signed record naming the quote. The quote is a signed record too, so a
-guard opened over a persisted log adopts the quotes in it that no record answers and that
-have not expired: a restart loses none, and whichever guard of the log answers one, it is
-answered once (`BudgetGuard(..., adopt=False)` adopts none). A root scope is topped up in
-place, and if the money running out is what tripped it, its breaker is reset. A delegated
-scope cannot be topped up, so the grant delegates `{scope}/ext-N` beside it, carries along
-what the old scope had left, and the task bills there from then on. A grant the parent
-cannot make changes nothing. A scope halted for any other reason is not quoted:
-`authorize()` raises AgentGov's `CircuitOpenError`, because more money is not the answer to
-a safety halt.
+A quote is answered once, before it expires, by the guard that issued it, with `grant()`
+or `decline()`. Each answer is a signed record that names the quote. The quote is a signed
+record too, so a guard opened over a persisted log adopts any unexpired quotes that no
+record has answered yet. A restart loses none, and whichever guard on the log answers a
+quote, it's answered once (`BudgetGuard(..., adopt=False)` adopts none). A root scope is
+topped up in place, and if running out of money is what tripped it, its breaker is reset.
+A delegated scope can't be topped up, so the grant delegates `{scope}/ext-N` beside it,
+carries over what the old scope had left, and the task bills there from then on. A grant
+the parent can't make changes nothing. A scope halted for any other reason isn't quoted.
+`authorize()` raises AgentGov's `CircuitOpenError`, because more money doesn't fix a safety
+halt.
 
-A `RecoveryRuntime` given the guard quotes for its own reserve the same way: when a step
-will not fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up
-the grant. Quotes are operator evidence; nothing in them is sent to the agent. Granting is
-the operator's act: the guard records `approved_by` but cannot authenticate it, so put
-`grant()` behind the approval you already trust, and never within the agent's reach as a
-tool.
+A `RecoveryRuntime` given the guard asks for quotes on its own reserve the same way. When a
+step won't fit, `RecoveryExhaustedError.quote` carries the request, and `extend()` takes up
+the grant. Quotes are operator evidence, and nothing in them is sent to the agent. Granting
+is the operator's decision. The guard records `approved_by` but can't authenticate it, so
+put `grant()` behind an approval process you already trust, and never give the agent a
+tool that reaches it.
 
 ## PostgreSQL
 
@@ -1049,9 +1054,9 @@ off. For a transaction that opened no stage, the trigger logs the write to
 `interlock.unmediated` (see [Unrecorded writes](#unrecorded-writes)). For one that did, it
 writes before and after images into a temporary table that exists only in that session for
 that transaction. Rows are keyed to the stage by `pg_current_xact_id()`, read from a row
-only the stage-opening function can write, not from the `interlock.stage_id` setting,
-which any statement could change; the setting is still set, and the trigger refuses to go
-on when the two disagree.
+that only the stage-opening function can write. They aren't keyed by the
+`interlock.stage_id` setting, which any statement could change. The setting is still set,
+and the trigger refuses to continue when the two disagree.
 
 Every stage checks, before its first effect and with the observed tables locked
 `ROW EXCLUSIVE` so none of it can change underneath:
@@ -1060,11 +1065,11 @@ Every stage checks, before its first effect and with the observed tables locked
   its `TableSpec`'s columns, and has no inheritance children or partitions (a statement
   on the parent writes their rows too, through no trigger, and PostgreSQL checks
   privileges on the parent alone);
-- the stage's role is not a superuser, owns no observed table (an owner can disable a
-  trigger), and can write no other table, directly, through a column grant, or through
-  any role it belongs to. PostgreSQL has no statement authorizer, so the grant is the table
-  boundary; the substrate checks it rather than trusting it. `enforce_table_access=False`
-  trusts it;
+- the stage's role isn't a superuser, owns no observed table (an owner can disable a
+  trigger), and can't write any other table, whether directly, through a column grant, or
+  through a role it belongs to. PostgreSQL has no statement authorizer, so grants are the
+  table boundary, and the substrate checks them instead of trusting them.
+  `enforce_table_access=False` trusts them;
 - the cascade check, read from `pg_constraint`.
 
 What differs from SQLite:
@@ -1091,26 +1096,27 @@ What differs from SQLite:
   work there is bounded by the stage's `lock_timeout` and not by its statement bound.
 
 **Behind a connection pooler.** A stage holds its connection for its whole life, and reads
-the rate windows on a second, in `READ COMMITTED`: its own snapshot cannot see what other
-plans committed after it began. With PgBouncer in transaction mode, give the stage role's pool at least one connection more than
-`[engine] workers`: a windows' read then waits only for other windows' reads, never for a
-commit. A pool no larger is slow, never stuck. The second connection must be had within
-`[engine] pool_timeout_seconds` (the lock timeout by default); when it cannot be, the stage
-is aborted with `PoolExhaustedError`, a `StageConflictError`, its locks and its connection
-released, and the daemon's engine pool stages the plan again. The read is one transaction
-that sets nothing beyond it, and nothing is prepared, so PgBouncer needs no
-`max_prepared_statements` and no client inherits another's session.
+the rate windows on a second connection in `READ COMMITTED`, because its own snapshot can't
+see what other plans committed after it began. With PgBouncer in transaction mode, give the
+stage role's pool at least one connection more than `[engine] workers`. Then a window read
+waits only for other window reads, never for a commit. A pool no larger is slow but never
+stuck. The second connection has to be obtained within `[engine] pool_timeout_seconds` (the
+lock timeout by default). When it can't be, the stage is aborted with `PoolExhaustedError`
+(a `StageConflictError`), its locks and connection are released, and the daemon's engine
+pool stages the plan again. The read is one transaction that sets nothing beyond itself,
+and nothing is prepared, so PgBouncer needs no `max_prepared_statements` and no client
+inherits another's session.
 
-What grants cannot see, so the substrate cannot either: a `SECURITY DEFINER` function the
-role may call that writes elsewhere, an extension such as `dblink` that opens another
-connection, and large objects. Do not grant them to the stage role. Requires PostgreSQL 14
-or later; CI runs 16.
+Some things grants can't see, so the substrate can't either: a `SECURITY DEFINER` function
+the role may call that writes elsewhere, an extension such as `dblink` that opens another
+connection, and large objects. Don't grant them to the stage role. PostgreSQL 14 or later
+is required, and CI runs 16.
 
 ## Git: the same guarantee on a branch
 
-`GitSubstrate` stages a plan on a Git branch with the guarantee the SQL substrates give:
-what was measured is exactly what committed, or nothing committed. It needs only the `git`
-command.
+`GitSubstrate` stages a plan on a Git branch with the same guarantee the SQL substrates
+give: what commits is exactly what was measured, or nothing commits. It needs only the
+`git` command.
 
 - **Stage.** Each plan gets a worktree of its own at the branch's head, its *base*.
 - **Apply.** Effects edit files there. The repository's hooks run after each effect, the way
@@ -1317,14 +1323,14 @@ engine = EscrowEngine(cluster, checkers=[BlastRadius(20), NoDelete(())])
 ```
 
 `TerraformSubstrate` (Terraform or OpenTofu) measures with a saved plan. Effects `set` input
-variables; the stage runs `plan -out` and reads `show -json`. Each entry of
-`resource_changes` is a row of its resource type's table (`TfResource`): a replacement is a
-deletion and an insertion, and a resource of a type no table names is measured in
-`resources`. An observed attribute the provider knows only after the apply is an
+variables, and the stage runs `plan -out` and reads `show -json`. Each entry of
+`resource_changes` is a row of its resource type's table (`TfResource`). A replacement is a
+deletion plus an insertion, and a resource whose type no table names is measured in
+`resources`. An observed attribute that the provider only knows after the apply is an
 `UnknownValue`, which `TruncationGuard` refuses unless that column is acknowledged
 (`TruncationGuard(acknowledged_unknown={"db_instances.endpoint"})`). The commit checks the
-state's `serial` and `lineage` and applies exactly the saved plan; the stage's id reaches the
-state as the `interlock_stage_id` output, which the configuration declares.
+state's `serial` and `lineage` and applies exactly the saved plan. The stage's id reaches
+the state as the `interlock_stage_id` output, which the configuration has to declare.
 
 Both are configured in `interlock.toml` (`substrate = "kubernetes"` with `[kubernetes]` and
 `[[kubernetes.kinds]]`, `substrate = "terraform"` with `[terraform]` and
@@ -1334,37 +1340,40 @@ cloud credentials.
 
 ## FHIR servers: predicted and verified
 
-A FHIR server (an EHR's API) can neither hold a transaction open nor dry-run a write. What
-it does have is a version on every resource and conditional writes. Interlock calls the
-guarantee it builds from them *predicted and verified*: what was judged is a prediction,
-made true by a write on the version read and held to it by a read-back. Every receipt of
-such a plan says `coverage.measurement = "predicted"`.
+A FHIR server (an EHR's API) can't hold a transaction open or dry-run a write. It does keep
+a version on every resource, and it supports conditional writes. Interlock builds a
+guarantee from those that it calls *predicted and verified*. The checks judge a
+prediction of the change. The write is conditional on the version that was read, and a
+read-back afterwards confirms the result matches the prediction. Every receipt for such a
+plan says `coverage.measurement = "predicted"`.
 
 `FhirSubstrate`:
 
-- **Stage.** Each effect reads what it reaches live, with its `meta.versionId`, and the
-  first time a stage reaches a patient it reads that patient's whole chart (every observed
-  type, `[type]?patient=<id>`). `create` builds a resource from a template whose
-  `":name"` values are the effect's parameters; each conditional reference
+- **Stage.** Each effect reads the resources it touches live, with their `meta.versionId`.
+  The first time a stage reaches a patient, it reads that patient's whole chart (every
+  observed type, `[type]?patient=<id>`). `create` builds a resource from a template whose
+  `":name"` values are the effect's parameters. Each conditional reference
   (`Encounter?location=:bed&status=in-progress`) is resolved by a search that must find
-  exactly one. `patch` applies a JSON merge patch. `expect-version` pins a version.
-- **Judge.** The prediction is the diff: every checker, partition and window judges it
-  before anything is written, so an order that resolves to the wrong patient is refused
-  before the server sees it.
+  exactly one match. `patch` applies a JSON merge patch, and `expect-version` pins a
+  version.
+- **Judge.** The predicted change is the diff that every checker, partition and window
+  judges. That happens before anything is written, so an order that resolves to the wrong
+  patient is refused before the server sees it.
 - **Undo first.** Each effect declares its undo (`void <table>` for a create, `restore
   <table>` for a patch). The undo journal gets every before image, and the charts as read,
   before the first write. A created record is undone by marking it `entered-in-error`, never
   by deleting it.
-- **Write.** The charts are read again; anything that moved since the stage read it (a
-  clinician's edit while the plan waited for a warrant) refuses the commit, and nothing is
-  written. Each update carries `If-Match`, so a change in the last instant answers
+- **Write.** The charts are read again. If anything changed since the stage read it, such
+  as a clinician's edit while the plan waited for a warrant, the commit is refused and
+  nothing is written. Each update carries `If-Match`, so a change in the last instant gets
   `412 Precondition Failed`. Every write carries the stage's id, in `meta.tag` and in
   `X-Request-Id`, which the server's `AuditEvent` log records.
-- **Read back.** The charts are read once more and held to the prediction. A difference (a
-  rule on the server that stopped the encounter's other orders, a dose it rewrote) is
-  never accepted: everything the write changed is put back, the discrepancies are named,
-  and the stage is `COMPENSATED`, its receipt's outcome `compensated` (ARC1 1.4), so
-  `agentgov reconcile-actions --format fhir-auditevent` ties the write and its undo to it.
+- **Read back.** The charts are read once more and compared with the prediction. Any
+  difference, such as a server rule that stopped the encounter's other orders or a dose it
+  rewrote, means everything the write changed is put back and the discrepancies are named.
+  The stage is recorded as `COMPENSATED`, with receipt outcome `compensated` (ARC1 1.4), so
+  `agentgov reconcile-actions --format fhir-auditevent` ties both the write and its undo to
+  that receipt.
 
 <!-- readme-test: skip reason="needs a FHIR server; tests/test_fhir.py makes the same calls on interlock.sim.fhir" -->
 ```python
@@ -1391,12 +1400,12 @@ ehr = FhirSubstrate(
 engine = EscrowEngine(ehr, checkers=[BlastRadius(12), TenantIsolation(declared=True)])
 ```
 
-Configured in `interlock.toml` as `substrate = "fhir"` with `[fhir]` and `[[fhir.types]]`.
-`interlock.sim.fhir` is a loopback FHIR R4 server (versions, `If-Match`, search with
-`_has`, rules that write as the server, and an `AuditEvent` log): CI stages class V with
-no EHR. What class V cannot do is see a server rule before the write: that is caught by the
-read-back and undone, not refused before it, and the receipt says so by its class. The
-server must allow client-assigned ids, so a create is predicted exactly.
+It's configured in `interlock.toml` as `substrate = "fhir"` with `[fhir]` and
+`[[fhir.types]]`. `interlock.sim.fhir` is a loopback FHIR R4 server (versions, `If-Match`,
+search with `_has`, rules that write as the server, and an `AuditEvent` log), so CI stages
+class V without an EHR. Class V can't see a server rule before the write. The rule's effect
+is caught by the read-back and undone, not refused in advance, and the receipt's class says
+so. The server has to allow client-assigned ids, so that a create can be predicted exactly.
 
 ### Sensor facts: an analyzer's word on the exact diff
 
@@ -1405,7 +1414,7 @@ scanner or a test suite. A *sensor* can. The engine shows each measured diff to 
 (`EscrowEngine(sensors=...)`), and each signs a `SensorFact` with its own key: its verdict,
 its findings, the digest of its report, and the hash of the diff it read. The pure
 `SensorAttestation` checker then requires a clean fact from a key the policy pins. A fact
-about another diff, or one signed by another key, is no fact.
+about a different diff, or one signed by a different key, doesn't count.
 
 <!-- readme-test: skip reason="needs an analyzer command; tests/test_sensors.py runs one" -->
 ```python
@@ -1421,11 +1430,10 @@ engine = EscrowEngine(
 
 ### Pinned checker packs
 
-A domain whose invariant cannot be composed from the built-in checkers ships a pack: a
-module naming `PACK_VERSION` and `CHECKERS`. `load_pack(PackPin(module, version, digest))`
-loads it only if the code installed is exactly the code pinned (the digest covers every file
-of the package), and says which it is otherwise: not installed, another version, or
-tampered.
+A domain whose invariant can't be built from the built-in checkers ships a pack: a module
+that names `PACK_VERSION` and `CHECKERS`. `load_pack(PackPin(module, version, digest))`
+loads it only if the installed code is exactly the pinned code (the digest covers every file
+in the package). Otherwise it says why: not installed, a different version, or tampered.
 
 ### Tested against the real systems
 
@@ -1457,14 +1465,14 @@ fixed in 1.4.1:
 
 ## Outbound requests: the transactional outbox
 
-An email, a refund through a payment API, a webhook: a plan often has to call something
-besides its database, and none of those calls can be staged, measured or rolled back. An
-agent that makes the call itself has made it before anything could check it, which is how
-an instruction injected through a tool result gets out.
+Plans often need to call something besides their database: send an email, issue a refund
+through a payment API, post a webhook. None of those calls can be staged, measured or
+rolled back. An agent that makes the call itself has made it before anything could check
+it, and that's how an instruction injected through a tool result gets out.
 
-So Interlock does not let the plan make the call. It uses the **transactional outbox**
-pattern: the plan *enqueues a request* for the call, beside its SQL effects, and the request
-is handled like a row, on PostgreSQL and on SQLite alike (the design, and the proofs, are in
+So Interlock doesn't let the plan make the call. It uses the **transactional outbox**
+pattern. The plan *enqueues a request* for the call alongside its SQL effects, and the
+request is handled like a row, on PostgreSQL and SQLite alike. (The design and the proofs are in
 [`docs/OUTBOX_DESIGN.md`](docs/OUTBOX_DESIGN.md) and
 [`docs/EPIC3_DESIGN.md`](docs/EPIC3_DESIGN.md)).
 
@@ -1475,9 +1483,9 @@ is handled like a row, on PostgreSQL and on SQLite alike (the design, and the pr
 2. **Stage.** The stage writes the request to `interlock.outbox` in its own transaction,
    through a function gated by a token only the substrate holds. The checkers read it back
    from there, beside the measured rows. It commits with the rows and the stage marker, or
-   not at all: a refused or failed plan leaves no request behind.
+   not at all, so a refused or failed plan leaves no request behind.
 3. **Pay.** The plan pays at commit, in the settlement that commits with it: its settle
-   cost and each request's `cost_per_call`. The hold placed before staging covers both; a
+   cost plus each request's `cost_per_call`. The hold placed before staging covers both. A
    refused plan pays only its settle cost, since its requests never commit.
 4. **Deliver.** `interlock relay`, a separate process under its own database role and the
    only holder of the sinks' credentials, reads committed requests and makes the calls, at
@@ -1486,8 +1494,8 @@ is handled like a row, on PostgreSQL and on SQLite alike (the design, and the pr
 ### Configuring a sink
 
 Sinks are declared in `interlock.toml` beside the tables. `interlock install` mirrors them
-into the database, which then refuses a request for any sink or operation it does not
-hold. A sink has no URL and no credential here: those belong to the relay.
+into the database, which then refuses a request for any sink or operation it doesn't hold.
+A sink has no URL or credential here. Those belong to the relay.
 
 ```toml
 substrate = "postgres"
@@ -1559,16 +1567,16 @@ plan = (
 result = engine.execute(plan)
 ```
 
-A row diff alone has a blind spot: every row can be valid and every request well-formed,
-and the two can still contradict each other. `CrossEffectAgreement` closes it. If a tool
-result talks the agent into asking the payment API for 5000.00 while the refund row it
-inserts says 50.00, the plan is refused before it commits: no row, no request, nothing for
-the relay to send. Both halves are measured, the request read back from the outbox and the
-rows from the stage's capture, so the check judges exactly what would be sent and what
-would be committed. `measure="net"` holds a request to the change in a balance it moves,
-and `measure="value"` to one exact value such as a currency. The rule is strict both
-ways: a refund call with no refund row, or a refund row with no call, is refused too. The
-agent is told which rule it broke, never the amounts.
+A row diff alone has a blind spot. Every row can be valid and every request well-formed,
+and the two can still contradict each other. `CrossEffectAgreement` closes that gap. If a
+tool result talks the agent into asking the payment API for 5000.00 while the refund row it
+inserts says 50.00, the plan is refused before it commits, so there's no row, no request
+and nothing for the relay to send. Both halves are measured: the request is read back from
+the outbox and the rows from the stage's capture. The check judges exactly what would be
+sent and what would be committed. `measure="net"` holds a request to the change in a
+balance it moves, and `measure="value"` holds it to one exact value, such as a currency.
+The rule is strict both ways, so a refund call with no refund row, or a refund row with no
+call, is refused too. The agent is told which rule it broke, but never the amounts.
 
 ### Running the relay
 
@@ -1599,46 +1607,47 @@ interlock outbox verify  --config interlock.toml --database postgresql://owner@d
 interlock outbox release --scope support-agent --key ~/.interlock/alice.key --config interlock.toml ...
 ```
 
-Run as many relays as throughput needs, on as many hosts: they share the work through
-`FOR UPDATE SKIP LOCKED` and never wait on each other. On SIGTERM a relay finishes the call
-in hand, records it, and exits. `interlock outbox show <message>` prints a message's
-delivery log; `requeue` sends a dead message back with a fresh budget of attempts, and
-`cancel` drops one.
+Run as many relays as throughput needs, on as many hosts as you like. They share the work
+through `FOR UPDATE SKIP LOCKED` and never wait on each other. On SIGTERM a relay finishes
+the call in hand, records it, and exits. `interlock outbox show <message>` prints a
+message's delivery log. `requeue` sends a dead message back with a fresh budget of
+attempts, and `cancel` drops one.
 
-A relay reads AgentGov's ledger and never writes it: over a ledger shared through
-PostgreSQL, grant its role `USAGE` on the `agentgov` schema and `SELECT` on its tables,
-nothing more. Over a SQLite ledger, name the file; it is opened read-only. Without AgentGov
-at all, set `breaker = "none"`, explicitly: a relay never runs without a breaker by default.
+A relay reads AgentGov's ledger and never writes it. For a ledger shared through
+PostgreSQL, grant its role `USAGE` on the `agentgov` schema and `SELECT` on its tables, and
+nothing more. For a SQLite ledger, name the file, and it's opened read-only. Without
+AgentGov at all, set `breaker = "none"` explicitly. A relay never runs without a breaker
+by default.
 
 What the relay guarantees, each with a test that fails without it:
 
 - **Nothing is sent before its plan commits, and nothing but what was adjudicated.** The
-  relay reads committed rows only, and re-hashes the stored payload before every call; a
-  payload that no longer matches is refused, not sent.
+  relay reads committed rows only, and hashes the stored payload again before every call.
+  A payload that no longer matches is refused, not sent.
 - **Every call is recorded before it is made, and its outcome after**, in the message's
   delivery log, `interlock.outbox_attempts`. The database links each row to the one before
-  it by hash; `interlock outbox verify` recomputes every link and checks each message's
+  it by hash, and `interlock outbox verify` recomputes every link and checks each message's
   state against its log.
-- **A tripped breaker holds.** AgentGov's breaker for the message's scope is read
-  immediately before every call; tripped, the message is held, not sent, until an operator
-  releases it. Each call records the ledger position its breaker check read.
+- **A tripped breaker holds messages.** AgentGov's breaker for the message's scope is read
+  right before every call. If it's tripped, the message is held instead of sent, until an
+  operator releases it. Each call records the ledger position its breaker check read.
 - **Relays never share a message.** Leases are claimed with `FOR UPDATE SKIP LOCKED`, and a
   fence on each lease stops a relay whose lease ran out from acting on the message again.
 - **Delivery is at least once, and a duplicate is never silent.** Every call carries the
-  same idempotency key. A relay that dies after its call reached the sink and before it
-  recorded the outcome leaves the call to be recorded as lost and made again: a sink that
-  honours the key acts once, one that does not acts twice, and the log shows the lost call
-  the second effect came from. `unknown_outcome = "dead-letter"` makes such a sink at most
-  once instead. `tests/test_relay_crash.py` kills relays at every point of this path.
+  same idempotency key. If a relay dies after its call reached the sink but before it
+  recorded the outcome, the call is recorded as lost and made again. A sink that honours
+  the key acts once. One that doesn't acts twice, and the log shows which lost call the
+  second effect came from. `unknown_outcome = "dead-letter"` makes such a sink at most once
+  instead. `tests/test_relay_crash.py` kills relays at every point of this path.
 - **Failure is bounded.** Retries back off exponentially with deterministic jitter, honour
-  `Retry-After`, and stop at `max_attempts` or the request's deadline. A dead request takes
-  the requests waiting for it with it; `interlock outbox requeue` brings them back.
+  `Retry-After`, and stop at `max_attempts` or the request's deadline. When a request dies,
+  the requests waiting on it die with it, and `interlock outbox requeue` brings them back.
 
 ### Stripe and SendGrid
 
-Two sinks are typed: they bring their operations, strict payload schemas of their own, and
-an adapter that speaks their vendor's API. Configuration names which operations to allow;
-it does not write their schemas.
+Two sinks are typed. They bring their own operations, strict payload schemas, and an
+adapter that speaks the vendor's API. Configuration names which operations to allow, but
+doesn't write their schemas.
 
 ```toml
 [[sinks]]
@@ -1670,28 +1679,30 @@ secret_env = "SENDGRID_API_KEY"
 ```
 
 - **A Stripe charge carries the refund that undoes exactly it.** The refund names the charge
-  by the placeholder `{"$bind": "delivered.id"}`, never a literal id, so a plan cannot point
-  its undo at another customer's payment; it refunds no more than was charged, and names no
+  by the placeholder `{"$bind": "delivered.id"}`, never a literal id, so a plan can't point
+  its undo at another customer's payment. It refunds no more than was charged, and names no
   currency. The rule is checked at admission and again by the database when the request is
-  written, so an engine configured with a laxer registry cannot stage the charge either.
+  written, so an engine configured with a looser registry can't stage the charge either.
 - **The adapter** sends Stripe's form encoding with the request's idempotency key and a
   pinned `Stripe-Version`, and records the id of the payment intent it created in the
-  delivery log. A redelivered call is answered by Stripe's idempotent replay: one charge,
-  whatever the relay went through.
-- **SendGrid has no idempotency keys**, so its sinks are at most once by default: a call
-  whose outcome is unknown is not made again, and the message is dead for an operator to
-  resolve. Every email carries its message id and key in `custom_args`.
+  delivery log. Stripe answers a redelivered call with an idempotent replay, so there's one
+  charge whatever the relay went through.
+- **SendGrid has no idempotency keys**, so its sinks are at most once by default. A call
+  whose outcome is unknown isn't made again, and the message goes dead for an operator to
+  resolve. Every email carries its message id and idempotency key in `custom_args`, which
+  SendGrid's Event Webhook echoes, so `agentgov reconcile-actions --format sendgrid-events`
+  can match each sent message to its delivery receipt.
 - `tests/test_relay_crash.py` drives both through the relay's kill matrix, on both stores:
   a charge is made once and an email is never sent twice.
 
 ### MCP tools, and holding an operation for a warrant
 
-An MCP tool that writes, behind a sink of type `mcp`, is governed like any request: the
+An MCP tool that writes, behind a sink of type `mcp`, is governed like any request. The
 plan is measured and judged, the call is committed to the outbox, and the relay makes it
-as one `tools/call`. MCP has no idempotency key, so an `mcp` sink is always at most once:
-a call whose outcome is unknown is never made again, and goes to an operator. Some
+as one `tools/call`. MCP has no idempotency key, so an `mcp` sink is always at most once. A
+call whose outcome is unknown is never made again, and goes to an operator. Some
 operations should never run on an agent's word alone. Mark them `hold = true`, on any
-sink, and every request of them enters the outbox held, even with the breaker closed,
+sink, and every request for them enters the outbox held, even with the breaker closed,
 until an operator or a warrant releases it:
 
 ```toml
@@ -1709,38 +1720,38 @@ sink = "crm"
 command = ["crm-mcp-server", "--stdio"]
 ```
 
-The receipt of a plan whose only effect is such a request says so: it was measured only
-as the request, and names the sink that carries its effect.
+The receipt of a plan whose only effect is such a request says so. It records that only
+the request was measured, and names the sink that carries the effect.
 
 ### Sinks and sources of your own
 
 A FHIR server, ServiceNow or a cloud's API can be a typed sink of its own, configured from
-`interlock.toml` like Stripe: a package registers its kind with `register_sink_kind`, or
-under the `interlock.sinks` entry point, following the contract `interlock.stripe` and
-`interlock.mcp` follow (its operations or none, its idempotency, its payload rules, and its
-relay adapter). A vendor whose webhooks sign their own way is an inbox source kind,
-through `register_source_kind` or `interlock.sources`.
+`interlock.toml` like Stripe. A package registers its kind with `register_sink_kind`, or
+under the `interlock.sinks` entry point, and follows the same contract as `interlock.stripe`
+and `interlock.mcp`: its operations (or none), its idempotency, its payload rules and its
+relay adapter. A vendor that signs its webhooks its own way is an inbox source kind,
+registered with `register_source_kind` or under `interlock.sources`.
 
 ### On SQLite
 
-The outbox, the relay and every operator command work on a SQLite file as they do on
-PostgreSQL. `interlock install` switches the file to WAL and installs the outbox; the
-relay is `interlock relay` with the same configuration. SQLite admits one writer at a time,
-and that is the mechanism: every write is a short `BEGIN IMMEDIATE` transaction, so claims
-queue where PostgreSQL's skip, and a relay never holds the lock while it calls a sink. WAL
-means every process that opens the file runs on one host. SQLite has no roles: the file's
-permissions are the boundary, and verification is how an edit made around Interlock is
-found.
+The outbox, the relay and every operator command work on a SQLite file the same way they do
+on PostgreSQL. `interlock install` switches the file to WAL and installs the outbox, and
+the relay is `interlock relay` with the same configuration. SQLite admits one writer at a
+time, and Interlock relies on that. Every write is a short `BEGIN IMMEDIATE` transaction, so
+claims queue where PostgreSQL's would skip, and a relay never holds the lock while it calls
+a sink. WAL means every process that opens the file has to run on one host. SQLite has no
+roles. The file's permissions are the boundary, and verification is how an edit made around
+Interlock gets found.
 
 ### Operators: every action signed
 
 Releasing a held request, cancelling one, requeueing a dead one, and compensating a
 delivered one are a person's decisions about money and messages that leave the system.
-Each is signed with the operator's own Ed25519 key, in two phases: a signed intent names
-the targets and the delivery-log head of each, before the database is touched; the
-database acts under the intent's hash, only at those heads, and refuses an operator's row
-that carries no such authority; a signed outcome names the rows it wrote. A command killed
-between the phases is resolved by the next one.
+Each is signed with the operator's own Ed25519 key, in two phases. First, before the
+database is touched, a signed intent names the targets and the delivery-log head of each.
+The database acts under the intent's hash, only at those heads, and refuses any operator
+row that carries no such authority. Then a signed outcome names the rows it wrote. If a
+command is killed between the phases, the next one resolves it.
 
 ```bash
 interlock operator keygen --out ~/.interlock/alice.key --name alice   # prints the line below
@@ -1763,19 +1774,20 @@ interlock outbox compensate --plan <plan> --late --config ...   # a whole plan, 
 interlock outbox verify    --config ...
 ```
 
-`interlock outbox verify` holds every delivery log to the operator log, from public keys
-alone, and names each edit made around it: an operator row with no authority, an authority
-no signed intent holds or one replayed on another message, a row written at a head other
-than the one signed for, an operator log edited or cut short (its signatures, its AgentGov
-anchors), a sink re-enabled or widened since the last signed `interlock install`. A
-database's owner can still edit their own database; they cannot do it unnoticed.
+`interlock outbox verify` checks every delivery log against the operator log, using public
+keys alone, and names each edit made around it. That includes an operator row with no
+authority, an authority that no signed intent holds or one replayed on another message, a
+row written at a head other than the one signed for, an operator log that was edited or cut
+short (its signatures or its AgentGov anchors), and a sink re-enabled or widened since the
+last signed `interlock install`. A database's owner can still edit their own database, but
+not without it being noticed.
 
 ### Relays sign every outcome
 
-What a sink answered is recorded only as the relay that heard it signed it: an ARC1 1.1
-attestation, with the relay's own Ed25519 key, over the request as the outbox committed it
-and the outcome as the row records it. The database refuses an outcome without one, and a
-relay starts only with a key registered for verification:
+A sink's answer is recorded only with the signature of the relay that heard it: an ARC1
+1.1 attestation, made with the relay's own Ed25519 key, over the request as the outbox
+committed it and the outcome as the row records it. The database refuses an outcome
+without one, and a relay starts only with a key registered for verification:
 
 ```bash
 interlock keygen --role relay --out ~/.interlock/east-1.key --name east-1   # prints the line below
@@ -1787,17 +1799,17 @@ east-1 = "ed25519:9a1b..."
 ```
 
 `interlock outbox verify` rebuilds each outcome's attestation from the outbox row and the
-log row, and names every outcome no registered relay signed: a delivery written around
-Interlock, linked and hashed perfectly, is named all the same, and so is a genuine row
-rewritten after it was signed. Outcomes recorded before schema version 4 carry no
-attestation. They are the legacy set the install that brought version 4 recorded, once,
-and the signed `interlock install` vouches for it: a row forged into an old log later is
-not in it, however early it is dated.
+log row, and names every outcome that no registered relay signed. A delivery written around
+Interlock is named even if it's linked and hashed perfectly, and so is a genuine row that
+was rewritten after it was signed. Outcomes recorded before schema version 4 carry no
+attestation. The install that brought version 4 recorded them once as a legacy set, and
+the signed `interlock install` vouches for that set. A row forged into an old log later
+isn't in it, however early it's dated.
 
 ### Keys held by a signing service
 
-A relay, the inbox, the vacuum and the receipt log can sign with a key a KMS, an HSM or
-Vault's transit engine holds: the process keeps the key's name, the version it pinned, the
+A relay, the inbox, the vacuum and the receipt log can sign with a key held by a KMS, an
+HSM or Vault's transit engine. The process keeps the key's name, the version it pinned, the
 public half and a credential, and never the private key (`docs/EPIC8_DESIGN.md` §1).
 
 ```toml
@@ -1813,23 +1825,23 @@ timeout_seconds = 5
 signer = "relay"                    # in place of key = "relay.key"
 ```
 
-Every signature the service hands back is verified under the pinned key before it is
-used: a service that signs with another key or version, or answers with anything but a
-signature, fails the call, and nothing is attested. `sign_async` signs off the event loop.
+Every signature the service hands back is verified under the pinned key before it's used.
+If the service signs with another key or version, or answers with anything but a
+signature, the call fails and nothing is attested. `sign_async` signs off the event loop.
 Operator commands take `--signer NAME` in place of `--key PATH`. An adapter for another
 service implements `RemoteSigner._remote_key` and `_remote_sign`.
 
 ### Registering, revoking and rotating keys
 
 The operator log is the key registry and its revocation list (`docs/EPIC8_DESIGN.md` §2).
-An operator registers a key beside the configuration's; it is trusted from the next record
-on. Revoking one is an operator action in two phases, like every other. For a relay's or an
-inbox's key, the database records the revocation, in the transaction of the signed intent,
-and *seals* every row the key attested: the reference and hash of each. The applied record
-signs the seal's count and digest, anchored in AgentGov, and from then on the database
-refuses every row the key would attest. What the key attested before verifies as it always
-did, exactly as sealed: a row written around the refusal, or one of its rows rewritten, is
-named by `interlock outbox verify`.
+An operator registers a key beside the configuration's, and it's trusted from the next
+record on. Revoking one is a two-phase operator action, like every other. For a relay's or
+an inbox's key, the database records the revocation in the transaction of the signed
+intent, and *seals* every row the key attested by recording each one's reference and hash.
+The applied record signs the seal's count and digest and is anchored in AgentGov. From then
+on, the database refuses every row the key would attest. What the key attested before still
+verifies, exactly as sealed. `interlock outbox verify` names any row written around the
+refusal and any sealed row that was rewritten.
 
 ```bash
 interlock keys list --config interlock.toml
@@ -1839,12 +1851,13 @@ interlock keys revoke --config interlock.toml --key ops.key --role relay 03dd37a
     --reason "rotated"
 ```
 
-A planned rotation: a new version at the key service; register it; reload the daemon
-(`kill -HUP`, or `await supervisor.reload()`), each part finishing its step and opening
-again with the key it is given now; then revoke the old one. Nothing is refused on the way.
-After a compromise, revoke first: a relay finds its key revoked before its next claim, the
-inbox at its next matching pass, and each opens again with the key its service serves
-then. An operator's key is revoked by another operator, never its own, and never the last.
+For a planned rotation, create a new version at the key service and register it. Reload
+the daemon (`kill -HUP`, or `await supervisor.reload()`): each part finishes its step and
+opens again with the key it's given now. Then revoke the old one. Nothing is refused along
+the way. After a compromise, revoke first. A relay finds its key revoked before its next
+claim, and the inbox at its next matching pass, and each opens again with the key its
+service serves at that point. An operator's key is revoked by another operator, never by
+itself, and the last operator key can't be revoked.
 
 ### Settlement: delivery receipts, and credits for compensations
 
@@ -1870,31 +1883,33 @@ settler = Settler(
 report = settler.settle()  # as often as you like
 ```
 
-- **A delivery receipt** for each delivered request: an ARC1 `DeliveryReceipt` signed by
-  the receipt log, carrying the relay's attestation, bound to the action receipt of the
-  plan that committed the request by that receipt's leaf hash: the plan its attested
-  idempotency key was derived from, not merely the one its row names. agentgov's verifier
-  checks it: `agentgov verify-receipt delivery.json --relay-key ... --action action.json`.
-- **A credit** for a delivered compensation: AgentGov `refund()` of the `cost_per_call`
-  the engine's sink registry prices the request at, which is what its plan was charged
-  for it, to the scope the ledger charged; never the money the request moved. Only when a
-  registered relay attested the compensation's delivery; the original's `compensated` row
-  carries the authority of a signed operator intent that names exactly this compensation,
-  recorded applied; and the outbox row agrees with the registry's price and the
-  compensation's signed key. No column the database's owner can rewrite sets the amount
-  or the scope: the plan's charge caps the credits, and nothing is credited when the row
-  and the registry disagree.
-- **Exactly once.** Each step finds what a crashed run left of it. Killed after the
-  receipt, the credit, or the settlement row, the next run settles every request once: no
-  receipt twice, no orphaned receipt, no second credit.
+- **A delivery receipt** for each delivered request. It's an ARC1 `DeliveryReceipt` signed
+  by the receipt log, carrying the relay's attestation. It's bound by leaf hash to the
+  action receipt of the plan that committed the request, meaning the plan the attested
+  idempotency key was derived from, not just the one the row names. agentgov's verifier
+  checks it with `agentgov verify-receipt delivery.json --relay-key ... --action action.json`,
+  and `agentgov reconcile-actions` matches a vendor's own log against it by the idempotency
+  key and the vendor's id.
+- **A credit** for a delivered compensation. It's an AgentGov `refund()` of the
+  `cost_per_call` that the engine's sink registry prices the request at, which is what its
+  plan was charged for it, to the scope the ledger charged. It never refunds the money the
+  request moved. It's posted only when all of these hold: a registered relay attested the
+  compensation's delivery, the original's `compensated` row carries the authority of a
+  signed operator intent that names exactly this compensation and is recorded as applied,
+  and the outbox row agrees with the registry's price and the compensation's signed key. No
+  column the database's owner can rewrite sets the amount or the scope. The plan's charge
+  caps the credits, and nothing is credited when the row and the registry disagree.
+- **Exactly once.** Each step first finds what a crashed run left of it. If a run is
+  killed after the receipt, the credit or the settlement row, the next run still settles
+  every request once: no duplicate receipt, no orphaned receipt, no second credit.
 
 ### Inbound facts: the zero-trust inbox
 
-Vendors answer later. Stripe sends `charge.refund.updated` days after the refund; SendGrid
-reports a bounce an hour after the send. An agent has to react, and a webhook is exactly
-where a prompt injection would ride in: a forged request, or a genuine one whose
+Vendors answer later. Stripe sends `charge.refund.updated` days after the refund, and
+SendGrid reports a bounce an hour after the send. An agent has to react, and a webhook is
+an obvious way in for a prompt injection: a forged request, or a genuine one whose
 description field says "refund everything". The inbox turns a webhook into a fact the
-agent may act on, and nothing else (`docs/EPIC5_DESIGN.md` §2):
+agent may act on, and nothing more (`docs/EPIC5_DESIGN.md` §2):
 
 ```toml
 inbox_roles = ["interlock_inbox"]     # PostgreSQL: the inbox's own role
@@ -1921,18 +1936,18 @@ interlock inbox verify --config interlock.toml
 
 - **Verified, or not recorded.** The vendor's signature (Stripe's HMAC, Standard Webhooks'
   HMAC, SendGrid's ECDSA) is checked over the raw bytes, within a timestamp tolerance, before
-  the body is parsed. A forged, replayed or stale webhook is answered `401` and writes
-  nothing; a retry of a genuine one records nothing twice.
-- **Bound to what Interlock sent.** An event names what it is about (a refund's id). It is
-  bound to the delivered request whose relay-attested `remote_ref` is that id: never to a
-  delivery no registered relay attested, never to two messages' deliveries at once. The
-  binding gives the fact its scope and plan.
+  the body is parsed. A forged, replayed or stale webhook gets `401` and writes nothing. A
+  retry of a genuine one doesn't record anything twice.
+- **Bound to what Interlock sent.** An event names what it's about, such as a refund's id.
+  It's bound to the delivered request whose relay-attested `remote_ref` is that id. It's
+  never bound to a delivery no registered relay attested, or to two messages' deliveries at
+  once. The binding gives the fact its scope and plan.
 - **Attested, and chained.** Each source's events form a hash-linked log, and the inbox
   signs every event and every fact with its own Ed25519 key. A fact written, copied or
   moved around the inbox does not verify, and `interlock inbox verify` names it.
 - **Typed.** A fact carries a projection: ids, codes, integers, decimals, currencies,
   booleans, instants. No type admits free text, so a vendor's description, metadata or
-  error message never reaches the agent. A value that does not fit is withheld, by name.
+  error message never reaches the agent. A value that doesn't fit is withheld, and named.
 
 An engine consumes facts, never webhooks:
 
@@ -1968,12 +1983,12 @@ plan = (
 engine.execute(plan)
 ```
 
-A fact is consumed in the plan's own stage, exactly when it commits, once: a second plan
-naming it is refused, and a refused plan consumes nothing. The stage reads the fact back
-for the diff, where it is verified again, and the receipt commits to it. No statement of a
-plan can read the inbox. `FactAgreement` makes the reaction answer to the fact: a plan that
-writes a status no consumed fact says is refused, and the agent is told the rule, never the
-values.
+A fact is consumed once, in the plan's own stage, exactly when the plan commits. A second
+plan that names it is refused, and a refused plan consumes nothing. The stage reads the
+fact back for the diff, where it's verified again, and the receipt commits to it. No
+statement in a plan can read the inbox. `FactAgreement` ties the agent's reaction to the
+fact: a plan that writes a status no consumed fact supports is refused, and the agent is
+told the rule but never the values.
 
 ### Compaction: the vacuum
 
@@ -1994,23 +2009,24 @@ interlock vacuum --config interlock.toml --verify-archive archive/checkpoint-1.j
 ```
 
 It verifies everything first: delivery logs, relay attestations, operator records, earlier
-checkpoints, and the inbox under `[inbox.keys]`. What does not verify is kept and named.
-What may go: stages whose every request is delivered and settled, or cancelled, past the
-retention; window history past the longest span; each inbound source's prefix of events
-past the retention whose facts were all consumed. A *checkpoint* commits to all of it
-(each pruned message's log head and settlement, folds over everything pruned, where each
-inbound log was cut) and is signed in an operator intent and anchored into AgentGov before
-a row is deleted. One database transaction then records it, recomputes every fold from
-what the database holds, and deletes; the database refuses any other delete. Afterwards
-every verifier passes, accounting for pruned history by its tombstones and cuts, and a
-window that would reach back past pruned history fails closed.
+checkpoints, and the inbox under `[inbox.keys]`. Anything that doesn't verify is kept and
+named. Three kinds of history can go: stages past the retention period whose every request
+was delivered and settled, or cancelled; window history older than the longest span; and,
+for each inbound source, the events past the retention period whose facts were all
+consumed. A *checkpoint* commits to all of it: each pruned message's log head and
+settlement, folds over everything pruned, and where each inbound log was cut. It's signed
+in an operator intent and anchored into AgentGov before any row is deleted. One database
+transaction then records it, recomputes every fold from what the database holds, and
+deletes. The database refuses any other delete. Afterwards every verifier passes, counting
+pruned history through its tombstones and cuts, and a window that would reach back past
+pruned history fails closed.
 
 ## The daemon: every part in one process
 
-`interlock daemon` runs the engines that execute your agents' plans beside the relays, the
-inbox, the settler and the vacuum: one process, one asyncio event loop, every database call
-on a thread of its own part's (`docs/EPIC6_DESIGN.md`). Each part connects as its own role,
-from the sections `interlock.toml` already has, and these:
+`interlock daemon` runs the engines that execute your agents' plans alongside the relays,
+the inbox, the settler and the vacuum. It's one process with one asyncio event loop, and
+each part makes its database calls on a thread of its own (`docs/EPIC6_DESIGN.md`). Each
+part connects as its own role, from the sections `interlock.toml` already has, plus these:
 
 ```toml
 [engine]                              # the engines executing agents' plans
@@ -2070,16 +2086,17 @@ interlock daemon --config interlock.toml --app myapp.agents:build
 ```
 
 A plan that loses a race for a row or a window key is staged again, with jittered backoff.
-A part that fails is reopened after a backoff that doubles. `SIGHUP` reloads it: the relays
-and the inbox finish their step and open again, signing with the key their configuration
-points at then, the inbox behind a listener that never closes; the vacuum opens its key at
-each run anyway; engines and agents run on. `GET /healthz` on the inbox's
-port answers `200` while every part runs, `503` otherwise, with each part's counters.
-`SIGTERM` stops it in order, every step bounded: the agents; the engines (queued plans run
-until the deadline, and a running stage always finishes); the inbox, then one last match;
-the relays; the settler, one last pass; a vacuum in progress. A second signal skips the
-drains and gives the parts a second to close, and the next start recovers as after a
-crash. Without `--app`, the daemon runs the relays, the inbox and the vacuum.
+A part that fails is reopened after a backoff that doubles each time. `SIGHUP` reloads the
+daemon. The relays and the inbox finish their step and open again, signing with whichever
+key their configuration points at by then, and the inbox's listener never closes. The
+vacuum opens its key at each run anyway, and engines and agents keep running. `GET
+/healthz` on the inbox's port answers `200` while every part runs and `503` otherwise, with
+each part's counters. `SIGTERM` stops the parts in order, each step bounded in time: the
+agents; the engines (queued plans run until the deadline, and a running stage always
+finishes); the inbox, followed by one last match; the relays; the settler, with one last
+pass; and any vacuum in progress. A second signal skips the drains and gives the parts one
+second to close, and the next start recovers as it would after a crash. Without `--app`,
+the daemon runs the relays, the inbox and the vacuum.
 
 In a process of your own, `build_supervisor(config, application)` returns the same
 `InterlockSupervisor`, to run on your event loop.
@@ -2097,27 +2114,28 @@ heartbeat_seconds = 1
 session_timeout_seconds = 10          # a node silent this long holds nothing more
 ```
 
-A node's name is 40 characters at most (letters, digits, `.`, `_`, `-`), and `database` is
-the database Interlock is installed in: a node's lock is that database's own, where the
-relays look for it, and a node refuses to join one without Interlock's storage. Its role
-needs no privilege for the locks; to fence (below) it needs `pg_signal_backend`, and the
-parts' roles must not be superusers, whose sessions only a superuser can end:
+A node's name is at most 40 characters (letters, digits, `.`, `_`, `-`). `database` is the
+database Interlock is installed in. A node's lock lives in that database, where the relays
+look for it, and a node refuses to join a database without Interlock's storage. Its role
+needs no privilege for the locks. To fence other nodes (below), it needs
+`pg_signal_backend`, and the parts' roles must not be superusers, because only a superuser
+can end a superuser's sessions:
 
 ```sql
 CREATE ROLE interlock_cluster LOGIN PASSWORD '...';
 GRANT pg_signal_backend TO interlock_cluster;
 ```
 
-A node holds its node's lock in PostgreSQL, a session-level advisory lock, for as long as
-its process lives, so the database alone decides when a node is gone: when it ends the
-node's session, at once for a process killed, after `session_timeout_seconds` for one
-frozen or lost to the network. Every node runs the engines, the relays, the inbox and the
-metrics endpoint. The vacuum, and the inbox's matching of webhooks that came before their
-delivery was recorded, run on one node at a time: the one leading their role, an advisory
-lock on the same session, which another node takes at its next ask once the leader is
-gone. Each node settles the deliveries of the plans its own engines committed, into its
-own receipt log, since a delivery receipt goes into the log that holds its plan's action
-receipt: no two nodes ever settle one message.
+A node holds its lock in PostgreSQL, as a session-level advisory lock, for as long as its
+process lives. So the database alone decides when a node is gone: when it ends the node's
+session. That's immediate for a killed process, and takes `session_timeout_seconds` for one
+that froze or lost the network. Every node runs the engines, the relays, the inbox and the
+metrics endpoint. The vacuum, and the inbox's matching of webhooks that arrived before
+their delivery was recorded, run on one node at a time: the node leading that role, which
+holds another advisory lock on the same session. Another node takes the role the next time
+it asks after the leader is gone. Each node settles the deliveries of the plans its own
+engines committed, into its own receipt log, because a delivery receipt goes into the log
+that holds its plan's action receipt. No two nodes ever settle the same message.
 
 A relay's lease names its node (storage version 8: `interlock install` upgrades version 7
 in place, and a relay of version 7 left running keeps claiming). When a node is gone, the
@@ -2127,54 +2145,66 @@ holds what others wait for, the relays', the inbox's and every AgentGov governor
 bounded by `session_timeout_seconds`, and every connection a node opens says whose it is in
 `pg_stat_activity`: `interlock-<part>@<node>`.
 
-A node gone is fenced: at each heartbeat a node ends every session of a node whose lock no
-session holds, found by its connections' names. A frozen node, or one lost to the network,
-holds nothing past its session timeout and a heartbeat: not its transactions, and not a
-lock it was waiting for, which it would otherwise take and sit on for a bound of its own,
-one wait after another. A node that may not end them says so once in its log, and they
-end at their own bounds; `interlock_cluster_fenced_total` counts the sessions a node ended.
+A node that's gone is fenced. At each heartbeat, a node ends every session belonging to a
+node whose lock no session holds, found by its connections' names. A frozen node, or one
+cut off from the network, holds nothing past its session timeout plus a heartbeat. That
+covers its transactions and any lock it was waiting for, which it would otherwise take and
+sit on for its own bound, wait after wait. A node that isn't allowed to end those sessions
+says so once in its log, and they end at their own bounds.
+`interlock_cluster_fenced_total` counts the sessions a node ended.
 
-In Kubernetes: a StatefulSet, with `INTERLOCK_NODE` from the pod's name; a volume per pod
-for its escrow chains and its receipt log (`[receipts] log_id` unique per pod); the operator
-log on a `ReadWriteMany` volume every pod mounts, whose file locks work; `/healthz` for
-readiness and liveness, a node on standby for a role being healthy; and the node's session
-reaching PostgreSQL directly or through a pool in session mode, never in transaction mode.
-`interlock daemon` exits 3 when its node runs already, or when another process took its
-name while it ran.
+On Kubernetes, run it as a StatefulSet:
+
+- `INTERLOCK_NODE` set from the pod's name;
+- a volume per pod for its escrow chains and receipt log, with a unique `[receipts] log_id`
+  per pod;
+- the operator log on a `ReadWriteMany` volume that every pod mounts, with working file
+  locks;
+- `/healthz` for readiness and liveness (a node on standby for a role counts as healthy);
+- the node's session reaching PostgreSQL directly, or through a pool in session mode,
+  never transaction mode.
+
+`interlock daemon` exits 3 when its node is already running, or when another process took
+its name while it ran.
 
 ### Metrics
 
 With `[metrics] listen` set, or `interlock daemon --metrics HOST:PORT`, the daemon serves
-Prometheus's text format on a port of its own, never the inbox's, which faces vendors:
-`GET /metrics`, and `GET /healthz`. Each part measures what it does: the engines, every
-plan by outcome and time, the races lost (to a row's lock or to the pool), the waits for
-window keys' locks and for the windows' connection, and the longest of each in the last
-minute; the relays, every call by sink and outcome; the settler, each delivery receipt's
-lag behind its delivery; the inbox, every webhook by answer and by the trace context it
-carried; the vacuum, its runs and what they pruned; every part, its state, steps and
-failures. What only the database knows is sampled every `every_seconds`, in one read-only
-snapshot, as the `database` role: the outbox's depth by state and its oldest message due,
-settlement's backlog, the facts no plan has consumed, and each rate window's fullest key
-against its limit (`interlock_window_saturation`). A scrape reads memory and never the
-database. No label is a tenant, a scope, a plan or a key, so the number of series is set
-by the configuration, never by the traffic. `interlock.telemetry.CATALOG` lists every
-metric; `docs/EPIC7_DESIGN.md` §2 says what each measures. The registry costs a plan under
-two microseconds (`scripts/metrics_overhead.py`).
+Prometheus's text format on a port of its own (never the inbox's, which faces vendors):
+`GET /metrics` and `GET /healthz`. Each part measures its own work:
 
-The endpoint is not authenticated: bind it to an address only your scraper reaches. It
-shows the system's shape, never its data.
+- the engines: every plan by outcome and duration, races lost (to a row's lock or to the
+  pool), waits for window-key locks and for the windows' connection, and the longest of
+  each in the last minute;
+- the relays: every call by sink and outcome;
+- the settler: each delivery receipt's lag behind its delivery;
+- the inbox: every webhook by answer and by the trace context it carried;
+- the vacuum: its runs and what they pruned;
+- every part: its state, steps and failures.
+
+What only the database knows is sampled every `every_seconds`, in one read-only snapshot,
+as the `database` role: the outbox's depth by state and its oldest due message,
+settlement's backlog, facts no plan has consumed, and each rate window's fullest key
+against its limit (`interlock_window_saturation`). A scrape reads memory, never the
+database. No label is a tenant, a scope, a plan or a key, so the configuration sets the
+number of series and traffic doesn't. `interlock.telemetry.CATALOG` lists every metric, and
+`docs/EPIC7_DESIGN.md` §2 says what each one measures. The registry adds under two
+microseconds to a plan (`scripts/metrics_overhead.py`).
+
+The endpoint isn't authenticated, so bind it to an address only your scraper can reach. It
+shows how the system is behaving, never its data.
 
 ### Trace context
 
-A plan may carry a W3C `traceparent`, and Interlock carries it wherever the plan's effects
-go: beside each request in the outbox; out as the `traceparent` header of every call the
-relay makes (`HttpAdapter`, Stripe's and SendGrid's adapters), retries included; onto the
-refund an operator issues to compensate a charge. A webhook whose signature verifies has
-the context it carried kept beside its event, and the fact the inbox binds to a delivery
-continues the delivery's trace: under the webhook's context when the vendor continued
-ours, and the delivery's own when it sent a trace of its own, a malformed one, or none. A
-plan that consumes the fact continues it, and agent, outbox, relay, vendor, webhook and
-agent again are one trace:
+A plan can carry a W3C `traceparent`, and Interlock carries it wherever the plan's effects
+go: beside each request in the outbox, out as the `traceparent` header of every call the
+relay makes (`HttpAdapter`, and Stripe's and SendGrid's adapters), retries included, and
+onto the refund an operator issues to compensate a charge. When a webhook's signature
+verifies, the context it carried is kept beside its event. The fact the inbox binds to a
+delivery continues the delivery's trace. It uses the webhook's context when the vendor
+continued ours, and the delivery's own when the vendor sent its own trace, a malformed one,
+or none. A plan that consumes the fact continues the trace too, so agent, outbox, relay,
+vendor, webhook and agent again form one trace:
 
 ```python
 from interlock import PlanBuilder, child_traceparent, new_traceparent, parse_traceparent
@@ -2200,11 +2230,11 @@ assert follow_up.split("-")[1] == checkout.split("-")[1] and follow_up != checko
 ```
 
 In the daemon, `ctx.plan(scope, traceparent=...)` does the same, and each fact from
-`ctx.facts(scope)` has its `traceparent`. Trace context is outside every hash: a plan, a
-request, a delivery log, a relay's attestation, a receipt, an event and a fact hash the
-same with it or without it, and nothing Interlock decides reads it. It is kept in tables
-of its own, pruned by the vacuum with the rows it describes. Interlock propagates context
-and records it; it exports no spans of its own.
+`ctx.facts(scope)` has its `traceparent`. Trace context is outside every hash. A plan, a
+request, a delivery log, a relay's attestation, a receipt, an event and a fact all hash the
+same with or without it, and no decision Interlock makes reads it. It's kept in tables of
+its own, which the vacuum prunes along with the rows they describe. Interlock propagates
+and records trace context, but exports no spans of its own.
 
 ### The soak
 
@@ -2216,52 +2246,65 @@ uv run python scripts/live_stress_test.py --docker --minutes 5
 uv run python scripts/live_stress_test.py --dsn postgresql://admin:pw@localhost:5432/postgres
 ```
 
-It runs `--nodes` daemons, three by default, each `interlock daemon --node` in a process of
-its own, over one database and one ledger. On every node, agents keep plans in flight:
+It runs `--nodes` daemons (three by default), each an `interlock daemon --node` in its own
+process, over one database and one ledger. On every node, agents keep plans in flight:
 checkouts that insert an order and charge for it, carrying the refund that undoes it;
-reconciliations of what the payment API's webhooks say; notes on rows every node contends
-for; and, now and then, a plan that must be refused. A fake
-payment API answers in Stripe's shape, honours idempotency keys, and fails on purpose:
-500s after acting, 429s, replies slower than the relay waits. Its webhooks come back
-signed, duplicated, early, about objects nobody created, and forged. An operator refunds
-paid orders, every action signed. Webhooks reach the nodes through a balancer that takes a
-node out when it stops answering. At 45% of the load the node leading the vacuum is killed
-with `SIGKILL` while its relays have a call in flight; at 70% the node leading it then is
-frozen with `SIGSTOP` with a call in flight and a stage open, its connections left open as
-a host lost to the network leaves them, and killed once the server and the other nodes have
-ended everything it held. Each comes back, as a pod is rescheduled, and recovers. Then the soak proves, from the database, the ledger, the logs and
-each node's journal of what its agents did: no deadlock; lock waits within their bounds and every lost race retried to an
-outcome; every rate window within its limit at every instant of its history; the ledger
-balanced to the cent, each plan charged once and each refund credited once; one charge per
-order and one receipt per delivery, but for a plan whose node died before issuing its action
-receipt; no forgery accepted; the vacuum keeping the outbox
-bounded as it runs; every verifier passing after; a graceful stop, a second daemon
-recovering nothing; every checkout's trace context carried to the payment API, onto its
-refund, back on the facts its webhooks became and on to the plans that consumed them,
-whatever the vendor sent; the metrics, scraped every second, telling what the run
-counted itself; keys that rotate under load; every node sharing the work; one node leading
-each role at a time; the killed node's lock gone with it, its leases taken over within a
-second and its call in flight made again and acted on once; the frozen node's leases taken
-only once its node was gone, every session it had fenced a heartbeat after, and no survivor
-waiting on one of them longer.
-The relays, the inbox and the vacuum sign through a key service in the soak's process, and
-a quarter of the way through, the operator rotates the relays' key: a new version,
-registered; every node reloaded with `SIGHUP`; the old key revoked while a stale relay still
-holding it has a call in flight. The database refuses that relay's outcome, another relay
-delivers its message once under the new key, and everything the old key attested before
-verifies under its seal. `tests/test_soak.py` runs it for a minute and a half in the test
-suite.
+reconciliations of what the payment API's webhooks say; notes on rows that every node
+contends for; and now and then a plan that has to be refused.
+
+A fake payment API answers in Stripe's shape, honours idempotency keys, and fails on
+purpose: 500s after acting, 429s, replies slower than the relay waits. Its webhooks come
+back signed, duplicated, early, about objects nobody created, and forged. An operator
+refunds paid orders, signing every action. Webhooks reach the nodes through a balancer
+that takes a node out when it stops answering.
+
+At 45% of the load, the node leading the vacuum is killed with `SIGKILL` while its relays
+have a call in flight. At 70%, the node leading it then is frozen with `SIGSTOP`, with a
+call in flight and a stage open, its connections left open the way a host cut off from
+the network leaves them. It's killed once the server and the other nodes have ended
+everything it held. Each node comes back, as a rescheduled pod would, and recovers.
+
+A quarter of the way through, the operator rotates the relays' key, which the relays, the
+inbox and the vacuum sign with through a key service in the soak's process. A new version
+is registered, every node is reloaded with `SIGHUP`, and the old key is revoked while a
+stale relay that still holds it has a call in flight. The database refuses that relay's
+outcome, another relay delivers the message once under the new key, and everything the old
+key attested before still verifies under its seal.
+
+Then the soak checks, from the database, the ledger, the logs and each node's journal of
+what its agents did:
+
+- no deadlock, lock waits within their bounds, and every lost race retried to an outcome;
+- every rate window within its limit at every instant of its history;
+- the ledger balanced to the cent, each plan charged once and each refund credited once;
+- one charge per order and one receipt per delivery, except for a plan whose node died
+  before issuing its action receipt;
+- no forgery accepted, and the vacuum keeping the outbox bounded as it runs;
+- every verifier passing afterwards, a graceful stop, and a second daemon finding nothing
+  to recover;
+- every checkout's trace context carried to the payment API, onto its refund, back on the
+  facts its webhooks became and on to the plans that consumed them, whatever the vendor
+  sent;
+- the metrics, scraped every second, agreeing with what the run counted itself;
+- keys rotating under load, every node sharing the work, and one node leading each role at
+  a time;
+- the killed node's lock gone with it, its leases taken over within a second, and its call
+  in flight made again and acted on once;
+- the frozen node's leases taken only once it was gone, every session it held fenced a
+  heartbeat later, and no survivor waiting on any of them longer.
+
+`tests/test_soak.py` runs it for a minute and a half in the test suite.
 
 ### The security audit
 
-`scripts/security_audit.py` asks whether any sensitive value reaches a hash Interlock
+`scripts/security_audit.py` checks whether any sensitive value reaches a hash Interlock
 commits to (`docs/EPIC8_DESIGN.md` §4). On each store it runs one scenario through the
-daemon with canaries planted in a plan's trace context, the relay's API key, a webhook's
-body and headers, and its signing secret, and records the input of every SHA-256 and every
-signature Interlock and AgentGov compute. None may hold a sensitive value or its digest, but
-for the body's SHA-256, which the inbound event commits to; and only the columns made for
-one may hold one. It prints, column by column, what holds a sensitive value and which hash
-reads it:
+daemon, with canaries planted in a plan's trace context, the relay's API key, a webhook's
+body and headers, and its signing secret. It records the input of every SHA-256 and every
+signature Interlock and AgentGov compute. None of them may contain a sensitive value or its
+digest, except the body's SHA-256, which the inbound event commits to, and only columns
+made for a sensitive value may hold one. It prints, column by column, what holds a
+sensitive value and which hash reads it:
 
 ```bash
 uv run python scripts/security_audit.py --docker
@@ -2273,14 +2316,14 @@ uv run python scripts/security_audit.py --docker
 business domains on SQLite: accounts-payable disbursements on a double-entry ledger, cluster
 operations, a multi-tenant SaaS admin console, and fulfilment in dependent stages for a
 third-party warehouse. Each has its own schema, triggers, constraints and simulated outside
-APIs, and each policy is built by one function from the same checkers; only table and
-column names and limits differ. The model is given each domain's everyday request, requests
+APIs, and one function builds each domain's policy from the same checkers. Only table and
+column names and limits differ. The model gets each domain's everyday request, requests
 that conflict with its rules (another tenant's rows, a cap, a table outside its remit, an
-append-only log), and conflicting figures, and everything it proposes goes through
-`PlanBuilder` and `EscrowEngine.execute`. Oracles that do not ask Interlock check every
-outcome: other tenants' rows byte for byte, each committed request against its rows, the
-domain's own invariants, delivery order and count, and that nothing shown to the model names
-another tenant's data. Reference proposals, one per policy dimension in every domain, run
+append-only log), and conflicting figures. Everything it proposes goes through
+`PlanBuilder` and `EscrowEngine.execute`. Independent checks, which don't ask Interlock,
+verify every outcome: other tenants' rows byte for byte, each committed request against its
+rows, the domain's own invariants, delivery order and count, and that nothing shown to the
+model names another tenant's data. Reference proposals, one per policy dimension in every domain, run
 the same tool with no model, in CI (`tests/test_acceptance_suite.py`). The last live run is
 recorded in [`docs/CUSTOMER_ACCEPTANCE_MATRIX.md`](docs/CUSTOMER_ACCEPTANCE_MATRIX.md), with
 every tool call the first model named made, exactly as it made it.
@@ -2294,9 +2337,9 @@ BENCHMARK_API_KEY=sk-ant-... uv run python demo/customer_acceptance_suite.py \
 ## Unrecorded writes
 
 The monitor only sees what goes through it. A cron job, a migration, a DBA at a prompt, or
-the agent's own credentials used directly all write observed tables and leave nothing in
-the escrow chain. `interlock reconcile-effects` is the check that closes the loop: nothing
-changes an observed table without a record.
+the agent's own credentials used directly can all write observed tables without leaving
+anything in the escrow chain. `interlock reconcile-effects` closes that gap by checking
+that nothing changed an observed table without a record.
 
 ```bash
 interlock install           --config interlock.toml   # once; SQLite needs it for this too
@@ -2305,20 +2348,20 @@ interlock reconcile-effects --config interlock.toml --chain escrow.jsonl [--afte
 
 It fails (exit 1) on:
 
-- **an unmediated write:** a row change no stage made. On PostgreSQL the installed trigger
-  logs each one to `interlock.unmediated` inside the writer's own transaction, with the
-  session user, `application_name` and transaction id; a `TRUNCATE` is logged too. On
+- **an unmediated write**, a row change no stage made. On PostgreSQL, the installed
+  trigger logs each one to `interlock.unmediated` inside the writer's own transaction, with
+  the session user, `application_name` and transaction id. A `TRUNCATE` is logged too. On
   SQLite, `interlock install` adds permanent journal triggers that record every row change
   in `_interlock_journal`, and each committed stage records the range of journal rows it
-  produced, which is exact because `BEGIN IMMEDIATE` admits one writer at a time. A
+  produced. That range is exact because `BEGIN IMMEDIATE` admits one writer at a time. A
   cascade from a table nobody observes is found row by row;
 - **an unrecorded stage:** one the database committed that no chain records, such as one
   opened by hand with the stage role's credentials, or by an engine on the default
   in-memory chain;
 - **a contradicted stage:** recorded as aborted, or under another plan;
-- **an unresolved stage:** committed with only its commit intent in the chain, after a
-  crash in the commit window. Recovery resolves it; `EscrowRuntime` runs recovery at
-  startup;
+- **an unresolved stage**, one that committed with only its commit intent in the chain,
+  after a crash in the commit window. Recovery resolves it, and `EscrowRuntime` runs
+  recovery at startup;
 - on SQLite, an observed table whose journal trigger is missing.
 
 Each run prints `last entry: N`; pass it back as `--after N` to check only what is new.
@@ -2326,9 +2369,9 @@ Exit code 5 means a chain failed verification and proves nothing. On PostgreSQL,
 a role named in `audit_roles` at install, which may read Interlock's logs and write
 nothing.
 
-What it cannot see: anyone who can disable the triggers or edit the logs. On PostgreSQL
-that is the tables' owner or a superuser, which logical decoding would close; on SQLite it
-is anyone who can write the file.
+It can't see anyone who can disable the triggers or edit the logs. On PostgreSQL that's
+the tables' owner or a superuser (logical decoding would close that gap). On SQLite it's
+anyone who can write the file.
 
 ## Scope
 
@@ -2346,16 +2389,16 @@ against the shipped code, not inferred.
   so it cannot be the boundary. `SqliteSubstrate` installs a
   `sqlite3.Connection.set_authorizer` callback that denies `INSERT`/`UPDATE`/`DELETE` on
   any table not in `TableSpec`, plus `ATTACH`/`DETACH`. A statement whose label claims an
-  observed table while writing elsewhere never executes; it raises
-  `ForbiddenStatementError` naming the table it reached for. Pass
-  `enforce_table_access=False` to lift the unobserved-table rule for a migration; the rules
+  observed table while writing elsewhere never executes. It raises
+  `ForbiddenStatementError`, naming the table it reached for. Pass
+  `enforce_table_access=False` to lift the unobserved-table rule for a migration. The rules
   below stay on.
 
   The same callback refuses a statement that writes the capture table (which would erase
-  the measurement), the commit-marker table, or transaction control: a `COMMIT` inside a
+  the measurement), the commit-marker table, or transaction control. A `COMMIT` inside a
   stage used to make every effect before it durable before any checker ran. Grant the
-  connection exactly the observed tables anyway; a database-enforced grant is a boundary,
-  and this is a second one in front of it.
+  connection exactly the observed tables anyway. A grant the database enforces is a
+  boundary, and the callback is a second one in front of it.
 
   DDL and transaction control are refused twice over: `SqliteSubstrate.reject_reason()`
   reads the statement's leading verb at admission, so `ALTER`/`DROP`/`CREATE`/`TRUNCATE`
@@ -2366,65 +2409,70 @@ against the shipped code, not inferred.
   those notes unmeasured. Every stage now reads the foreign-key graph under its write lock
   and refuses, before a row changes, a delete or a referenced-key update whose `CASCADE`,
   `SET NULL` or `SET DEFAULT` actions reach an unobserved table, naming the path. The
-  analysis follows chains of actions to any depth and is column-precise: updating
+  analysis follows chains of actions to any depth and is precise to the column, so updating
   `orders.status` is never refused because of a key on `orders.id`. `EscrowRuntime` runs
   the same check at startup and logs every gated operation. To let a cascade run
-  unmeasured, name the table in `acknowledge_cascades=[...]`; every stage that runs with
+  unmeasured, name the table in `acknowledge_cascades=[...]`. Every stage that runs with
   that gap says so in its `STAGE_OPENED` record. The refusal is enforced three ways, so no
-  single layer is load-bearing: the authorizer refuses the parent operation, the
-  authorizer refuses any foreign-key action SQLite compiles into the table (which is what
-  catches `INSERT OR REPLACE`), and temporary triggers on the table abort any row change
-  there while the stage is open.
-- **One engine stages one substrate.** A plan whose effects name another
-  substrate is refused at admission; nothing coordinates two substrates, so a
-  plan spanning SQL and a non-transactional sink needs the outbox pattern below.
+  single layer carries it alone. The authorizer refuses the parent operation. It also
+  refuses any foreign-key action SQLite compiles into the table, which is what catches
+  `INSERT OR REPLACE`. And temporary triggers on the table abort any row change there while
+  the stage is open.
+- **One engine stages one substrate.** A plan whose effects name another substrate is
+  refused at admission. Nothing coordinates two substrates, so a plan that spans SQL and a
+  non-transactional sink needs the outbox pattern below.
 - **`blast_radius` counts captured mutations, not distinct rows.** A row mutated twice in
   one plan contributes 2, so the limit is conservative and is not a row tally.
 - **`ColumnValueGuard` and `TenantDrawdownGuard` are one-directional.** Both fire on a
   fall in the column total, which counts each row once: its value before the plan and its
-  value after, however many times the plan or a trigger wrote it. An inflation passes, and so does any diff whose pre-image total
-  is zero, which includes every insert-only plan. `TenantDrawdownGuard` re-denominates
-  per tenant; it does not make the guard symmetric.
+  value after, however many times the plan or a trigger wrote it. An inflation passes, and
+  so does any diff whose pre-image total is zero, which includes every insert-only plan.
+  `TenantDrawdownGuard` works per tenant, but that doesn't make it symmetric. Use a rise
+  bound (`max_rise`) to catch an increase.
 - **`StatedFootprint` is a cooperative diagnostic.** It reads `Effect.stated_rows`. An agent
   that omits the field on any effect turns the checker into a no-op.
 - **Chain durability is opt-in.** With no `chain_path` the chain lives in memory and
-  dies with the process. With one, the intent is write-ahead and a crashed commit is
-  resolved exactly on restart; see [Lifecycle](#lifecycle). The `_interlock_commits`
-  table gains one row per committed stage and is not pruned, not even by the
-  [vacuum](#compaction-the-vacuum): recovery and `reconcile-effects` read it.
+  dies with the process. With one, the intent is written ahead and a crashed commit is
+  resolved exactly on restart (see [Lifecycle](#lifecycle)). The `_interlock_commits`
+  table gains one row per committed stage and isn't pruned, not even by the
+  [vacuum](#compaction-the-vacuum), because recovery and `reconcile-effects` read it.
 - **The chain is keyless.** Anyone who can write the chain file can recompute a SHA-256
   chain from start to finish and it will verify. A reverse anchor in a governed AgentGov
   is one copy of the head outside the file. With [receipts](#receipts) on, each
   adjudicated plan also gets a signed receipt naming its terminal record, under a key the
-  chain file does not hold; the chain itself stays unsigned.
+  chain file doesn't hold. The chain itself stays unsigned.
 - **Lock footprint.** A stage holds write locks for its whole life, a repair search's
-  included. `max_stage_seconds` bounds it. Human review must not happen inside an open stage; abort, present the recorded
-  diff, and re-stage on approval, because the substrate may have moved.
+  included. `max_stage_seconds` bounds it. Human review must not happen inside an open
+  stage. Abort, present the recorded diff, and stage again on approval, because the
+  substrate may have moved in the meantime.
 - **Recovery trusts the harness to route its calls.** The runtime holds and records its
   own steps, refuses a revoked tool when asked, and catches an edited transcript at the
   next step. It cannot see a harness that bills a recovery call to another scope, runs a
   tool without calling `check_tool()`, or sends the model something other than
   `step.messages`.
 - **An extension estimate is arithmetic on what the harness declares.** Cost per declared
-  milestone times those remaining assumes the rest of the work costs what the done work
-  did; with none declared it prices only the call that did not fit. The receipts in a
-  quote's proof of work are verifiable; its milestones are the harness's claim.
+  milestone times the milestones remaining assumes the rest of the work costs what the
+  finished work did. With none declared, it prices only the call that didn't fit. The
+  receipts in a quote's proof of work are verifiable, but its milestones are only the
+  harness's claim.
 - **Latency.** Staging roughly doubles write-path round trips. Plans below a blast-radius
   threshold should bypass escrow entirely.
-- **External effects get a weaker guarantee than rows, by design.** The guarantee for
-  external effects is deliberately weaker, and stated as such: the **request** is measured,
-  adjudicated and made durable exactly when the rest of the plan is; its **delivery** is
-  at-least-once, recorded, and bounded; what the external system then does is not measured
-  at all. What it reports back arrives as an [inbound fact](#inbound-facts-the-zero-trust-inbox):
-  the vendor's signed word, bound to the request, never a measurement. See
-  [Outbound requests](#outbound-requests-the-transactional-outbox). On SQLite the outbox is
-  installed by `interlock install`, as on PostgreSQL.
+- **External effects get a weaker guarantee than rows, by design.** The **request** is
+  measured, adjudicated and made durable exactly when the rest of the plan is. Its
+  **delivery** is at least once, recorded, and bounded. What the external system then does
+  isn't measured at all. What it reports back arrives as an
+  [inbound fact](#inbound-facts-the-zero-trust-inbox), which is the vendor's signed word,
+  bound to the request, and never a measurement. To check what the vendor actually did,
+  reconcile its own log against the delivery receipts with `agentgov reconcile-actions`.
+  See [Outbound requests](#outbound-requests-the-transactional-outbox). On SQLite,
+  `interlock install` installs the outbox, as it does on PostgreSQL.
 - **Every threshold in `default_checkers` is a placeholder.** They are uncalibrated.
   Measure your own diffs and set them from the measurement.
-- **A node's deliveries wait for it.** In a cluster each node settles its own plans'
-  deliveries, from its own chains and receipt log: a node that never comes back leaves them
-  unsettled until its volume is given to another process as that node. Its payments are
-  made, its webhooks recorded and its facts consumed by the rest of the cluster meanwhile.
+- **A node's deliveries wait for it.** In a cluster, each node settles its own plans'
+  deliveries, from its own chains and receipt log. If a node never comes back, its
+  deliveries stay unsettled until another process takes over its volume as that node. In
+  the meantime, the rest of the cluster still makes its payments, records its webhooks and
+  consumes its facts.
 
 [`docs/ESCROW_SPEC.md`](docs/ESCROW_SPEC.md) is the interface contract, the architecture
 built on it (§5: components, data flows, roles, evidence, concurrency), and a conformance
@@ -2446,9 +2494,9 @@ Or install the package directly:
 uv pip install git+https://github.com/crimsondevil0929/interlock
 ```
 
-Signing, a relay's attestations and an operator's records, needs the `sign` extra
-(`cryptography`); verifying never does. `kms-aws` adds `boto3` for `AwsKmsSigner`, a key
-AWS KMS holds, and `otel` agentgov's OpenTelemetry metrics; both pass through to
+Signing (a relay's attestations, an operator's records) needs the `sign` extra
+(`cryptography`). Verifying never does. `kms-aws` adds `boto3` for `AwsKmsSigner`, a key
+held by AWS KMS, and `otel` adds agentgov's OpenTelemetry metrics. Both pass through to
 agentgov's extras of the same names.
 
 **Developing on both repos at once.** `uv sync` resolves agentgov from PyPI, and a sibling
@@ -2473,9 +2521,9 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy src/ && uv run mypy --strict tests/ demo.py
 ```
 
-The PostgreSQL tests run against a live server: set `INTERLOCK_TEST_POSTGRES_DSN` to a
+The PostgreSQL tests run against a live server. Set `INTERLOCK_TEST_POSTGRES_DSN` to a
 role that may create databases and roles, and `INTERLOCK_REQUIRE_POSTGRES=1` to fail
-rather than skip without one. Two suites are release gates.
+rather than skip when there isn't one. Two suites are release gates.
 `tests/test_crash_consistency.py` kills a real process with `SIGKILL` at every step of a
 PostgreSQL commit, and at random instants, then checks exactly what recovery makes of it.
 `tests/test_tamper_evidence.py` alters every part of the audit trail and checks that
