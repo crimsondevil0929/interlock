@@ -9,6 +9,34 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.4.2] - unreleased
+
+What an agent is told when a plan is refused, in plainer sentences, and a
+substrate that is set up wrong no longer reported as unreachable. Upgrades from
+1.4.1 in place. No verdict changes.
+
+### Fixed
+
+- **A table, path class or resource type the plan may not write, when its name
+  is withheld.** The feedback read "changed files of class a class it does not
+  name, which it may not write". It now reads "changed files in a path class it
+  may not write", and "rows from orders and from another table" when one is
+  named and one is not. The same applies to deletes, and to a SQL statement that
+  writes an unobserved table.
+- **A substrate that is set up wrong.** A missing install, a stage role without
+  its grants, or a stage role that could become a superuser was reported to the
+  agent as `unavailable: the database could not be reached`, marked
+  non-retryable. It is now `misconfigured` (`Guidance.MISCONFIGURED`): the
+  system is not set up for this deployment, nothing was tried, and its operator
+  has to fix it. An unreachable substrate is still `unavailable`, and still
+  retryable.
+- **PostgreSQL: the hint for a stage role without its privileges** named an
+  `interlock install --stage-role` flag that does not exist. It now says to
+  grant USAGE on the schema and DML on the observed tables, list the role in
+  `stage_roles`, and run `interlock install` again.
+- **A write that was read back and put back** is described plainly: what
+  changed, that it was put back, and that the system is as it was before.
+
 ## [1.4.1] - 2026-11-04
 
 The plan-bound and predicted substrates, run against the real systems for the

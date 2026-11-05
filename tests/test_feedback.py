@@ -329,10 +329,9 @@ def test_table_allowlist_no_delete_truncation_and_ddl() -> None:
     )
     rendered = [c.render() for c in fb.constraints]
     assert rendered == [
-        "table_allowlist: the plan changed rows in a table the plan does not name, which it "
-        "may not write.",
-        "no_delete: the plan deletes rows from orders and a table the plan does not name, "
-        "where deletes are not allowed.",
+        "table_allowlist: the plan changed rows in a table it may not write.",
+        "no_delete: the plan deletes rows from orders and from another table, where deletes "
+        "are not allowed.",
         "truncation_guard: the plan changed more rows than can be measured (2-9). Split the work.",
     ]
     assert "secret_table" not in text_of(fb)
@@ -515,7 +514,7 @@ def test_a_subclass_of_a_built_in_is_not_trusted_with_numbers() -> None:
         (StageConflictError("row 600 of globex is locked"), Guidance.CONFLICT, True),
         (StageExpiredError("expired"), Guidance.EXPIRED, False),
         (SubstrateUnavailableError("host db.internal down"), Guidance.UNAVAILABLE, True),
-        (SubstrateConfigurationError("role can write payroll"), Guidance.UNAVAILABLE, False),
+        (SubstrateConfigurationError("role can write payroll"), Guidance.MISCONFIGURED, False),
         (
             StageError("UNIQUE constraint failed: Key (email)=(ceo@globex.test) already exists"),
             Guidance.STATEMENT_FAILED,
@@ -903,7 +902,7 @@ def test_sqlite_unobserved_write_names_no_table_the_plan_did_not(back_office: st
     fb = caught.value.feedback
     assert isinstance(fb, AgentFeedback)
     assert "customers" not in text_of(fb)
-    assert "a statement writes a table the plan does not name" in fb.render()
+    assert "a statement writes a table this runtime does not let a plan write" in fb.render()
 
 
 def test_execute_or_raise_carries_feedback(back_office: str) -> None:
@@ -976,3 +975,17 @@ def test_plan_ids_are_not_part_of_feedback() -> None:
     plan = plan_of(("orders", "acme"))
     fb = feedback(plan, [row("orders", 1, "acme", D("1"), D("2"))], [BlastRadius(0)])
     assert str(plan.plan_id) not in text_of(fb)
+
+
+def test_a_substrate_set_up_wrong_is_not_called_unreachable() -> None:
+    """1.4.2: a role that lacks a grant, or Interlock not installed, is the
+    operator's to fix; the agent is told that retrying will not help."""
+    from interlock.exceptions import SubstrateConfigurationError, SubstrateUnavailableError
+
+    plan = plan_of(("orders", "acme"))
+    wrong = feedback_for_error(plan, SubstrateConfigurationError("role lacks a grant"))
+    (c,) = wrong.constraints
+    assert c.guidance is Guidance.MISCONFIGURED and not wrong.retryable
+    assert "not set up" in text_of(wrong) and "could not be reached" not in text_of(wrong)
+    down = feedback_for_error(plan, SubstrateUnavailableError("connection refused"))
+    assert down.constraints[0].guidance is Guidance.UNAVAILABLE and down.retryable

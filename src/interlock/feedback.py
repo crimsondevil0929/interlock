@@ -141,6 +141,9 @@ class Guidance(StrEnum):
     found the prediction did not say; none, a write that failed part way."""
     SCOPE_HALTED = "scope_halted"
     UNAVAILABLE = "unavailable"
+    MISCONFIGURED = "misconfigured"
+    """The substrate is not set up for this deployment (1.4.2): a missing install,
+    a role that lacks a grant or has too many. Retrying cannot help."""
     OUTBOUND_REQUEST = "outbound_request"
     # Raised by a checker over the measured diff and the outbox.
     OUTBOUND_AGREEMENT = "outbound_agreement"
@@ -188,6 +191,7 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.READ_BACK: "put_back",
     Guidance.SCOPE_HALTED: "scope_halted",
     Guidance.UNAVAILABLE: "unavailable",
+    Guidance.MISCONFIGURED: "misconfigured",
     Guidance.OUTBOUND_REQUEST: "outbound_request",
     Guidance.OUTBOUND_AGREEMENT: "cross_effect_agreement",
     Guidance.RATE_WINDOW: "rate_window",
@@ -355,6 +359,26 @@ class AgentFeedback:
         }
 
 
+def _outside(c: ConstraintFeedback, *, did: str, kind: str) -> str:
+    """A write to tables the plan may not write. A table outside the plan's scope
+    is not named to the agent (``withheld_tables``), so the sentence reads well
+    either way: ``changed rows in orders, which it may not write``, ``changed
+    rows in a table it may not write``."""
+    named = ", ".join(c.tables)
+    if not named:
+        return f"the plan {did} a {kind} it may not write."
+    other = f" and in another {kind}" if c.withheld_tables else ""
+    return f"the plan {did} {named}{other}, which it may not write."
+
+
+def _no_delete(c: ConstraintFeedback, *, rows: str, kind: str) -> str:
+    named = ", ".join(c.tables)
+    if not named:
+        return f"the plan deletes {rows} from a {kind} where deletes are not allowed."
+    other = f" and from another {kind}" if c.withheld_tables else ""
+    return f"the plan deletes {rows} from {named}{other}, where deletes are not allowed."
+
+
 def _tables(c: ConstraintFeedback, *, fallback: str = "a table the plan does not name") -> str:
     named = ", ".join(c.tables)
     if named and c.withheld_tables:
@@ -433,12 +457,8 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     ),
     Guidance.TENANT_SCOPE: _scope,
     Guidance.UNDECLARED_TENANT: _undeclared,
-    Guidance.TABLE_SCOPE: lambda c: (
-        f"the plan changed rows in {_tables(c)}, which it may not write."
-    ),
-    Guidance.NO_DELETE: lambda c: (
-        f"the plan deletes rows from {_tables(c)}, where deletes are not allowed."
-    ),
+    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="changed rows in", kind="table"),
+    Guidance.NO_DELETE: lambda c: _no_delete(c, rows="rows", kind="table"),
     Guidance.VALUE_DROP: lambda c: f"the plan lowers {_column(c)} by more than {_percent(c)}.",
     Guidance.VALUE_RISE: _rise,
     Guidance.TENANT_DRAWDOWN: _drawdown,
@@ -461,6 +481,8 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     ),
     Guidance.UNOBSERVED_WRITE: lambda c: (
         f"a statement writes {_tables(c)}, which this runtime does not let a plan write."
+        if c.tables
+        else "a statement writes a table this runtime does not let a plan write."
     ),
     Guidance.CASCADE: lambda c: (
         f"changing {_tables(c)} this way would cascade into data this runtime does "
@@ -475,14 +497,18 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     Guidance.CONFLICT: lambda c: "another writer holds the rows the plan needs.",
     Guidance.EXPIRED: lambda c: "the plan took longer than a stage allows. Split the work.",
     Guidance.READ_BACK: lambda c: (
-        f"after the write, the system held {c.measured} change(s) the plan did not predict; "
-        f"everything the write changed was put back, and nothing of the plan stands."
+        f"after the write, the system held {c.measured} change(s) the plan did not predict, "
+        f"so everything the write changed was put back. The system is as it was before."
         if c.measured
-        else "a write failed part way; what was written was put back, and nothing of the "
-        "plan stands."
+        else "a write failed part way, so what was written was put back. The system is as it "
+        "was before."
     ),
     Guidance.SCOPE_HALTED: lambda c: "the agent's scope is halted; no plan will be staged.",
     Guidance.UNAVAILABLE: lambda c: "the database could not be reached.",
+    Guidance.MISCONFIGURED: lambda c: (
+        "the system this deployment writes to is not set up for it, so nothing was tried. "
+        "Its operator has to fix that; retrying will not help."
+    ),
     Guidance.OUTBOUND_REQUEST: lambda c: (
         "an outbound request names a sink or operation that is not registered, or its "
         "payload breaks that operation's rules (schema, size, credentials, compensation)."
@@ -553,14 +579,8 @@ _GIT: Final[Mapping[Guidance, Any]] = {
         f"the plan changed files of an owner it does not declare; its declared owners are "
         f"{_tenants(c)}. Confine the plan to the files its declared owners hold."
     ),
-    Guidance.TABLE_SCOPE: lambda c: (
-        f"the plan changed files of class {_tables(c, fallback='a class it does not name')}, "
-        f"which it may not write."
-    ),
-    Guidance.NO_DELETE: lambda c: (
-        f"the plan deletes files of class {_tables(c, fallback='a class it does not name')}, "
-        f"where deletes are not allowed."
-    ),
+    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="changed files in", kind="path class"),
+    Guidance.NO_DELETE: lambda c: _no_delete(c, rows="files", kind="path class"),
     Guidance.TRUNCATED: lambda c: (
         f"the plan changed more files than can be measured ({c.measured or 'too many'}). "
         f"Split the work."
@@ -600,10 +620,7 @@ _FHIR: Final[Mapping[Guidance, Any]] = {
         f"chart is {_tenants(c)}. A bed or an order may belong to another patient: confine "
         f"the plan to the session's own chart."
     ),
-    Guidance.TABLE_SCOPE: lambda c: (
-        f"the plan writes records of type {_tables(c, fallback='a type it does not name')}, "
-        f"which it may not write."
-    ),
+    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="writes records of", kind="resource type"),
     Guidance.STATED_FOOTPRINT: lambda c: (
         f"the plan stated {c.limit or 'a number of'} record(s); the EHR's records predict "
         f"{c.measured or 'more'}."
@@ -622,13 +639,13 @@ _FHIR: Final[Mapping[Guidance, Any]] = {
     ),
     Guidance.UNAVAILABLE: lambda c: "the EHR could not be reached.",
     Guidance.READ_BACK: lambda c: (
-        f"the EHR changed {c.measured} record(s) the plan did not touch when it was written "
-        f"(a rule on the EHR, not this plan): the read-back caught it, every record the "
-        f"write changed was put back, and nothing of the plan stands. The same call would "
-        f"do the same: ask a pharmacist."
+        f"the EHR changed {c.measured} record(s) the plan did not touch when it was written. "
+        f"A rule on the EHR did that, not this plan. The read-back caught it and every record "
+        f"the write changed was put back, so the chart is as it was. The same call would do "
+        f"the same again, so ask a pharmacist."
         if c.measured
-        else "a write failed part way; what was written was put back, and nothing of the "
-        "plan stands."
+        else "a write failed part way, so what was written was put back. The chart is as it "
+        "was before."
     ),
 }
 
@@ -908,9 +925,11 @@ def feedback_for_error(
         retryable = not found
     elif isinstance(error, StageExpiredError):
         hint = FeedbackHint(kind=Guidance.EXPIRED)
-    elif isinstance(error, SubstrateUnavailableError | SubstrateConfigurationError):
+    elif isinstance(error, SubstrateConfigurationError):
+        hint = FeedbackHint(kind=Guidance.MISCONFIGURED)
+    elif isinstance(error, SubstrateUnavailableError):
         hint = FeedbackHint(kind=Guidance.UNAVAILABLE)
-        retryable = isinstance(error, SubstrateUnavailableError)
+        retryable = True
     elif isinstance(error, StageError):
         hint = FeedbackHint(kind=Guidance.STATEMENT_FAILED)
     elif isinstance(error, InterlockError | sqlite3.Error):

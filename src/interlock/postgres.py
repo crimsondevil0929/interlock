@@ -2058,8 +2058,9 @@ class PostgresSubstrate:
             )
         if sqlstate == _PRIVILEGE:
             return SubstrateConfigurationError(
-                f"the stage's role lacks a privilege a stage needs: {exc}. Grant it DML on "
-                f"the observed tables, and pass it to `interlock install --stage-role`"
+                f"the stage's role lacks a privilege a stage needs: {exc}. Grant it USAGE on "
+                f"the tables' schema and DML on the observed tables, list it in stage_roles, "
+                f"and run `interlock install` again"
             )
         return SubstrateUnavailableError(f"cannot open a stage: {exc}")
 
