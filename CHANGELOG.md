@@ -9,6 +9,38 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-11-06
+
+Documentation, a benchmark and package metadata. No change to the library, and nothing to
+do to upgrade.
+
+### Added
+
+- **`scripts/overhead.py`: what a write costs through Interlock,** on SQLite,
+  PostgreSQL, Git, Kubernetes and FHIR (on the loopback servers in `interlock.sim`) and an
+  outbound request through the outbox and the relay. Each system is timed directly and
+  through the whole path (staged, measured, checked, committed, chained and receipted) in
+  alternating rounds. It counts what each write costs in requests, connections, statements
+  or git processes, so a reader can add their own network's round trip. The README's table
+  replaces "staging roughly doubles write-path round trips".
+
+### Changed
+
+- **The README is the front door.** It opens with how AgentGov, Interlock and Fiduciary fit
+  together, and links to the live console. It keeps the problem, what Interlock measures
+  (now with the four measurement classes T, P, V and R in one table), the lifecycle, the
+  quickstart, what a write costs, and install. It is down from 2,535 lines to about 350.
+- **The rest moved, verbatim,** to `docs/GUIDE.md` (the engine) and `docs/SYSTEMS.md` (each
+  system, the outbox and the daemon). `test_readme_snippets` now runs every Python block in
+  all three files, all 25 of them, as it ran the README's before.
+- **`demo.py` names its five steps "Scenario 1" to "Scenario 5",** not "ACT", as the rest of
+  the stack does since 1.4.2.
+- **The development status is "4 - Beta",** not "5 - Production/Stable": a full test suite
+  and CI against real PostgreSQL, Kubernetes, OpenTofu and FHIR servers, but no external
+  production deployment yet.
+- **The PyPI page links to** the live console, the guide, the repository, the issue tracker
+  and the changelog. 1.4.2 and earlier linked to nothing.
+
 ## [1.4.2] - 2026-11-05
 
 What an agent is told when a plan is refused, in plainer sentences, and a

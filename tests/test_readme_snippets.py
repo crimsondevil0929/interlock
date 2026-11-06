@@ -1,4 +1,4 @@
-"""Execute every Python block in README.md.
+"""Execute every Python block in README.md, and in the guides moved out of it.
 
 A README that cannot be copied and run is a README that has already drifted.
 This module extracts each ``python`` fence, runs it in a scratch directory
@@ -38,6 +38,9 @@ import pytest
 import interlock
 
 README = Path(__file__).resolve().parent.parent / "README.md"
+#: Every file whose Python blocks run here: the README, and the reference moved out of
+#: it into docs/ in 1.4.3, so no example lost its test when it moved.
+DOCS = (README, README.parent / "docs" / "GUIDE.md", README.parent / "docs" / "SYSTEMS.md")
 PACKAGE = "interlock"
 
 _BLOCK = re.compile(
@@ -69,10 +72,11 @@ PROSE_EXEMPT = frozenset(
 class Block:
     """One fenced block, with its directive."""
 
-    def __init__(self, index: int, code: str, directive: str) -> None:
+    def __init__(self, index: int, code: str, directive: str, source: str = "README.md") -> None:
         self.index = index
         self.code = code
         self.directive = directive.strip()
+        self.source = source
 
     @property
     def skipped(self) -> bool:
@@ -88,15 +92,19 @@ class Block:
         return found.group("reason") if found else ""
 
     def __repr__(self) -> str:
-        return f"block#{self.index}"
+        return f"{self.source}#{self.index}"
 
 
 def _blocks() -> list[Block]:
-    text = README.read_text(encoding="utf-8")
-    return [
-        Block(i, m.group("code"), m.group("directive") or "")
-        for i, m in enumerate(_BLOCK.finditer(text))
-    ]
+    found: list[Block] = []
+    for path in DOCS:
+        text = path.read_text(encoding="utf-8")
+        name = path.relative_to(README.parent).as_posix()
+        found.extend(
+            Block(i, m.group("code"), m.group("directive") or "", name)
+            for i, m in enumerate(_BLOCK.finditer(text))
+        )
+    return found
 
 
 BLOCKS = _blocks()
@@ -136,6 +144,17 @@ def test_readme_has_python_blocks() -> None:
     assert BLOCKS, "README.md contains no ```python blocks"
 
 
+def test_every_file_has_python_blocks_and_none_continues_another() -> None:
+    """A guide whose blocks stopped being collected would pass every other test here;
+    and a block that continues one in another file would run in a namespace it never
+    sees."""
+    for path in DOCS:
+        name = path.relative_to(README.parent).as_posix()
+        mine = [b for b in BLOCKS if b.source == name]
+        assert mine, f"{name} contains no ```python blocks"
+        assert not mine[0].continues, f"{mine[0]} continues a block in another file"
+
+
 @pytest.mark.parametrize("block", BLOCKS, ids=repr)
 def test_block_parses(block: Block) -> None:
     """Gate 1: every block is valid Python, including the skipped ones."""
@@ -169,7 +188,7 @@ def test_prose_symbols_resolve() -> None:
     This is the gate that would have caught a README naming a function that
     only ever existed in an unreleased branch.
     """
-    text = README.read_text(encoding="utf-8")
+    text = "\n".join(path.read_text(encoding="utf-8") for path in DOCS)
     unresolved: list[str] = []
     for symbol in sorted(set(_PROSE_SYMBOL.findall(text))):
         if symbol in PROSE_EXEMPT or not _resolves(symbol):
@@ -191,10 +210,12 @@ def test_all_blocks_execute(tmp_path: Path) -> None:
     namespace: dict[str, Any] = {}
     os.chdir(tmp_path)
     try:
+        source = ""
         for block in BLOCKS:
             if block.skipped:
                 continue
-            if not block.continues:
+            if not block.continues or block.source != source:
+                source = block.source
                 namespace = {"__name__": "__readme__"}
                 # Each independent block gets a pristine database, so block
                 # order never becomes a hidden dependency.
@@ -207,7 +228,7 @@ def test_all_blocks_execute(tmp_path: Path) -> None:
                 # module. The input is a file in this repository, reviewed in
                 # the same pull request as the code it documents.
                 exec(  # noqa: S102
-                    compile(block.code, f"README.md::{block}", "exec"), namespace
+                    compile(block.code, f"{block}", "exec"), namespace
                 )
             except Exception as exc:
                 pytest.fail(

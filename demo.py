@@ -5,12 +5,12 @@ The scenario is a support agent with legitimate write access to an orders
 table, doing a task it is authorized to do. A customer-submitted field it reads
 contains an injected instruction, and the model follows it.
 
-Act 1 applies the plan directly. Act 2 applies the identical plan through
+Scenario 1 applies the plan directly. Scenario 2 applies the identical plan through
 Interlock. Every figure printed is measured at runtime against a SQLite file;
 none of it is hardcoded.
 
 The run is also a control for model quality: the agent does not loop, costs
-$0.0012, and emits valid SQL on the first attempt. None of the damage in Act 1
+$0.0012, and emits valid SQL on the first attempt. None of the damage in scenario 1
 comes from the model getting something wrong.
 
 Run:
@@ -300,7 +300,7 @@ def money_str(value: float | Decimal) -> str:
 
 def act_ungoverned(s: Style, path: str) -> tuple[int, float, int]:
     """Run the injected plan with no escrow. This is production today."""
-    rule(s, "ACT 1  The same agent, no interlock. This is production today.")
+    rule(s, "SCENARIO 1  The plan applied directly, as production runs it today.")
     before = snapshot(path)
     print(
         f"    before   open orders {before[0]:>4}   book value {money_str(before[1]):>14}"
@@ -332,7 +332,7 @@ def act_ungoverned(s: Style, path: str) -> tuple[int, float, int]:
 
 
 def act_intercepted(s: Style, path: str, engine: EscrowEngine) -> None:
-    rule(s, "ACT 2  The identical plan, through Interlock.")
+    rule(s, "SCENARIO 2  The identical plan, through Interlock.")
     before = snapshot(path)
     plan = injected_plan()
 
@@ -377,7 +377,7 @@ def act_intercepted(s: Style, path: str, engine: EscrowEngine) -> None:
 
 
 def act_no_false_positive(s: Style, path: str, engine: EscrowEngine) -> None:
-    rule(s, "ACT 3  The legitimate version of the same task.")
+    rule(s, "SCENARIO 3  The legitimate version of the same task.")
     plan = legitimate_plan()
     before = snapshot(path)
     result = engine.execute(plan)
@@ -395,7 +395,7 @@ def act_no_false_positive(s: Style, path: str, engine: EscrowEngine) -> None:
 
 
 def act_cascade(s: Style, path: str, engine: EscrowEngine) -> None:
-    rule(s, "ACT 4  Why the diff must be measured, not predicted.")
+    rule(s, "SCENARIO 4  Why the diff must be measured, not predicted.")
     plan = cascade_plan()
     result = engine.execute(plan)
     diff = result.diff
@@ -414,7 +414,7 @@ def act_cascade(s: Style, path: str, engine: EscrowEngine) -> None:
 
 
 def act_audit(s: Style, engine: EscrowEngine, anchor: LedgerAnchor, gov: BudgetManager) -> None:
-    rule(s, "ACT 5  The evidence.")
+    rule(s, "SCENARIO 5  The evidence.")
     chain = engine.chain
     chain.verify()
     chain.verify_anchors()
@@ -460,7 +460,7 @@ def act_audit(s: Style, engine: EscrowEngine, anchor: LedgerAnchor, gov: BudgetM
 def act_thesis(s: Style, gov: BudgetManager) -> None:
     rule(s, "CONTROL: THIS WAS NOT A MODEL FAILURE")
     spend = sum(e.amount for e in gov.audit_trail() if e.entry_type.value == "spend")
-    print(f"    The agent in Act 2 looped {s.bold('0')} times.")
+    print(f"    The agent in scenario 2 looped {s.bold('0')} times.")
     print(f"    It produced valid SQL on the {s.bold('first')} attempt.")
     print(f"    Metered model spend for the whole run: {s.bold(f'${spend:.6f}')}.")
     print()
