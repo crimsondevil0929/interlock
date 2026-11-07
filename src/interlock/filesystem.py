@@ -81,7 +81,6 @@ from __future__ import annotations
 
 import contextlib
 import difflib
-import fcntl
 import hashlib
 import json
 import logging
@@ -128,6 +127,11 @@ from interlock.types import (
     WindowMeasure,
 )
 from interlock.windows import WindowCharge
+
+try:  # POSIX: the commit lock is an advisory flock on the state directory's lock file
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
 
 __all__ = [
     "COLUMNS",
@@ -639,6 +643,11 @@ class FilesystemSubstrate:
         max_file_bytes: int = 4 * 1024 * 1024,
         max_scan_bytes: int = 1024 * 1024,
     ) -> None:
+        if fcntl is None:  # pragma: no cover - Windows
+            raise SubstrateConfigurationError(
+                "the filesystem substrate needs POSIX file locks (fcntl), which this platform "
+                "does not have"
+            )
         if mode not in COMMIT_MODES:
             raise SubstrateConfigurationError(f"mode is 'in-place' or 'swap', not {mode!r}")
         self._mode = mode
