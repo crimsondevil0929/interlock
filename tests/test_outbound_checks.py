@@ -266,7 +266,7 @@ def test_outbound_count_tells_a_bucketed_count_its_limit_and_the_plans_own_sink(
     eleven = plan_of(*(refund(str(n)) for n in range(11)))
     (told,) = feedback(OutboundCount(per_sink={"payments": 9}), eleven).blocking
     assert (told.measured, told.limit, told.sinks) == ("10-99", "9", ("payments",))
-    assert "the plan enqueues 10-99 outbound request(s) to payments; the limit is 9" in (
+    assert "the plan enqueues 10-99 outbound requests to payments; the limit is 9" in (
         told.render()
     )
 

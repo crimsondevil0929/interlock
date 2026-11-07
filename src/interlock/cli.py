@@ -95,6 +95,7 @@ from interlock.reconcile import (
     reconcile_sqlite,
 )
 from interlock.substrate import SqliteSubstrate
+from interlock.text import tally
 from interlock.wiring import INBOX_KEY_ENV, RELAY_KEY_ENV, live_keyring, trusted_keyring
 from interlock.wiring import RefusedError as _RefusedError
 from interlock.wiring import compactor as _compactor
@@ -444,7 +445,7 @@ def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> No
             record = operator.installed(legacy)
     print(
         f"signed by {operator.name}: the sink registry and the legacy set "
-        f"({record.body['legacy']['rows']} row(s) from before version 4), operator record "
+        f"({tally(record.body['legacy']['rows'], 'row')} from before version 4), operator record "
         f"{record.seq} ({record.record_hash[:16]})",
         file=out,
     )
@@ -454,7 +455,7 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
     if config.plan_bound or config.predicted:
         return _install_plan_bound(config, out)
-    if config.git is not None:
+    if config.git is not None or config.filesystem is not None:
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
@@ -464,14 +465,20 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
             print(f"registered sink: {sink.name} ({_kind(sink)}{operations})", file=out)
         for source in config.inbox.sources:
             print(f"registered inbound source: {source.name} ({source.kind})", file=out)
-        _print_git(config, out)
+        if config.git is not None:
+            _print_git(config, out)
+        else:
+            _print_filesystem(config, out)
         return EXIT_OK, legacy
     if config.substrate != "postgres":
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         install_sqlite_journal(config.database, config.tables)
         legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
-        print(f"installed: journal triggers on {len(config.tables)} table(s): {names}", file=out)
+        print(
+            f"installed: journal triggers on {tally(len(config.tables), 'table')}: {names}",
+            file=out,
+        )
         print("installed: the outbox, the inbox, and WAL mode", file=out)
         for sink in config.sinks:
             operations = ", ".join(op.name for op in sink.operations)
@@ -505,7 +512,7 @@ def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
         raise SubstrateUnavailableError(f"install failed: {exc}") from exc
     except ValueError as exc:
         raise SubstrateConfigurationError(str(exc)) from exc
-    print(f"installed: {len(config.tables)} table(s) in {config.schema}: {names}", file=out)
+    print(f"installed: {tally(len(config.tables), 'table')} in {config.schema}: {names}", file=out)
     for role in config.stage_roles:
         print(f"granted to stage role: {role}", file=out)
     for role in config.audit_roles:
@@ -592,7 +599,10 @@ def _relay(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> in
         threads = [threading.Thread(target=work, args=(r,), name=r.relay_id) for r in relays]
         for thread in threads:
             thread.start()
-        print(f"relaying with {len(threads)} worker(s); stop with SIGTERM or Ctrl-C", file=out)
+        print(
+            f"relaying with {tally(len(threads), 'worker')}; stop with SIGTERM or Ctrl-C",
+            file=out,
+        )
         for thread in threads:
             while thread.is_alive():
                 thread.join(timeout=0.5)
@@ -791,14 +801,14 @@ def _verify(config: InterlockConfig, source: Any, out: TextIO) -> int:
         if checkpoints:
             pruned = len(reader(source).compacted())
             print(
-                f"{len(checkpoints)} checkpoint(s) verify against their signed intents; "
-                f"{pruned} message(s) pruned under them, every tombstone in its fold",
+                f"{tally(len(checkpoints), 'checkpoint')} verified against their signed intents; "
+                f"{tally(pruned, 'message')} pruned under them, every tombstone in its fold",
                 file=out,
             )
         if keys.registered or keys.revoked:
             print(
-                f"{keys.registered} key(s) registered by operators; {keys.revoked} revoked, each "
-                f"held to the seal its operator signed",
+                f"{tally(keys.registered, 'key')} registered by operators; {keys.revoked} revoked, "
+                f"each held to the seal its operator signed",
                 file=out,
             )
         print(
@@ -884,7 +894,7 @@ def _signed(config: InterlockConfig, source: Any, args: argparse.Namespace, out:
                 resolved = operator.resolve()
                 for record in resolved:
                     print(f"record {record.seq}: {record.kind}", file=out)
-                print(f"resolved {len(resolved)} intent(s)", file=out)
+                print(f"resolved {tally(len(resolved), 'intent')}", file=out)
                 return EXIT_OK
             try:
                 outcome = _act(operator, config, args)
@@ -1097,8 +1107,9 @@ def _vacuum(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
         verb = "pruned" if report.outcome == "applied" else "would prune"
         print(
             f"checkpoint {checkpoint.seq} ({checkpoint.digest[:16]}): {verb} "
-            f"{report.messages} message(s), {report.log_rows} log row(s), "
-            f"{report.window_rows} window row(s), {report.inbox_events} inbound event(s)"
+            f"{tally(report.messages, 'message')}, {tally(report.log_rows, 'log row')}, "
+            f"{tally(report.window_rows, 'window row')}, "
+            f"{tally(report.inbox_events, 'inbound event')}"
             + (f"; archived to {report.archive}" if report.archive else ""),
             file=out,
         )
@@ -1214,7 +1225,7 @@ def _inbox_command(config: InterlockConfig, args: argparse.Namespace, out: TextI
             match_window=settings.match_window,
         )
         if args.action == "match":
-            print(f"bound {inbox.match_pending()} event(s) to their deliveries", file=out)
+            print(f"bound {tally(inbox.match_pending(), 'event')} to their deliveries", file=out)
             return EXIT_OK
         missing = sorted(
             f"{s.secret_env} (source {s.name})"
@@ -1312,8 +1323,8 @@ def _inbox_verify(config: InterlockConfig, source: Any, keys: Any, out: TextIO) 
     if report.problems:
         return EXIT_FINDINGS
     print(
-        f"every inbound log verifies: {report.events} event(s), each attested by a registered "
-        f"inbox; {report.facts} fact(s) bound to the deliveries they name"
+        f"every inbound log verifies: {tally(report.events, 'event')}, each attested by a "
+        f"registered inbox; {tally(report.facts, 'fact')} bound to the deliveries they name"
         + ("" if relays is None else ", each attested by a registered relay")
         + f"; {report.consumed} consumed",
         file=out,
@@ -1381,8 +1392,8 @@ def _daemon(config: InterlockConfig, args: argparse.Namespace, out: TextIO) -> i
     for name, status in sorted(report.items()):
         counters = ", ".join(f"{k} {v}" for k, v in sorted(status.counters.items()) if v)
         print(
-            f"{name}: {status.state}, {status.steps} step(s), {status.failures} failure(s)"
-            + (f"; {counters}" if counters else ""),
+            f"{name}: {status.state}, {tally(status.steps, 'step')}, "
+            f"{tally(status.failures, 'failure')}" + (f"; {counters}" if counters else ""),
             file=out,
         )
     taken = report.get("cluster")
@@ -1397,14 +1408,18 @@ def _check(config: InterlockConfig, out: TextIO) -> int:
     if config.plan_bound or config.predicted:
         measured = "plan-bound" if config.plan_bound else "predicted"
         print(
-            f"ok: {config.substrate} ({measured}), {len(config.tables)} observed table(s)",
+            f"ok: {config.substrate} ({measured}), {tally(len(config.tables), 'observed table')}",
             file=out,
         )
         _print_plan_bound(config, out)
         return EXIT_OK
     if config.git is not None:
-        print(f"ok: git, {len(config.tables)} path class(es)", file=out)
+        print(f"ok: git, {tally(len(config.tables), 'path class')}", file=out)
         _print_git(config, out)
+        return EXIT_OK
+    if config.filesystem is not None:
+        print(f"ok: filesystem, {tally(len(config.tables), 'path class')}", file=out)
+        _print_filesystem(config, out)
         return EXIT_OK
     if config.substrate == "postgres":
         report = PostgresSubstrate(
@@ -1415,7 +1430,7 @@ def _check(config: InterlockConfig, out: TextIO) -> int:
         ).check_cascades()
     else:
         report = _sqlite(config).check_cascades()
-    print(f"ok: {config.substrate}, {len(config.tables)} observed table(s)", file=out)
+    print(f"ok: {config.substrate}, {tally(len(config.tables), 'observed table')}", file=out)
     _print_report(report, out)
     return EXIT_OK
 
@@ -1476,7 +1491,9 @@ def _install_plan_bound(config: InterlockConfig, out: TextIO) -> tuple[int, Any]
     system it stages on; its control database, when it has one, gets the
     outbox and inbox."""
     legacy = None
-    if (config.kubernetes is not None or config.fhir is not None) and config.database:
+    if (
+        config.kubernetes is not None or config.fhir is not None or config.rest is not None
+    ) and config.database:
         from interlock.sqlite_outbox import install_sqlite_outbox
 
         legacy = install_sqlite_outbox(config.database, config.sinks, config.inbox.sources)
@@ -1519,6 +1536,23 @@ def _print_plan_bound(config: InterlockConfig, out: TextIO) -> None:
         print(
             f"control database: {config.database or 'none (no outbox, inbox or windows)'}", file=out
         )
+    elif config.rest is not None:
+        settings_rest = config.rest
+        print(f"API: {settings_rest.server}", file=out)
+        for rest_type in settings_rest.resources:
+            tenant = f", tenant {rest_type.tenant}" if rest_type.tenant else ""
+            undo = "deleted" if rest_type.void is None else f"patched {json.dumps(rest_type.void)}"
+            print(
+                f"resource: {rest_type.path} as table {rest_type.table}{tenant}, version from "
+                f"{rest_type.version}, written by {rest_type.write}; undone by being {undo} "
+                f"when created",
+                file=out,
+            )
+        print(f"tenants: {', '.join(settings_rest.tenants) or 'any'}", file=out)
+        print(f"undo journal: {settings_rest.journal}", file=out)
+        print(
+            f"control database: {config.database or 'none (no outbox, inbox or windows)'}", file=out
+        )
     elif config.terraform is not None:
         tf = config.terraform
         print(f"configuration: {tf.directory} ({' '.join(tf.executable)})", file=out)
@@ -1548,6 +1582,29 @@ def _print_git(config: InterlockConfig, out: TextIO) -> None:
     print(f"control database: {control}", file=out)
 
 
+def _print_filesystem(config: InterlockConfig, out: TextIO) -> None:
+    """The directory a filesystem substrate stages on: its mode, classes, hooks and control
+    database (1.5.0)."""
+    from interlock.wiring import open_filesystem
+
+    substrate = open_filesystem(config)
+    settings = config.filesystem
+    assert settings is not None
+    version = substrate.version()
+    at = f", at version {version}" if version else ""
+    print(f"workspace: {substrate.root} ({substrate.mode}{at})", file=out)
+    print(f"files: {len(substrate.files())}", file=out)
+    classes = ", ".join(c.name for c in settings.classes)
+    print(f"path classes: {classes}, other", file=out)
+    if settings.ignore:
+        print(f"ignored: {', '.join(settings.ignore)}", file=out)
+    for hook in settings.hooks:
+        when = ", ".join(hook.when) or "every effect"
+        print(f"hook: {hook.name} ({' '.join(hook.argv)}), after {when}", file=out)
+    control = substrate.control or "none (no outbox, inbox or windows)"
+    print(f"control database: {control}", file=out)
+
+
 def _sqlite(config: InterlockConfig) -> SqliteSubstrate:
     return SqliteSubstrate(
         config.database, tables=config.tables, acknowledge_cascades=config.acknowledge_cascades
@@ -1561,7 +1618,7 @@ def _print_report(report: CascadeReport, out: TextIO) -> None:
         print(f"acknowledged: {reach.describe()}", file=out)
     for table in sorted(report.unreached_acknowledgments):
         print(f"stale acknowledgment: {table} (no cascade reaches it)", file=out)
-    state = "closed" if report.closed else f"open, {len(report.gaps)} acknowledged gap(s)"
+    state = "closed" if report.closed else f"open, {tally(len(report.gaps), 'acknowledged gap')}"
     print(f"cascade closure: {state}", file=out)
 
 

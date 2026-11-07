@@ -73,6 +73,7 @@ from interlock.exceptions import (
 )
 from interlock.planbound import PLAN_BOUND, UndoJournal
 from interlock.substrate import TableSpec
+from interlock.text import tally
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -202,7 +203,7 @@ def _statement(text: str) -> tuple[str, list[tuple[str, str]]]:
     ]
     wanted = 2 if found.group(1) == "set" else 1
     if len(arguments) != wanted:
-        raise ValueError(f"{found.group(1)} takes {wanted} argument(s)")
+        raise ValueError(f"{found.group(1)} takes {tally(wanted, 'argument')}")
     return found.group(1), arguments
 
 

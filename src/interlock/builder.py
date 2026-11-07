@@ -35,6 +35,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from interlock.exceptions import PlanError
+from interlock.text import noun
 from interlock.trace import require_traceparent
 from interlock.types import (
     OUTBOX_TARGET,
@@ -262,7 +263,7 @@ class PlanBuilder:
             unknown = [d for d in after if d not in known]
             if unknown:
                 raise PlanError(
-                    f"after= names effect(s) this builder has not added: "
+                    f"after= names {noun(len(unknown), 'effect')} this builder has not added: "
                     f"{', '.join(map(str, unknown))}"
                 )
             return tuple(after)

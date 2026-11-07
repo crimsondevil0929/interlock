@@ -48,6 +48,7 @@ from decimal import Decimal
 from typing import Any, Final
 
 from interlock.exceptions import OutboundRequestError
+from interlock.text import noun
 from interlock.types import MAX_NOT_AFTER, OutboundRequest, canonical_hash, exact_number
 
 __all__ = [
@@ -640,8 +641,8 @@ def _check_schema(schema: Any, where: str) -> None:
     unknown = sorted(set(schema) - _SCHEMA_KEYWORDS)
     if unknown:
         raise ValueError(
-            f"{where}: unsupported keyword(s) {', '.join(unknown)}; they would be ignored, "
-            f"not enforced"
+            f"{where}: unsupported {noun(len(unknown), 'keyword')} {', '.join(unknown)}: "
+            f"ignored, not enforced"
         )
     kinds = schema.get("type")
     if kinds is not None:

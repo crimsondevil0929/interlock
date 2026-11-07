@@ -809,7 +809,7 @@ def test_keys_are_listed_registered_and_revoked_from_the_command_line(
     assert f"relay-2              {new.key_id}  registered by operator record" in listed
     code, verified = run("outbox", "verify")
     assert code == 0, verified
-    assert "1 key(s) registered by operators; 1 revoked" in verified
+    assert "1 key registered by operators; 1 revoked" in verified
 
 
 # --------------------------------------------------------------------------
@@ -946,7 +946,7 @@ def test_a_reload_rotates_the_relay_and_inbox_keys_while_the_daemon_runs(
     # Everything verifies: the revoked keys' attestations under their seals.
     code, verified = cli(site, "outbox", "verify")
     assert code == 0, verified
-    assert "2 key(s) registered by operators; 2 revoked" in verified
+    assert "2 keys registered by operators; 2 revoked" in verified
     code, verified = cli(site, "inbox", "verify")
     assert code == 0, verified
 
@@ -1033,7 +1033,7 @@ def test_interlock_daemon_reloads_on_sighup(site: Site, tmp_path: Path) -> None:
     assert code == 0, (daemon.lines, daemon.errors)
     assert reloaded == "reloaded: inbox, metrics, relay-0, vacuum"
     (relay,) = [line for line in daemon.lines if line.startswith("relay-0: stopped")]
-    assert "0 failure(s)" in relay and "reloads 1" in relay
+    assert "0 failures" in relay and "reloads 1" in relay
 
 
 def test_a_key_registered_while_a_part_runs_is_trusted_at_its_first_use(

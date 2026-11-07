@@ -84,6 +84,7 @@ from interlock.inbox import INBOUND_DOMAIN
 from interlock.operators import generate_key, load_key
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE
 from interlock.supervisor import AgentContext
+from interlock.text import tally
 from interlock.trace import child_traceparent
 from interlock.types import OutboundRequest
 
@@ -1175,7 +1176,7 @@ def report(run: Run, say: Callable[[str], None]) -> None:
             say(f"    {table}.{column}: {what}; read by {read}")
     say("  the one commitment a sensitive value has (the inbound event to its body's SHA-256):")
     for what, count in sorted(run.commitments.items()):
-        say(f"    {what}: {count} input(s)")
+        say(f"    {what}: {tally(count, 'input')}")
     for unseen in run.unseen:
         say(f"  NOT SEEN: {unseen}")
     for leak in run.leaks:

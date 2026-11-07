@@ -37,8 +37,9 @@ Every adjudication is written to a hash-linked chain, anchored to an AgentGov
 ledger when one is attached. See :mod:`interlock.anchor` for the seam, which is
 read-only by default.
 
-Two substrates, SQLite and PostgreSQL, and a measurement scoped to the tables
-each was configured to observe. ``docs/ESCROW_SPEC.md`` has a conformance
+Substrates for SQL (SQLite and PostgreSQL), a Git branch, a directory, a Kubernetes cluster,
+Terraform or OpenTofu, a FHIR server and any JSON REST API, each measured over what it was
+configured to observe. ``docs/ESCROW_SPEC.md`` has a conformance
 section listing what is implemented, partial and unimplemented; read it before
 putting this in front of a production database.
 """
@@ -96,6 +97,7 @@ from interlock.extension import (
 )
 from interlock.feedback import AgentFeedback, ConstraintFeedback, OperatorEvidence, Refusal
 from interlock.fhir import FhirSubstrate, FhirType
+from interlock.filesystem import FilesystemSubstrate
 from interlock.inbox import (
     InboundSource,
     Inbox,
@@ -154,6 +156,7 @@ from interlock.relay import (
     retry_delay,
 )
 from interlock.repair import DroppedEffect, Repair, RepairFeedback
+from interlock.rest import RestResource, RestSubstrate
 from interlock.runtime import EscrowRuntime
 from interlock.sensors import CommandSensor, FunctionSensor, SensorAttestation, sign_fact
 from interlock.settlement import SettlementReport, Settler, verify_settlements
@@ -203,7 +206,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.4.3"
+__version__ = "1.5.0"
 
 __all__ = [
     "AdmissionError",
@@ -251,6 +254,7 @@ __all__ = [
     "FactAgreement",
     "FhirSubstrate",
     "FhirType",
+    "FilesystemSubstrate",
     "ForbiddenStatementError",
     "FunctionSensor",
     "HttpAdapter",
@@ -317,6 +321,8 @@ __all__ = [
     "RepairFeedback",
     "RequestSum",
     "Requests",
+    "RestResource",
+    "RestSubstrate",
     "RowDelta",
     "RowSum",
     "Rung",

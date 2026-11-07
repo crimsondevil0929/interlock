@@ -402,7 +402,7 @@ def test_the_diff_carries_the_windows_and_the_verdict_replays(outbox: Outbox) ->
         if r.record_type is RecordType.DIFF_COMPUTED and r.plan_id == plan.plan_id
     ]
     assert computed.payload_hash == result.diff.content_hash()
-    assert "1 window key(s)" in computed.note
+    assert "1 window key" in computed.note
     # The verdict replays from the plan and the diff alone.
     replayed = RateWindowCheck(window).check(plan, result.diff)
     assert replayed == result.verdict.blocking

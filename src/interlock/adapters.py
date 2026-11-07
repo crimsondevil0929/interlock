@@ -139,7 +139,7 @@ class HttpAdapter:
         retryable_statuses: frozenset[int] = RETRYABLE_STATUSES,
     ) -> None:
         if not base_url.startswith(("http://", "https://")):
-            raise ValueError(f"an endpoint is an http(s) URL, not {base_url!r}")
+            raise ValueError(f"an endpoint is an http or https URL, not {base_url!r}")
         self._base = base_url.rstrip("/")
         parsed: dict[str, tuple[str, str]] = {}
         for operation, route in routes.items():

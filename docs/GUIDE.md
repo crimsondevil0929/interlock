@@ -740,7 +740,7 @@ print(quote.requested, governor.is_halted("support-agent"))  # 3.44 False
 print(quote.render())
 # Extension requested for support-agent: 3.44000000.
 # Spent 4.60000000 (support-agent 4.60000000); held 0.00000000; 0.40000000 left; ...
-# Proof of work: 0 plan(s) committed (0 rows); declared 3 of 5 tickets done.
+# Proof of work: 0 plans committed (0 rows); declared 3 of 5 tickets done.
 # Estimate: 1.53333333 per unit x 2 remaining = 3.06666667, plus 25% margin = 3.84000000 ...
 
 grant = guard.grant(quote, approved_by="ops@example.com")

@@ -1578,23 +1578,60 @@ class InterlockSupervisor:
             running.opened = False
             running.state = STOPPED
             running.executor.shutdown(wait=False)
+        # The engines and the shared resources close within the same bound. A close
+        # waits on a connection or a lock, so a step still running behind a service's
+        # close can hold it (1.5.0): past the bound, the close is left to finish on its
+        # own thread and the shutdown goes on, rather than wait on it forever.
+        bound = min(CLOSE_GRACE, self._drain) if self._force else self._drain
         if self._engines is not None:
             if self._engine_executor is not None:
                 if engines_idle:
-                    await self._loop.run_in_executor(self._engine_executor, self._engines.close)
+                    closed = self._loop.run_in_executor(self._engine_executor, self._engines.close)
+                    done, _ = await asyncio.wait({closed}, timeout=bound)
+                    if not done:
+                        logger.warning("shutdown: the engines' close did not finish in time")
+                    elif closed.exception() is not None:
+                        logger.error("closing the engines failed", exc_info=closed.exception())
                 else:  # forced: a stage still runs, and is left as a crash leaves it
                     logger.warning("shutdown: the engines are left open to a running stage")
                 self._engine_executor.shutdown(wait=False)
             if self._reader is not None:
                 self._reader.shutdown(wait=False)
-        for close in reversed(self._closers):
-            try:
-                close()
-            except Exception:
-                logger.exception("closing a shared resource failed")
+        if self._closers:
+            await self._close_shared(list(reversed(self._closers)), bound)
         # 8. The node leaves the cluster: its next incarnation, which waits
         # for the node's lock, finds every file this one held closed.
         await self._leave()
+
+    async def _close_shared(self, closers: Sequence[Callable[[], None]], bound: float) -> None:
+        """Run ``closers`` in order on a thread of their own, waiting ``bound`` seconds at most.
+        One that raises is logged and the rest still run; one that is still running at the bound
+        is named, and left to finish after the shutdown returns."""
+        assert self._loop is not None
+        loop = self._loop
+        finished: asyncio.Future[None] = loop.create_future()
+        current: list[str] = [""]
+
+        def settle() -> None:
+            if not finished.done():
+                finished.set_result(None)
+
+        def run() -> None:
+            for close in closers:
+                current[0] = getattr(close, "__qualname__", repr(close))
+                try:
+                    close()
+                except Exception:
+                    logger.exception("closing a shared resource failed")
+            with contextlib.suppress(RuntimeError):  # the loop is gone: nothing to tell
+                loop.call_soon_threadsafe(settle)
+
+        threading.Thread(target=run, name="interlock-close", daemon=True).start()
+        done, _ = await asyncio.wait({finished}, timeout=bound)
+        if not done:
+            logger.warning(
+                "shutdown: closing a shared resource (%s) did not finish in time", current[0]
+            )
 
     async def _drained(self) -> None:
         """Until every queued plan has been taken by a worker, or no worker is

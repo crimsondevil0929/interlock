@@ -1046,6 +1046,37 @@ stops a whole encounter's orders) is caught after the write and undone, never
 refused before it. That is the difference between class V and class P, and why
 the receipt names its class.
 
+*Amended in 1.5.0:* `RestSubstrate` stages any JSON REST API as class V, under E4-11 to
+E4-15 as written. Its scope is a tenant (every observed resource the API lists for the
+tenant the resource names). Its version is an `ETag`, sent back as `If-Match`, or a version
+field, sent back in the body. A created resource is voided by a merge patch the type
+declares (`{"status": "deleted"}`), or deleted when the type declares none: E4-12's "MUST NOT
+delete" binds the clinical records it was written for, and a type opts in to deletion only by
+declaring no void. A change the put-back finds in the scope is the stage's to put back only
+when the API's `source` field names the stage's request; otherwise it is named for a person.
+
+## 4.7 Directory substrates (added in 1.5.0)
+
+A directory is staged as class T: the stage works on a private copy, and the commit lands
+only on the files that were measured.
+
+- **E4-16.** A directory substrate MUST measure a stage's diff from its copy of the
+  workspace (every file a plan or a hook created, changed or removed, by SHA-256 against the
+  base hashed when the stage opened), never from the plan. A path that is absolute, holds
+  `..`, reaches into `.git`, passes through a symbolic link, is ignored, or is a hook's
+  source MUST NOT stage. The substrate's own state MUST NOT be inside the workspace.
+- **E4-17.** The commit MUST hold the workspace's commit lock, and MUST write nothing unless
+  every file the diff touches is at its base hash (in place), or the whole base version is
+  unchanged and still current (swap).
+- **E4-18.** In place, each file MUST be written beside its target and renamed over it, the
+  set journaled durably first. A crash after the journal MUST be finished by recovery when
+  every file is at its before or after state, and left for a person otherwise. A failure
+  while alive MUST put back what was written. Swap MUST switch the workspace with one rename
+  of its link.
+- **E4-19.** Every write's stage MUST be recoverable from a marker the substrate writes
+  (in place) or from the version history (swap), and receipts MUST say
+  `coverage.measurement = "transactional"`.
+
 ---
 
 # 5. Architecture of `interlock` 0.5.0
@@ -1304,6 +1335,11 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-13: nothing written when the scope moved; every update on the version read | Implemented (1.4.0) | the scope read again before the first write; `If-Match: W/"<versionId>"`, `412` a conflict | `test_fhir` |
 | E4-14: read back against the prediction; a difference put back and receipted `compensated` | Implemented (1.4.0; only what landed is put back, 1.4.1; against HAPI FHIR, `test_real_fhir`) | `CompensatedError(discrepancies=)`, `RecordType.COMPENSATED`, `OutcomeStatus.COMPENSATED` (agentgov 1.2.0) | `test_fhir` |
 | E4-15: predicted receipts; the stage's id on every write | Implemented (1.4.0) | `SubstrateCapabilities(measurement="predicted", predicted=True)`; `meta.tag` and `X-Request-Id` | `test_fhir` |
+| E4-11 to E4-15 on any JSON REST API | Implemented (1.5.0) | `RestSubstrate`, `RestResource` (`ETag` or a version field; `If-Match`; merge patches; a tenant's listing as the scope; `source` for whose change it is) | `test_rest` |
+| E4-16: a directory measured from the stage's copy; unsafe paths refused | Implemented (1.5.0) | `FilesystemSubstrate` (`_manifest`, `path_problem`, `ignore`, hook sources) | `test_filesystem` |
+| E4-17: commit only onto the files measured, under the commit lock | Implemented (1.5.0) | `FilesystemSubstrate._verify` (`fcntl` lock; per-file hashes in place, the whole version for swap) | `test_filesystem` |
+| E4-18: rename over each file, journaled; a crash finished, a failure put back; swap in one rename | Implemented (1.5.0) | `_write_in_place`, `_settle`, `_put_back`, `_swap`, `prepare_swap` | `test_filesystem` (a child process killed mid-commit) |
+| E4-19: markers and version history; transactional receipts | Implemented (1.5.0) | `resolve_intent`, `commits/`, `parents/` | `test_filesystem` |
 
 ## Beyond sections 1 to 4
 
@@ -1330,6 +1366,8 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | Sensor facts (1.3.0): analyzers sign facts bound to the measured diff's hash; a pure checker requires a clean one under a pinned key | `sensors` | `test_sensors` |
 | Pinned checker packs (1.3.0): a pack's code loaded only as pinned by module, version and digest | `checker_packs` | `test_checker_packs` |
 | Loopback stand-ins (1.3.0): a Kubernetes API server with admission webhooks and an audit log; a `terraform` command | `sim.kubernetes`, `sim.terraform` | `test_kubernetes`, `test_terraform` |
+| A loopback JSON REST API (1.5.0): ETags, conditional writes, paged lists, automation rules, an audit log | `sim.rest` | `test_rest` |
+| A shutdown bounded throughout (1.5.0): the engines' and shared resources' closes, like the services', end the wait at the drain bound | `supervisor` | `test_supervisor` |
 
 ## Partial
 

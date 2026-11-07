@@ -78,6 +78,7 @@ from interlock.records import (
     anchor_memo,
     check_anchors,
 )
+from interlock.text import tally
 from interlock.types import EffectId, OutboundRequest, outbound_key
 
 if TYPE_CHECKING:
@@ -1147,9 +1148,10 @@ def _verify_operators(
                 )
     if unvouched:
         problems.append(
-            f"{unvouched} operator row(s) from before version 3 carry no authority, and no "
-            f"signed install vouches for the legacy set they are in: they rest on the "
-            f"database's word. Vouch for it with `interlock install`"
+            f"{tally(unvouched, 'operator row')} from before version 3 "
+            f"{'carries' if unvouched == 1 else 'carry'} no authority, and no signed install "
+            f"vouches for the legacy set: it rests on the database's word. Vouch for it with "
+            f"`interlock install`"
         )
     if recorded is not None:
         problems += recorded.vanished(events)

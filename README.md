@@ -23,9 +23,9 @@ uv run python demo.py
     ADJUDICATED by 7 deterministic checks:
       BLOCK   blast_radius          plan would mutate 229 rows, limit is 8
       BLOCK   tenant_isolation      plan spans 4 tenants, limit is 1
-      BLOCK   no_delete             plan deletes 103 row(s) from ungranted table(s): order_audit
+      BLOCK   no_delete             plan deletes 103 rows from ungranted table: order_audit
       BLOCK   column_value_guard    orders.total falls 100.0% (20,925.00 to 0.00), limit is 30%
-      advise  stated_footprint      agent stated 6 row(s); substrate measured 229 (38.2x)
+      advise  stated_footprint      agent stated 6 rows; substrate measured 229 (38.2x)
 
     OUTCOME  ROLLED BACK
       Byte-identical to before the plan ran. Nothing reached disk.
@@ -92,9 +92,9 @@ ways it was:
 
 | Class | Measured | Where | What it rests on |
 |---|---|---|---|
-| **T**, transactional | inside the transaction, before it commits | SQLite, PostgreSQL | the database's own capture of every row the plan touched |
+| **T**, transactional | inside the transaction, before it commits | SQLite, PostgreSQL, a directory | the database's own capture of every row the plan touched; for a directory, every file's hash in the stage's copy, committed only onto the files that were measured |
 | **P**, plan-bound | the system's own plan of the change, applied only if nothing moved | Git (the diff), Kubernetes (the API server's dry run), Terraform (the plan) | the plan applied is the one measured: a compare-and-swap on the head, version or plan file |
-| **V**, predicted and verified | a prediction, written conditionally, then read back | FHIR servers | the read-back: anything that differs from the prediction is put back and receipted `compensated` |
+| **V**, predicted and verified | a prediction, written conditionally, then read back | FHIR servers, JSON REST APIs (ticketing, CRM, HR) | the read-back: anything that differs from the prediction is put back and receipted `compensated` |
 | **R**, request-only | the request itself | outbound API calls through the outbox | the vendor's word: delivery is receipted, and its own log is reconciled against the receipts |
 
 ## Lifecycle

@@ -46,6 +46,7 @@ from interlock.deliveries import (
 )
 from interlock.keys import outcome_ref, revocations_of
 from interlock.records import Keyring
+from interlock.text import tally
 
 __all__ = ["AttestationReport", "attestation_of", "verify_attestations"]
 
@@ -185,9 +186,10 @@ def _verify_attestations(
         attested += 1
     if unvouched and legacy is None:
         problems.append(
-            f"{unvouched} outcome(s) from before version 4 carry no relay attestation, and no "
-            f"signed install vouches for the legacy set they are in: they rest on the "
-            f"database's word. Vouch for it with `interlock install` under [operators]"
+            f"{tally(unvouched, 'outcome')} from before version 4 "
+            f"{'carries' if unvouched == 1 else 'carry'} no relay attestation, and no signed "
+            f"install vouches for the legacy set: it rests on the database's word. Vouch for "
+            f"it with `interlock install` under [operators]"
         )
     problems += recorded.vanished(events)
     return AttestationReport(tuple(problems), attested, counted)

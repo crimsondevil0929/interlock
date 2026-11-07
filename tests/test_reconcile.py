@@ -266,7 +266,7 @@ def test_the_cli_reconciles_sqlite(back_office: str, tmp_path: Path) -> None:
     assert main(args, out=out) == 1
     lines = out.getvalue().splitlines()
     assert lines[1].startswith("UNMEDIATED   #4 update orders pk=600 at ")
-    assert lines[-2:] == ["last entry: 4", "result: FAIL, 1 finding(s)"]
+    assert lines[-2:] == ["last entry: 4", "result: FAIL, 1 finding"]
     assert main([*args, "--after", "4"], out=io.StringIO()) == 0
 
 

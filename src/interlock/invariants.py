@@ -30,6 +30,7 @@ from interlock.outbound_checks import (
     RecipientAllowlist,
     SinkAllowlist,
 )
+from interlock.text import noun, tally
 from interlock.types import (
     PARTITION,
     TENANT,
@@ -215,11 +216,11 @@ class TenantIsolation:
                         invariant=self.name,
                         severity=Severity.BLOCKING,
                         message=(
-                            f"plan changes rows of {len(undeclared)} tenant(s) its effects do "
-                            f"not declare: {', '.join(sorted(undeclared))}"
+                            f"plan changes rows of {tally(len(undeclared), 'tenant')} its effects "
+                            f"do not declare: {', '.join(sorted(undeclared))}"
                             if tenant
                             else f"plan changes rows of {len(undeclared)} {self._dimension} "
-                            f"partition(s) its effects do not declare: "
+                            f"{noun(len(undeclared), 'partition')} its effects do not declare: "
                             f"{', '.join(sorted(undeclared))}"
                         ),
                         evidence={
@@ -335,7 +336,8 @@ class NoDelete:
                 invariant=self.name,
                 severity=Severity.BLOCKING,
                 message=(
-                    f"plan deletes {count} row(s) from ungranted table(s): {', '.join(offenders)}"
+                    f"plan deletes {tally(count, 'row')} from ungranted "
+                    f"{noun(len(offenders), 'table')}: {', '.join(offenders)}"
                 ),
                 evidence={"tables": ",".join(offenders), "rows": str(count)},
             ),
@@ -676,7 +678,9 @@ class TruncationGuard:
                 invariant=self.name,
                 severity=Severity.BLOCKING,
                 message=(
-                    f"{len(unmeasured)} value(s) are known only after the apply, so the diff "
+                    f"{tally(len(unmeasured), 'value')} "
+                    f"{'is' if len(unmeasured) == 1 else 'are'} known only after the apply, so "
+                    f"the diff "
                     f"does not measure them: {table}.{column} of {key} first. Refusing to "
                     f"adjudicate what was not measured"
                 ),
@@ -732,7 +736,7 @@ class StatedFootprint:
                 invariant=self.name,
                 severity=self._severity,
                 message=(
-                    f"agent stated {stated} row(s); substrate measured "
+                    f"agent stated {tally(stated, 'row')}; substrate measured "
                     f"{diff.blast_radius} ({ratio:.1f}x)"
                 ),
                 evidence={

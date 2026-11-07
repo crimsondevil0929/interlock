@@ -796,7 +796,7 @@ def test_the_receipt_commits_to_the_request(pg: Pg) -> None:
     assert set(effect.summary.tables) == {"orders", "interlock.outbox"}
     assert effect.summary.tenants == ("acme",)
     assert any(
-        g.startswith("1 outbound request(s): delivered at least once")
+        g.startswith("1 outbound request: delivered at least once")
         for g in receipt.coverage.known_gaps
     )
     index = log.index_of(receipt.receipt_id)

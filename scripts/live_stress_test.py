@@ -180,6 +180,7 @@ from interlock.signers import HttpRemoteSigner
 from interlock.stripe import PAYMENT_INTENTS_CREATE, REFUNDS_CREATE
 from interlock.supervisor import AgentContext
 from interlock.telemetry import CATALOG
+from interlock.text import tally
 from interlock.trace import child_traceparent, new_traceparent, parse_traceparent, trace_id
 from interlock.types import InboundFact, OutboundRequest, PlanId
 
@@ -2129,7 +2130,7 @@ class Node:
             elif line.startswith(("reloaded:", "reload:")):
                 with self._lock:
                     self.reloads.append(line)
-            elif ": " in line and " step(s), " in line:
+            elif ": " in line and re.search(r" \d+ steps?, \d+ failures?", line):
                 name, _, rest = line.partition(": ")
                 status[name] = rest
         self.statuses[incarnation] = status
@@ -2559,7 +2560,7 @@ def rotate(run: Run) -> None:
     say(
         run.settings,
         f"  {rotation.ended:6.0f}s  the relays' key rotated: {rotation.old} -> {rotation.new}, "
-        f"{len(rotation.reload)} node(s) reloaded; the stale relay "
+        f"{tally(len(rotation.reload), 'node')} reloaded; the stale relay "
         f"{rotation.stale.split(':')[0] or 'did nothing'}",
     )
 
@@ -3147,8 +3148,10 @@ def die(run: Run, how: str) -> DeathReport | None:
             say(
                 run.settings,
                 f"  {time.monotonic() - run.started:6.0f}s  node {node.name} {how}, leading "
-                f"{', '.join(report.led) or 'nothing'}, with {len(report.leases)} lease(s) and "
-                f"{sum(1 for *_, h in report.sessions.values() if h)} session(s) holding locks",
+                f"{', '.join(report.led) or 'nothing'}, with {tally(len(report.leases), 'lease')} "
+                "and "
+                f"{tally(sum(1 for *_, h in report.sessions.values() if h), 'session')} holding "
+                "locks",
             )
             _watch_death(run, conn, node, report)
             if how == "frozen":
@@ -3433,7 +3436,7 @@ def progress(run: Run) -> str:
     up = [n.name for n in run.nodes if n.alive]
     leading = run.watch.leader("vacuum") or "-"
     return (
-        f"  {time.monotonic() - run.started:6.0f}s  {len(up)} node(s) up, vacuum led by "
+        f"  {time.monotonic() - run.started:6.0f}s  {tally(len(up), 'node')} up, vacuum led by "
         f"{leading}  plans {total('interlock_plans_total', outcome='committed'):.0f} committed"
         f" / {total('interlock_plans_total', outcome='refused'):.0f} refused"
         f"  delivered {total('interlock_deliveries_total', sink=SINK, outcome='delivered'):.0f}"
@@ -3613,15 +3616,15 @@ def second(run: Run) -> None:
                 "seconds": took,
                 "recovered": engines[3].get("recovered", 0) if engines else -1,
                 "failed": {
-                    name: rest for name, rest in status.items() if " 0 failure(s)" not in rest
+                    name: rest for name, rest in status.items() if " 0 failures" not in rest
                 },
             }
         )
 
 
 def parse_status(rest: str) -> tuple[str, int, int, dict[str, int]] | None:
-    """A part's line as a stopped daemon prints it: ``stopped, 3 step(s), 0
-    failure(s); committed 12, refused 2``."""
+    """A part's line as a stopped daemon prints it: ``stopped, 3 steps, 0
+    failures; committed 12, refused 2``."""
     head, _, tail = rest.partition("; ")
     parts = head.split(", ")
     if len(parts) != 3:
@@ -4117,9 +4120,9 @@ def ledger_balances(
     claims = governor.pending_claims()
     holds = governor.stale_authorizations(0)
     if claims:
-        problems.append(f"{len(claims)} settlement claim(s) never redeemed")
+        problems.append(f"{tally(len(claims), 'settlement claim')} never redeemed")
     if holds:
-        problems.append(f"{len(holds)} hold(s) left open")
+        problems.append(f"{tally(len(holds), 'hold')} left open")
     memo_plan: dict[str, str] = {}
     for records in evidence.chains.values():
         for record in records:
@@ -4173,7 +4176,7 @@ def ledger_balances(
     all_credits = [a for amounts in credits.values() for a in amounts]
     if len(all_credits) != int(credited) or any(a != CALL_COST for a in all_credits):
         problems.append(
-            f"{len(all_credits)} credit(s) in the ledger, {credited} settled; amounts "
+            f"{tally(len(all_credits), 'credit')} in the ledger, {credited} settled; amounts "
             f"{sorted(set(all_credits))}"
         )
     if int(credited) != run.desk.applied:
@@ -4212,7 +4215,7 @@ def exactly_once(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) ->
     api = run.api
     twice = [k for k, n in api.executions.items() if n > 1]
     if twice:
-        problems.append(f"{len(twice)} idempotency key(s) acted on more than once")
+        problems.append(f"{tally(len(twice), 'idempotency key')} acted on more than once")
     intents = api.of("payment_intent")
     refunds = api.of("refund")
     per_order = Counter(str(i["metadata"].get("order")) for i in intents)
@@ -4225,15 +4228,16 @@ def exactly_once(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) ->
     }
     if set(per_order) != committed:
         problems.append(
-            f"{len(committed - set(per_order))} committed order(s) never charged, "
-            f"{len(set(per_order) - committed)} charge(s) for no committed order"
+            f"{tally(len(committed - set(per_order)), 'committed order')} never charged, "
+            f"{tally(len(set(per_order) - committed), 'charge')} for no committed order"
         )
     per_intent = Counter(str(r["payment_intent"]) for r in refunds)
     if any(n > 1 for n in per_intent.values()):
         problems.append("a payment refunded twice")
     if len(refunds) != run.desk.applied:
         problems.append(
-            f"{len(refunds)} refund(s) made, {run.desk.applied} compensation(s) applied"
+            f"{tally(len(refunds), 'refund')} made, {tally(run.desk.applied, 'compensation')} "
+            "applied"
         )
     states = dict(
         conn.execute("SELECT s.state, count(*) FROM interlock.outbox_state s GROUP BY 1").fetchall()
@@ -4253,7 +4257,7 @@ def exactly_once(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) ->
         " WHERE event = 'delivered' GROUP BY message_id HAVING count(*) > 1) AS d",
     )
     if twice_delivered:
-        problems.append(f"{twice_delivered} message(s) recorded delivered twice")
+        problems.append(f"{tally(twice_delivered, 'message')} recorded delivered twice")
     # A delivery settled without a receipt only when its plan's never could
     # be: the plan in flight on a node that died between its commit and its
     # action receipt, which its commit names and its log does not hold.
@@ -4290,7 +4294,7 @@ def exactly_once(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) ->
         or any(n > 1 for n in per_message.values())
     ):
         problems.append(
-            f"{len(per_message)} message(s) receipted for {delivered} delivered; "
+            f"{tally(len(per_message), 'message')} receipted for {delivered} delivered; "
             f"{unreceipted} settled without one, {len(justified)} of a plan whose action "
             f"receipt its node died before issuing"
         )
@@ -4316,7 +4320,7 @@ def exactly_once(run: Run, evidence: Evidence, conn: psycopg.Connection[Any]) ->
     )
     recorded_twice = sorted(e for e, n in recordings.items() if n > 1)
     if recorded_twice:
-        problems.append(f"{len(recorded_twice)} event(s) recorded more than once")
+        problems.append(f"{tally(len(recorded_twice), 'event')} recorded more than once")
     spread = Counter(s.node for s in answered if s.recorded)
     lost = sum(1 for s in run.vendor.sent if s.status == 0)
     return Claim(
@@ -4533,7 +4537,8 @@ def everything_verifies(
                 chains += len(chain.records())
                 if chain.unresolved_intents():
                     found["escrow chains"].append(
-                        f"{node.name}/{path.name}: {len(chain.unresolved_intents())} intent(s) open"
+                        f"{node.name}/{path.name}: "
+                        f"{tally(len(chain.unresolved_intents()), 'intent')} open"
                     )
             except Exception as exc:
                 found["escrow chains"].append(f"{node.name}/{path.name}: {exc}")
@@ -4543,7 +4548,8 @@ def everything_verifies(
         not problems,
         [
             f"delivery logs, relays' attestations, {len(records)} operator records with their "
-            f"AgentGov anchors, {keys.registered} key(s) registered and {keys.revoked} revoked "
+            f"AgentGov anchors, {tally(keys.registered, 'key')} registered and {keys.revoked} "
+            "revoked "
             f"with the seal its operator signed, settlements against {receipt_count} receipts in "
             f"{len(logs)} nodes' logs, {report.events} inbound events and {report.facts} facts, "
             f"{sum(len(chain_paths(run, n)) for n in run.nodes)} escrow chains ({chains} records) "
@@ -5006,7 +5012,9 @@ def one_leader_at_a_time(run: Run, evidence: Evidence) -> Claim:
         if r.node not in {watch.leader("vacuum", r.at), watch.leader("vacuum", r.at - 1.0)}
     ]
     if misled:
-        problems.append(f"{len(misled)} vacuum run(s) by a node not leading then: {misled[:3]}")
+        problems.append(
+            f"{tally(len(misled), 'vacuum run')} by a node not leading then: {misled[:3]}"
+        )
     by_node = Counter(r.node for r in runs)
     for death in run.deaths:
         if "vacuum" in death.led and "vacuum" not in death.took:
@@ -5142,9 +5150,10 @@ def survived(run: Run, evidence: Evidence, how: str) -> Claim:
         [
             f"node {death.node} (incarnation {death.incarnation}), leading "
             + (", ".join(death.led) or "nothing")
-            + f", {how} with {len(death.leases)} lease(s) in hand, {len(calls)} of them mid-call, "
-            f"{len(death.sessions)} session(s), {transactions} of them holding locks, "
-            f"{len(plans)} plan(s) in flight",
+            + f", {how} with {tally(len(death.leases), 'lease')} in hand, {len(calls)} of them "
+            "mid-call, "
+            f"{tally(len(death.sessions), 'session')}, {transactions} of them holding locks, "
+            f"{tally(len(plans), 'plan')} in flight",
             (
                 f"its node's lock released {lock:.2f}s after it died; its leases taken over "
                 f"{max(death.taken.values(), default=0.0):.2f}s after at most, each call in "
@@ -5170,7 +5179,8 @@ def survived(run: Run, evidence: Evidence, how: str) -> Claim:
             ),
             f"its plans in flight: {len(committed)} committed ({len(recovered_plans)} of them "
             f"by its next incarnation's recovery), {len(plans) - len(committed)} left nothing; it "
-            f"came back {death.back_after:.1f}s after it died and recovered {recovered} intent(s)",
+            f"came back {death.back_after:.1f}s after it died and recovered "
+            f"{tally(recovered, 'intent') if recovered is not None else 'an unknown number'}",
             f"the longest any survivor waited on one of its sessions: {death.blocked:.2f}s; on "
             f"any lock meanwhile: {death.waited:.2f}s",
             *(problems[:6] or ["nothing it held outlived its bound; nothing was done twice"]),

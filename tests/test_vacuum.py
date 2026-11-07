@@ -658,9 +658,9 @@ def test_interlock_vacuum_on_the_command_line(bench: Bench, tmp_path: Path) -> N
     config = _config(outbox, tmp_path, relays=relays)
 
     code, out = _cli("vacuum", "--config", str(config), "--key", str(key), "--dry-run")
-    assert code == 0 and "would prune 3 message(s)" in out
+    assert code == 0 and "would prune 3 messages" in out
     code, out = _cli("vacuum", "--config", str(config), "--key", str(key), "--reason", "monthly")
-    assert code == 0 and "checkpoint 1 (" in out and "pruned 3 message(s)" in out
+    assert code == 0 and "checkpoint 1 (" in out and "pruned 3 messages" in out
     archive = tmp_path / "archive" / "checkpoint-1.jsonl"
     assert f"archived to {archive}" in out
     code, out = _cli("vacuum", "--config", str(config), "--key", str(key))
@@ -669,7 +669,7 @@ def test_interlock_vacuum_on_the_command_line(bench: Bench, tmp_path: Path) -> N
     assert code == 0 and "proves checkpoint 1's pruned history" in out
     code, out = _cli("outbox", "verify", "--config", str(config))
     assert code == 0, out
-    assert "1 checkpoint(s) verify against their signed intents; 3 message(s) pruned" in out
+    assert "1 checkpoint verified against their signed intents; 3 messages pruned" in out
 
     # Refused before anything is signed: no ledger to anchor into, no relay
     # keys to verify with, no operator key.

@@ -27,10 +27,12 @@ if TYPE_CHECKING:
 
     from interlock.config import Endpoint, InterlockConfig, RelayConfig
     from interlock.fhir import FhirSubstrate
+    from interlock.filesystem import FilesystemSubstrate
     from interlock.git_substrate import GitSubstrate
     from interlock.keys import KeyRegistry
     from interlock.kubernetes import KubernetesSubstrate
     from interlock.records import Keyring
+    from interlock.rest import RestSubstrate
     from interlock.sensors import CommandSensor
     from interlock.telemetry import Metrics
     from interlock.terraform import TerraformSubstrate
@@ -48,11 +50,13 @@ __all__ = [
     "live_keyring",
     "open_anchor",
     "open_fhir",
+    "open_filesystem",
     "open_git",
     "open_governor",
     "open_kubernetes",
     "open_ledger",
     "open_receipts",
+    "open_rest",
     "open_sensors",
     "open_signer",
     "open_substrate",
@@ -88,6 +92,10 @@ def open_substrate(
         return open_terraform(config)
     if config.fhir is not None:
         return open_fhir(config, control=dsn or None)
+    if config.filesystem is not None:
+        return open_filesystem(config, control=dsn or None)
+    if config.rest is not None:
+        return open_rest(config, control=dsn or None)
     if config.substrate == "postgres":
         return PostgresSubstrate(
             dsn,
@@ -170,6 +178,58 @@ def open_fhir(config: InterlockConfig, *, control: str | None = None) -> FhirSub
         patients=settings.patients,
         token=settings.token(),
         ca_file=None if settings.ca_file is None else str(settings.ca_file),
+        control=control if control is not None else (config.database or None),
+        timeout=settings.timeout_seconds,
+        max_stage_seconds=config.engine.max_stage_seconds,
+    )
+
+
+def open_filesystem(config: InterlockConfig, *, control: str | None = None) -> FilesystemSubstrate:
+    """The filesystem substrate ``[filesystem]`` names, with its control database ``control``
+    (the file's ``database`` unless given) (1.5.0)."""
+    from interlock.filesystem import FilesystemSubstrate
+
+    settings = config.filesystem
+    if settings is None:
+        raise SubstrateConfigurationError(
+            'the file configures no [filesystem]: substrate = "filesystem"'
+        )
+    return FilesystemSubstrate(
+        settings.root,
+        mode=settings.mode,
+        classes=settings.classes,
+        workspace=settings.workspace,
+        owners=settings.owners,
+        ignore=settings.ignore,
+        hooks=settings.hooks,
+        control=control if control is not None else (config.database or None),
+        state=settings.state,
+        versions=settings.versions,
+        keep_versions=settings.keep_versions,
+        max_stage_seconds=config.engine.max_stage_seconds,
+        max_files=settings.max_files,
+        max_bytes=settings.max_bytes,
+        max_file_bytes=settings.max_file_bytes,
+        max_scan_bytes=settings.max_scan_bytes,
+    )
+
+
+def open_rest(config: InterlockConfig, *, control: str | None = None) -> RestSubstrate:
+    """The REST substrate ``[rest]`` names, with its control database ``control`` (the file's
+    ``database`` unless given), if any (1.5.0)."""
+    from interlock.rest import RestSubstrate
+
+    settings = config.rest
+    if settings is None:
+        raise SubstrateConfigurationError('the file configures no [rest]: substrate = "rest"')
+    return RestSubstrate(
+        settings.server,
+        resources=settings.resources,
+        journal=settings.journal,
+        tenants=settings.tenants,
+        token=settings.token(),
+        ca_file=None if settings.ca_file is None else str(settings.ca_file),
+        request_header=settings.request_header,
         control=control if control is not None else (config.database or None),
         timeout=settings.timeout_seconds,
         max_stage_seconds=config.engine.max_stage_seconds,

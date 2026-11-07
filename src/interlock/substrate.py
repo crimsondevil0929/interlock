@@ -67,6 +67,7 @@ from interlock.sqlite_outbox import (
     trace_stage,
 )
 from interlock.sqlite_outbox import WINDOWS_DDL as _WINDOWS_DDL
+from interlock.text import noun
 from interlock.types import (
     PARTITION,
     TENANT,
@@ -450,7 +451,8 @@ class SqliteSubstrate:
         clash = sorted(acknowledged & self._folded)
         if clash:
             raise ValueError(
-                f"acknowledge_cascades names observed table(s) {', '.join(clash)}; a "
+                f"acknowledge_cascades names observed {noun(len(clash), 'table')} "
+                f"{', '.join(clash)}; a "
                 f"cascade into an observed table is measured, so there is no gap to accept"
             )
         self._acknowledged = acknowledged

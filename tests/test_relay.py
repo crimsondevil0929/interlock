@@ -1376,7 +1376,7 @@ def test_a_relay_process_stops_cleanly_on_sigterm(
         if process.poll() is None:
             process.kill()
     assert process.returncode == 0, err.decode()
-    assert b"relaying with 2 worker(s)" in out
+    assert b"relaying with 2 workers" in out
     assert b"claimed 2: delivered 2" in out
 
 
