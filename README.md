@@ -344,8 +344,9 @@ Apache-2.0: see [LICENSE](LICENSE). To report a vulnerability, see [SECURITY.md]
 - [docs/GUIDE.md](docs/GUIDE.md): the engine in full. Typing, invariants and partitions,
   refusals and repair, rate windows, AgentGov and Fiduciary, receipts, recovery, extension
   quotes, and [what Interlock does and does not claim](docs/GUIDE.md#scope).
-- [docs/SYSTEMS.md](docs/SYSTEMS.md): each system it stages on (PostgreSQL, Git, Kubernetes
-  and Terraform, FHIR), outbound requests through the outbox, and the daemon.
+- [docs/SYSTEMS.md](docs/SYSTEMS.md): each system it stages on (PostgreSQL, Git, a directory,
+  Kubernetes and Terraform, FHIR, any JSON REST API), outbound requests through the outbox, and
+  the daemon.
 - [docs/ESCROW_SPEC.md](docs/ESCROW_SPEC.md): the specification, with every requirement
   traced to its tests. [docs/OUTBOX_DESIGN.md](docs/OUTBOX_DESIGN.md) and the `EPIC*_DESIGN`
   documents record how each part was designed.

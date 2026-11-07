@@ -822,9 +822,12 @@ anyone who can write the file.
 
 ## Scope
 
-**Two substrates: SQLite and PostgreSQL.** One connector at the row-level-diff standard is
-worth more than several reporting only row counts, because a row count is the summary this
-design exists to replace.
+**Substrates, each at the measurement class it can honestly claim.** SQLite and PostgreSQL,
+a Git branch and a directory are transactional (T); Kubernetes and Terraform are plan-bound
+(P); a FHIR server and any JSON REST API with versions are predicted and verified (V); an
+outbound request is request-only (R). Every one measures at the row-level-diff standard: one
+row, file, object or record per change, never a count reported by the system. A row count is
+the summary this design exists to replace. See [SYSTEMS.md](SYSTEMS.md) for each.
 
 ### What this is not yet a boundary against
 
