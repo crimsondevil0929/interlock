@@ -532,9 +532,9 @@ def test_a_rule_that_changes_more_than_the_plan_is_put_back(
     assert result is not None and result.state is StageState.COMPENSATED  # type: ignore[attr-defined]
     told = found.feedback.render() if isinstance(found.feedback, AgentFeedback) else ""
     assert told.startswith("The plan was admitted and written, then put back")
-    assert "put_back: the EHR changed 2-9 record(s) the plan did not touch" in told
+    assert "put_back: the EHR changed 2-9 records the plan did not touch" in told
     assert "ch-2c8e04" not in told and "lisinopril" not in told, "counts, never values"
-    assert "read-back not as predicted (3 discrepancy(ies)" in run.chain.records()[-1].note
+    assert "read-back not as predicted (3 discrepancies" in run.chain.records()[-1].note
     receipt = found.receipt
     assert isinstance(receipt, ActionReceipt)
     assert receipt.outcome.status is OutcomeStatus.COMPENSATED
@@ -624,7 +624,7 @@ def test_someone_elses_change_is_named_and_never_put_back(
         return original(stage)
 
     sub._discrepancies = nurse_edits_meanwhile  # type: ignore[method-assign]
-    with pytest.raises(CompensatedError, match="left as they are, for a person") as caught:
+    with pytest.raises(CompensatedError, match="left as it is, for a person") as caught:
         engine(sub, tmp_path).execute(plan(patch("2", {"status": "on-hold"})))
     assert "MedicationRequest/3" in str(caught.value)
     assert statuses(server)["2"] == "active", "the plan's own write is put back"

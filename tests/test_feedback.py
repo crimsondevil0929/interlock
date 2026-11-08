@@ -371,7 +371,7 @@ def test_an_advisory_rides_on_a_committed_plan() -> None:
     assert fb.outcome == "committed"
     (c,) = fb.constraints
     assert not c.blocking
-    assert c.render() == "stated_footprint: the plan stated 1 row(s); the database measured 10-99."
+    assert c.render() == "stated_footprint: the plan stated 1 row; the database measured 10-99."
 
 
 def test_constraints_are_ordered_canonically_and_duplicates_collapse() -> None:

@@ -66,7 +66,8 @@ def test_the_database_comes_from_the_flag_then_the_environment_then_the_file(
         ("substrate = ", "not valid TOML"),
         (
             'substrate = "mysql"\n' + GOOD.split("\n", 2)[2],
-            "'sqlite', 'postgres', 'git', 'kubernetes', 'terraform' or 'fhir'",
+            "'sqlite', 'postgres', 'git', 'filesystem', 'kubernetes', 'terraform', 'fhir' "
+            "or 'rest'",
         ),
         ('substrate = "sqlite"\n[[tables]]\nname = "t"\ncolumns = ["id"]\n', "no database"),
         ('database = "x.db"\n', "no \\[\\[tables\\]\\]"),
@@ -120,14 +121,14 @@ def test_the_cli_on_sqlite(back_office: str, tmp_path: Path) -> None:
     )
     out = io.StringIO()
     assert main(["install", "--config", str(config)], out=out) == 0
-    assert out.getvalue().startswith("installed: journal triggers on 1 table(s): order_items")
+    assert out.getvalue().startswith("installed: journal triggers on 1 table: order_items")
     out = io.StringIO()
     assert main(["check", "--config", str(config)], out=out) == 0
     assert out.getvalue().splitlines() == [
-        "ok: sqlite, 1 observed table(s)",
+        "ok: sqlite, 1 observed table",
         "acknowledged: DELETE on order_items reaches refunds: "
         "order_items -[ON DELETE CASCADE]-> refunds",
-        "cascade closure: open, 1 acknowledged gap(s)",
+        "cascade closure: open, 1 acknowledged gap",
     ]
     missing = write(tmp_path, GOOD.replace('"postgres"', '"sqlite"'))
     assert main(["check", "--config", str(missing), "--database", str(tmp_path / "no.db")]) == 4
@@ -353,7 +354,7 @@ def test_keys_at_a_signing_service_load(tmp_path: Path) -> None:
     ("replace", "message"),
     [
         (('type = "http"\nurl = "https://kms', 'type = "aws"\nurl = "https://kms'), "'http'"),
-        (("https://kms.internal:8443", "ftp://kms.internal"), r"http\(s\)"),
+        (("https://kms.internal:8443", "ftp://kms.internal"), r"http://host\[:port\] or https"),
         (("version = 3", "version = 0"), "positive integer"),
         (("version = 3", "version = 3\nregion = 'eu'"), r"\[signers.relay-kms\]: unknown key"),
         (('signer = "relay-kms"', 'signer = "nobody"'), r"names no \[signers.nobody\]"),

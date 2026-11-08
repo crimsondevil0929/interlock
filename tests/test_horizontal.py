@@ -200,7 +200,7 @@ def test_isolation_holds_a_plan_to_one_patients_chart() -> None:
     )
     spans, undeclared = check.check(plan, _diff(*rows))
     assert spans.message == "plan spans 2 patient partitions, limit is 1"
-    assert "1 patient partition(s) its effects do not declare: p-2" in undeclared.message
+    assert "1 patient partition its effects do not declare: p-2" in undeclared.message
     feedback = sanitize(
         check.hint(plan, _diff(*rows), undeclared), plan, blocking=True, trusted=True
     )

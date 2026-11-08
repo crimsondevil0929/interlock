@@ -37,6 +37,7 @@ from agentgov.receipts.canonical import canonical_bytes
 from agentgov.receipts.signing import Keyring, Signer, Verifier, parse_key
 
 from interlock.exceptions import StageError
+from interlock.text import tally
 from interlock.types import (
     EffectDiff,
     EffectPlan,
@@ -336,7 +337,7 @@ class SensorAttestation:
             if fact.verdict != "pass":
                 return (
                     self._violation(
-                        f"sensor {self._sensor} found {fact.findings} problem(s) in this "
+                        f"sensor {self._sensor} found {tally(fact.findings, 'problem')} in this "
                         f"diff (report {fact.detail[:12]})",
                         {
                             "sensor": self._sensor,

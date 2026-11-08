@@ -62,6 +62,7 @@ from interlock.exceptions import (
     SubstrateUnavailableError,
     UncompensatableEffectError,
 )
+from interlock.text import tally
 from interlock.types import (
     PARTITION,
     TENANT,
@@ -479,8 +480,8 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     ),
     # For this kind ``limit`` carries the plan's own stated count.
     Guidance.STATED_FOOTPRINT: lambda c: (
-        f"the plan stated {c.limit or 'a number of'} row(s); the database measured "
-        f"{c.measured or 'more'}."
+        f"the plan stated {tally(c.limit, 'row') if c.limit else 'a number of rows'}; the "
+        f"database measured {c.measured or 'more'}."
     ),
     Guidance.SCHEMA_CHANGE: lambda c: (
         "an effect is declared as a schema change, which cannot be staged."
@@ -508,7 +509,8 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
     Guidance.CONFLICT: lambda c: "another writer holds the rows the plan needs.",
     Guidance.EXPIRED: lambda c: "the plan took longer than a stage allows. Split the work.",
     Guidance.READ_BACK: lambda c: (
-        f"after the write, the system held {c.measured} change(s) the plan did not predict, "
+        f"after the write, the system held {tally(c.measured or 0, 'change')} the plan did not "
+        f"predict, "
         f"so everything the write changed was put back. The system is as it was before."
         if c.measured
         else "a write failed part way, so what was written was put back. The system is as it "
@@ -546,7 +548,8 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         f"a request to {_sinks(c)} uses a sink or operation this plan may not call."
     ),
     Guidance.OUTBOUND_COUNT: lambda c: (
-        f"the plan enqueues {c.measured or 'too many'} outbound request(s)"
+        "the plan enqueues "
+        + (tally(c.measured, "outbound request") if c.measured else "too many outbound requests")
         + (f" to {_sinks(c)}" if c.sinks else "")
         + f"; the limit is {c.limit or 'lower'}. Split the work."
     ),
@@ -599,8 +602,8 @@ _GIT: Final[Mapping[Guidance, Any]] = {
         f"Split the work."
     ),
     Guidance.STATED_FOOTPRINT: lambda c: (
-        f"the plan stated {c.limit or 'a number of'} file(s); the repository measured "
-        f"{c.measured or 'more'}, counting the files its hooks wrote."
+        f"the plan stated {tally(c.limit, 'file') if c.limit else 'a number of files'}; the "
+        f"repository measured {c.measured or 'more'}, counting the files its hooks wrote."
     ),
     Guidance.STATEMENT_KIND: lambda c: (
         "a statement is not one this repository stages: write, replace, delete, mode, patch "
@@ -635,8 +638,8 @@ _FHIR: Final[Mapping[Guidance, Any]] = {
     ),
     Guidance.TABLE_SCOPE: lambda c: _outside(c, did="writes records of", kind="resource type"),
     Guidance.STATED_FOOTPRINT: lambda c: (
-        f"the plan stated {c.limit or 'a number of'} record(s); the EHR's records predict "
-        f"{c.measured or 'more'}."
+        f"the plan stated {tally(c.limit, 'record') if c.limit else 'a number of records'}; the "
+        f"EHR's records predict {c.measured or 'more'}."
     ),
     Guidance.STATEMENT_KIND: lambda c: (
         "a write is not one this EHR stages: create from a template, patch an order, or pin "
@@ -652,7 +655,8 @@ _FHIR: Final[Mapping[Guidance, Any]] = {
     ),
     Guidance.UNAVAILABLE: lambda c: "the EHR could not be reached.",
     Guidance.READ_BACK: lambda c: (
-        f"the EHR changed {c.measured} record(s) the plan did not touch when it was written. "
+        f"the EHR changed {tally(c.measured or 0, 'record')} the plan did not touch when it was "
+        f"written. "
         f"A rule on the EHR did that, not this plan. The read-back caught it and every record "
         f"the write changed was put back, so the chart is as it was. The same call would do "
         f"the same again, so ask a pharmacist."
@@ -662,7 +666,83 @@ _FHIR: Final[Mapping[Guidance, Any]] = {
     ),
 }
 
-_NOUNS: Final[Mapping[str, Mapping[Guidance, Any]]] = {"git": _GIT, "fhir": _FHIR}
+_FILES: Final[Mapping[Guidance, Any]] = {
+    **_GIT,
+    Guidance.ROW_LIMIT: lambda c: (
+        f"the plan changes {c.measured or 'too many'} files, counting the files the workspace's "
+        f"hooks wrote; the limit is {c.limit or 'lower'}. Change fewer files, or split the work."
+    ),
+    Guidance.STATED_FOOTPRINT: lambda c: (
+        f"the plan stated {tally(c.limit, 'file') if c.limit else 'a number of files'}; the "
+        f"workspace measured {c.measured or 'more'}, counting the files its hooks wrote."
+    ),
+    Guidance.STATEMENT_KIND: lambda c: (
+        "a statement is not one this workspace stages: write, append, replace, delete, move, "
+        "mode or expect-hash, on a path inside the workspace that is not ignored, passes "
+        "through no link, and is no hook's source."
+    ),
+    Guidance.STATEMENT_FAILED: lambda c: (
+        "an edit could not be made in the workspace: a replace whose text is not there exactly "
+        "once, a file that is not there, a move onto a file that exists, or a hook that failed."
+    ),
+    Guidance.CONFLICT: lambda c: (
+        "a file the plan changes was edited in the workspace after the plan read it; nothing "
+        "was written. Read the file again before planning."
+    ),
+    Guidance.UNAVAILABLE: lambda c: "the workspace could not be read.",
+}
+"""A directory's nouns (1.5.0): files and path classes, as Git's, in a workspace."""
+
+_REST: Final[Mapping[Guidance, Any]] = {
+    Guidance.ROW_LIMIT: lambda c: (
+        f"the plan changes {c.measured or 'too many'} records; the limit is "
+        f"{c.limit or 'lower'}. Change fewer records, or split the work."
+    ),
+    Guidance.TENANT_SCOPE: lambda c: (
+        f"the plan reaches records of more accounts than allowed "
+        f"(at most {c.limit or 'a set number'}); the session's account is {_tenants(c)}. "
+        f"Confine the plan to the session's own account."
+    ),
+    Guidance.UNDECLARED_TENANT: lambda c: (
+        f"the plan writes records of an account other than the session's; the session's "
+        f"account is {_tenants(c)}. Confine the plan to the session's own account."
+    ),
+    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="writes records of", kind="resource type"),
+    Guidance.STATED_FOOTPRINT: lambda c: (
+        f"the plan stated {tally(c.limit, 'record') if c.limit else 'a number of records'}; the "
+        f"API's records predict {c.measured or 'more'}."
+    ),
+    Guidance.STATEMENT_KIND: lambda c: (
+        "a write is not one this API stages: create from a template, patch a record, or pin "
+        "its version, each declaring how it is undone."
+    ),
+    Guidance.STATEMENT_FAILED: lambda c: (
+        "the API could not stage the write: a record that is not there, or one in an account "
+        "the plan may not write."
+    ),
+    Guidance.CONFLICT: lambda c: (
+        "a record changed after the plan read it (someone else edited it): nothing was "
+        "written. Read the record again before planning."
+    ),
+    Guidance.UNAVAILABLE: lambda c: "the API could not be reached.",
+    Guidance.READ_BACK: lambda c: (
+        f"the system changed {tally(c.measured or 0, 'record')} the plan did not touch when it "
+        f"was written. An automation in the system did that, not this plan. The read-back "
+        f"caught it and every record the write changed was put back, so the account is as it "
+        f"was. The same call would set the automation off again, so ask a person."
+        if c.measured
+        else "a write failed part way, so what was written was put back. The records are as "
+        "they were before."
+    ),
+}
+"""A REST API's nouns (1.5.0): records, accounts and automations."""
+
+_NOUNS: Final[Mapping[str, Mapping[Guidance, Any]]] = {
+    "git": _GIT,
+    "fhir": _FHIR,
+    "filesystem": _FILES,
+    "rest": _REST,
+}
 """Each substrate whose nouns are not SQL's, and the templates it says them in.
 A kind it does not name keeps the SQL template."""
 

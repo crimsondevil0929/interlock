@@ -304,7 +304,7 @@ class StripeAdapter:
         a callable is asked on every call, for a key that rotates.
     :param base_url: Stripe's API. A test points it at a fake.
     :param version: The ``Stripe-Version`` every call pins.
-    :raises ValueError: On a URL that is not http(s), or no key.
+    :raises ValueError: On a URL that is not http or https, or no key.
     """
 
     __slots__ = ("_base", "_key", "_version")
@@ -317,7 +317,7 @@ class StripeAdapter:
         version: str = STRIPE_VERSION,
     ) -> None:
         if not base_url.startswith(("http://", "https://")):
-            raise ValueError(f"an endpoint is an http(s) URL, not {base_url!r}")
+            raise ValueError(f"an endpoint is an http or https URL, not {base_url!r}")
         if not api_key:
             raise ValueError("a Stripe adapter needs the account's secret key")
         self._base = base_url.rstrip("/")

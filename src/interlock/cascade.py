@@ -247,7 +247,8 @@ class CascadeReport:
         unobserved = sorted({r.table for r in self.gated if _fold(r.parent) == key})
         return (
             f"{what} on {table!r} is refused: a foreign-key action carries it into "
-            f"unobserved table(s) where it would execute without being measured ({found}). "
+            f"{'an unobserved table' if len(unobserved) == 1 else 'unobserved tables'} where it "
+            f"would execute without being measured ({found}). "
             f"Observe {', '.join(unobserved) or 'the reached table'} with a TableSpec, or "
             f"accept the unmeasured write with acknowledge_cascades"
         )

@@ -550,7 +550,7 @@ def test_version_4_over_version_3_on_sqlite(tmp_path: Path) -> None:
         assert recorded is not None and len(recorded) == 2
         # Until a signed install vouches for it, it rests on the database's word.
         (unvouched,) = verify_attestations(operator, RELAYS).problems
-        assert "2 outcome(s) from before version 4" in unvouched
+        assert "2 outcomes from before version 4" in unvouched
         assert "no signed install vouches" in unvouched
         vouched = vouch(operator, tmp_path / "operators.ilok1")
         assert (vouched.rows, vouched.digest) == (2, recorded.digest)
@@ -765,8 +765,8 @@ def test_a_legacy_set_edited_after_its_vouch_is_named_and_never_vouched_again(
     report = verify_attestations(outbox.operator(), RELAYS, legacy=vouched)
     (found,) = report.problems
     assert found == (
-        f"the legacy set (1 row(s)) is not the one operator record {vouched.record} vouched "
-        f"for (0 row(s)): it was edited around Interlock"
+        f"the legacy set (1 row) is not the one operator record {vouched.record} vouched "
+        f"for (0 rows): it was edited around Interlock"
     )
     assert report.legacy == 0
     with pytest.raises(OperatorRefusedError, match="is not the one operator record 1"):
@@ -831,7 +831,7 @@ def test_install_signs_the_legacy_set_and_verify_holds_the_database_to_it(
     monkeypatch.setenv("INTERLOCK_OPERATOR_KEY", str(tmp_path / "ops.key"))
     code, out = cli("install", "--config", str(path))
     assert code == 0
-    assert "signed by ops: the sink registry and the legacy set (0 row(s)" in out
+    assert "signed by ops: the sink registry and the legacy set (0 rows" in out
     code, out = cli("outbox", "verify", "--config", str(path))
     assert code == 0 and "every outcome is attested by a registered relay (0)" in out
 
@@ -846,7 +846,7 @@ def test_install_signs_the_legacy_set_and_verify_holds_the_database_to_it(
         owner.close()
     code, out = cli("outbox", "verify", "--config", str(path))
     assert code == 1
-    assert "the legacy set (1 row(s)) is not the one operator record 1 vouched for" in out
+    assert "the legacy set (1 row) is not the one operator record 1 vouched for" in out
     assert out.count("is not the one operator record 1 vouched for") == 1
     # And no install will vouch for it now.
     code, _ = cli("install", "--config", str(path))

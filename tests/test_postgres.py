@@ -57,6 +57,7 @@ from interlock.exceptions import (  # noqa: E402
     SubstrateUnavailableError,
 )
 from interlock.postgres import install  # noqa: E402
+from interlock.text import tally  # noqa: E402
 from interlock.types import Effect, EffectPlan  # noqa: E402
 from tests.conftest import OBSERVED, PASSWORD, Pg, create_role, drop_role  # noqa: E402
 from tests.schemas import specs  # noqa: E402
@@ -886,15 +887,15 @@ def test_the_cli_installs_and_checks(pg: Pg, tmp_path: Path) -> None:
     out = io.StringIO()
     assert main(["install", "--config", str(config), "--database", pg.admin], out=out) == 0
     text = out.getvalue()
-    assert f"installed: {len(OBSERVED)} table(s) in public" in text
+    assert f"installed: {tally(len(OBSERVED), 'table')} in public" in text
     assert f"granted to stage role: {pg.role}" in text
     assert "acknowledged: DELETE on shipments reaches shipment_events" in text
     assert "refused:      DELETE on accounts reaches ledger_entries" in text
-    assert "cascade closure: open, 1 acknowledged gap(s)" in text
+    assert "cascade closure: open, 1 acknowledged gap" in text
 
     out = io.StringIO()
     assert main(["check", "--config", str(config), "--database", pg.agent], out=out) == 0
-    assert out.getvalue().startswith(f"ok: postgres, {len(OBSERVED)} observed table(s)")
+    assert out.getvalue().startswith(f"ok: postgres, {tally(len(OBSERVED), 'observed table')}")
 
 
 def test_the_cli_exit_codes(pg: Pg, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

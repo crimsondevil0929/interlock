@@ -740,7 +740,7 @@ print(quote.requested, governor.is_halted("support-agent"))  # 3.44 False
 print(quote.render())
 # Extension requested for support-agent: 3.44000000.
 # Spent 4.60000000 (support-agent 4.60000000); held 0.00000000; 0.40000000 left; ...
-# Proof of work: 0 plan(s) committed (0 rows); declared 3 of 5 tickets done.
+# Proof of work: 0 plans committed (0 rows); declared 3 of 5 tickets done.
 # Estimate: 1.53333333 per unit x 2 remaining = 3.06666667, plus 25% margin = 3.84000000 ...
 
 grant = guard.grant(quote, approved_by="ops@example.com")
@@ -822,9 +822,12 @@ anyone who can write the file.
 
 ## Scope
 
-**Two substrates: SQLite and PostgreSQL.** One connector at the row-level-diff standard is
-worth more than several reporting only row counts, because a row count is the summary this
-design exists to replace.
+**Substrates, each at the measurement class it can honestly claim.** SQLite and PostgreSQL,
+a Git branch and a directory are transactional (T); Kubernetes and Terraform are plan-bound
+(P); a FHIR server and any JSON REST API with versions are predicted and verified (V); an
+outbound request is request-only (R). Every one measures at the row-level-diff standard: one
+row, file, object or record per change, never a count reported by the system. A row count is
+the summary this design exists to replace. See [SYSTEMS.md](SYSTEMS.md) for each.
 
 ### What this is not yet a boundary against
 

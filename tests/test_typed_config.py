@@ -153,7 +153,7 @@ def test_a_typed_sink_takes_its_kinds_operations(tmp_path: Path) -> None:
             "for a stripe sink",
         ),
         (lambda t: t.replace('secret_env = "TEST_STRIPE_KEY"\n', ""), "missing 'secret_env'"),
-        (lambda t: t.replace('url = "{stripe}"', 'url = "ftp://x"'), r"http\(s\) URL"),
+        (lambda t: t.replace('url = "{stripe}"', 'url = "ftp://x"'), r"an http or https URL"),
     ],
 )
 def test_a_typed_sink_is_configured_as_its_kind_allows(
@@ -294,4 +294,4 @@ def test_the_relay_command_delivers_to_stripe_and_sendgrid(
     code, out = cli("outbox", "verify", "--config", str(path))
     assert code == 0 and "every operator action is signed" in out
     code, out = cli("outbox", "resolve", "--config", str(path))
-    assert (code, out.strip()) == (0, "resolved 0 intent(s)")
+    assert (code, out.strip()) == (0, "resolved 0 intents")

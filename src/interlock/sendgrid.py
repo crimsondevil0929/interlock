@@ -184,7 +184,7 @@ class SendGridAdapter:
         self, api_key: str | Callable[[], str], *, base_url: str = API, sandbox: bool = False
     ) -> None:
         if not base_url.startswith(("http://", "https://")):
-            raise ValueError(f"an endpoint is an http(s) URL, not {base_url!r}")
+            raise ValueError(f"an endpoint is an http or https URL, not {base_url!r}")
         if not api_key:
             raise ValueError("a SendGrid adapter needs an API key")
         self._base = base_url.rstrip("/")

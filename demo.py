@@ -52,6 +52,7 @@ from interlock import (
     TruncationGuard,
 )
 from interlock.chain import RecordType
+from interlock.text import tally
 
 # --------------------------------------------------------------------------
 # A small but realistic production schema
@@ -438,7 +439,7 @@ def act_audit(s: Style, engine: EscrowEngine, anchor: LedgerAnchor, gov: BudgetM
     print()
 
     blocked = [r for r in chain.records() if r.record_type is RecordType.ABORTED]
-    print(f"    {len(blocked)} refusal(s) recorded, each with the diff hash it refused:")
+    print(f"    {tally(len(blocked), 'refusal')} recorded, each with the diff hash it refused:")
     for record in blocked:
         print(s.dim(f"      seq={record.sequence:>2} {record.note[:66]}"))
 

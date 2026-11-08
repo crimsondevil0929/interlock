@@ -93,6 +93,7 @@ from interlock.outbox_sql import (
 )
 from interlock.substrate import TableSpec, _verb_reason, leading_verb
 from interlock.telemetry import Metrics, NullMetrics
+from interlock.text import noun
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -1008,7 +1009,8 @@ class PostgresSubstrate:
         clash = sorted(acknowledged & self._folded)
         if clash:
             raise ValueError(
-                f"acknowledge_cascades names observed table(s) {', '.join(clash)}; a "
+                f"acknowledge_cascades names observed {noun(len(clash), 'table')} "
+                f"{', '.join(clash)}; a "
                 f"cascade into an observed table is measured, so there is no gap to accept"
             )
         self._acknowledged = acknowledged
@@ -1993,7 +1995,7 @@ class PostgresSubstrate:
         ).fetchall()
         if owned:
             raise SubstrateConfigurationError(
-                f"the stage's role ({roles}) owns observed table(s) "
+                f"the stage's role ({roles}) owns observed {noun(len(owned), 'table')} "
                 f"{', '.join(str(r[0]) for r in owned)}; an owner can disable the capture "
                 f"trigger. Stage as a role granted DML on them, not their owner"
             )
@@ -2032,7 +2034,8 @@ class PostgresSubstrate:
         ).fetchall()
         if internal:
             raise SubstrateConfigurationError(
-                f"the stage's role ({roles}) can write Interlock's own table(s) "
+                f"the stage's role ({roles}) can write Interlock's own "
+                f"{noun(len(internal), 'table')} "
                 f"{', '.join('interlock.' + str(r[0]) for r in internal)}; a stage writes "
                 f"them only through the installed functions, which check its token. Revoke "
                 f"the grant"
@@ -2043,7 +2046,7 @@ class PostgresSubstrate:
                 for schema, name in ((str(r[0]), str(r[1])) for r in writable)
             )
             raise SubstrateConfigurationError(
-                f"the stage's role ({roles}) can write table(s) outside the observed set: "
+                f"the stage's role ({roles}) can write tables outside the observed set: "
                 f"{names}. On PostgreSQL the grant is the table boundary; a write there "
                 f"would execute and measure as nothing. Revoke it, observe the table, or "
                 f"pass enforce_table_access=False to trust the grants unchecked"

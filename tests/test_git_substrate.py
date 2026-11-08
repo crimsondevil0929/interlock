@@ -1182,7 +1182,7 @@ def test_the_agent_is_told_about_files_not_rows(repo: Repo) -> None:
     assert cascade.feedback is not None
     told = cascade.feedback.render()
     assert "files, counting the ones the repository's hooks wrote; the limit is 10" in told
-    assert "the plan stated 1 file(s); the repository measured" in told
+    assert "the plan stated 1 file; the repository measured" in told
     assert "rows" not in told and "WHERE" not in told and "database" not in told
     workflow = built.execute(edit("workflows", "write '.github/workflows/release.yml' 'x'").build())
     assert workflow.feedback is not None
@@ -1308,7 +1308,8 @@ def test_a_git_substrate_is_configured_in_interlock_toml(repo: Repo) -> None:
         ),
         (
             'substrate = "svn"\ndatabase = "c.db"\n',
-            "'sqlite', 'postgres', 'git', 'kubernetes', 'terraform' or 'fhir'",
+            "'sqlite', 'postgres', 'git', 'filesystem', 'kubernetes', 'terraform', 'fhir' "
+            "or 'rest'",
         ),
     ],
 )
@@ -1335,7 +1336,7 @@ def test_the_command_line_installs_checks_and_reconciles_a_repository(repo: Repo
     assert f"refs/heads/main at {repo.base}" in out.getvalue()
     out = io.StringIO()
     assert main(["check", "--config", str(path)], out=out) == 0
-    assert out.getvalue().startswith("ok: git, 8 path class(es)")
+    assert out.getvalue().startswith("ok: git, 8 path classes")
     assert "hook: codegen" in out.getvalue()
 
     chain = repo.root / "plans.chain"

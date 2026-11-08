@@ -87,6 +87,7 @@ from interlock.cascade import CascadeReport
 from interlock.chain import EscrowRecord
 from interlock.invariants import BlastRadius, InvariantChecker
 from interlock.meters import Metered
+from interlock.text import tally
 from interlock.types import (
     INBOX_TARGET,
     OUTBOX_TARGET,
@@ -471,7 +472,7 @@ def _gaps(substrate: object, report: object, outbound: int = 0) -> tuple[str, ..
     gaps: list[str] = []
     if outbound:
         gaps.append(
-            f"{outbound} outbound request(s): delivered at least once by the relay after "
+            f"{tally(outbound, 'outbound request')}: delivered at least once by the relay after "
             f"commit; their external effects are not measured"
         )
     if isinstance(report, CascadeReport):

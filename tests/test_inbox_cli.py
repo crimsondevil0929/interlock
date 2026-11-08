@@ -306,7 +306,7 @@ def test_the_inbox_receives_a_webhook_over_http_and_proves_it(configured: Path) 
     code, out = cli("inbox", "verify", "--config", str(configured))
     assert (code, out.splitlines()[0]) == (
         0,
-        "every inbound log verifies: 1 event(s), each attested by a registered inbox; 1 fact(s) "
+        "every inbound log verifies: 1 event, each attested by a registered inbox; 1 fact "
         "bound to the deliveries they name, each attested by a registered relay; 0 consumed",
     )
     engine = EscrowEngine(
@@ -344,9 +344,9 @@ def test_an_event_before_its_delivery_is_bound_by_inbox_match(configured: Path) 
     assert code == 0 and out.strip().endswith("unmatched")
     _deliver(config.database, "re_7")
     code, out = cli("inbox", "match", "--config", str(configured))
-    assert (code, out.strip()) == (0, "bound 1 event(s) to their deliveries")
+    assert (code, out.strip()) == (0, "bound 1 event to their deliveries")
     assert cli("inbox", "match", "--config", str(configured))[1].strip() == (
-        "bound 0 event(s) to their deliveries"
+        "bound 0 events to their deliveries"
     )
     assert cli("inbox", "list", "--config", str(configured), "--source", "hooks")[1] == ""
 
@@ -424,9 +424,9 @@ def test_the_inbox_on_postgresql(pg: Pg, tmp_path: Path) -> None:
         assert "registered inbound source: hooks (http)" in out
         dsn = make_conninfo(pg.admin, user=role, password=PASSWORD)
         code, out = cli("inbox", "match", "--config", str(path), "--database", dsn)
-        assert (code, out.strip()) == (0, "bound 0 event(s) to their deliveries")
+        assert (code, out.strip()) == (0, "bound 0 events to their deliveries")
         code, out = cli("inbox", "verify", "--config", str(path))
-        assert code == 0 and "0 event(s)" in out
+        assert code == 0 and "0 events" in out
         code, out = cli("inbox", "list", "--config", str(path))
         assert (code, out) == (0, "")
         # A stage role cannot stand in for the inbox's.

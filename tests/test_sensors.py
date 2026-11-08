@@ -134,7 +134,7 @@ def test_a_fail_blocks_and_no_fact_blocks() -> None:
     diff = _diff()
     failed = dataclasses.replace(diff, sensors=(_fact(diff, verdict="fail"),))
     (violation,) = SensorAttestation("policy-check", [KEY.spec()]).check(_plan(), failed)
-    assert "found 2 problem(s)" in violation.message
+    assert "found 2 problems" in violation.message
     assert violation.evidence["verdict"] == "fail" and violation.evidence["findings"] == "2"
     (none,) = SensorAttestation("policy-check", [KEY.spec()]).check(_plan(), diff)
     assert "attested nothing" in none.message

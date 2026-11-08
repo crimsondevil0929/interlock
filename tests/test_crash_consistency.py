@@ -96,6 +96,7 @@ from interlock.exceptions import (  # noqa: E402
 )
 from interlock.outbound import SinkRegistry  # noqa: E402
 from interlock.reconcile import Reconciliation, StageFinding, reconcile_postgres  # noqa: E402
+from interlock.text import tally  # noqa: E402
 from tests.children import Child  # noqa: E402
 from tests.conftest import OBSERVED, Pg  # noqa: E402
 from tests.crash_child import (  # noqa: E402
@@ -541,7 +542,7 @@ def check_settlements(opened: Restarted, records: Sequence[EscrowRecord]) -> Non
         expected = 1 if intent.stage_id in committed else 0
         found = spends.get(intent.record_hash[:16], 0)
         assert found == expected, (
-            f"stage {intent.stage_id}: {found} settled spend(s) naming its intent, "
+            f"stage {intent.stage_id}: {tally(found, 'settled spend')} naming its intent, "
             f"{'committed' if expected else 'not committed'}"
         )
     assert opened.governor.pending_claims() == (), "a claim left unbooked"

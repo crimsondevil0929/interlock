@@ -64,6 +64,7 @@ from agentgov.receipts import ActionReceipt, OutcomeStatus, ReceiptLog
 from interlock.exceptions import ExtensionError
 from interlock.records import RecordKind, RecordLog, SignedRecord, anchor_memo, money
 from interlock.recovery import breaker_reason, spent_out
+from interlock.text import tally
 
 __all__ = [
     "BudgetGuard",
@@ -235,12 +236,12 @@ class ExtensionRequest:
         """The quote in words, for the operator deciding on it."""
         spent = ", ".join(f"{s} {money(a)}" for s, a in self.spend.scopes)
         progress = self.progress
-        proof = f"{progress.committed} plan(s) committed ({progress.rows} rows)"
+        proof = f"{tally(progress.committed, 'plan')} committed ({tally(progress.rows, 'row')})"
         if progress.checkpoint is not None:
             size, root = progress.checkpoint
             proof += f", provable in receipt log {progress.log} at size {size}, root {root[:16]}"
         if progress.recovery_steps:
-            proof += f"; {progress.recovery_steps} recovery step(s)"
+            proof += f"; {tally(progress.recovery_steps, 'recovery step')}"
         if progress.milestones is not None:
             declared = progress.milestones
             proof += f"; declared {declared.done} of {declared.total} {declared.unit} done"

@@ -9,6 +9,66 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-07
+
+Two new substrates, so agents that edit files and agents that work through SaaS APIs get the
+same guarantees as SQL; counts written as English; and a shutdown that can no longer hang.
+
+### Added
+
+- **`FilesystemSubstrate` (class T): a directory, staged like a database.** An agent's file
+  changes are made in a private copy of the workspace and measured from it, file by file: the
+  path class is the table (`secrets` for `.env`, `.ssh/` and key files first, then
+  `workflows`, `governance`, `infra`, `deps`, `scripts`, `tests`, `src`, `config`, `docs`,
+  `other`), and each file's `sha256`, `mode`, `bytes`, line counts and `secret_markers` are
+  its columns. The commit holds the workspace's lock and lands only if every touched file is
+  still at the hash the stage measured.
+  - `mode = "in-place"` writes each file beside its target and renames it over, the set
+    journaled first: a crash part-way is finished by the next stage, and a failure while
+    alive puts back what was written.
+  - `mode = "swap"` keeps the workspace as a link to a version directory and switches it with
+    one `rename(2)`, so a reader sees the old tree or the new one, never a mix.
+    `prepare_swap` converts a plain directory; old versions are kept for rollback.
+  - Statements: `write`, `append`, `replace`, `delete`, `move`, `mode`, `expect-hash`. Paths
+    through links, into `.git`, ignored, or a hook's source are refused before staging.
+  - `substrate = "filesystem"` with `[filesystem]` in `interlock.toml`; `interlock install`
+    and `interlock check` describe it. Spec §4.7, E4-16 to E4-19.
+- **`RestSubstrate` and `RestResource` (class V): any JSON REST API.** The FHIR substrate's
+  predict, write-on-the-version-read, read-back and put-back cycle, for ticketing, CRM and HR
+  systems: versions from an `ETag` (sent back as `If-Match`) or a version field (sent back in
+  the body), merge-patch or full-replace writes, a tenant's listing as the scope a write is
+  checked over (followed page by page), creates at ids the stage assigns
+  (`If-None-Match: *`), a declared void patch or a `DELETE` as a create's undo, and a `source`
+  field that tells a rule your write set off (put back) from a person's change (left alone
+  and named). `substrate = "rest"` with `[rest]` and `[[rest.resources]]`. Spec §4.6, amended.
+- **`interlock.sim.rest`:** a loopback JSON REST API with ETags, conditional `PATCH`/`PUT`/
+  `DELETE`, `409` on a stale body version, paged lists, automation rules that write as the
+  system, faults and an audit log, so CI stages REST writes without a vendor account.
+- **Agent feedback in each system's words** for the new substrates: files and the workspace;
+  records, accounts and automations.
+- **`interlock.text`:** `tally(3, "row")` is "3 rows", `noun(1, "row")` is "row".
+
+### Changed
+
+- **No message writes `row(s)` any more.** Every count Interlock reports (refusals, feedback,
+  CLI output, notes on the escrow chain, log lines) takes the form its number takes: "1
+  tenant", "3 tenants", "2 discrepancies". `http(s)` reads "http or https". Tests and scripts
+  that matched the old text are updated.
+- **`interlock check` on Git** says "8 path classes", not "8 path class(es)".
+
+### Fixed
+
+- **B6: a shutdown could hang forever.** The engines' close and the shared resources' closes
+  (the governor's ledger, the receipt log) ran on the event loop with no bound. When a
+  service's step was still running past the drain bound, its lock or SQLite connection held
+  one of those closes, and `run()` never returned: the hang seen once in
+  `test_the_daemon_signs_with_every_key_at_a_signing_service`, with threads in
+  `SqliteOutboxStore.close` and agentgov's `close`. Both now end their wait at the drain
+  bound (the forced grace when forced), name what did not finish, and leave it to finish on
+  its own thread. Two tests reproduce it; the first hangs on 1.4.3.
+- **CI cannot hang on a test:** `pytest-timeout` fails a test still running after fifteen
+  minutes, with every thread's stack.
+
 ## [1.4.3] - 2026-11-06
 
 Documentation, a benchmark and package metadata. No change to the library, and nothing to

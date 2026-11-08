@@ -153,7 +153,7 @@ def test_a_removed_tail_is_caught_by_the_head() -> None:
             (("sending", 1, "leased"), ("delivered", 1, "delivered")),
             "delivered",
             3,
-            "counts 3 call(s)",
+            "counts 3 calls",
         ),
         ((("delivered", 1, "delivered"),), "delivered", 0, "reports a call never started"),
         (

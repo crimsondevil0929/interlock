@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 from agentgov.receipts.canonical import loads_strict
 
 from interlock.exceptions import OutboundRequestError
+from interlock.text import tally
 
 if TYPE_CHECKING:
     import psycopg
@@ -463,8 +464,9 @@ class LegacyVouch:
         if recorded.digest == self.digest and len(recorded) == self.rows:
             return None
         return (
-            f"the legacy set ({len(recorded)} row(s)) is not the one operator record "
-            f"{self.record} vouched for ({self.rows} row(s)): it was edited around Interlock"
+            f"the legacy set ({tally(len(recorded), 'row')}) is not the one operator record "
+            f"{self.record} vouched for ({tally(self.rows, 'row')}): it was edited around "
+            f"Interlock"
         )
 
 
@@ -1083,7 +1085,7 @@ def _verify_one(
     if calls != list(range(1, len(calls) + 1)):
         problems.append(f"calls are numbered {calls}, not 1, 2, 3...")
     if attempts != len(calls):
-        problems.append(f"the state counts {attempts} call(s), and the log {len(calls)}")
+        problems.append(f"the state counts {tally(attempts, 'call')}, and the log {len(calls)}")
     started: set[int | None] = set()
     reported: Counter[int | None] = Counter()
     lost: Counter[int | None] = Counter()

@@ -485,7 +485,7 @@ them without being told.
   any row.
 - `effect.summary.tables` includes `interlock.outbox`.
 - `coverage.known_gaps` gains, when a plan enqueues:
-  *"N outbound request(s): delivered at least once by the relay after commit;
+  *"N outbound requests: delivered at least once by the relay after commit;
   their external effects are not measured."*
 - `decision.checkers` lists the outbound checkers with their config hashes, as
   today.

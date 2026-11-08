@@ -191,7 +191,7 @@ def proof_of_work(
         assert index is not None
         report = verify_bundle(log.bundle(index, checkpoint), issuer_key=key)
         assert report.passed, report.to_json()
-    assert f"2 plan(s) committed (2 rows), provable in receipt log {log.log_id}" in quote.render()
+    assert f"2 plans committed (2 rows), provable in receipt log {log.log_id}" in quote.render()
 
 
 def receipted(key: HmacKey) -> ReceiptIssuer:
@@ -452,7 +452,7 @@ def test_a_spent_reserve_is_quoted_and_a_grant_lets_recovery_go_on() -> None:
     assert isinstance(quote, ExtensionRequest)
     assert (quote.scope_id, quote.task) == ("support-agent/recovery", "support-agent")
     assert quote.progress.recovery_steps == 2
-    assert "0 plan(s) committed (0 rows); 2 recovery step(s)" in quote.render()
+    assert "0 plans committed (0 rows); 2 recovery steps" in quote.render()
     assert [s for s, _ in quote.spend.scopes] == ["support-agent", "support-agent/recovery"]
     assert (quote.spend.available, quote.requested) == (Decimal("0.04"), Decimal("0.09"))
 

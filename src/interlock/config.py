@@ -170,6 +170,57 @@ those it names::
     compartment = "patient"           # the search parameter that finds a patient's resources
     void_status = "entered-in-error"  # what marks a created one void, its undo
 
+A directory stages like a database (:mod:`interlock.filesystem`, 1.5.0): ``substrate =
+"filesystem"``, a ``[filesystem]`` section, and ``database`` naming the SQLite control database.
+Its tables are its path classes, as Git's are, each with the columns ``path``, ``sha256``,
+``mode``, ``bytes``, ``lines_added``, ``lines_deleted``, ``net_lines`` and ``secret_markers``::
+
+    substrate = "filesystem"
+    database = "control.db"           # the control database: a SQLite file
+
+    [filesystem]
+    root = "workspace"                # relative to this file
+    mode = "in-place"                 # or "swap": root is a link to a version directory
+    workspace = "billing"             # the partition of every path no owner rule names
+    owners = [{ glob = "src/**", owner = "app-team" }]
+    ignore = ["node_modules/**", ".venv/**"]  # neither copied nor measured; in-place only
+    # state = ".workspace.interlock"  # stages, the commit lock, journals; beside root by default
+    # keep_versions = 10              # swap: how many versions to keep
+
+    [[filesystem.classes]]            # replaces the default classes when given; first match wins
+    name = "secrets"
+    patterns = [".env", ".env.*", ".ssh/**"]
+
+    [[filesystem.hooks]]              # as [[git.hooks]]: run in the stage's copy after each effect
+    name = "format"
+    argv = ["ruff", "format", "."]
+
+A JSON REST API stages predicted and verified (:mod:`interlock.rest`, 1.5.0): ``substrate =
+"rest"``, a ``[rest]`` section, and, for an outbox, inbox or windows, ``database`` naming a
+SQLite control database. Its tables are its resource types, each with the columns ``id``,
+``tenant``, ``fingerprint`` and those it names::
+
+    substrate = "rest"
+    database = "control.db"           # optional: the control database
+
+    [rest]
+    server = "https://desk.example.com/api"  # or http://127.0.0.1:<port>/api, loopback only
+    token_file = "agent.token"        # the bearer token the stage acts with
+    tenants = []                      # the tenants a plan may write; any when empty
+    journal = "journal"               # where undos are written down before each write
+    request_header = "X-Request-Id"   # what each write carries the stage's id in
+
+    [[rest.resources]]
+    table = "tickets"
+    path = "/tickets"                 # one ticket is at /tickets/<id>
+    columns = { status = "status", priority = "priority", assignee = "assignee.id" }
+    tenant = "account_id"             # the field naming its tenant; listed by ?account_id=<id>
+    version = "etag"                  # or the field holding its version ("version")
+    managed = ["updated_at", "version"]  # fields the API writes itself
+    write = "patch"                   # a JSON merge patch; or "put", the whole resource
+    void = { status = "deleted" }     # how a created one is undone; or void = "delete"
+    source = "last_request"           # where the API records the request that last wrote it
+
 Terraform or OpenTofu stages plan-bound too (:mod:`interlock.terraform`)::
 
     substrate = "terraform"
@@ -339,6 +390,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from interlock.fhir import FhirType, fhir_tables
+from interlock.filesystem import COMMIT_MODES, filesystem_tables
+from interlock.filesystem import DEFAULT_CLASSES as FILESYSTEM_CLASSES
 from interlock.git_substrate import COLUMNS, DEFAULT_CLASSES, FALLBACK_CLASS, GitHook, PathClass
 from interlock.inbox import MAX_BODY, TYPES, FieldSpec, InboundSource
 from interlock.kubernetes import KubeKind, kubernetes_tables
@@ -352,8 +405,10 @@ from interlock.outbound import (
     typed_sink,
 )
 from interlock.records import Keyring
+from interlock.rest import RestResource, rest_tables
 from interlock.substrate import TableSpec
 from interlock.terraform import FALLBACK_TABLE, TfResource, terraform_tables
+from interlock.text import noun
 from interlock.windows import Measure, Plans, RateWindow, Requests, RequestSum, RowSum
 
 if TYPE_CHECKING:
@@ -371,6 +426,7 @@ __all__ = [
     "DaemonConfig",
     "Endpoint",
     "EngineConfig",
+    "FilesystemConfig",
     "GitConfig",
     "InboxConfig",
     "InterlockConfig",
@@ -378,6 +434,7 @@ __all__ = [
     "OperatorsConfig",
     "ReceiptsConfig",
     "RelayConfig",
+    "RestConfig",
     "SettlerConfig",
     "SignerConfig",
     "VacuumConfig",
@@ -792,6 +849,51 @@ class SensorConfig:
     env: Mapping[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class FilesystemConfig:
+    """``[filesystem]``: the directory a ``substrate = "filesystem"`` stages on, as
+    :class:`~interlock.filesystem.FilesystemSubstrate` takes it (1.5.0)."""
+
+    root: Path
+    mode: str = "in-place"
+    classes: tuple[PathClass, ...] = FILESYSTEM_CLASSES
+    workspace: str | None = None
+    owners: tuple[tuple[str, str], ...] = ()
+    ignore: tuple[str, ...] = ()
+    hooks: tuple[GitHook, ...] = ()
+    state: Path | None = None
+    versions: Path | None = None
+    keep_versions: int = 10
+    max_files: int = 50_000
+    max_bytes: int = 256 * 1024 * 1024
+    max_file_bytes: int = 4 * 1024 * 1024
+    max_scan_bytes: int = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class RestConfig:
+    """``[rest]``: the API a ``substrate = "rest"`` stages on, as
+    :class:`~interlock.rest.RestSubstrate` takes it (1.5.0)."""
+
+    server: str
+    resources: tuple[RestResource, ...]
+    journal: Path
+    tenants: tuple[str, ...] = ()
+    token_file: Path | None = None
+    ca_file: Path | None = None
+    request_header: str = "X-Request-Id"
+    timeout_seconds: float = 15.0
+
+    def token(self) -> str | None:
+        """The bearer token, read from ``token_file``."""
+        if self.token_file is None:
+            return None
+        try:
+            return self.token_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"[rest]: cannot read token_file: {exc}") from exc
+
+
 def git_tables(classes: tuple[PathClass, ...]) -> tuple[TableSpec, ...]:
     """A Git substrate's tables: one per path class and the fallback, keyed by
     path, with the columns every path's image has."""
@@ -847,6 +949,10 @@ class InterlockConfig:
     """``[sensors.<name>]``: the analyzers each measured diff is shown to."""
     fhir: FhirConfig | None = None
     """``[fhir]``: the server, when ``substrate = "fhir"`` (1.4.0)."""
+    filesystem: FilesystemConfig | None = None
+    """``[filesystem]``: the directory, when ``substrate = "filesystem"`` (1.5.0)."""
+    rest: RestConfig | None = None
+    """``[rest]``: the API, when ``substrate = "rest"`` (1.5.0)."""
 
     @property
     def plan_bound(self) -> bool:
@@ -855,14 +961,18 @@ class InterlockConfig:
 
     @property
     def predicted(self) -> bool:
-        """Whether the substrate is a FHIR server (class V, 1.4.0)."""
-        return self.fhir is not None
+        """Whether the substrate is a FHIR server or a REST API (class V)."""
+        return self.fhir is not None or self.rest is not None
 
     @property
     def controlled(self) -> bool:
         """Whether ``database`` is a control database beside the substrate
-        (Git, Kubernetes, a FHIR server), rather than the substrate itself."""
-        return self.git is not None or self.kubernetes is not None or self.fhir is not None
+        (Git, a directory, Kubernetes, a FHIR server, a REST API), rather than the substrate
+        itself."""
+        return any(
+            s is not None
+            for s in (self.git, self.filesystem, self.kubernetes, self.fhir, self.rest)
+        )
 
     def relay_keyring(self) -> Keyring | None:
         return None if self.relays is None else Keyring(self.relays)
@@ -936,15 +1046,21 @@ def load_config(
     kubernetes = _kubernetes(raw.get("kubernetes"), Path(path).parent, substrate)
     terraform = _terraform(raw.get("terraform"), Path(path).parent, substrate)
     fhir = _fhir(raw.get("fhir"), Path(path).parent, substrate)
+    filesystem = _filesystem(raw.get("filesystem"), Path(path).parent, substrate)
+    rest = _rest(raw.get("rest"), Path(path).parent, substrate)
     entries = raw.get("tables")
     tables: list[TableSpec] = []
-    if git is not None or kubernetes is not None or terraform is not None or fhir is not None:
+    if any(s is not None for s in (git, kubernetes, terraform, fhir, filesystem, rest)):
         if entries is not None:
             raise ConfigError(
                 f"{path}: a {substrate} substrate's tables are its "
                 + (
                     "path classes ([[git.classes]])"
                     if git is not None
+                    else "path classes ([[filesystem.classes]])"
+                    if filesystem is not None
+                    else "resource types ([[rest.resources]])"
+                    if rest is not None
                     else "kinds ([[kubernetes.kinds]])"
                     if kubernetes is not None
                     else "resource types ([[fhir.types]])"
@@ -956,6 +1072,10 @@ def load_config(
         entries = []
         if git is not None:
             tables = list(git_tables(git.classes))
+        elif filesystem is not None:
+            tables = list(filesystem_tables(filesystem.classes))
+        elif rest is not None:
+            tables = list(rest_tables(rest.resources))
         elif kubernetes is not None:
             tables = list(kubernetes_tables(kubernetes.kinds))
         elif fhir is not None:
@@ -1060,10 +1180,21 @@ def load_config(
         terraform=terraform,
         sensors=_sensors(raw.get("sensors")),
         fhir=fhir,
+        filesystem=filesystem,
+        rest=rest,
     )
 
 
-SUBSTRATES: Final = ("sqlite", "postgres", "git", "kubernetes", "terraform", "fhir")
+SUBSTRATES: Final = (
+    "sqlite",
+    "postgres",
+    "git",
+    "filesystem",
+    "kubernetes",
+    "terraform",
+    "fhir",
+    "rest",
+)
 """What ``substrate`` may name."""
 
 _KUBE_KEYS = frozenset(
@@ -1128,7 +1259,7 @@ def _kubernetes(raw: object, base: Path, substrate: str) -> KubernetesConfig | N
         return None
     unknown = sorted(set(section) - _KUBE_KEYS)
     if unknown:
-        raise ConfigError(f"[kubernetes]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[kubernetes]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     entries = section.get("kinds")
     if not isinstance(entries, list) or not entries:
         raise ConfigError("[kubernetes]: kinds are [[kubernetes.kinds]] tables, at least one")
@@ -1139,7 +1270,7 @@ def _kubernetes(raw: object, base: Path, substrate: str) -> KubernetesConfig | N
             raise ConfigError(f"{where}: a table")
         unknown = sorted(set(entry) - _KIND_KEYS)
         if unknown:
-            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
         replace = entry.get("replace_on_immutable", False)
         if not isinstance(replace, bool):
             raise ConfigError(f"{where}: replace_on_immutable is true or false")
@@ -1179,7 +1310,7 @@ def _fhir(raw: object, base: Path, substrate: str) -> FhirConfig | None:
         return None
     unknown = sorted(set(section) - _FHIR_KEYS)
     if unknown:
-        raise ConfigError(f"[fhir]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[fhir]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     entries = section.get("types")
     if not isinstance(entries, list) or not entries:
         raise ConfigError("[fhir]: types are [[fhir.types]] tables, at least one")
@@ -1190,7 +1321,7 @@ def _fhir(raw: object, base: Path, substrate: str) -> FhirConfig | None:
             raise ConfigError(f"{where}: a table")
         unknown = sorted(set(entry) - _FHIR_TYPE_KEYS)
         if unknown:
-            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
         try:
             types.append(
                 FhirType(
@@ -1228,7 +1359,7 @@ def _terraform(raw: object, base: Path, substrate: str) -> TerraformConfig | Non
         return None
     unknown = sorted(set(section) - _TF_KEYS)
     if unknown:
-        raise ConfigError(f"[terraform]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[terraform]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     entries = section.get("resources")
     if not isinstance(entries, list) or not entries:
         raise ConfigError("[terraform]: resources are [[terraform.resources]] tables, at least one")
@@ -1239,7 +1370,7 @@ def _terraform(raw: object, base: Path, substrate: str) -> TerraformConfig | Non
             raise ConfigError(f"{where}: a table")
         unknown = sorted(set(entry) - _RESOURCE_KEYS)
         if unknown:
-            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
         try:
             resources.append(
                 TfResource(
@@ -1295,7 +1426,7 @@ def _sensors(raw: object) -> tuple[SensorConfig, ...]:
             raise ConfigError(f"{where}: a table")
         unknown = sorted(set(entry) - {"argv", "timeout_seconds", "env"})
         if unknown:
-            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
         argv = entry.get("argv")
         if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
             raise ConfigError(f"{where}: argv is the command, as a list of words")
@@ -1336,43 +1467,83 @@ def _git(raw: object, base: Path, substrate: str) -> GitConfig | None:
         raise ConfigError("'git' must be a table ([git])")
     unknown = sorted(set(raw) - _GIT_KEYS)
     if unknown:
-        raise ConfigError(f"[git]: unknown key(s) {', '.join(unknown)}")
-    classes: tuple[PathClass, ...] = DEFAULT_CLASSES
+        raise ConfigError(f"[git]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
+    classes = _classes(raw, "git", DEFAULT_CLASSES)
+    owners = _owners(raw, "git")
+    hooks = _hooks(raw, "git")
+    author = raw.get("author", {"name": "interlock", "email": "interlock@localhost"})
+    if not isinstance(author, dict) or set(author) != {"name", "email"}:
+        raise ConfigError("[git]: author is a table of name and email")
+    stage_root = _string(raw, "stage_root", default="")
+    sizes = {key: _integer(raw, key, default) for key, default in (
+        ("max_file_bytes", 4 * 1024 * 1024), ("max_scan_bytes", 1024 * 1024)
+    )}  # fmt: skip
+    if min(sizes.values()) < 1:
+        raise ConfigError("[git]: max_file_bytes and max_scan_bytes are positive")
+    return GitConfig(
+        repository=base / _string(raw, "repository"),
+        branch=_string(raw, "branch", default="main"),
+        classes=classes,
+        workspace=_string(raw, "workspace", default="") or None,
+        owners=owners,
+        hooks=hooks,
+        stage_root=base / stage_root if stage_root else None,
+        author=(_string(author, "name"), _string(author, "email")),
+        max_file_bytes=sizes["max_file_bytes"],
+        max_scan_bytes=sizes["max_scan_bytes"],
+    )
+
+
+def _classes(
+    raw: Mapping[str, Any], section: str, defaults: tuple[PathClass, ...]
+) -> tuple[PathClass, ...]:
+    """``[[<section>.classes]]``, or the defaults."""
+    classes = defaults
     if "classes" in raw:
         entries = raw["classes"]
         if not isinstance(entries, list) or not entries:
-            raise ConfigError("[git]: classes are [[git.classes]] tables, at least one")
+            raise ConfigError(
+                f"[{section}]: classes are [[{section}.classes]] tables, at least one"
+            )
         found: list[PathClass] = []
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict) or set(entry) - {"name", "patterns"}:
-                raise ConfigError(f"git.classes[{index}]: a table of name and patterns")
+                raise ConfigError(f"{section}.classes[{index}]: a table of name and patterns")
             try:
                 found.append(PathClass(_string(entry, "name"), tuple(_strings(entry, "patterns"))))
             except ValueError as exc:
-                raise ConfigError(f"git.classes[{index}]: {exc}") from exc
+                raise ConfigError(f"{section}.classes[{index}]: {exc}") from exc
         classes = tuple(found)
     names = [c.name for c in classes]
     if len(set(names)) != len(names) or FALLBACK_CLASS in names:
         raise ConfigError(
-            f"[git]: path classes are named once each, and none is {FALLBACK_CLASS!r}, the "
+            f"[{section}]: path classes are named once each, and none is {FALLBACK_CLASS!r}, the "
             f"class of every path no pattern names"
         )
+    return classes
+
+
+def _owners(raw: Mapping[str, Any], section: str) -> tuple[tuple[str, str], ...]:
     owners: list[tuple[str, str]] = []
     for index, entry in enumerate(raw.get("owners", [])):
         if not isinstance(entry, dict) or set(entry) != {"glob", "owner"}:
-            raise ConfigError(f"git.owners[{index}]: a table of glob and owner")
+            raise ConfigError(f"{section}.owners[{index}]: a table of glob and owner")
         owners.append((_string(entry, "glob"), _string(entry, "owner")))
+    return tuple(owners)
+
+
+def _hooks(raw: Mapping[str, Any], section: str) -> tuple[GitHook, ...]:
     hooks: list[GitHook] = []
     hook_entries = raw.get("hooks", [])
     if not isinstance(hook_entries, list):
-        raise ConfigError("[git]: hooks are [[git.hooks]] tables")
+        raise ConfigError(f"[{section}]: hooks are [[{section}.hooks]] tables")
     for index, entry in enumerate(hook_entries):
-        where = f"git.hooks[{index}]"
+        where = f"{section}.hooks[{index}]"
         if not isinstance(entry, dict):
             raise ConfigError(f"{where} is not a table")
         unknown = sorted(set(entry) - _HOOK_KEYS)
         if unknown:
-            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
         env = entry.get("env", {})
         if not isinstance(env, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()
@@ -1392,27 +1563,156 @@ def _git(raw: object, base: Path, substrate: str) -> GitConfig | None:
         except ValueError as exc:
             raise ConfigError(f"{where}: {exc}") from exc
     if len({h.name for h in hooks}) != len(hooks):
-        raise ConfigError("[git]: hooks are named once each")
-    author = raw.get("author", {"name": "interlock", "email": "interlock@localhost"})
-    if not isinstance(author, dict) or set(author) != {"name", "email"}:
-        raise ConfigError("[git]: author is a table of name and email")
-    stage_root = _string(raw, "stage_root", default="")
-    sizes = {key: _integer(raw, key, default) for key, default in (
-        ("max_file_bytes", 4 * 1024 * 1024), ("max_scan_bytes", 1024 * 1024)
+        raise ConfigError(f"[{section}]: hooks are named once each")
+    return tuple(hooks)
+
+
+_FILESYSTEM_KEYS = frozenset(
+    {
+        "root",
+        "mode",
+        "classes",
+        "workspace",
+        "owners",
+        "ignore",
+        "hooks",
+        "state",
+        "versions",
+        "keep_versions",
+        "max_files",
+        "max_bytes",
+        "max_file_bytes",
+        "max_scan_bytes",
+    }
+)
+
+
+def _filesystem(raw: object, base: Path, substrate: str) -> FilesystemConfig | None:
+    section = _section(raw, "filesystem", substrate)
+    if section is None:
+        return None
+    unknown = sorted(set(section) - _FILESYSTEM_KEYS)
+    if unknown:
+        raise ConfigError(f"[filesystem]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
+    mode = _string(section, "mode", default="in-place")
+    if mode not in COMMIT_MODES:
+        raise ConfigError(f"[filesystem]: mode is 'in-place' or 'swap', not {mode!r}")
+    ignore = tuple(_strings(section, "ignore", required=False))
+    if ignore and mode == "swap":
+        raise ConfigError("[filesystem]: mode 'swap' copies every file, so it ignores none")
+    sizes = {key: _integer(section, key, default) for key, default in (
+        ("keep_versions", 10), ("max_files", 50_000), ("max_bytes", 256 * 1024 * 1024),
+        ("max_file_bytes", 4 * 1024 * 1024), ("max_scan_bytes", 1024 * 1024),
     )}  # fmt: skip
     if min(sizes.values()) < 1:
-        raise ConfigError("[git]: max_file_bytes and max_scan_bytes are positive")
-    return GitConfig(
-        repository=base / _string(raw, "repository"),
-        branch=_string(raw, "branch", default="main"),
-        classes=classes,
-        workspace=_string(raw, "workspace", default="") or None,
-        owners=tuple(owners),
-        hooks=tuple(hooks),
-        stage_root=base / stage_root if stage_root else None,
-        author=(_string(author, "name"), _string(author, "email")),
+        raise ConfigError("[filesystem]: keep_versions and the max_ sizes are positive")
+    state = _string(section, "state", default="")
+    versions = _string(section, "versions", default="")
+    return FilesystemConfig(
+        root=base / _string(section, "root"),
+        mode=mode,
+        classes=_classes(section, "filesystem", FILESYSTEM_CLASSES),
+        workspace=_string(section, "workspace", default="") or None,
+        owners=_owners(section, "filesystem"),
+        ignore=ignore,
+        hooks=_hooks(section, "filesystem"),
+        state=base / state if state else None,
+        versions=base / versions if versions else None,
+        keep_versions=sizes["keep_versions"],
+        max_files=sizes["max_files"],
+        max_bytes=sizes["max_bytes"],
         max_file_bytes=sizes["max_file_bytes"],
         max_scan_bytes=sizes["max_scan_bytes"],
+    )
+
+
+_REST_KEYS = frozenset(
+    {
+        "server",
+        "resources",
+        "journal",
+        "tenants",
+        "token_file",
+        "ca_file",
+        "request_header",
+        "timeout_seconds",
+    }
+)
+_REST_RESOURCE_KEYS = frozenset(
+    {
+        "table",
+        "path",
+        "columns",
+        "tenant",
+        "scope",
+        "partitions",
+        "version",
+        "managed",
+        "write",
+        "void",
+        "items",
+        "next",
+        "source",
+    }
+)
+
+
+def _rest(raw: object, base: Path, substrate: str) -> RestConfig | None:
+    section = _section(raw, "rest", substrate)
+    if section is None:
+        return None
+    unknown = sorted(set(section) - _REST_KEYS)
+    if unknown:
+        raise ConfigError(f"[rest]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
+    entries = section.get("resources")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError("[rest]: resources are [[rest.resources]] tables, at least one")
+    resources = []
+    for index, entry in enumerate(entries):
+        where = f"rest.resources[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: a table")
+        unknown = sorted(set(entry) - _REST_RESOURCE_KEYS)
+        if unknown:
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
+        void = entry.get("void")
+        if void is not None and void != "delete" and not isinstance(void, dict):
+            raise ConfigError(f'{where}: void is a table (a merge patch) or "delete"')
+        try:
+            resources.append(
+                RestResource(
+                    _string(entry, "table"),
+                    _string(entry, "path"),
+                    columns=_paths(entry.get("columns"), f"{where}.columns"),
+                    tenant=_string(entry, "tenant", default="") or None,
+                    scope=_string(entry, "scope", default="") or None,
+                    partitions=_paths(entry.get("partitions"), f"{where}.partitions"),
+                    version=_string(entry, "version", default="etag"),
+                    managed=tuple(_strings(entry, "managed", required=False)),
+                    write=_string(entry, "write", default="patch"),
+                    void=None if void in (None, "delete") else dict(void),
+                    items=_string(entry, "items", default="data"),
+                    next=_string(entry, "next", default="next"),
+                    source=_string(entry, "source", default="") or None,
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError(f"{where}: {exc}") from exc
+    if len({r.table for r in resources}) != len(resources):
+        raise ConfigError("[rest]: each resource type is its own table")
+    if len({r.path for r in resources}) != len(resources):
+        raise ConfigError("[rest]: each resource type has its own path")
+    token = _string(section, "token_file", default="")
+    ca = _string(section, "ca_file", default="")
+    return RestConfig(
+        server=_string(section, "server"),
+        resources=tuple(resources),
+        journal=base / _string(section, "journal", default="interlock-journal"),
+        tenants=tuple(_strings(section, "tenants", required=False)),
+        token_file=base / token if token else None,
+        ca_file=base / ca if ca else None,
+        request_header=_string(section, "request_header", default="X-Request-Id"),
+        timeout_seconds=_timeout(section, "[rest]", 15.0),
     )
 
 
@@ -1433,13 +1733,15 @@ def _signers(raw: object) -> dict[str, SignerConfig]:
             raise ConfigError(f"{where} must be a table")
         unknown = sorted(set(entry) - _SIGNER_KEYS)
         if unknown:
-            raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+            raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
         kind = _string(entry, "type")
         if kind != "http":
             raise ConfigError(f"{where}: type is 'http', not {kind!r}")
         url = _string(entry, "url")
         if not url.startswith(("http://", "https://")):
-            raise ConfigError(f"{where}: url is http(s)://host[:port], not {url!r}")
+            raise ConfigError(
+                f"{where}: url is http://host[:port] or https://host[:port], not {url!r}"
+            )
         version = None
         if "version" in entry:
             version = _integer(entry, "version", 0)
@@ -1474,7 +1776,7 @@ def _vacuum(raw: object, base: Path) -> VacuumConfig:
     }
     unknown = sorted(set(raw) - known)
     if unknown:
-        raise ConfigError(f"[vacuum]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[vacuum]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     if "retain_days" in raw and "retain_seconds" in raw:
         raise ConfigError("[vacuum]: retain_days or retain_seconds, not both")
     retain = (
@@ -1521,21 +1823,34 @@ _ENGINE_KEYS = frozenset(
 
 def _engine(raw: object, base: Path, substrate: str) -> EngineConfig:
     # A Git stage checks a worktree out and runs hooks: its default bound is longer.
-    stage_seconds = {"git": 120.0, "kubernetes": 120.0, "terraform": 900.0, "fhir": 120.0}.get(
-        substrate, 10.0
-    )
+    stage_seconds = {
+        "git": 120.0,
+        "filesystem": 120.0,
+        "kubernetes": 120.0,
+        "terraform": 900.0,
+        "fhir": 120.0,
+        "rest": 120.0,
+    }.get(substrate, 10.0)
     if raw is None:
         return EngineConfig(max_stage_seconds=stage_seconds)
     if not isinstance(raw, dict):
         raise ConfigError("'engine' must be a table ([engine])")
     unknown = sorted(set(raw) - _ENGINE_KEYS)
     if unknown:
-        raise ConfigError(f"[engine]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[engine]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     workers = _integer(raw, "workers", 1)
     retries = _integer(raw, "conflict_retries", 16)
     if workers < 1 or retries < 0:
         raise ConfigError("[engine]: workers is at least 1, conflict_retries not negative")
-    if workers > 1 and substrate in ("sqlite", "git", "kubernetes", "terraform", "fhir"):
+    if workers > 1 and substrate in (
+        "sqlite",
+        "git",
+        "filesystem",
+        "kubernetes",
+        "terraform",
+        "fhir",
+        "rest",
+    ):
         raise ConfigError(
             "[engine]: SQLite admits one writer, and a stage holds the write lock for its "
             "whole life (a Git stage, its control database's): one worker"
@@ -1579,7 +1894,7 @@ def _receipts(raw: object, base: Path) -> ReceiptsConfig | None:
         raise ConfigError("'receipts' must be a table ([receipts])")
     unknown = sorted(set(raw) - {"log", "key", "signer", "log_id", "issuer", "policy_epoch"})
     if unknown:
-        raise ConfigError(f"[receipts]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[receipts]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     epoch = _integer(raw, "policy_epoch", 0)
     if epoch < 0:
         raise ConfigError("[receipts]: policy_epoch is not negative")
@@ -1600,7 +1915,7 @@ def _settler(raw: object) -> SettlerConfig:
         raise ConfigError("'settler' must be a table ([settler])")
     unknown = sorted(set(raw) - {"database", "every_seconds"})
     if unknown:
-        raise ConfigError(f"[settler]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[settler]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     return SettlerConfig(
         database=_string(raw, "database", default=""),
         every=timedelta(seconds=_seconds(raw, "every_seconds", 5.0)),
@@ -1614,7 +1929,7 @@ def _metrics(raw: object) -> MetricsConfig:
         raise ConfigError("'metrics' must be a table ([metrics])")
     unknown = sorted(set(raw) - {"listen", "every_seconds", "database"})
     if unknown:
-        raise ConfigError(f"[metrics]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[metrics]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     listen = _string(raw, "listen", default="") or None
     if listen is not None:
         host, _, port = listen.rpartition(":")
@@ -1635,7 +1950,7 @@ def _daemon(raw: object) -> DaemonConfig:
     known = {"drain_timeout_seconds", "restart_min_seconds", "restart_max_seconds"}
     unknown = sorted(set(raw) - known)
     if unknown:
-        raise ConfigError(f"[daemon]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[daemon]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     low = _seconds(raw, "restart_min_seconds", 0.5)
     high = _seconds(raw, "restart_max_seconds", 30.0)
     if high < low:
@@ -1655,7 +1970,7 @@ def _cluster(raw: object, substrate: str) -> ClusterConfig | None:
     known = {"node", "database", "heartbeat_seconds", "session_timeout_seconds"}
     unknown = sorted(set(raw) - known)
     if unknown:
-        raise ConfigError(f"[cluster]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[cluster]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     if substrate != "postgres":
         raise ConfigError(
             "[cluster] needs PostgreSQL: a cluster's nodes meet in its database, and a "
@@ -1724,7 +2039,7 @@ def _inbox(raw: object, base: Path) -> InboxConfig:
         raise ConfigError("'inbox' must be a table ([inbox])")
     unknown = sorted(set(raw) - _INBOX_KEYS)
     if unknown:
-        raise ConfigError(f"[inbox]: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"[inbox]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     entries = raw.get("sources", [])
     if not isinstance(entries, list):
         raise ConfigError("inbox.sources must be an array of tables ([[inbox.sources]])")
@@ -1772,7 +2087,7 @@ def _source(entry: object, index: int) -> InboundSource:
         raise ConfigError(f"{where} is not a table")
     unknown = sorted(set(entry) - _SOURCE_KEYS)
     if unknown:
-        raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+        raise ConfigError(f"{where}: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
     fields: list[FieldSpec] = []
     raw_fields = entry.get("fields", [])
     if not isinstance(raw_fields, list):
@@ -2020,7 +2335,7 @@ def _typed_endpoint(entry: Mapping[str, Any], sink: SinkSpec, where: str) -> End
         raise ConfigError(f"{where}: 'sandbox' is true or false, for a sendgrid sink")
     url = _string(entry, "url", default="")
     if url and not url.startswith(("http://", "https://")):
-        raise ConfigError(f"{where}: 'url' is an http(s) URL")
+        raise ConfigError(f"{where}: 'url' is an http or https URL")
     return Endpoint(
         sink=sink.name,
         url=url,

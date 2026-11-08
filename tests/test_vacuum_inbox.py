@@ -410,7 +410,7 @@ def test_interlock_vacuum_cuts_the_inbox_on_the_command_line(
     assert code == 0, out
     # Retention 0: stripe's events up to the pending fact, and hooks' (its
     # recent one too, unless the database's clock is behind this one's).
-    pruned = re.search(r"0 window row\(s\), (\d) inbound event\(s\)", out)
+    pruned = re.search(r"0 window rows, (\d) inbound events?", out)
     assert pruned is not None and int(pruned.group(1)) in (4, 5), out
     archive = tmp_path / "archive" / "checkpoint-1.jsonl"
     code, out = cli("vacuum", "--config", str(config), "--verify-archive", str(archive))

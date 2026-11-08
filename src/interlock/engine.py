@@ -85,6 +85,7 @@ from interlock.records import Keyring
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
 from interlock.sensors import Sensor, sense
 from interlock.substrate import ShadowSubstrate, _verb_reason
+from interlock.text import noun, tally
 from interlock.trace import require_traceparent
 from interlock.types import (
     Effect,
@@ -399,8 +400,9 @@ class EscrowEngine:
         missing = [str(f) for f in plan.facts if f not in pending]
         if missing:
             raise InboundFactError(
-                f"plan {plan.plan_id} consumes fact(s) {', '.join(missing)}, not pending for "
-                f"scope {plan.scope_id!r} or not attested under [inbox.keys]"
+                f"plan {plan.plan_id} consumes {noun(len(missing), 'fact')} "
+                f"{', '.join(missing)}, not pending for scope {plan.scope_id!r} or not attested "
+                f"under [inbox.keys]"
             )
 
     def _consume(self, handle: StageHandle, plan: EffectPlan) -> None:
@@ -505,7 +507,8 @@ class EscrowEngine:
         )
         if foreign:
             raise PlanError(
-                f"plan targets substrate(s) {', '.join(foreign)} but this engine holds "
+                f"plan targets {noun(len(foreign), 'substrate')} {', '.join(foreign)} but this "
+                f"engine holds "
                 f"{expected!r}; one engine stages one substrate, and a cross-substrate "
                 f"plan needs 2PC or a saga rather than silent routing"
             )
@@ -515,7 +518,7 @@ class EscrowEngine:
             unseen = sorted({e.table for e in statements} - observed)
             if unseen:
                 raise PlanError(
-                    f"plan targets unobserved table(s): {', '.join(unseen)}; "
+                    f"plan targets {noun(len(unseen), 'unobserved table')}: {', '.join(unseen)}; "
                     f"mutations there would not appear in the diff"
                 )
 
@@ -651,9 +654,9 @@ class EscrowEngine:
                 plan,
                 diff.content_hash(),
                 stage=handle.stage_id,
-                note=f"{diff.blast_radius} rows, {diff.tenant_count} tenant(s)"
-                + (f", {len(diff.windows)} window key(s)" if diff.windows else "")
-                + (f", {len(diff.unknowns)} unknown value(s)" if diff.unknowns else ""),
+                note=f"{tally(diff.blast_radius, 'row')}, {tally(diff.tenant_count, 'tenant')}"
+                + (f", {tally(len(diff.windows), 'window key')}" if diff.windows else "")
+                + (f", {tally(len(diff.unknowns), 'unknown value')}" if diff.unknowns else ""),
             )
             # The analyzers read the diff as measured, and sign what they
             # found about it; the verdict judges the diff with their facts.
@@ -786,12 +789,13 @@ class EscrowEngine:
                     else ""
                 )
                 note = (
-                    f"read-back not as predicted ({len(exc.discrepancies)} discrepancy(ies): "
-                    f"{named}); {exc.restored} resource(s) put back from undo {exc.undo[:16]}"
+                    f"read-back not as predicted ({tally(len(exc.discrepancies), 'discrepancy')}: "
+                    f"{named}); {tally(exc.restored, 'resource')} put back from undo "
+                    f"{exc.undo[:16]}"
                 )
             else:
                 note = (
-                    f"partial apply undone: {exc.restored} of {exc.applied} object(s) "
+                    f"partial apply undone: {exc.restored} of {tally(exc.applied, 'object')} "
                     f"restored from undo {exc.undo[:16]}"
                 )
             undone = self._record(
@@ -1438,7 +1442,7 @@ class EscrowEngine:
                 )
                 continue
             if settled:
-                logger.warning("recovered %d %s meter hold(s)", settled, meter.unit)
+                logger.warning("recovered %s of %s meter", tally(settled, "hold"), meter.unit)
 
     def awaiting_recovery(self) -> int:
         """Commit intents :meth:`recover` could not settle yet: their marker
@@ -1583,7 +1587,7 @@ class EscrowEngine:
         measured = {d.effect_id: d for d in diff.outbound}
         if len(measured) != len(diff.outbound) or measured.keys() != declared.keys():
             raise StageError(
-                f"the stage's outbox holds {len(diff.outbound)} request(s) and the plan "
+                f"the stage's outbox holds {tally(len(diff.outbound), 'request')} and the plan "
                 f"declares {len(declared)}, not the same ones; nothing is charged or sent "
                 f"for a request the plan and the outbox do not agree on"
             )

@@ -559,6 +559,67 @@ def test_engines_are_closed_after_the_services() -> None:
     assert ("settler", "close") in log
 
 
+def test_a_shared_close_that_blocks_cannot_hang_the_shutdown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B6 (1.5.0): a shared resource's close waiting on a lock a step still holds (here, one
+    never released) used to hold the event loop, and ``run`` never returned. The close is
+    bounded like the services' closes: past it, the shutdown goes on and names the close."""
+    held = threading.Lock()
+    held.acquire()
+    closed: list[str] = []
+    supervisor = InterlockSupervisor(services=[Recorder("settler", [])], drain_timeout=0.3)
+    supervisor.on_close(lambda: closed.append("first"))
+
+    def stuck() -> None:
+        with held:  # never released while the shutdown waits
+            closed.append("stuck")
+
+    supervisor.on_close(stuck)
+
+    async def body() -> None:
+        await asyncio.sleep(0.02)
+
+    began = time.monotonic()
+    try:
+        run(supervisor, body)
+        assert time.monotonic() - began < 5
+        assert closed == []  # reversed: the stuck close runs first and holds the rest
+        assert "did not finish in time" in caplog.text and "stuck" in caplog.text
+    finally:
+        held.release()
+    deadline = time.monotonic() + 5
+    while closed != ["stuck", "first"]:  # left to finish on its own thread
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def test_an_engine_close_that_blocks_cannot_hang_the_shutdown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    held = threading.Event()
+    engines = pool([FakeEngine()])
+    original = engines.close
+
+    def slow() -> None:
+        held.wait(5)
+        original()
+
+    engines.close = slow  # type: ignore[method-assign]
+    supervisor = InterlockSupervisor(engines=engines, drain_timeout=0.3)
+
+    async def body() -> None:
+        await asyncio.sleep(0.02)
+
+    began = time.monotonic()
+    try:
+        run(supervisor, body)
+        assert time.monotonic() - began < 4
+        assert "the engines' close did not finish in time" in caplog.text
+    finally:
+        held.set()
+
+
 def test_an_engine_that_cannot_open_fails_the_start() -> None:
     def broken(index: int) -> tuple[Any, Callable[[], None]]:
         raise RuntimeError("no database")

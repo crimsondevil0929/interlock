@@ -106,6 +106,7 @@ from interlock.exceptions import (
 )
 from interlock.reconcile import Reconciliation, UnmediatedWrite, _stage_findings
 from interlock.substrate import SqliteSubstrate
+from interlock.text import tally
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -435,7 +436,7 @@ def parse_statement(statement: str) -> GitStatement:
     arguments = tokens[1:]
     wanted = VERBS[verb]
     if len(arguments) != len(wanted):
-        raise ValueError(f"{verb} takes {len(wanted)} argument(s): {' '.join(wanted)}")
+        raise ValueError(f"{verb} takes {tally(len(wanted), 'argument')}: {' '.join(wanted)}")
     for index, (kind, value) in enumerate(arguments, 1):
         if kind == "bare":
             raise ValueError(

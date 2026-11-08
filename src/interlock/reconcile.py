@@ -47,6 +47,7 @@ from interlock.substrate import (
     STAGE_JOURNAL_TABLE,
     TableSpec,
 )
+from interlock.text import tally
 
 if TYPE_CHECKING:
     import psycopg
@@ -138,7 +139,7 @@ class Reconciliation:
 
 
 def chain_outcomes(records: Iterable[EscrowRecord]) -> dict[str, tuple[RecordType, str]]:
-    """Each stage's standing in the chain(s): its terminal record, else its
+    """Each stage's standing in the chains: its terminal record, else its
     commit intent, with the plan it was recorded under."""
     outcomes: dict[str, tuple[RecordType, str]] = {}
     for record in records:
@@ -381,12 +382,15 @@ def reconcile_postgres(
 def format_reconciliation(result: Reconciliation) -> list[str]:
     """Human-readable lines, one per finding, then a verdict."""
     lines = [
-        f"reconcile-effects: {result.substrate}, {result.stages_checked} committed stage(s), "
-        f"{result.writes_checked} logged write(s) checked"
+        f"reconcile-effects: {result.substrate}, "
+        f"{tally(result.stages_checked, 'committed stage')}, "
+        f"{tally(result.writes_checked, 'logged write')} checked"
     ]
     lines += [f"UNJOURNALED  {table}: no journal trigger" for table in result.unjournaled]
     lines += [f"UNMEDIATED   {write.describe()}" for write in result.unmediated]
     lines += [f"{f.problem.upper():<12} {f.describe()}" for f in result.stages]
     lines.append(f"last entry: {result.last_entry}")
-    lines.append("result: clean" if result.clean else f"result: FAIL, {result.findings} finding(s)")
+    lines.append(
+        "result: clean" if result.clean else f"result: FAIL, {tally(result.findings, 'finding')}"
+    )
     return lines

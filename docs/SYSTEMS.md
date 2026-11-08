@@ -261,6 +261,60 @@ holds the commit.
 - A commit that a force-push later removes from the branch reads as not committed to
   recovery, unless a control database recorded it. Reconciliation names the rewrite.
 
+## A directory: the same guarantee on a workspace (1.5.0)
+
+`FilesystemSubstrate` stages an agent's file changes on an ordinary directory: a checkout a
+coding agent works in, a service's `config/`, a `deploy/` folder. The guarantee is the SQL
+one: what commits is exactly what was measured, or nothing commits.
+
+- **Stage.** `open` copies the workspace into a stage of its own and hashes every file. Those
+  hashes are the stage's *base*.
+- **Apply.** Effects edit the copy, never the workspace. Hooks you configure (a formatter, a
+  code generator) run in the copy after each effect.
+- **Measure.** The copy is walked and compared with the base, file by file. Each changed file
+  is a row: its path class is the table (`secrets` for `.env`, `.ssh/` and key files, then
+  `workflows`, `governance`, `infra`, `deps`, `scripts`, `tests`, `src`, `config`, `docs`,
+  `other`), and its columns are `sha256`, `mode`, `bytes`, `lines_added`, `lines_deleted`,
+  `net_lines` and `secret_markers`. `TableAllowlist`, `NoDelete` and `BlastRadius` read it
+  as they read rows.
+- **Commit.** Under the workspace's commit lock, every file the diff touches must still be at
+  its base hash. If a person or another agent edited one in the meantime, nothing is written.
+  Then, with `mode="in-place"`, each file is written beside its target and renamed over it,
+  the set journaled first so a crash part-way is finished by the next stage. With
+  `mode="swap"`, the workspace is a link to a version directory: the stage's copy becomes the
+  next version and one `rename(2)` of the link switches every reader at once. Old versions
+  are kept for rollback (`keep_versions`). `prepare_swap` converts a plain directory.
+
+<!-- readme-test: skip reason="needs a workspace on disk; tests/test_filesystem.py makes the same calls" -->
+```python
+from interlock import BlastRadius, EscrowEngine, NoDelete, PlanBuilder, TableAllowlist
+from interlock.filesystem import FilesystemSubstrate
+
+workspace = FilesystemSubstrate(
+    "/srv/billing",
+    ignore=["node_modules/**", ".venv/**"],
+    control="/var/lib/interlock/control.db",
+)
+engine = EscrowEngine(
+    workspace, checkers=[BlastRadius(10), TableAllowlist(["config", "docs"]), NoDelete()]
+)
+plan = PlanBuilder("ops-agent", intent="raise the checkout timeout").update(
+    table="config",
+    statement="replace 'config/service.toml' :old :new",
+    parameters={"old": "timeout_ms = 2500", "new": "timeout_ms = 4000"},
+    stated_rows=1,
+)
+result = engine.execute(plan.build())
+```
+
+Statements are `write`, `append`, `replace`, `delete`, `move`, `mode` and `expect-hash` (pin a
+file to the hash the approvers saw). A path that is absolute, holds `..`, reaches into `.git`,
+passes through a symbolic link, is ignored, or is a hook's source is refused before anything
+is staged. It's configured in `interlock.toml` as `substrate = "filesystem"` with
+`[filesystem]`. In-place mode is atomic per file and crash-consistent as a set; a reader can
+see some files new and others old for the moment the commit takes. Use `swap` when readers
+must see one tree or the other.
+
 ## Kubernetes and Terraform: plan-bound
 
 A cluster and a Terraform configuration cannot be staged in a transaction and rolled back.
@@ -406,6 +460,56 @@ search with `_has`, rules that write as the server, and an `AuditEvent` log), so
 class V without an EHR. Class V can't see a server rule before the write. The rule's effect
 is caught by the read-back and undone, not refused in advance, and the receipt's class says
 so. The server has to allow client-assigned ids, so that a create can be predicted exactly.
+
+## REST APIs: ticketing, CRM and HR systems, predicted and verified (1.5.0)
+
+`RestSubstrate` gives any JSON REST API the FHIR substrate's class V guarantee. It needs two
+things most SaaS APIs have: a version on each resource (an `ETag`, or a `version` field) and
+writes that can be made conditional on it.
+
+- **Stage.** Each effect reads the resource it touches, with its version. The first time a
+  stage reaches a tenant (an account, an organization), it lists every observed resource of
+  that tenant (`/tickets?account_id=<id>`, page by page): the scope the write is checked over.
+- **Judge.** `create` builds a resource from a template at an id the stage assigns; `patch`
+  applies a JSON merge patch. The prediction is the diff every checker judges.
+- **Write.** The undo goes to the journal first. The tenant is listed again: if anything in it
+  changed, nothing is written. Each write carries the version read (`If-Match`, or the version
+  field in the body) and the stage's id (`X-Request-Id`, or a header you name).
+- **Read back.** The tenant is listed once more and compared with the prediction. If an
+  automation in the system did more than the plan (escalated the ticket, reassigned it,
+  opened an incident), everything the write changed is put back and the stage is recorded
+  `COMPENSATED`. With `source` naming the field where the API records the request that last
+  wrote a resource, a rule your write set off is put back and a person's change is left alone
+  and named.
+
+<!-- readme-test: skip reason="needs an API; tests/test_rest.py makes the same calls on interlock.sim.rest" -->
+```python
+from interlock import BlastRadius, EscrowEngine, RestResource, RestSubstrate, TenantIsolation
+
+desk = RestSubstrate(
+    "https://desk.example.com/api",
+    token=open("/var/run/secrets/support-agent/token").read().strip(),
+    journal="/var/lib/interlock/undo",
+    resources=[
+        RestResource(
+            "tickets",
+            "/tickets",
+            columns={"status": "status", "priority": "priority", "assignee": "assignee"},
+            tenant="account_id",
+            managed=("updated_at", "version"),
+            source="last_request",
+            void={"status": "deleted"},
+        ),
+    ],
+)
+engine = EscrowEngine(desk, checkers=[BlastRadius(5), TenantIsolation(declared=True)])
+```
+
+It's configured in `interlock.toml` as `substrate = "rest"` with `[rest]` and
+`[[rest.resources]]`. `interlock.sim.rest` is a loopback API with ETags, conditional `PATCH`
+and `PUT`, paged lists, automation rules that write as the system, and an audit log, so CI
+stages REST writes without a vendor account. An API must accept client-assigned ids (or an
+external-id upsert path) for a create to be predicted exactly.
 
 ### Sensor facts: an analyzer's word on the exact diff
 

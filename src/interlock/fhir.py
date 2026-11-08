@@ -115,6 +115,7 @@ from interlock.exceptions import (
 from interlock.planbound import UndoJournal
 from interlock.predicted import PREDICTED
 from interlock.substrate import SqliteSubstrate, TableSpec
+from interlock.text import tally
 from interlock.types import (
     CommitReceipt,
     Effect,
@@ -1380,8 +1381,10 @@ class FhirSubstrate:
         if found:
             restored = self._put_back(stage, "the read-back was not the prediction", applied)
             left = (
-                f"; {len(stage.foreign)} change(s) another request made "
-                f"({', '.join(stage.foreign)}) were left as they are, for a person to review"
+                f"; {tally(len(stage.foreign), 'change')} another request made "
+                f"({', '.join(stage.foreign)}) "
+                f"{'was' if len(stage.foreign) == 1 else 'were'} left as "
+                f"{'it is' if len(stage.foreign) == 1 else 'they are'}, for a person to review"
                 if stage.foreign
                 else ""
             )
