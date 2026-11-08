@@ -9,6 +9,17 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-08
+
+### Fixed
+
+- **Bounded HTTP response body reads in `RestSubstrate` (`src/interlock/rest.py`).** `_Api.call`
+  now bounds response and error body reads to `max_response_bytes` (`10 MiB` by default), raising
+  `SubstrateUnavailableError` if an API returns an oversized payload, preventing out-of-memory exhaustion.
+- **Cyclic and runaway pagination protection in `RestSubstrate.find` (`src/interlock/rest.py`).**
+  `find()` now tracks visited pagination URLs in `seen_pages` and bounds page traversal to `max_pages`,
+  raising `StageError` to fail closed if a repeating cursor or excessive page sequence is encountered.
+
 ## [1.5.0] - 2026-11-07
 
 Two new substrates, so agents that edit files and agents that work through SaaS APIs get the

@@ -28,6 +28,7 @@ from interlock.exceptions import (
     StageConflictError,
     StageError,
     SubstrateConfigurationError,
+    SubstrateUnavailableError,
 )
 from interlock.predicted import PREDICTED
 from interlock.rest import (
@@ -593,3 +594,34 @@ def test_a_write_through_the_engine_is_forbidden_when_not_a_statement(
     bad = plan((EffectKind.UPDATE, "DELETE FROM tickets", {}, "tickets", "restore tickets"))
     with pytest.raises(ForbiddenStatementError):
         engine(sub, tmp_path).execute(bad)
+
+
+def test_oversized_response_raises_substrate_unavailable(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    sub = substrate(server, tmp_path, max_response_bytes=32)
+    assert sub.max_response_bytes == 32
+    with pytest.raises(SubstrateUnavailableError, match="exceeded 32 bytes"):
+        sub._api.call("GET", "/tickets/tkt-1")
+
+
+def test_repeating_pagination_cursor_raises_stage_error(
+    server: LoopbackRestServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sub = substrate(server, tmp_path)
+    # 1. Test page budget limit
+    with pytest.raises(StageError, match="repeating pagination cursor or exceeded 1 pages"):
+        sub._api.find(TICKETS, "account_id", ACME, limit=10, max_pages=1)
+
+    # 2. Test cyclic cursor detection
+    def mock_cyclic_call(self: Any, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+        return type(
+            "Reply",
+            (),
+            {"status": 200, "body": {"data": [{"id": "tkt-1"}], "next": path}, "etag": None},
+        )()
+
+    monkeypatch.setattr(sub._api.__class__, "call", mock_cyclic_call)
+    with pytest.raises(StageError, match="repeating pagination cursor or exceeded"):
+        sub._api.find(TICKETS, "account_id", ACME, limit=10, max_pages=10)
+

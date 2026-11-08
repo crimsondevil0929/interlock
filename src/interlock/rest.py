@@ -120,6 +120,7 @@ from interlock.windows import WindowCharge
 
 __all__ = [
     "COMPENSATIONS",
+    "MAX_RESPONSE_BYTES",
     "VERBS",
     "RestResource",
     "RestStatement",
@@ -131,6 +132,9 @@ __all__ = [
 ]
 
 logger = logging.getLogger("interlock.rest")
+
+MAX_RESPONSE_BYTES: Final = 10 * 1024 * 1024
+"""Maximum HTTP response body read by default (10 MiB) before raising SubstrateUnavailableError."""
 
 ID: Final = "id"
 """Every type's primary key column: the resource's id."""
@@ -469,14 +473,28 @@ class _Reply:
 class _Api:
     """The API, over HTTPS (or HTTP on loopback), with a bearer token."""
 
-    __slots__ = ("_context", "_opener", "_server", "_timeout", "_token")
+    __slots__ = (
+        "_context",
+        "_max_response_bytes",
+        "_opener",
+        "_server",
+        "_timeout",
+        "_token",
+    )
 
     def __init__(
-        self, server: str, *, token: str | None, ca_file: str | None, timeout: float
+        self,
+        server: str,
+        *,
+        token: str | None,
+        ca_file: str | None,
+        timeout: float,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> None:
         self._server = server.rstrip("/")
         self._token = token
         self._timeout = timeout
+        self._max_response_bytes = max_response_bytes
         handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
         if self._server.startswith("https://"):
             context = ssl.create_default_context(cafile=ca_file)
@@ -490,6 +508,10 @@ class _Api:
     @property
     def server(self) -> str:
         return self._server
+
+    @property
+    def max_response_bytes(self) -> int:
+        return self._max_response_bytes
 
     def call(
         self,
@@ -515,16 +537,27 @@ class _Api:
         )
         try:
             with self._opener.open(request, timeout=self._timeout) as reply:
-                raw = reply.read()
+                raw = reply.read(self._max_response_bytes + 1)
+                if len(raw) > self._max_response_bytes:
+                    raise SubstrateUnavailableError(
+                        f"response from {url} exceeded {self._max_response_bytes} bytes"
+                    )
                 return _Reply(
                     int(reply.status), json.loads(raw) if raw else None, reply.headers.get("ETag")
                 )
         except urllib.error.HTTPError as exc:
+            raw_err = exc.read(self._max_response_bytes + 1)
+            if len(raw_err) > self._max_response_bytes:
+                raise SubstrateUnavailableError(
+                    f"error response from {url} exceeded {self._max_response_bytes} bytes"
+                ) from exc
             try:
-                answer = json.loads(exc.read() or b"null")
+                answer = json.loads(raw_err or b"null")
             except ValueError:
                 answer = None
             raise _RestError(exc.code, answer) from None
+        except SubstrateUnavailableError:
+            raise
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise SubstrateUnavailableError(f"cannot reach the API {self._server}: {exc}") from exc
 
@@ -543,13 +576,29 @@ class _Api:
         return reply.body, _version_of(kind, reply.body, reply.etag)
 
     def find(
-        self, kind: RestResource, parameter: str, value: str, *, limit: int
+        self,
+        kind: RestResource,
+        parameter: str,
+        value: str,
+        *,
+        limit: int,
+        max_pages: int | None = None,
     ) -> list[dict[str, Any]]:
         """Every resource of ``kind`` whose ``parameter`` is ``value``, following next pages, at
         most ``limit``."""
+        max_pages = max(50, limit) if max_pages is None else max_pages
         path: str | None = f"{kind.path}?{urlencode([(parameter, value)])}"
         found: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        pages = 0
         while path:
+            if path in seen_pages or pages >= max_pages:
+                raise StageError(
+                    f"listing {kind.path} encountered a repeating pagination cursor or "
+                    f"exceeded {max_pages} pages"
+                )
+            seen_pages.add(path)
+            pages += 1
             reply = self.call("GET", path)
             items: Any = reply.body
             if kind.items:
@@ -665,6 +714,7 @@ class RestSubstrate:
         timeout: float = 15.0,
         max_stage_seconds: float = 120.0,
         max_diff_rows: int = 50_000,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> None:
         tables = [r.table for r in resources]
         if not tables:
@@ -680,7 +730,13 @@ class RestSubstrate:
         self._types = {r.table: r for r in resources}
         self._tenants = frozenset(tenants)
         self._header = request_header
-        self._api = _Api(server, token=token, ca_file=ca_file, timeout=timeout)
+        self._api = _Api(
+            server,
+            token=token,
+            ca_file=ca_file,
+            timeout=timeout,
+            max_response_bytes=max_response_bytes,
+        )
         self._journal = UndoJournal(journal)
         self._stage_seconds = max_stage_seconds
         self._max_rows = max_diff_rows
@@ -729,6 +785,10 @@ class RestSubstrate:
     @property
     def server(self) -> str:
         return self._api.server
+
+    @property
+    def max_response_bytes(self) -> int:
+        return self._api.max_response_bytes
 
     @property
     def control(self) -> str | None:
