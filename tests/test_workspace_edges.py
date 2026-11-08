@@ -8,6 +8,7 @@ import os
 import socket
 import sqlite3
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -88,16 +89,24 @@ def test_a_replace_in_binary_text_and_a_mode_on_nothing(workspace: Path) -> None
     assert result.committed and (workspace / "docs/new.md").read_text() == "hi"
 
 
-def test_a_special_file_in_the_workspace_is_refused(workspace: Path, tmp_path: Path) -> None:
-    path = workspace / "sock"
-    with closing(socket.socket(socket.AF_UNIX)) as sock:
-        try:
-            sock.bind(str(path))
-        except OSError:  # pragma: no cover - a path too long for a socket
-            pytest.skip("cannot bind a socket here")
-        sub = FilesystemSubstrate(workspace)
-        with pytest.raises(StageError, match="neither a file nor a symbolic link"):
-            sub.open(edit("write 'x' 'y'").build())
+def test_a_special_file_in_the_workspace_is_refused(workspace: Path) -> None:
+    os.mkfifo(workspace / "pipe")
+    sub = FilesystemSubstrate(workspace)
+    with pytest.raises(StageError, match="neither a file nor a symbolic link"):
+        sub.files()
+    with pytest.raises(StageError, match="neither a file nor a symbolic link"):
+        sub.open(edit("write 'x' 'y'").build())
+    (workspace / "pipe").unlink()
+    short_base = "/tmp" if Path("/tmp").is_dir() else None  # noqa: S108 - AF_UNIX sun_path cap
+    with tempfile.TemporaryDirectory(dir=short_base) as raw:
+        short_ws = Path(raw) / "svc"
+        short_ws.mkdir()
+        (short_ws / "a.txt").write_text("ok\n")
+        with closing(socket.socket(socket.AF_UNIX)) as sock:
+            sock.bind(str(short_ws / "sock"))
+            sock_sub = FilesystemSubstrate(short_ws)
+            with pytest.raises(StageError, match="neither a file nor a symbolic link"):
+                sock_sub.open(edit("write 'x' 'y'").build())
 
 
 def test_a_link_in_the_workspace_is_measured_and_may_be_deleted(workspace: Path) -> None:

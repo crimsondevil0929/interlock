@@ -461,18 +461,48 @@ def _ignored(path: str, ignore: Sequence[str], *, directory: bool = False) -> bo
     return directory and any(glob_match(pattern, path + "/") for pattern in ignore)
 
 
-def _copy_tree(source: Path, target: Path, ignore: Sequence[str]) -> None:
+def _copy_tree(
+    source: Path, target: Path, ignore: Sequence[str], limits: _Limits | None = None
+) -> None:
     """``source`` copied to ``target`` (which must not exist), links as links, permissions kept,
     ignored paths left out."""
+    files = 0
+    total = 0
+
+    def copy_one(item: str, destination: str) -> None:
+        nonlocal files, total
+        info = os.lstat(item)
+        if not stat.S_ISREG(info.st_mode):
+            raise StageError(f"{Path(item).name} is neither a file nor a symbolic link")
+        files += 1
+        total += info.st_size
+        if limits is not None and (files > limits.files or total > limits.bytes):
+            raise SubstrateConfigurationError(
+                f"{source} holds more than {tally(limits.files, 'file')} or "
+                f"{limits.bytes} bytes: past what a stage copies (max_files, max_bytes)"
+            )
+        shutil.copy2(item, destination, follow_symlinks=False)
 
     def skip(directory: str, names: list[str]) -> list[str]:
         relative = Path(directory).relative_to(source).as_posix()
         prefix = "" if relative == "." else relative + "/"
         return [
-            n for n in names if _ignored(prefix + n, ignore, directory=Path(directory, n).is_dir())
+            n
+            for n in names
+            if _ignored(
+                prefix + n,
+                ignore,
+                directory=not Path(directory, n).is_symlink() and Path(directory, n).is_dir(),
+            )
         ]
 
-    shutil.copytree(source, target, symlinks=True, ignore=skip if ignore else None)
+    shutil.copytree(
+        source,
+        target,
+        symlinks=True,
+        ignore=skip if ignore else None,
+        copy_function=copy_one,
+    )
 
 
 def _text(path: Path, limit: int) -> str:
@@ -873,8 +903,8 @@ class FilesystemSubstrate:
                     version = None
                     source = self._root
                     base_tree = directory / "base"
-                    _copy_tree(source, base_tree, self._ignore)
-                _copy_tree(base_tree, tree, self._ignore)
+                    _copy_tree(source, base_tree, self._ignore, self._limits)
+                _copy_tree(base_tree, tree, self._ignore, self._limits)
             base = _manifest(tree, self._ignore, self._limits)
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
