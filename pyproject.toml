@@ -26,7 +26,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "interlock-agentgov>=1.3.0",
+    "interlock-agentgov>=1.3.2",
 ]
 
 [project.scripts]
@@ -38,13 +38,13 @@ postgres = ["psycopg[binary]>=3.2"]
 # operator's records (interlock outbox release, compensate...), an inbox's
 # (interlock inbox serve, which also verifies SendGrid's ECDSA signatures).
 # Verifying any of them needs nothing extra.
-sign = ["interlock-agentgov[sign]>=1.3.0"]
+sign = ["interlock-agentgov[sign]>=1.3.2"]
 # Signing with an Ed25519 key held by AWS KMS (interlock.signers.AwsKmsSigner,
 # AgentGov's own): boto3, through AgentGov's extra.
-kms-aws = ["interlock-agentgov[kms-aws]>=1.3.0"]
+kms-aws = ["interlock-agentgov[kms-aws]>=1.3.2"]
 # AgentGov's OpenTelemetry metrics (agentgov.otel.OpenTelemetryMetrics), for a
 # governor Interlock anchors to.
-otel = ["interlock-agentgov[otel]>=1.3.0"]
+otel = ["interlock-agentgov[otel]>=1.3.2"]
 
 [project.urls]
 Homepage = "https://crimsondevil0929.github.io/fiduciary/"

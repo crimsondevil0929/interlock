@@ -291,7 +291,7 @@ Run `uv run python scripts/overhead.py --postgres "$DSN" --markdown` for your ow
 pip install interlock-escrow          # or, with the stack above it: pip install interlock-fiduciary
 ```
 
-To work on it, clone it. `agentgov` comes from PyPI (`interlock-agentgov>=1.3.0`, ARC1
+To work on it, clone it. `agentgov` comes from PyPI (`interlock-agentgov>=1.3.2`, ARC1
 1.4), so a clone needs nothing beside it:
 
 ```bash
