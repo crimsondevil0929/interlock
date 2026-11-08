@@ -624,4 +624,3 @@ def test_repeating_pagination_cursor_raises_stage_error(
     monkeypatch.setattr(sub._api.__class__, "call", mock_cyclic_call)
     with pytest.raises(StageError, match="repeating pagination cursor or exceeded"):
         sub._api.find(TICKETS, "account_id", ACME, limit=10, max_pages=10)
-
