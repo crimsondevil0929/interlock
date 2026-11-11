@@ -16,7 +16,7 @@ import ssl
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +104,20 @@ class _Cluster:
 
     def delete(self, plural: str, name: str) -> None:
         self.call("DELETE", self.path(plural, name), {"propagationPolicy": "Background"})
+
+    def change(self, plural: str, name: str, edit: Callable[[dict[str, Any]], None]) -> None:
+        """Another writer's change, as a client makes one: read, edit, write on the version
+        read, and read again when the cluster moved in between. The Deployment controller
+        writes status on its own schedule, so a single read-then-write is sometimes refused
+        with 409 (it was, in CI, about once in a few dozen runs)."""
+        for _ in range(20):
+            current = self.get(plural, name)
+            edit(current)
+            status, found = self.call("PUT", self.path(plural, name), current)
+            if status == 200:
+                return
+            assert status == 409, found
+        raise AssertionError(f"{plural}/{name} was refused with 409 twenty times in a row")
 
 
 @pytest.fixture
@@ -315,10 +329,9 @@ def test_a_cluster_that_moved_fails_closed(
     original = sub.commit
 
     def raced(handle: Any) -> Any:
-        current = cluster.get("deployments", names["checkout"])
-        current["spec"]["replicas"] = 9
-        status, _ = cluster.call("PUT", cluster.path("deployments", names["checkout"]), current)
-        assert status == 200
+        cluster.change(
+            "deployments", names["checkout"], lambda found: found["spec"].update(replicas=9)
+        )
         return original(handle)
 
     sub.commit = raced  # type: ignore[method-assign]
@@ -346,10 +359,11 @@ def test_a_partial_apply_is_put_back(
         written.append(obj.name)
         if len(written) == 1:
             other = names["checkout"] if obj.name == names["cart"] else names["cart"]
-            current = cluster.get("deployments", other)
-            current["metadata"].setdefault("labels", {})["touched"] = "yes"
-            status, _ = cluster.call("PUT", cluster.path("deployments", other), current)
-            assert status == 200
+            cluster.change(
+                "deployments",
+                other,
+                lambda found: found["metadata"].setdefault("labels", {}).update(touched="yes"),
+            )
         return found
 
     sub._write = write  # type: ignore[method-assign]

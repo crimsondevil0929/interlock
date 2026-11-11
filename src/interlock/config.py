@@ -405,7 +405,7 @@ from interlock.outbound import (
     typed_sink,
 )
 from interlock.records import Keyring
-from interlock.rest import RestResource, rest_tables
+from interlock.rest import MAX_PAGES, MAX_RESPONSE_BYTES, RestResource, rest_tables
 from interlock.substrate import TableSpec
 from interlock.terraform import FALLBACK_TABLE, TfResource, terraform_tables
 from interlock.text import noun
@@ -883,6 +883,10 @@ class RestConfig:
     ca_file: Path | None = None
     request_header: str = "X-Request-Id"
     timeout_seconds: float = 15.0
+    max_response_bytes: int = MAX_RESPONSE_BYTES
+    """The longest answer read from the API (1.5.2): a longer one is refused, not read."""
+    max_pages: int = MAX_PAGES
+    """How many pages one listing follows (1.5.2)."""
 
     def token(self) -> str | None:
         """The bearer token, read from ``token_file``."""
@@ -1636,6 +1640,8 @@ _REST_KEYS = frozenset(
         "ca_file",
         "request_header",
         "timeout_seconds",
+        "max_response_bytes",
+        "max_pages",
     }
 )
 _REST_RESOURCE_KEYS = frozenset(
@@ -1713,7 +1719,16 @@ def _rest(raw: object, base: Path, substrate: str) -> RestConfig | None:
         ca_file=base / ca if ca else None,
         request_header=_string(section, "request_header", default="X-Request-Id"),
         timeout_seconds=_timeout(section, "[rest]", 15.0),
+        max_response_bytes=_bound(section, "[rest]", "max_response_bytes", MAX_RESPONSE_BYTES),
+        max_pages=_bound(section, "[rest]", "max_pages", MAX_PAGES),
     )
+
+
+def _bound(raw: Mapping[str, Any], where: str, key: str, default: int) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError(f"{where}: {key} is a whole number, at least 1")
+    return value
 
 
 _SIGNER_KEYS = frozenset({"type", "url", "key", "token_env", "timeout_seconds", "version"})

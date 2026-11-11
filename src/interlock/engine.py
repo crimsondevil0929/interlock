@@ -81,11 +81,12 @@ from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedbac
 from interlock.invariants import InvariantChecker
 from interlock.meters import Meter, MeterCheck, Metered
 from interlock.outbound import SinkRegistry
+from interlock.predicted import Settlement
 from interlock.records import Keyring
 from interlock.repair import Repair, Trial, dropped_effects, search, subplan
 from interlock.sensors import Sensor, sense
 from interlock.substrate import ShadowSubstrate, _verb_reason
-from interlock.text import noun, tally
+from interlock.text import noun, nouns, tally
 from interlock.trace import require_traceparent
 from interlock.types import (
     Effect,
@@ -252,6 +253,7 @@ class EscrowEngine:
         "_inbox",
         "_inflight",
         "_meters",
+        "_nouns",
         "_receipts",
         "_reserving",
         "_sensors",
@@ -277,6 +279,7 @@ class EscrowEngine:
         sensors: Sequence[Sensor] = (),
     ) -> None:
         self._substrate = substrate
+        self._nouns = nouns(substrate.substrate_id)
         self._sensors = tuple(sensors)
         named = [s.name for s in self._sensors]
         if len(set(named)) != len(named):
@@ -654,7 +657,8 @@ class EscrowEngine:
                 plan,
                 diff.content_hash(),
                 stage=handle.stage_id,
-                note=f"{tally(diff.blast_radius, 'row')}, {tally(diff.tenant_count, 'tenant')}"
+                note=f"{tally(diff.blast_radius, self._nouns.row)}, "
+                f"{tally(diff.tenant_count, 'tenant')}"
                 + (f", {tally(len(diff.windows), 'window key')}" if diff.windows else "")
                 + (f", {tally(len(diff.unknowns), 'unknown value')}" if diff.unknowns else ""),
             )
@@ -723,7 +727,7 @@ class EscrowEngine:
                         plan,
                         diff.content_hash(),
                         stage=handle.stage_id,
-                        note=f"about to commit {diff.blast_radius} rows"
+                        note=f"about to commit {tally(diff.blast_radius, self._nouns.row)}"
                         + (f"{_TXID}{txid}" if txid else "")
                         + (f"{_OUTBOUND}{len(diff.outbound)}" if diff.outbound else "")
                         + (f"{_UNDO}{undo}" if undo else "")
@@ -753,9 +757,13 @@ class EscrowEngine:
                         lost_reply = True
                     committed = True
                 state = StageState.COMMITTED
-                note = f"{diff.blast_radius} rows committed"
+                note = f"{tally(diff.blast_radius, self._nouns.row)} committed"
                 if lost_reply:
-                    note += "; the commit's reply was lost; its commit marker is present"
+                    note += (
+                        "; the commit could not confirm it, and the system read back as predicted"
+                        if _settles_by_read_back(self._substrate)
+                        else "; the commit's reply was lost; its commit marker is present"
+                    )
                 raced = self._anchor.halted_after_commit(plan.scope_id) if self._anchor else ""
                 terminal = self._record(
                     RecordType.COMMITTED,
@@ -1027,7 +1035,8 @@ class EscrowEngine:
                     plan,
                     whole.diff.content_hash(),
                     stage=handle.stage_id,
-                    note=f"repair search, whole plan: {whole.diff.blast_radius} rows",
+                    note=f"repair search, whole plan: "
+                    f"{tally(whole.diff.blast_radius, self._nouns.row)}",
                 )
                 self._record(
                     RecordType.VERDICT,
@@ -1370,6 +1379,28 @@ class EscrowEngine:
             point = self._observe(best_effort=True)
             undone = _compensated(self._substrate, stage_id) if not outcome else None
             if undone is not None:
+                found = _settlement(self._substrate, stage_id)
+                if found is not None and found.discrepancies:
+                    shown = "; ".join(found.discrepancies[:10]) + (
+                        f"; and {len(found.discrepancies) - 10} more"
+                        if len(found.discrepancies) > 10
+                        else ""
+                    )
+                    how = (
+                        f"recovered: read-back not as predicted "
+                        f"({tally(len(found.discrepancies), 'discrepancy')}: {shown}); "
+                        f"{tally(found.restored, 'resource')} put back from undo {undone[:16]}"
+                    )
+                elif found is not None:
+                    how = (
+                        f"recovered: the write stopped part way; "
+                        f"{tally(found.restored, 'resource')} put back from undo {undone[:16]}"
+                    )
+                else:
+                    how = (
+                        f"recovered: the apply stopped part way and was undone from undo "
+                        f"{undone[:16]}"
+                    )
                 record = self._chain.append(
                     RecordType.COMPENSATED,
                     plan_id=intent.plan_id,
@@ -1378,8 +1409,7 @@ class EscrowEngine:
                     anchored=point.anchored,
                     agentgov_head_hash=point.head_hash,
                     agentgov_sequence=point.sequence,
-                    note=f"recovered: the apply stopped part way and was undone from undo "
-                    f"{undone[:16]} (intent {intent.sequence})",
+                    note=f"{how} (intent {intent.sequence})",
                 )
                 logger.warning(
                     "recovered commit intent for plan %s (stage %s): partial apply undone",
@@ -1396,12 +1426,7 @@ class EscrowEngine:
                 anchored=point.anchored,
                 agentgov_head_hash=point.head_hash,
                 agentgov_sequence=point.sequence,
-                note=(
-                    f"recovered: commit marker present, stage committed (intent {intent.sequence})"
-                    if outcome
-                    else f"recovered: no commit marker, stage rolled back "
-                    f"(intent {intent.sequence})"
-                ),
+                note=_recovered_note(self._substrate, outcome, intent.sequence),
             )
             logger.warning(
                 "recovered commit intent for plan %s (stage %s): %s",
@@ -1522,6 +1547,25 @@ class EscrowEngine:
         if not outcome:
             undone = _compensated(self._substrate, stage_id)
             if undone is not None:
+                found = _settlement(self._substrate, stage_id)
+                if found is not None:
+                    # A predicted stage, read back after its commit could not finish
+                    # (1.5.2): what landed was put back, and the record says what was found.
+                    raise CompensatedError(
+                        f"stage {stage_id}: the commit could not finish ({lost}); the system "
+                        f"was read back"
+                        + (
+                            f" and was not what was predicted ({'; '.join(found.discrepancies)})"
+                            if found.discrepancies
+                            else ""
+                        )
+                        + f", and every resource the write changed was put back from undo "
+                        f"{undone[:16]}",
+                        applied=found.applied,
+                        restored=found.restored,
+                        undo=undone,
+                        discrepancies=found.discrepancies,
+                    ) from lost
                 # A plan-bound apply that stopped part way, put back from its
                 # undo: nothing of it is left applied.
                 raise CompensatedError(
@@ -1530,6 +1574,11 @@ class EscrowEngine:
                     applied=0,
                     restored=0,
                     undo=undone,
+                ) from lost
+            if _settles_by_read_back(self._substrate):
+                raise StageError(
+                    f"commit failed: {lost}. The system was read back, and nothing of stage "
+                    f"{stage_id} is on it"
                 ) from lost
             raise StageError(
                 f"commit failed: the connection was lost and stage {stage_id} left no "
@@ -1817,6 +1866,35 @@ def _compensated(substrate: ShadowSubstrate, stage_id: uuid.UUID) -> str | None:
         return None
     digest = reader(stage_id)
     return str(digest) if digest else None
+
+
+def _settles_by_read_back(substrate: ShadowSubstrate) -> bool:
+    """Whether the substrate settles an unfinished commit by reading the system back (a
+    predicted substrate, 1.5.2), not by a commit marker inside a transaction."""
+    return callable(getattr(substrate, "settlement", None))
+
+
+def _settlement(substrate: ShadowSubstrate, stage_id: uuid.UUID) -> Settlement | None:
+    """What a predicted substrate found and put back when it settled the stage, if it says."""
+    reader = getattr(substrate, "settlement", None)
+    if not callable(reader):
+        return None
+    found = reader(stage_id)
+    return found if isinstance(found, Settlement) else None
+
+
+def _recovered_note(substrate: ShadowSubstrate, committed: bool, intent: int) -> str:
+    if _settles_by_read_back(substrate):
+        return (
+            f"recovered: read back as predicted, stage committed (intent {intent})"
+            if committed
+            else f"recovered: nothing of the stage was written (intent {intent})"
+        )
+    return (
+        f"recovered: commit marker present, stage committed (intent {intent})"
+        if committed
+        else f"recovered: no commit marker, stage rolled back (intent {intent})"
+    )
 
 
 def _recorded_txid(note: str) -> str | None:

@@ -461,6 +461,12 @@ class V without an EHR. Class V can't see a server rule before the write. The ru
 is caught by the read-back and undone, not refused in advance, and the receipt's class says
 so. The server has to allow client-assigned ids, so that a create can be predicted exactly.
 
+Since 1.5.2 a commit that cannot finish is never recorded as aborted once a write has gone
+out. The intent stays open and is settled by reading the whole chart back, at once or at the
+next `recover()`, as [the REST section](#rest-apis-ticketing-crm-and-hr-systems-predicted-and-verified-150)
+describes. The undo journal now holds each chart resource whole, so recovery can put back
+an order that a server rule changed and the stage did not write.
+
 ## REST APIs: ticketing, CRM and HR systems, predicted and verified (1.5.0)
 
 `RestSubstrate` gives any JSON REST API the FHIR substrate's class V guarantee. It needs two
@@ -481,6 +487,27 @@ writes that can be made conditional on it.
   `COMPENSATED`. With `source` naming the field where the API records the request that last
   wrote a resource, a rule your write set off is put back and a person's change is left alone
   and named.
+- **When the commit cannot finish (1.5.2).** Once a write has been sent, a failure no longer
+  says whether it landed: the connection dropped, the write timed out, or the read-back
+  could not be read. The stage is then *unsettled*, never aborted. The commit intent stays
+  open on the chain and the undo stays in the journal. The engine settles it at once if the
+  API answers, and `recover()` settles it at the next start if not. Either way the
+  settlement does the whole read-back: every resource the stage writes, and every tenant
+  it listed. As predicted, the stage is recorded `COMMITTED`. Anything else, and what the
+  stage wrote is put back (with whatever `source` says its request set off) and it is
+  recorded `COMPENSATED`. A resource someone else has written since, or one that cannot be
+  put back, leaves the intent open for a person, with a warning that names it.
+
+Two bounds keep one bad answer from taking the process down, both settable under `[rest]`:
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `max_response_bytes` | 10485760 (10 MiB) | The longest answer read. A longer one is refused, not read. |
+| `max_pages` | 1000 | How many pages one listing follows. A next link that leads back to a page already read is refused whatever this is. |
+
+Recovery after a long outage is deliberately strict. It applies the commit's own rule, so
+a neighbor that anyone changed while the process was down counts as a difference, and the
+stage's write is put back. The agent can run the plan again against the account as it is now.
 
 <!-- readme-test: skip reason="needs an API; tests/test_rest.py makes the same calls on interlock.sim.rest" -->
 ```python

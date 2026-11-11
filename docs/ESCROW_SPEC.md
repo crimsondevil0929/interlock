@@ -1036,6 +1036,19 @@ conditional write and held to it by a read-back.
   write made) is someone else's change, MUST NOT be put back, and leaves the
   intent open for a person, whether or not the server names the request in
   `meta.source` (HAPI FHIR does not, by default).
+  *Amended in 1.5.2:* once a write of the commit has been sent, the substrate MUST NOT
+  report any later failure as a failed commit: a lost connection, a write that timed out,
+  an answer it could not parse or would not read, a read-back it could not complete. The
+  outcome is then unknown, the intent MUST stay open, and the stage MUST NOT be recorded
+  `ABORTED` while a write of it may stand. Settling it (at once, or at recovery) MUST read
+  back what the commit would have: every resource the stage writes and the whole scope,
+  under the rule of this requirement. As predicted, the stage is `COMMITTED`. With any
+  difference, what the stage wrote and what the system attributes to its request MUST be
+  put back and the stage recorded `COMPENSATED`; a resource written again by another
+  request, or one that cannot be put back, leaves the intent open for a person. The undo
+  of E4-12 MUST therefore hold each resource of the scope whole, not only its version or
+  digest. An undo written by an earlier release holds no such image: a resource the
+  stage's request changed without writing it is then left for a person.
 - **E4-15.** Every receipt of a predicted stage MUST say
   `coverage.measurement = "predicted"` (ARC1 1.3), and every write MUST carry
   the stage's id, as a marker recovery reads and an identifier the system's
@@ -1334,6 +1347,7 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-12: the undo first; a created record voided, never deleted; each effect declares its undo | Implemented (1.4.0) | `planbound.UndoJournal`; `void <table>`, `restore <table>`; `SubstrateCapabilities(requires_compensation=True)` | `test_fhir` |
 | E4-13: nothing written when the scope moved; every update on the version read | Implemented (1.4.0) | the scope read again before the first write; `If-Match: W/"<versionId>"`, `412` a conflict | `test_fhir` |
 | E4-14: read back against the prediction; a difference put back and receipted `compensated` | Implemented (1.4.0; only what landed is put back, 1.4.1; against HAPI FHIR, `test_real_fhir`) | `CompensatedError(discrepancies=)`, `RecordType.COMPENSATED`, `OutcomeStatus.COMPENSATED` (agentgov 1.2.0) | `test_fhir` |
+| E4-14 (1.5.2): a sent write is never recorded aborted; recovery reads the whole scope back | Implemented (1.5.2) | `CommitUnsettledError` from `commit()` once a write is sent; `resolve_intent` (written resources and the scope; put-back from the undo's images); `predicted.Settlement`; `[rest] max_response_bytes`, `max_pages` | `test_rest`, `test_fhir` (a process killed between the write and the read-back, `tests/predicted_child.py`) |
 | E4-15: predicted receipts; the stage's id on every write | Implemented (1.4.0) | `SubstrateCapabilities(measurement="predicted", predicted=True)`; `meta.tag` and `X-Request-Id` | `test_fhir` |
 | E4-11 to E4-15 on any JSON REST API | Implemented (1.5.0) | `RestSubstrate`, `RestResource` (`ETag` or a version field; `If-Match`; merge patches; a tenant's listing as the scope; `source` for whose change it is) | `test_rest` |
 | E4-16: a directory measured from the stage's copy; unsafe paths refused | Implemented (1.5.0) | `FilesystemSubstrate` (`_manifest`, `path_problem`, `ignore`, hook sources) | `test_filesystem` |

@@ -19,6 +19,7 @@ from interlock.rest import RestSubstrate
 from interlock.runtime import EscrowRuntime
 from interlock.sim.rest import Collection, LoopbackRestServer
 from interlock.types import Compensation, EffectKind
+from interlock.wiring import open_rest
 
 
 def workspace_config(tmp_path: Path, extra: str = "") -> Path:
@@ -228,6 +229,28 @@ def test_an_api_configuration_is_checked(
     path.write_text(text)
     with pytest.raises(ConfigError, match=why):
         load_config(path)
+
+
+def test_an_apis_answer_and_listing_bounds_are_settings(
+    tmp_path: Path, desk: LoopbackRestServer
+) -> None:
+    """``[rest] max_response_bytes`` and ``max_pages`` (1.5.2): 10 MiB and 1,000 pages unless
+    the file says otherwise, and each a whole number of at least 1."""
+    path = rest_config(tmp_path, desk)
+    config = load_config(path)
+    assert config.rest is not None
+    assert (config.rest.max_response_bytes, config.rest.max_pages) == (10 * 1024 * 1024, 1000)
+    text = path.read_text()
+    limits = 'journal = "journal"\nmax_response_bytes = 65536\nmax_pages = 40\n'
+    path.write_text(text.replace('journal = "journal"\n', limits))
+    config = load_config(path)
+    assert config.rest is not None
+    sub = open_rest(config)
+    assert (sub.max_response_bytes, sub.max_pages) == (65536, 40)
+    for bad in ("max_pages = 0", "max_response_bytes = 1.5", "max_pages = true"):
+        path.write_text(text.replace('journal = "journal"\n', f'journal = "journal"\n{bad}\n'))
+        with pytest.raises(ConfigError, match="is a whole number, at least 1"):
+            load_config(path)
 
 
 def test_a_rest_section_needs_its_resources(tmp_path: Path) -> None:

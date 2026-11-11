@@ -30,7 +30,7 @@ from interlock.outbound_checks import (
     RecipientAllowlist,
     SinkAllowlist,
 )
-from interlock.text import noun, tally
+from interlock.text import noun, nouns, tally
 from interlock.types import (
     PARTITION,
     TENANT,
@@ -119,7 +119,10 @@ class BlastRadius:
             InvariantViolation(
                 invariant=self.name,
                 severity=Severity.BLOCKING,
-                message=(f"plan would mutate {diff.blast_radius} rows, limit is {self._limit}"),
+                message=(
+                    f"plan would mutate {diff.blast_radius} "
+                    f"{noun(2, nouns(diff.substrate_id).row)}, limit is {self._limit}"
+                ),
                 evidence={
                     "measured_rows": str(diff.blast_radius),
                     "limit": str(self._limit),
@@ -189,6 +192,7 @@ class TenantIsolation:
         found: list[InvariantViolation] = []
         tenant = self._dimension == TENANT
         labels = diff.partition_ids(self._dimension)
+        things = noun(2, nouns(diff.substrate_id).row)
         if len(labels) > self._max_tenants:
             found.append(
                 InvariantViolation(
@@ -216,10 +220,10 @@ class TenantIsolation:
                         invariant=self.name,
                         severity=Severity.BLOCKING,
                         message=(
-                            f"plan changes rows of {tally(len(undeclared), 'tenant')} its effects "
-                            f"do not declare: {', '.join(sorted(undeclared))}"
+                            f"plan changes {things} of {tally(len(undeclared), 'tenant')} its "
+                            f"effects do not declare: {', '.join(sorted(undeclared))}"
                             if tenant
-                            else f"plan changes rows of {len(undeclared)} {self._dimension} "
+                            else f"plan changes {things} of {len(undeclared)} {self._dimension} "
                             f"{noun(len(undeclared), 'partition')} its effects do not declare: "
                             f"{', '.join(sorted(undeclared))}"
                         ),
@@ -288,7 +292,10 @@ class TableAllowlist:
             InvariantViolation(
                 invariant=self.name,
                 severity=Severity.BLOCKING,
-                message=f"plan touched tables outside the allowlist: {', '.join(sorted(trespass))}",
+                message=(
+                    f"plan touched {noun(2, nouns(diff.substrate_id).table)} outside the "
+                    f"allowlist: {', '.join(sorted(trespass))}"
+                ),
                 evidence={
                     "unexpected": ",".join(sorted(trespass)),
                     "allowed": ",".join(sorted(self._allowed)),
@@ -336,8 +343,9 @@ class NoDelete:
                 invariant=self.name,
                 severity=Severity.BLOCKING,
                 message=(
-                    f"plan deletes {tally(count, 'row')} from ungranted "
-                    f"{noun(len(offenders), 'table')}: {', '.join(offenders)}"
+                    f"plan deletes {tally(count, nouns(diff.substrate_id).row)} from ungranted "
+                    f"{noun(len(offenders), nouns(diff.substrate_id).table)}: "
+                    f"{', '.join(offenders)}"
                 ),
                 evidence={"tables": ",".join(offenders), "rows": str(count)},
             ),
@@ -736,8 +744,8 @@ class StatedFootprint:
                 invariant=self.name,
                 severity=self._severity,
                 message=(
-                    f"agent stated {tally(stated, 'row')}; substrate measured "
-                    f"{diff.blast_radius} ({ratio:.1f}x)"
+                    f"agent stated {tally(stated, nouns(diff.substrate_id).row)}; substrate "
+                    f"measured {diff.blast_radius} ({ratio:.1f}x)"
                 ),
                 evidence={
                     "stated": str(stated),
@@ -913,6 +921,7 @@ class CrossEffectAgreement:
         )
 
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        one = nouns(diff.substrate_id).row
         requests = [
             o for o in diff.outbound if o.sink == self._sink and o.operation in self._operations
         ]
@@ -937,7 +946,7 @@ class CrossEffectAgreement:
                     problems.append(
                         (
                             f"a {self._calls} request has no {self._key[0]} "
-                            f"to pair it with {self._table} rows",
+                            f"to pair it with {self._table} {noun(2, one)}",
                             {"effect": request.effect_id},
                         )
                     )
@@ -949,14 +958,14 @@ class CrossEffectAgreement:
                 if scalar is None:
                     problems.append(
                         (
-                            f"a {self._table} row has no {key_column} to pair it with a request",
+                            f"a {self._table} {one} has no {key_column} to pair it with a request",
                             {"row": row.primary_key},
                         )
                     )
                     continue
                 groups.setdefault(scalar, ([], []))[1].append(row)
         for group_key, (grouped_requests, grouped_rows) in groups.items():
-            problems += self._compare(group_key, grouped_requests, grouped_rows)
+            problems += self._compare(group_key, grouped_requests, grouped_rows, one)
         return tuple(
             InvariantViolation(
                 invariant=self.name,
@@ -979,13 +988,14 @@ class CrossEffectAgreement:
         group: tuple[str, str] | None,
         requests: list[OutboundDelta],
         rows: list[RowDelta],
+        one: str,
     ) -> list[tuple[str, dict[str, str]]]:
         where = "" if group is None or self._key is None else f" for {self._key[0]} {group[1]}"
         evidence = {} if group is None else {"key": group[1]}
         if not requests:
             return [
                 (
-                    f"the plan wrote {self._table} rows{where} with no "
+                    f"the plan wrote {self._table} {noun(2, one)}{where} with no "
                     f"{self._calls} request to match them",
                     evidence,
                 )
@@ -993,12 +1003,13 @@ class CrossEffectAgreement:
         if not rows:
             return [
                 (
-                    f"a {self._calls} request{where} has no {self._table} rows to agree with",
+                    f"a {self._calls} request{where} has no {self._table} {noun(2, one)} "
+                    f"to agree with",
                     evidence,
                 )
             ]
         if self._measure == "value":
-            return self._compare_values(where, evidence, requests, rows)
+            return self._compare_values(where, evidence, requests, rows, one)
         requested = Decimal(0)
         for request in requests:
             found, value = _at(request.payload, self._path)
@@ -1017,7 +1028,7 @@ class CrossEffectAgreement:
             if change is None:
                 return [
                     (
-                        f"a {self._table} row{where} holds no number in {self._column}",
+                        f"a {self._table} {one}{where} holds no number in {self._column}",
                         {**evidence, "row": row.primary_key},
                     )
                 ]
@@ -1027,7 +1038,7 @@ class CrossEffectAgreement:
         return [
             (
                 f"{self._calls} asks for {requested} at {self._field}{where}; "
-                f"the plan's {self._table} rows record {measured} "
+                f"the plan's {self._table} {noun(2, one)} record {measured} "
                 f"({'inserted' if self._measure == 'inserted' else 'net change'})",
                 {**evidence, "requested": str(requested), "measured": str(measured)},
             )
@@ -1056,6 +1067,7 @@ class CrossEffectAgreement:
         evidence: dict[str, str],
         requests: list[OutboundDelta],
         rows: list[RowDelta],
+        one: str,
     ) -> list[tuple[str, dict[str, str]]]:
         recorded: set[tuple[str, str]] = set()
         for row in rows:
@@ -1064,7 +1076,7 @@ class CrossEffectAgreement:
             if scalar is None:
                 return [
                     (
-                        f"a {self._table} row{where} holds no value in {self._column}",
+                        f"a {self._table} {one}{where} holds no value in {self._column}",
                         {**evidence, "row": row.primary_key},
                     )
                 ]
@@ -1072,8 +1084,8 @@ class CrossEffectAgreement:
         if len(recorded) > 1:
             return [
                 (
-                    f"the plan's {self._table} rows{where} hold {len(recorded)} different "
-                    f"{self._column} values, so no request can agree with them",
+                    f"the plan's {self._table} {noun(2, one)}{where} hold {len(recorded)} "
+                    f"different {self._column} values, so no request can agree with them",
                     evidence,
                 )
             ]
@@ -1085,8 +1097,8 @@ class CrossEffectAgreement:
                 return [
                     (
                         f"a {self._calls} request{where} carries a "
-                        f"{self._field} other than the {self._column} its {self._table} rows "
-                        f"hold",
+                        f"{self._field} other than the {self._column} its {self._table} "
+                        f"{noun(2, one)} hold",
                         {**evidence, "effect": request.effect_id},
                     )
                 ]
@@ -1180,6 +1192,7 @@ class FactAgreement:
         return f"fact_agreement:{'|'.join(self._kinds)}.{self._field}={self._table}.{self._column}"
 
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        one = nouns(diff.substrate_id).row
         table = self._table.lower()
         facts = [f for f in diff.facts if f.kind in self._kinds]
         problems: list[tuple[str, str]] = []
@@ -1196,7 +1209,7 @@ class FactAgreement:
                     continue
             if written in self._exempt:
                 continue
-            problem = self._unjustified(row, written, facts)
+            problem = self._unjustified(row, written, facts, one)
             if problem is not None:
                 problems.append((problem, row.primary_key))
         return tuple(
@@ -1215,7 +1228,7 @@ class FactAgreement:
         )
 
     def _unjustified(
-        self, row: RowDelta, written: tuple[str, str] | None, facts: list[InboundFact]
+        self, row: RowDelta, written: tuple[str, str] | None, facts: list[InboundFact], one: str
     ) -> str | None:
         """Why no fact justifies the row's write, or ``None`` when one does.
         Values are not echoed: what a vendor said is data."""
@@ -1228,14 +1241,14 @@ class FactAgreement:
             assert row.after is not None
             paired = _scalar(row.after.get(key_column))
             if paired is None:
-                return f"a {self._table} row has no {key_column} to pair it with a {kinds} fact"
+                return f"a {self._table} {one} has no {key_column} to pair it with a {kinds} fact"
             facts = [f for f in facts if _scalar(f.fields.get(fact_field)) == paired]
         if row.tenant_id is not None:
             facts = [f for f in facts if f.tenant_id in (None, row.tenant_id)]
         if not facts:
             return (
                 f"the plan writes {self._table}.{self._column} without consuming a {kinds} "
-                f"fact about that row"
+                f"fact about that {one}"
             )
         if any(_scalar(f.fields.get(self._field)) == written for f in facts):
             return None

@@ -721,19 +721,48 @@ def test_a_refused_write_is_never_put_back_over_someone_elses(tmp_path: Path) ->
         server.stop()
 
 
-def test_a_put_back_that_fails_leaves_the_intent_open(
+def test_a_put_back_that_fails_once_is_finished_at_once(
     server: LoopbackFhirServer, tmp_path: Path
 ) -> None:
+    """Since 1.5.2 the engine settles an unsettled commit right away: a put-back the server
+    refused once is tried again, and the stage is recorded compensated."""
+
     def refuse_the_undo(ctx: RuleContext, change: Change) -> None:
         if change.after.get("status") == "stopped" and change.actor == AGENT:
             server.fail_next("MedicationRequest", "2", 503)
 
     server.add_rule(refuse_the_undo)
     run = engine(substrate(server, tmp_path), tmp_path)
+    with pytest.raises(CompensatedError, match="the system was read back"):
+        run.execute(plan(stop("1")))
+    assert run.chain.records()[-1].record_type is RecordType.COMPENSATED
+    assert statuses(server) == {"1": "active", "2": "active", "3": "active"}
+    assert not list((tmp_path / "journal").glob("*.undo.json"))
+
+
+def test_a_put_back_that_keeps_failing_leaves_the_intent_open(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    sub = substrate(server, tmp_path)
+    restore = sub._restore
+
+    def refuse(stage_id: Any, kind: Any, resource_id: str, before: Any, now: Any) -> str | None:
+        if resource_id == "2":
+            return "MedicationRequest/2: HTTP 503"
+        return restore(stage_id, kind, resource_id, before, now)
+
+    sub._restore = refuse  # type: ignore[method-assign]
+    run = engine(sub, tmp_path)
     with pytest.raises(CommitUnsettledError, match="could not put everything back"):
         run.execute(plan(stop("1")))
     assert run.chain.records()[-1].record_type is RecordType.COMMIT_INTENT
     assert list((tmp_path / "journal").glob("*.undo.json"))
+    assert statuses(server)["2"] == "stopped"
+    run.chain.close()
+    # The server takes the write again: the next recovery finishes the put-back.
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMPENSATED
+    assert statuses(server) == {"1": "active", "2": "active", "3": "active"}
 
 
 def test_expect_version_pins_the_plan_to_what_was_approved(
@@ -1188,3 +1217,120 @@ def test_the_server_speaks_enough_fhir(server: LoopbackFhirServer) -> None:
     assert any(
         e["agent"][0]["who"]["identifier"]["value"] == "anonymous" for e in strict.audit_events()
     )
+
+
+# -- a commit that cannot finish is settled by reading back, never recorded as aborted (1.5.2) --
+#
+# As tests/test_rest.py: once a write has gone out, a failure says nothing about whether it
+# landed. The intent stays open until the chart can be read back.
+
+
+class _Flaky:
+    """The server's API, ``searches`` of its chart reads failing once a write has gone out
+    (a negative number: every one)."""
+
+    def __init__(self, inner: Any, *, searches: int) -> None:
+        self._inner = inner
+        self._searches = searches
+        self.wrote = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def call(self, method: str, path: str, body: Any = None, **kwargs: Any) -> Any:
+        reply = self._inner.call(method, path, body, **kwargs)
+        self.wrote = self.wrote or method == "PUT"
+        return reply
+
+    def read(self, resource_type: str, resource_id: str) -> Any:
+        return self._inner.read(resource_type, resource_id)
+
+    def search(self, query: str, *, limit: int) -> Any:
+        if self.wrote and self._searches:
+            self._searches -= 1
+            raise SubstrateUnavailableError("cannot reach the FHIR server: timed out")
+        return self._inner.search(query, limit=limit)
+
+
+def flaky(sub: FhirSubstrate, searches: int) -> FhirSubstrate:
+    sub._api = _Flaky(sub._api, searches=searches)  # type: ignore[assignment]
+    return sub
+
+
+def test_a_read_back_that_fails_once_is_settled_at_once(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), 1), tmp_path)
+    result = run.execute(plan(patch("2", {"status": "on-hold"})))
+    assert result.committed and statuses(server)["2"] == "on-hold"
+    last = run.chain.records()[-1]
+    assert last.record_type is RecordType.COMMITTED
+    assert "the system read back as predicted" in last.note
+    assert not list((tmp_path / "journal").glob("*"))
+
+
+def test_a_read_back_that_cannot_be_read_leaves_the_intent_open(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), -1), tmp_path)
+    with pytest.raises(CommitUnsettledError, match="A write had been sent"):
+        run.execute(plan(patch("2", {"status": "on-hold"})))
+    assert statuses(server)["2"] == "on-hold", "the write is on the server"
+    kinds = [r.record_type for r in run.chain.records()]
+    assert RecordType.ABORTED not in kinds and kinds[-1] is RecordType.COMMIT_INTENT
+    run.chain.close()
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMMITTED and "read back as predicted" in record.note
+
+
+def test_recovery_reads_the_whole_chart_back_and_undoes_a_rule(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    """E4-14 at recovery. The order was stopped, the EHR's rule stopped the rest of the
+    encounter and opened a task, and the commit never got to read the chart back. Recovery
+    does: the two orders the rule changed are put back from the undo's images, the task is
+    marked entered-in-error, and the stage is recorded compensated."""
+    run = engine(flaky(substrate(server, tmp_path), -1), tmp_path)
+    with pytest.raises(CommitUnsettledError):
+        run.execute(plan(stop("1")))
+    assert statuses(server) == {"1": "stopped", "2": "stopped", "3": "stopped"}
+    run.chain.close()
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMPENSATED
+    assert "read-back not as predicted (3 discrepancies" in record.note
+    assert "MedicationRequest/2: status 'active' -> 'stopped'" in record.note
+    assert "4 resources put back" in record.note
+    assert statuses(server) == {"1": "active", "2": "active", "3": "active"}
+    (task,) = server.search("Task", patient=CHART)
+    assert task["status"] == "entered-in-error"
+    assert statuses(server, OTHER) == {"4": "active"}
+
+
+def test_a_request_is_queued_once_when_the_commit_is_settled_by_reading_back(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    """With a control database: the failed commit lets go of its transaction, and the
+    settlement writes the outbox row again from the redo record, once."""
+    control = _control(tmp_path)
+    sub = flaky(substrate(server, tmp_path, control=control), 1)
+    builder = PlanBuilder("med-rec-agent", intent="order and dispense")
+    kind, statement, parameters, table, undo = create()
+    builder.add(
+        kind,
+        table=f"fhir:{table}",
+        statement=statement,
+        parameters=parameters,
+        tenant_id=CHART,
+        compensation=Compensation(undo),
+    )
+    builder.enqueue(
+        sink="pharmacy", operation="dispense.create", payload={"dose_mg": 650}, tenant_id=CHART
+    )
+    run = engine(sub, tmp_path, sinks=SinkRegistry(SINKS))
+    result = run.execute(builder.build())
+    assert result.committed and run.chain.records()[-1].record_type is RecordType.COMMITTED
+    with sqlite3.connect(control) as conn:
+        assert conn.execute("SELECT count(*) FROM _interlock_outbox").fetchone() == (1,)
+    again = substrate(server, tmp_path, control=control)
+    handle = again.open(plan(create()))  # the control database is not left locked
+    again.close(handle)

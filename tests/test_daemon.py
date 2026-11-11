@@ -936,7 +936,7 @@ def test_a_reload_rotates_the_relay_and_inbox_keys_while_the_daemon_runs(
         kms.close()
     assert [r.committed for r in charged] == [True, True]
     assert told["reload"] == dict.fromkeys(("relay-0", "inbox", "settler", "vacuum"))
-    assert "; 1 rows sealed" in told["relay"] and "; 0 rows sealed" in told["inbox"]
+    assert "; 1 row sealed" in told["relay"] and "; 0 rows sealed" in told["inbox"]
     # Each key signed only before its rotation, or only after.
     assert kms.signed[("relay", 1)] == 1 and kms.signed[("relay", 2)] == 1
     assert kms.signed[("inbox", 1)] == 0 and kms.signed[("inbox", 2)] == 4

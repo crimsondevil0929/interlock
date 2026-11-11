@@ -233,6 +233,8 @@ def open_rest(config: InterlockConfig, *, control: str | None = None) -> RestSub
         control=control if control is not None else (config.database or None),
         timeout=settings.timeout_seconds,
         max_stage_seconds=config.engine.max_stage_seconds,
+        max_response_bytes=settings.max_response_bytes,
+        max_pages=settings.max_pages,
     )
 
 

@@ -23,6 +23,7 @@ import pytest
 from interlock import BlastRadius, EscrowChain, EscrowEngine, PlanBuilder, TenantIsolation
 from interlock.chain import RecordType
 from interlock.exceptions import (
+    CommitUnsettledError,
     CompensatedError,
     ForbiddenStatementError,
     StageConflictError,
@@ -48,6 +49,7 @@ from interlock.sim.rest import (
     merge_patch,
 )
 from interlock.types import Compensation, EffectKind, StageState
+from tests.children import Child
 
 TOKEN = "agent-token"
 ACME, GLOBEX = "acct-acme", "acct-globex"
@@ -596,31 +598,359 @@ def test_a_write_through_the_engine_is_forbidden_when_not_a_statement(
         engine(sub, tmp_path).execute(bad)
 
 
-def test_oversized_response_raises_substrate_unavailable(
+# -- bounds on what one answer and one listing may be (1.5.1, settable in 1.5.2) --------------
+
+
+def test_an_answer_longer_than_the_bound_is_not_read(
     server: LoopbackRestServer, tmp_path: Path
 ) -> None:
     sub = substrate(server, tmp_path, max_response_bytes=32)
     assert sub.max_response_bytes == 32
-    with pytest.raises(SubstrateUnavailableError, match="exceeded 32 bytes"):
+    with pytest.raises(SubstrateUnavailableError, match=r"longer than 32 bytes \(max_response_"):
         sub._api.call("GET", "/tickets/tkt-1")
+    with pytest.raises(SubstrateUnavailableError, match=r"HTTP 404 answer .* longer than 8 bytes"):
+        substrate(server, tmp_path, max_response_bytes=8)._api.call("GET", "/tickets/nothing")
 
 
-def test_repeating_pagination_cursor_raises_stage_error(
-    server: LoopbackRestServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_listing_stops_at_the_page_bound(server: LoopbackRestServer, tmp_path: Path) -> None:
+    """The account's three tickets span two pages of two."""
+    sub = substrate(server, tmp_path, max_pages=1)
+    assert sub.max_pages == 1
+    with pytest.raises(StageError, match=r"runs past 1 page \(max_pages\)"):
+        sub._api.find(TICKETS, "account_id", ACME, limit=10)
+    assert (
+        len(
+            substrate(server, tmp_path, max_pages=2)._api.find(
+                TICKETS, "account_id", ACME, limit=10
+            )
+        )
+        == 3
+    )
+
+
+class _Looping:
+    """The API, every page of a list naming itself as the next one."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def call(self, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+        reply = self._inner.call(method, path, *args, **kwargs)
+        if method == "GET" and isinstance(reply.body, dict) and "data" in reply.body:
+            reply.body["next"] = path
+        return reply
+
+
+def test_a_next_link_that_loops_is_refused(server: LoopbackRestServer, tmp_path: Path) -> None:
+    sub = substrate(server, tmp_path)
+    looping = _Looping(sub._api)
+    with pytest.raises(StageError, match="leads back to a page already read"):
+        type(sub._api).find(looping, TICKETS, "account_id", ACME, limit=10)  # type: ignore[arg-type]
+
+
+# -- a commit that cannot finish is settled by reading back, never recorded as aborted (1.5.2) --
+#
+# Once a write has gone out, a failure says nothing about whether it landed. The commit
+# raises CommitUnsettledError, the intent stays open, and resolve_intent settles it: at once
+# if the API answers, at the next recovery if not.
+
+
+class _Flaky:
+    """The API, failing as a test says. ``listings``: how many lists fail once a write has
+    gone out (a negative number: every one). ``write``: ``"no-answer"`` for a write that
+    lands and whose answer is lost, ``"never-sent"`` for one that does not leave."""
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        listings: int = 0,
+        error: Exception | None = None,
+        write: str = "ok",
+    ) -> None:
+        self._inner = inner
+        self._listings = listings
+        self._error = error or SubstrateUnavailableError("cannot reach the API: timed out")
+        self._write = write
+        self.wrote = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def call(self, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+        if method == "GET":
+            return self._inner.call(method, path, *args, **kwargs)
+        if self._write == "never-sent":
+            raise SubstrateUnavailableError("cannot reach the API: connection refused")
+        reply = self._inner.call(method, path, *args, **kwargs)
+        self.wrote = True
+        if self._write == "no-answer":
+            self._write = "ok"
+            raise SubstrateUnavailableError("cannot reach the API: timed out")
+        return reply
+
+    def find(self, kind: Any, parameter: str, value: str, *, limit: int) -> Any:
+        if self.wrote and self._listings:
+            self._listings -= 1
+            raise self._error
+        return self._inner.find(kind, parameter, value, limit=limit)
+
+
+def flaky(sub: RestSubstrate, **kwargs: Any) -> RestSubstrate:
+    sub._api = _Flaky(sub._api, **kwargs)  # type: ignore[assignment]
+    return sub
+
+
+def kinds(run: EscrowEngine) -> list[RecordType]:
+    return [record.record_type for record in run.chain.records()]
+
+
+def journal(tmp_path: Path) -> list[Path]:
+    return sorted((tmp_path / "journal").glob("*"))
+
+
+def test_a_read_back_that_fails_once_is_settled_at_once(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), listings=1), tmp_path)
+    result = run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    assert result.committed and ticket(server, 1)["status"] == "pending"
+    last = run.chain.records()[-1]
+    assert last.record_type is RecordType.COMMITTED
+    assert "the system read back as predicted" in last.note
+    assert RecordType.ABORTED not in kinds(run) and not journal(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SubstrateUnavailableError("cannot reach the API: timed out"),
+        StageError("listing /tickets leads back to a page already read"),
+    ],
+    ids=["the API is unreachable", "the listing is refused"],
+)
+def test_a_read_back_that_cannot_be_read_leaves_the_intent_open(
+    server: LoopbackRestServer, tmp_path: Path, error: Exception
+) -> None:
+    """The reproduction of the 1.5.1 bug: the write stayed on the API and the chain said
+    ``aborted``. Now the intent stays open, and the next recovery reads the account back."""
+    run = engine(flaky(substrate(server, tmp_path), listings=-1, error=error), tmp_path)
+    with pytest.raises(CommitUnsettledError, match="A write had been sent"):
+        run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    assert ticket(server, 1)["status"] == "pending", "the write is on the API"
+    assert RecordType.ABORTED not in kinds(run)
+    assert kinds(run)[-1] is RecordType.COMMIT_INTENT and len(run.chain.unresolved_intents()) == 1
+    assert journal(tmp_path), "the undo stays while the stage is unsettled"
+    run.chain.close()
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMMITTED
+    assert "read back as predicted" in record.note and not journal(tmp_path)
+
+
+def test_recovery_reads_the_whole_account_back_and_undoes_a_cascade(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    """E4-14 at recovery: the ticket was written, the desk's rule reassigned it and opened an
+    incident, and the commit never got to read back. Recovery does, and puts all of it back."""
+    run = engine(flaky(substrate(server, tmp_path), listings=-1), tmp_path)
+    with pytest.raises(CommitUnsettledError):
+        run.execute(plan(patch("tkt-1", {"priority": "urgent"})))
+    assert ticket(server, 1)["assignee"] == "oncall", "the rule ran"
+    assert [i["status"] for i in server.find("incidents", account_id=ACME)] == ["open"]
+    run.chain.close()
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMPENSATED
+    assert "read-back not as predicted (2 discrepancies" in record.note
+    assert "tickets/tkt-1: assignee 'tier1' -> 'oncall', not as predicted" in record.note
+    assert "incidents/" in record.note and "was created" in record.note
+    assert "2 resources put back" in record.note
+    after = ticket(server, 1)
+    assert (after["priority"], after["assignee"]) == ("normal", "tier1")
+    assert [i["status"] for i in server.find("incidents", account_id=ACME)] == ["cancelled"]
+    assert not journal(tmp_path)
+
+
+def test_a_cascade_found_when_settling_at_once_is_compensated(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), listings=1), tmp_path)
+    with pytest.raises(CompensatedError, match="the system was read back") as caught:
+        run.execute(plan(patch("tkt-1", {"priority": "urgent"})))
+    assert caught.value.result is not None
+    assert caught.value.result.state is StageState.COMPENSATED  # type: ignore[attr-defined]
+    assert len(caught.value.discrepancies) == 2 and caught.value.restored == 2
+    assert kinds(run)[-1] is RecordType.COMPENSATED
+    assert ticket(server, 1)["priority"] == "normal"
+    assert [i["status"] for i in server.find("incidents", account_id=ACME)] == ["cancelled"]
+
+
+def test_a_write_whose_answer_is_lost_is_read_back_and_stands(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), write="no-answer"), tmp_path)
+    result = run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    assert result.committed and ticket(server, 1)["status"] == "pending"
+    assert kinds(run)[-1] is RecordType.COMMITTED
+
+
+def test_a_write_that_never_left_is_aborted_and_nothing_changed(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), write="never-sent"), tmp_path)
+    with pytest.raises(StageError, match=r"nothing of stage .* is on it"):
+        run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    assert ticket(server, 1)["status"] == "open"
+    assert kinds(run)[-1] is RecordType.ABORTED and not journal(tmp_path)
+
+
+def test_a_failure_before_any_write_is_still_a_plain_failure(
+    server: LoopbackRestServer, tmp_path: Path
 ) -> None:
     sub = substrate(server, tmp_path)
-    # 1. Test page budget limit
-    with pytest.raises(StageError, match="repeating pagination cursor or exceeded 1 pages"):
-        sub._api.find(TICKETS, "account_id", ACME, limit=10, max_pages=1)
 
-    # 2. Test cyclic cursor detection
-    def mock_cyclic_call(self: Any, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
-        return type(
-            "Reply",
-            (),
-            {"status": 200, "body": {"data": [{"id": "tkt-1"}], "next": path}, "etag": None},
-        )()
+    def unreadable(stage: Any) -> list[str]:
+        raise SubstrateUnavailableError("cannot reach the API: timed out")
 
-    monkeypatch.setattr(sub._api.__class__, "call", mock_cyclic_call)
-    with pytest.raises(StageError, match="repeating pagination cursor or exceeded"):
-        sub._api.find(TICKETS, "account_id", ACME, limit=10, max_pages=10)
+    sub._moved = unreadable  # type: ignore[method-assign]
+    run = engine(sub, tmp_path)
+    with pytest.raises(SubstrateUnavailableError):
+        run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    assert ticket(server, 1)["status"] == "open" and kinds(run)[-1] is RecordType.ABORTED
+
+
+def nudge(ctx: RuleContext, change: Change) -> None:
+    """A rule that changes a neighbor: a ticket set to pending raises tkt-2's priority."""
+    after, before = change.after or {}, change.before or {}
+    if change.collection != "tickets" or after.get("id") != "tkt-1":
+        return
+    if after.get("status") == "pending" and before.get("status") != "pending":
+        other = ctx.get("tickets", "tkt-2")
+        assert other is not None
+        ctx.write("tickets", {**other, "priority": "high"})
+
+
+def test_recovery_puts_back_a_neighbor_the_stages_request_changed(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    server._rules.append(nudge)
+    run = engine(flaky(substrate(server, tmp_path), listings=-1), tmp_path)
+    with pytest.raises(CommitUnsettledError):
+        run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    assert ticket(server, 2)["priority"] == "high"
+    run.chain.close()
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMPENSATED
+    assert (
+        "tickets/tkt-2: priority 'normal' -> 'high', which the plan did not change" in record.note
+    )
+    assert ticket(server, 1)["status"] == "open" and ticket(server, 2)["priority"] == "normal"
+
+
+def test_an_undo_written_before_1_5_2_leaves_such_a_neighbor_to_a_person(
+    server: LoopbackRestServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An older undo holds each neighbor's fingerprint and no image, so recovery cannot put
+    one back: it puts back what it can, says so, and the intent stays open."""
+    server._rules.append(nudge)
+    run = engine(flaky(substrate(server, tmp_path), listings=-1), tmp_path)
+    with pytest.raises(CommitUnsettledError):
+        run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    run.chain.close()
+    (undo,) = journal(tmp_path)
+    document = json.loads(undo.read_text())
+    for listed in document["scope"].values():
+        for entry in listed:
+            del entry["image"]
+    undo.write_text(json.dumps(document))
+    again = engine(substrate(server, tmp_path), tmp_path)
+    assert again.recover() == ()
+    assert "this undo holds no image of it" in caplog.text
+    assert ticket(server, 1)["status"] == "open", "what the stage wrote itself is put back"
+    assert ticket(server, 2)["priority"] == "high" and journal(tmp_path)
+    assert len(again.chain.unresolved_intents()) == 1
+
+
+def test_someone_elses_change_in_the_gap_is_named_and_never_put_back(
+    server: LoopbackRestServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    run = engine(flaky(substrate(server, tmp_path), listings=-1), tmp_path)
+    with pytest.raises(CommitUnsettledError):
+        run.execute(plan(patch("tkt-1", {"status": "pending"})))
+    server.write("tickets", {**ticket(server, 2), "priority": "low"})  # a person, meanwhile
+    run.chain.close()
+    (record,) = engine(substrate(server, tmp_path), tmp_path).recover()
+    assert record.record_type is RecordType.COMPENSATED, "a difference is never accepted"
+    assert ticket(server, 1)["status"] == "open" and ticket(server, 2)["priority"] == "low"
+    assert "tickets/tkt-2 differ from what the stage read and are not its own" in caplog.text
+
+
+def test_a_change_in_the_gap_with_nothing_written_is_a_plain_rollback(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    sub = substrate(server, tmp_path)
+    one = plan(patch("tkt-1", {"status": "pending"}))
+    handle = sub.open(one)
+    sub.apply(handle, one.effects[0])
+    sub.diff(handle)
+    sub.write_undo(handle)
+    server.write("tickets", {**ticket(server, 2), "priority": "low"})
+    recovered = substrate(server, tmp_path)
+    assert recovered.resolve_intent(handle.stage_id) is False
+    assert (
+        recovered.compensated(handle.stage_id) is None
+        and recovered.settlement(handle.stage_id) is None
+    )
+
+
+# -- end to end: a process killed between its write and the read-back (1.5.2) -----------------
+
+
+def killed_before_the_read_back(
+    server: LoopbackRestServer, tmp_path: Path, change: dict[str, Any]
+) -> uuid.UUID:
+    """Run the commit in a child process and SIGKILL it once every write has landed, before
+    the read-back starts. The stage's id."""
+    scenario = {"server": server.url, "directory": str(tmp_path), "change": change}
+    child = Child(scenario, tmp_path, 1, module="tests.predicted_child")
+    stage_id = child.wait_for("written").stage_id
+    child.kill()
+    return stage_id
+
+
+def test_a_process_killed_before_the_read_back_is_settled_by_the_next_one(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    killed_before_the_read_back(server, tmp_path, {"status": "pending"})
+    assert ticket(server, 1)["status"] == "pending", "the write landed before the kill"
+    run = engine(substrate(server, tmp_path), tmp_path)
+    assert kinds(run)[-1] is RecordType.COMMIT_INTENT and journal(tmp_path)
+    (record,) = run.recover()
+    assert record.record_type is RecordType.COMMITTED
+    assert "read back as predicted" in record.note
+    assert ticket(server, 1)["status"] == "pending" and not journal(tmp_path)
+    assert run.recover() == (), "settled once"
+
+
+def test_a_process_killed_after_a_write_that_set_off_a_rule_has_it_all_put_back(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    """The proof of E4-14 at recovery. Before 1.5.2 this recovered as committed: the ticket
+    was as predicted but for the rule's reassignment, and nobody listed the account again."""
+    stage_id = killed_before_the_read_back(server, tmp_path, {"priority": "urgent"})
+    before = ticket(server, 1)
+    assert (before["priority"], before["assignee"]) == ("urgent", "oncall")
+    (incident,) = server.find("incidents", account_id=ACME)
+    assert incident["status"] == "open" and incident["last_request"] == str(stage_id)
+    run = engine(substrate(server, tmp_path), tmp_path)
+    (record,) = run.recover()
+    assert record.record_type is RecordType.COMPENSATED
+    assert "read-back not as predicted (2 discrepancies" in record.note
+    after = ticket(server, 1)
+    assert (after["priority"], after["assignee"]) == ("normal", "tier1")
+    (incident,) = server.find("incidents", account_id=ACME)
+    assert incident["status"] == "cancelled", "voided, as the type declares, never deleted"
+    assert [t["id"] for t in server.find("tickets", account_id=GLOBEX)] == ["tkt-4"]
+    assert not journal(tmp_path) and run.chain.unresolved_intents() == ()

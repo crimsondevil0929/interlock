@@ -9,6 +9,70 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-11-11
+
+Two faults in how a predicted (class V) commit is settled when it cannot finish, on FHIR
+servers (since 1.4.0) and REST APIs (since 1.5.0). Upgrade if you stage on either. Nothing to
+change in a configuration; an undo journal written by an earlier release is still read.
+
+### Fixed
+
+- **A write that reached the system is never recorded as aborted.** If anything failed after
+  a commit had sent a write (the connection dropped, a write timed out, the read-back could
+  not be read, a listing ran past its bounds), the engine recorded the stage `ABORTED`. The
+  write stayed on the server, `recover()` had nothing to settle, and the undo was left
+  behind. The commit now raises `CommitUnsettledError` in every such case, so the intent
+  stays open. The engine settles it at once if the system answers, and `recover()` settles
+  it at the next start if not.
+- **Recovery does the whole read-back (E4-14).** `resolve_intent` judged a crashed stage by
+  the resources it had written and nothing else, so a rule that the write set off elsewhere
+  (an EHR stopping the rest of an encounter, a desk opening an incident) recovered as
+  `COMMITTED` if the process died before its read-back. It now reads every written resource
+  and the whole scope, and applies the commit's rule. As predicted, the stage is `COMMITTED`.
+  With any difference, what the stage wrote is put back, with whatever the system says its
+  request set off, and the stage is `COMPENSATED`, the record naming what was found. A
+  resource someone else wrote since, or one that cannot be put back, leaves the intent open
+  for a person.
+  - The undo journal now holds each resource of the scope whole, so recovery can put back
+    one the stage's request changed without writing it. An undo from an earlier release
+    holds only a version or a digest: such a resource is then left for a person, with a
+    warning that names it.
+  - A written resource that a rule rewrote is recognized as the stage's own when the system
+    names the stage's request as its last writer, where recovery used to give up on it.
+  - With a control database, a commit that fails lets go of the control transaction, so the
+    settlement can write the outbox rows again from the redo record, once.
+- **A put-back that fails once is finished at once.** The same settlement runs when a
+  put-back could not complete, so one refused write no longer leaves an intent open until
+  the next restart.
+- **`tests/test_real_kubernetes.py` no longer fails by chance.** Its own stand-in for
+  another writer read a Deployment and wrote it back in one try, and the Deployment
+  controller sometimes got in between (HTTP 409). `main` was red for that reason when
+  1.5.1 was tagged. It retries on the version it reads, as a client does.
+
+### Changed
+
+- **`[rest] max_response_bytes` and `max_pages`.** The bounds 1.5.1 added are settings now,
+  in `interlock.toml` and on `RestSubstrate`: 10 MiB and 1,000 pages unless you say
+  otherwise. In 1.5.1 the page bound was the larger of 50 and `max_diff_rows`, and could
+  not be set. Each refusal says which bound it was and names its setting; a next link that
+  leads back to a page already read is refused whatever `max_pages` is.
+- **A refusal uses the system's own nouns.** Checker findings and chain notes said "rows"
+  and "tables" on every system. A directory now reads "plan deletes 1 file from ungranted
+  path class: scripts", a cluster "objects" and "kinds", Terraform "resources" and "resource
+  types", FHIR "resources", a REST API "records". SQL's wording is unchanged. Checker names
+  (`table_allowlist`, `no_delete`) are identifiers that receipts and mandates carry, and
+  stay as they are.
+  - What an agent is told on Kubernetes and Terraform has its own wording too. It used to
+    fall back to SQL's, down to "narrow the statements' WHERE clauses".
+  - Chain notes count in the singular ("1 file committed", "about to commit 1 row"), and
+    so does `interlock keys` when it reports a revoked key ("1 row sealed").
+
+### Added
+
+- `interlock.predicted.Settlement`, and `settlement(stage_id)` on both predicted
+  substrates: what a settlement found and put back, for the engine's record.
+- `interlock.text.nouns(substrate_id)`: the two nouns of each system.
+
 ## [1.5.1] - 2026-11-08
 
 ### Fixed
