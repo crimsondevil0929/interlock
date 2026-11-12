@@ -966,6 +966,8 @@ class FilesystemSubstrate:
         stage = self._require(handle)
         self._assert_live(handle)
         problem = path_problem(path)
+        if problem is None and _ignored(path, self._ignore):
+            problem = "is ignored: a stage holds no copy of it"
         if problem is not None:
             raise ForbiddenStatementError(
                 f"read refused: path {path[:120]!r} {problem}", reason="statement_kind"
