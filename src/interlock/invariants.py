@@ -50,18 +50,24 @@ from interlock.windows import RateWindowCheck
 
 __all__ = [
     "BUILT_IN_CHECKERS",
+    "CHECKER_ALIASES",
     "BlastRadius",
+    "ChangeLimit",
     "ColumnValueGuard",
     "CrossEffectAgreement",
     "FactAgreement",
     "InvariantChecker",
+    "KindAllowlist",
     "NoDelete",
     "NoSchemaChange",
+    "PartitionIsolation",
     "StatedFootprint",
     "TableAllowlist",
     "TenantDrawdownGuard",
     "TenantIsolation",
     "TruncationGuard",
+    "ValueGuard",
+    "checker_family",
     "default_checkers",
 ]
 
@@ -88,21 +94,20 @@ class InvariantChecker(Protocol):
 # with nothing else.
 
 
-class BlastRadius:
-    """Bound the mutations a single plan may make.
+class _Limit:
+    """What :class:`ChangeLimit` and :class:`BlastRadius` share. Each concrete
+    checker declares its own ``__slots__``: a receipt digests a checker's
+    configuration from the slots its own class names."""
 
-    The coarse radius check: an agent that meant to touch three rows and is
-    about to touch four thousand is wrong regardless of why.
+    __slots__ = ()
 
-    Compares against ``diff.blast_radius``, which counts captured mutations
-    rather than distinct rows, so a row mutated twice counts twice. The limit
-    is therefore conservative.
-    """
-
-    __slots__ = ("_limit",)
+    _NAME: ClassVar[str]
+    _EVIDENCE: ClassVar[tuple[str, str]]
+    _limit: int
 
     def __init__(self, limit: int) -> None:
-        self._limit = limit
+        # Set by name: the slot is the concrete checker's, not this base's.
+        object.__setattr__(self, "_limit", limit)
 
     @property
     def limit(self) -> int:
@@ -110,11 +115,12 @@ class BlastRadius:
 
     @property
     def name(self) -> str:
-        return "blast_radius"
+        return self._NAME
 
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
         if diff.blast_radius <= self._limit:
             return ()
+        measured, kinds = self._EVIDENCE
         return (
             InvariantViolation(
                 invariant=self.name,
@@ -124,9 +130,9 @@ class BlastRadius:
                     f"{noun(2, nouns(diff.substrate_id).row)}, limit is {self._limit}"
                 ),
                 evidence={
-                    "measured_rows": str(diff.blast_radius),
+                    measured: str(diff.blast_radius),
                     "limit": str(self._limit),
-                    "tables": ",".join(sorted(diff.tables_touched)),
+                    kinds: ",".join(sorted(diff.tables_touched)),
                 },
             ),
         )
@@ -142,7 +148,174 @@ class BlastRadius:
         )
 
 
-class TenantIsolation:
+class ChangeLimit(_Limit):
+    """Bound the changes a single plan may make (1.6.0).
+
+    The coarse check: an agent that meant to touch three things and is about
+    to touch four thousand is wrong regardless of why. A change is a row, a
+    file, an object, a resource or a record, whatever the substrate counts.
+
+    Compares against ``diff.change_count``, which counts captured changes
+    rather than distinct resources, so one changed twice counts twice. The
+    limit is therefore conservative.
+
+    Records ``change_limit``. :class:`BlastRadius` is the same check under
+    the name it has had since 1.0: it records ``blast_radius``.
+    """
+
+    __slots__ = ("_limit",)
+
+    LABEL: ClassVar[str] = "change_limit"
+    _NAME: ClassVar[str] = "change_limit"
+    _EVIDENCE: ClassVar[tuple[str, str]] = ("measured", "kinds")
+
+
+class BlastRadius(_Limit):
+    """:class:`ChangeLimit` under its SQL name: bound the mutations a single
+    plan may make. Records ``blast_radius``, as it always has, so a
+    deployment configured with it keeps its receipts' digests.
+
+    Compares against ``diff.blast_radius``, which counts captured mutations
+    rather than distinct rows, so a row mutated twice counts twice.
+    """
+
+    __slots__ = ("_limit",)
+
+    _NAME: ClassVar[str] = "blast_radius"
+    _EVIDENCE: ClassVar[tuple[str, str]] = ("measured_rows", "tables")
+
+
+class _Isolation:
+    """What :class:`PartitionIsolation` and :class:`TenantIsolation` share."""
+
+    __slots__ = ()
+
+    _NEUTRAL: ClassVar[bool]
+    _declared: bool
+    _dimension: str
+    _max_tenants: int
+
+    def _set(self, maximum: int, declared: bool, dimension: str) -> None:
+        if not PARTITION.fullmatch(dimension):
+            raise ValueError(f"{dimension!r} is not a partition dimension")
+        object.__setattr__(self, "_max_tenants", maximum)
+        object.__setattr__(self, "_declared", declared)
+        object.__setattr__(self, "_dimension", dimension)
+
+    @property
+    def name(self) -> str:
+        if self._dimension == TENANT and not self._NEUTRAL:
+            return "tenant_isolation"
+        return f"partition_isolation:{self._dimension}"
+
+    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        found: list[InvariantViolation] = []
+        tenant = self._dimension == TENANT
+        # The tenant's own evidence keys are the SQL-named checker's; the
+        # neutral one names the dimension in every violation.
+        keyed = tenant and not self._NEUTRAL
+        labels = diff.partition_ids(self._dimension)
+        things = noun(2, nouns(diff.substrate_id).row)
+        if len(labels) > self._max_tenants:
+            found.append(
+                InvariantViolation(
+                    invariant=self.name,
+                    severity=Severity.BLOCKING,
+                    message=(
+                        f"plan spans {len(labels)} tenants, limit is {self._max_tenants}"
+                        if tenant
+                        else f"plan spans {len(labels)} {self._dimension} partitions, limit is "
+                        f"{self._max_tenants}"
+                    ),
+                    evidence=(
+                        {"tenants": ",".join(sorted(labels))}
+                        if keyed
+                        else {"dimension": self._dimension, "labels": ",".join(sorted(labels))}
+                    ),
+                )
+            )
+        if self._declared:
+            declared = _declared_labels(plan, self._dimension)
+            undeclared = labels - declared
+            if undeclared:
+                found.append(
+                    InvariantViolation(
+                        invariant=self.name,
+                        severity=Severity.BLOCKING,
+                        message=(
+                            f"plan changes {things} of {tally(len(undeclared), 'tenant')} its "
+                            f"effects do not declare: {', '.join(sorted(undeclared))}"
+                            if tenant
+                            else f"plan changes {things} of {len(undeclared)} {self._dimension} "
+                            f"{noun(len(undeclared), 'partition')} its effects do not declare: "
+                            f"{', '.join(sorted(undeclared))}"
+                        ),
+                        evidence={
+                            **({} if keyed else {"dimension": self._dimension}),
+                            "undeclared": ",".join(sorted(undeclared)),
+                            "declared": ",".join(sorted(declared)),
+                        },
+                    )
+                )
+        return tuple(found)
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # The labels touched, and the plan's own, go in for the sanitizer to
+        # cut down to the ones the plan declared: the agent is told its own,
+        # and that there were others. How many never leaves this method.
+        dimension = self._dimension
+        labels = tuple(sorted(diff.partition_ids(dimension) | _declared_labels(plan, dimension)))
+        if "undeclared" in violation.evidence:
+            return FeedbackHint(
+                kind=Guidance.UNDECLARED_TENANT, tenants=labels, dimension=dimension
+            )
+        return FeedbackHint(
+            kind=Guidance.TENANT_SCOPE,
+            tenants=labels,
+            limit=self._max_tenants,
+            dimension=dimension,
+        )
+
+
+class PartitionIsolation(_Isolation):
+    """Refuse a plan that reaches across partitions (1.6.0): across tenants,
+    or across any other dimension a resource is labelled in.
+
+    Independent of how much changes: one change spanning two tenants is a
+    cross-tenant write, which is the expensive failure in a shared system
+    whatever its size.
+
+    :param dimension: The dimension to isolate: the tenant by default, or
+        another the substrate labels its resources in (``"patient"``,
+        ``"namespace"``). One instance per dimension.
+    :param max: How many labels of the dimension one plan's changes may span.
+    :param declared: Also hold the changes to the labels the plan's effects
+        declare in the dimension. A count alone admits a plan declared for
+        one tenant that changes only another's: it spans one.
+
+    Records ``partition_isolation:<dimension>``. :class:`TenantIsolation` is
+    the same check under the name it has had since 1.0: for the tenant it
+    records ``tenant_isolation``.
+    """
+
+    __slots__ = ("_declared", "_dimension", "_max_tenants")
+
+    LABEL: ClassVar[str] = "partition_isolation"
+    _NEUTRAL: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        dimension: str = TENANT,
+        *,
+        max: int = 1,
+        declared: bool = False,
+    ) -> None:
+        self._set(max, declared, dimension)
+
+
+class TenantIsolation(_Isolation):
     """Refuse a plan that reaches across tenants, or across any partition.
 
     Independent of row count: a one-row change spanning two tenants is a
@@ -172,88 +345,12 @@ class TenantIsolation:
     __slots__ = ("_declared", "_dimension", "_max_tenants")
 
     UNSET: ClassVar[Mapping[str, object]] = {"_dimension": TENANT}
+    _NEUTRAL: ClassVar[bool] = False
 
     def __init__(
         self, max_tenants: int = 1, *, declared: bool = False, dimension: str = TENANT
     ) -> None:
-        if not PARTITION.fullmatch(dimension):
-            raise ValueError(f"{dimension!r} is not a partition dimension")
-        self._max_tenants = max_tenants
-        self._declared = declared
-        self._dimension = dimension
-
-    @property
-    def name(self) -> str:
-        if self._dimension == TENANT:
-            return "tenant_isolation"
-        return f"partition_isolation:{self._dimension}"
-
-    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
-        found: list[InvariantViolation] = []
-        tenant = self._dimension == TENANT
-        labels = diff.partition_ids(self._dimension)
-        things = noun(2, nouns(diff.substrate_id).row)
-        if len(labels) > self._max_tenants:
-            found.append(
-                InvariantViolation(
-                    invariant=self.name,
-                    severity=Severity.BLOCKING,
-                    message=(
-                        f"plan spans {len(labels)} tenants, limit is {self._max_tenants}"
-                        if tenant
-                        else f"plan spans {len(labels)} {self._dimension} partitions, limit is "
-                        f"{self._max_tenants}"
-                    ),
-                    evidence=(
-                        {"tenants": ",".join(sorted(labels))}
-                        if tenant
-                        else {"dimension": self._dimension, "labels": ",".join(sorted(labels))}
-                    ),
-                )
-            )
-        if self._declared:
-            declared = _declared_labels(plan, self._dimension)
-            undeclared = labels - declared
-            if undeclared:
-                found.append(
-                    InvariantViolation(
-                        invariant=self.name,
-                        severity=Severity.BLOCKING,
-                        message=(
-                            f"plan changes {things} of {tally(len(undeclared), 'tenant')} its "
-                            f"effects do not declare: {', '.join(sorted(undeclared))}"
-                            if tenant
-                            else f"plan changes {things} of {len(undeclared)} {self._dimension} "
-                            f"{noun(len(undeclared), 'partition')} its effects do not declare: "
-                            f"{', '.join(sorted(undeclared))}"
-                        ),
-                        evidence={
-                            **({} if tenant else {"dimension": self._dimension}),
-                            "undeclared": ",".join(sorted(undeclared)),
-                            "declared": ",".join(sorted(declared)),
-                        },
-                    )
-                )
-        return tuple(found)
-
-    def hint(
-        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
-    ) -> FeedbackHint:
-        # The labels touched, and the plan's own, go in for the sanitizer to
-        # cut down to the ones the plan declared: the agent is told its own,
-        # and that there were others. How many never leaves this method.
-        dimension = self._dimension
-        labels = tuple(sorted(diff.partition_ids(dimension) | _declared_labels(plan, dimension)))
-        if "undeclared" in violation.evidence:
-            return FeedbackHint(
-                kind=Guidance.UNDECLARED_TENANT, tenants=labels, dimension=dimension
-            )
-        return FeedbackHint(
-            kind=Guidance.TENANT_SCOPE,
-            tenants=labels,
-            limit=self._max_tenants,
-            dimension=dimension,
-        )
+        self._set(max_tenants, declared, dimension)
 
 
 def _declared_tenants(plan: EffectPlan) -> frozenset[str]:
@@ -267,22 +364,20 @@ def _declared_labels(plan: EffectPlan, dimension: str) -> frozenset[str]:
     return frozenset(label for label in found if label is not None)
 
 
-class TableAllowlist:
-    """Restrict the tables a plan may touch.
+class _Allowlist:
+    """What :class:`KindAllowlist` and :class:`TableAllowlist` share."""
 
-    Checked against the measured tables rather than the tables the statements
-    name, so a cascade into another observed table is caught. A cascade into an
-    unobserved table does not reach the diff and is not caught.
-    """
+    __slots__ = ()
 
-    __slots__ = ("_allowed",)
+    _NAME: ClassVar[str]
+    _allowed: frozenset[str]
 
     def __init__(self, allowed: Sequence[str]) -> None:
-        self._allowed = frozenset(allowed)
+        object.__setattr__(self, "_allowed", frozenset(allowed))
 
     @property
     def name(self) -> str:
-        return "table_allowlist"
+        return self._NAME
 
     def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
         trespass = diff.tables_touched - self._allowed
@@ -309,6 +404,38 @@ class TableAllowlist:
         return FeedbackHint(
             kind=Guidance.TABLE_SCOPE, tables=tuple(sorted(diff.tables_touched - self._allowed))
         )
+
+
+class KindAllowlist(_Allowlist):
+    """Restrict the kinds of thing a plan may change (1.6.0): the tables, the
+    path classes, the object kinds, the resource types.
+
+    Checked against the kinds the substrate measured rather than the ones the
+    statements name, so a change that arrives by a trigger, a hook or a
+    controller is caught wherever the substrate observes it.
+
+    Records ``kind_allowlist``. :class:`TableAllowlist` is the same check
+    under the name it has had since 1.0: it records ``table_allowlist``.
+    """
+
+    __slots__ = ("_allowed",)
+
+    LABEL: ClassVar[str] = "kind_allowlist"
+    _NAME: ClassVar[str] = "kind_allowlist"
+
+
+class TableAllowlist(_Allowlist):
+    """:class:`KindAllowlist` under its SQL name: restrict the tables a plan
+    may touch. Records ``table_allowlist``, as it always has.
+
+    Checked against the measured tables rather than the tables the statements
+    name, so a cascade into another observed table is caught. A cascade into an
+    unobserved table does not reach the diff and is not caught.
+    """
+
+    __slots__ = ("_allowed",)
+
+    _NAME: ClassVar[str] = "table_allowlist"
 
 
 class NoDelete:
@@ -361,7 +488,114 @@ class NoDelete:
         )
 
 
-class ColumnValueGuard:
+class _Guard:
+    """What :class:`ValueGuard` and :class:`ColumnValueGuard` share."""
+
+    __slots__ = ()
+
+    UNSET: ClassVar[Mapping[str, object]] = {"_max_rise": None}
+    _PREFIX: ClassVar[str]
+    _ALWAYS_EXACT: ClassVar[bool]
+    _column: str
+    _max_drop: Decimal | None
+    _max_rise: Decimal | None
+    _table: str
+
+    def _set(
+        self,
+        table: str,
+        column: str,
+        max_drop_fraction: float | Decimal | str | None,
+        max_rise_fraction: float | Decimal | str | None,
+    ) -> None:
+        if max_drop_fraction is None and max_rise_fraction is None:
+            raise ValueError("a value guard bounds a drop, a rise, or both")
+        object.__setattr__(self, "_table", table)
+        object.__setattr__(self, "_column", column)
+        # Decimal, because ``drop`` is Decimal: mixing the two raises
+        # TypeError, and a checker that raises is a blocking violation.
+        object.__setattr__(self, "_max_drop", _fraction(max_drop_fraction))
+        object.__setattr__(self, "_max_rise", _fraction(max_rise_fraction))
+
+    @property
+    def name(self) -> str:
+        return f"{self._PREFIX}:{self._table}.{self._column}"
+
+    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        before, after = diff.column_total(self._table, self._column)
+        if before <= 0:
+            return ()
+        where = f"{self._table}.{self._column}"
+        return tuple(
+            _moves(
+                self.name, where, before, after, self._max_drop, self._max_rise, exact=self._exact
+            )
+        )
+
+    @property
+    def _exact(self) -> bool:
+        return self._ALWAYS_EXACT or self._max_rise is not None
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        # The limit, which is policy. Never the totals or the fall, which are
+        # the data: from its own change and the fall an agent could work out
+        # the table's total.
+        rise = "rise_fraction" in violation.evidence
+        limit = self._max_rise if rise else self._max_drop
+        assert limit is not None  # a violation of a bound the guard has
+        return FeedbackHint(
+            kind=Guidance.VALUE_RISE if rise else Guidance.VALUE_DROP,
+            tables=(self._table,),
+            columns=(self._column,),
+            percent=_percent(limit),
+        )
+
+
+class ValueGuard(_Guard):
+    """Bound how far a numeric field's total may fall, or rise, in one plan
+    (1.6.0): a column of a table, a field of a resource type.
+
+    Catches the case where every change is individually valid and the
+    aggregate is not: zeroing a thousand order totals passes any per-row type
+    check, and so does a dose read in micrograms for milligrams.
+
+    The total is over what the plan changed, each resource counted once,
+    before and after. A diff whose total before is zero or negative is not
+    checked, which covers plans that only create: a new resource's value is
+    bounded by a window or a cap, not by a fraction of nothing.
+
+    :param kind: The kind of resource: the table, the resource type.
+    :param field: Its numeric field: the column.
+    :param max_drop_fraction: Largest permitted decrease as a fraction of the
+        total before. ``0.25`` allows a 25% reduction.
+    :param max_rise_fraction: Largest permitted increase, likewise. At least
+        one of the two is given.
+
+    Records ``value_guard:<kind>.<field>``, and reports totals at their own
+    precision. :class:`ColumnValueGuard` is the same check under the name it
+    has had since 1.0: it records ``column_value_guard:<table>.<column>``.
+    """
+
+    __slots__ = ("_column", "_max_drop", "_max_rise", "_table")
+
+    LABEL: ClassVar[str] = "value_guard"
+    _PREFIX: ClassVar[str] = "value_guard"
+    _ALWAYS_EXACT: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        kind: str,
+        field: str,
+        *,
+        max_drop_fraction: float | Decimal | str | None = None,
+        max_rise_fraction: float | Decimal | str | None = None,
+    ) -> None:
+        self._set(kind, field, max_drop_fraction, max_rise_fraction)
+
+
+class ColumnValueGuard(_Guard):
     """Bound how far a numeric column's total may fall, or rise, in one plan.
 
     Catches the case where every row is individually valid and the aggregate is
@@ -385,6 +619,8 @@ class ColumnValueGuard:
     __slots__ = ("_column", "_max_drop", "_max_rise", "_table")
 
     UNSET: ClassVar[Mapping[str, object]] = {"_max_rise": None}
+    _PREFIX: ClassVar[str] = "column_value_guard"
+    _ALWAYS_EXACT: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -394,49 +630,7 @@ class ColumnValueGuard:
         max_drop_fraction: float | Decimal | str | None = None,
         max_rise_fraction: float | Decimal | str | None = None,
     ) -> None:
-        if max_drop_fraction is None and max_rise_fraction is None:
-            raise ValueError("a value guard bounds a drop, a rise, or both")
-        self._table = table
-        self._column = column
-        # Decimal, because ``drop`` is Decimal: mixing the two raises
-        # TypeError, and a checker that raises is a blocking violation.
-        self._max_drop = _fraction(max_drop_fraction)
-        self._max_rise = _fraction(max_rise_fraction)
-
-    @property
-    def name(self) -> str:
-        return f"column_value_guard:{self._table}.{self._column}"
-
-    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
-        before, after = diff.column_total(self._table, self._column)
-        if before <= 0:
-            return ()
-        where = f"{self._table}.{self._column}"
-        return tuple(
-            _moves(
-                self.name, where, before, after, self._max_drop, self._max_rise, exact=self._exact
-            )
-        )
-
-    @property
-    def _exact(self) -> bool:
-        return self._max_rise is not None
-
-    def hint(
-        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
-    ) -> FeedbackHint:
-        # The limit, which is policy. Never the totals or the fall, which are
-        # the data: from its own change and the fall an agent could work out
-        # the table's total.
-        rise = "rise_fraction" in violation.evidence
-        limit = self._max_rise if rise else self._max_drop
-        assert limit is not None  # a violation of a bound the guard has
-        return FeedbackHint(
-            kind=Guidance.VALUE_RISE if rise else Guidance.VALUE_DROP,
-            tables=(self._table,),
-            columns=(self._column,),
-            percent=_percent(limit),
-        )
+        self._set(table, column, max_drop_fraction, max_rise_fraction)
 
 
 class TenantDrawdownGuard:
@@ -1308,10 +1502,14 @@ BUILT_IN_CHECKERS: frozenset[type] = frozenset(
         RateWindowCheck,
         MeterCheck,
         BlastRadius,
+        ChangeLimit,
         TenantIsolation,
+        PartitionIsolation,
         TableAllowlist,
+        KindAllowlist,
         NoDelete,
         ColumnValueGuard,
+        ValueGuard,
         TenantDrawdownGuard,
         TruncationGuard,
         StatedFootprint,
@@ -1320,3 +1518,26 @@ BUILT_IN_CHECKERS: frozenset[type] = frozenset(
 )
 """The checkers whose feedback hints are trusted with numbers. Exact types:
 a subclass can override ``hint`` and is treated like any custom checker."""
+
+
+CHECKER_ALIASES: Final[Mapping[str, str]] = {
+    "blast_radius": "change_limit",
+    "table_allowlist": "kind_allowlist",
+    "tenant_isolation": "partition_isolation",
+    "column_value_guard": "value_guard",
+}
+"""Each SQL-named checker, and the name the same check records since 1.6.0.
+Both are built in, and both stay: a record made under either name is read
+under it, and :func:`checker_family` says when two names are one check."""
+
+
+def checker_family(name: str) -> str:
+    """The check a recorded checker name is, whichever vocabulary recorded
+    it, without its configuration: ``change_limit`` for ``blast_radius`` and
+    for ``change_limit``, ``value_guard`` for
+    ``column_value_guard:orders.total_cents`` and for
+    ``value_guard:orders.total_cents``, ``partition_isolation`` for
+    ``tenant_isolation`` and for ``partition_isolation:patient``. Any other
+    name is returned without what follows its first colon."""
+    head = name.partition(":")[0]
+    return CHECKER_ALIASES.get(head, head)

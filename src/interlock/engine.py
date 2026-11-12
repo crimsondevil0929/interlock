@@ -44,19 +44,19 @@ import logging
 import re
 import threading
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agentgov.core import Authorization, EntryType, LedgerEntry, SettlementClaim
 from agentgov.exceptions import AgentGovError
 
 from interlock.adjudication import Adjudication, adjudicate
 from interlock.anchor import AnchorPoint, JoinedCommit, LedgerAnchor
-from interlock.builder import new_plan_id
+from interlock.builder import PlanBuilder, new_plan_id
 from interlock.cascade import CascadeReport
 from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.exceptions import (
@@ -89,6 +89,7 @@ from interlock.substrate import ShadowSubstrate, _verb_reason
 from interlock.text import noun, nouns, tally
 from interlock.trace import require_traceparent
 from interlock.types import (
+    Compensation,
     Effect,
     EffectDiff,
     EffectId,
@@ -109,7 +110,7 @@ if TYPE_CHECKING:
 
     from interlock.receipts import ReceiptIssuer
 
-__all__ = ["EscrowEngine", "StageResult"]
+__all__ = ["EscrowEngine", "OpenStage", "StageResult"]
 
 logger = logging.getLogger("interlock.engine")
 
@@ -542,7 +543,13 @@ class EscrowEngine:
 
     # -- the main path ------------------------------------------------------
 
-    def execute(self, plan: EffectPlan, *, settle_cost: Decimal | str | None = None) -> StageResult:
+    def execute(
+        self,
+        plan: EffectPlan,
+        *,
+        settle_cost: Decimal | str | None = None,
+        _opened: _Opened | None = None,
+    ) -> StageResult:
         """Run one plan through the full lifecycle.
 
         A refusal is a normal return with ``committed=False``, not an
@@ -575,7 +582,11 @@ class EscrowEngine:
         try:
             with self._repair_claim(plan) as repairs:
                 return self._execute(
-                    plan, settle_cost=settle_cost, repairs=repairs, receipt_id=receipt_id
+                    plan,
+                    settle_cost=settle_cost,
+                    repairs=repairs,
+                    receipt_id=receipt_id,
+                    opened=_opened,
                 )
         except InterlockError as exc:
             if exc.feedback is None:
@@ -593,40 +604,52 @@ class EscrowEngine:
         settle_cost: Decimal | str | None,
         repairs: str | None,
         receipt_id: str | None,
+        opened: _Opened | None = None,
     ) -> StageResult:
-        cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
-        if cost < 0:
-            raise PlanError(f"settle_cost cannot be negative, got {cost}")
-        self.admit(plan)
-        # Charged at commit with the plan: what producing it cost, and what
-        # each request it enqueues costs, as the operator's registry prices
-        # it. A refused plan pays only the first: its requests never commit.
-        quoted = self._quote_outbound(plan)
-        self._record(
-            RecordType.PLAN_ADMITTED,
-            plan,
-            plan.content_hash(),
-            note=(f"repair of {plan.repair_of}: " if plan.repair_of else "") + plan.intent[:80],
-        )
-        stamp = f"; receipt {receipt_id}" if receipt_id else ""
-        terminal: EscrowRecord | None = None
-        txid: str | None = None
+        try:
+            cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
+            if cost < 0:
+                raise PlanError(f"settle_cost cannot be negative, got {cost}")
+            self.admit(plan)
+            # Charged at commit with the plan: what producing it cost, and what
+            # each request it enqueues costs, as the operator's registry prices
+            # it. A refused plan pays only the first: its requests never commit.
+            quoted = self._quote_outbound(plan)
+            self._record(
+                RecordType.PLAN_ADMITTED,
+                plan,
+                plan.content_hash(),
+                note=(f"repair of {plan.repair_of}: " if plan.repair_of else "") + plan.intent[:80],
+            )
+            stamp = f"; receipt {receipt_id}" if receipt_id else ""
+            terminal: EscrowRecord | None = None
+            txid: str | None = None
 
-        # Claim and settle: the hold is placed before the stage opens, so the
-        # stage's snapshot can see it, and a plan its scope cannot pay for is
-        # refused before it stages anything.
-        held = self._hold_meters(plan)
-        try:
-            reservation = self._reserve(plan, cost + quoted)
+            # Claim and settle: the hold is placed before the stage opens, so the
+            # stage's snapshot can see it, and a plan its scope cannot pay for is
+            # refused before it stages anything.
+            held = self._hold_meters(plan)
+            try:
+                reservation = self._reserve(plan, cost + quoted)
+            except BaseException:
+                self._release_meters(held)
+                raise
         except BaseException:
-            self._release_meters(held)
+            # A stage that was opened before its plan (stage()) holds a
+            # transaction or a private copy: a plan refused before it is
+            # staged gives that back.
+            if opened is not None:
+                self._drop(opened.handle)
             raise
-        try:
-            handle = self._substrate.open(plan)
-        except BaseException:
-            self._release(reservation)
-            self._release_meters(held)
-            raise
+        if opened is not None:
+            handle = opened.handle
+        else:
+            try:
+                handle = self._substrate.open(plan)
+            except BaseException:
+                self._release(reservation)
+                self._release_meters(held)
+                raise
         outcomes: list[EffectOutcome] = []
         diff: EffectDiff | None = None
         verdict: Verdict | None = None
@@ -646,8 +669,13 @@ class EscrowEngine:
                 note=_coverage_note(self._substrate),
             )
             self._consume(handle, plan)
-            for effect in plan.topological_order():
-                outcomes.append(self._substrate.apply(handle, effect))
+            if opened is not None:
+                # Applied one at a time as the stage's owner made them, in the
+                # order the plan now states.
+                outcomes.extend(opened.outcomes)
+            else:
+                for effect in plan.topological_order():
+                    outcomes.append(self._substrate.apply(handle, effect))
             state = StageState.STAGED
 
             diff = self._windowed(handle, plan, self._substrate.diff(handle))
@@ -903,6 +931,61 @@ class EscrowEngine:
             feedback=judged.feedback(committed=committed) if judged is not None else None,
             receipt=receipt,
         )
+
+    def stage(
+        self,
+        scope_id: str,
+        *,
+        trajectory_id: str | None = None,
+        intent: str = "",
+        traceparent: str | None = None,
+    ) -> OpenStage:
+        """Open a stage before its plan is whole (1.6.0).
+
+        For a caller that works out what to change as it goes: code that
+        reads a row, decides, and writes another. Each effect is applied to
+        the stage as it is added, a read in the stage sees it, and
+        :meth:`OpenStage.settle` runs the plan the effects add up to through
+        the same lifecycle as :meth:`execute`: admitted, measured, judged,
+        then committed or refused, on this one stage. Nothing is recorded on
+        the chain until then, and a stage that is discarded leaves nothing.
+
+        :raises StageError: When the ledger settles inside the stage's own
+            transaction (PostgreSQL, joined): the hold a plan's cost needs is
+            placed before its stage opens, which this cannot do.
+        """
+        if self._anchor is not None and self._anchor.joins_transaction:
+            raise StageError(
+                "a stage that opens before its plan needs the ledger outside the stage's "
+                "transaction: this engine settles in the same transaction, where a plan's "
+                "hold is placed before its stage opens"
+            )
+        if traceparent is not None:
+            try:
+                require_traceparent(traceparent)
+            except ValueError as exc:
+                raise PlanError(str(exc)) from exc
+        builder = PlanBuilder(
+            scope_id,
+            trajectory_id=trajectory_id,
+            intent=intent,
+            plan_id=new_plan_id(),
+            created_at=datetime.now(UTC),
+            traceparent=traceparent,
+        )
+        handle = self._substrate.open(_provisional(builder, ()))
+        return OpenStage(self, builder, handle)
+
+    def _drop(self, handle: StageHandle) -> None:
+        """Give an open stage back, whatever state it is in."""
+        try:
+            self._substrate.abort(handle)
+        except Exception:
+            logger.warning("could not abort stage %s", handle.stage_id, exc_info=True)
+        try:
+            self._substrate.close(handle)
+        except Exception:
+            logger.warning("could not close stage %s", handle.stage_id, exc_info=True)
 
     def execute_or_raise(
         self, plan: EffectPlan, *, settle_cost: Decimal | str | None = None
@@ -1815,6 +1898,188 @@ class EscrowEngine:
             )
             return None
         return entry
+
+
+@dataclass(frozen=True, slots=True)
+class _Opened:
+    """A stage :meth:`EscrowEngine.stage` opened, with what was applied in it."""
+
+    handle: StageHandle
+    outcomes: tuple[EffectOutcome, ...]
+
+
+def _provisional(builder: PlanBuilder, effects: Sequence[Effect]) -> EffectPlan:
+    """The plan an open stage stands for so far: its final id, scope and
+    trajectory, and the effects applied up to now."""
+    return EffectPlan(
+        plan_id=builder._plan_id or new_plan_id(),
+        scope_id=builder._scope_id,
+        trajectory_id=builder._trajectory_id,
+        created_at=builder._created_at or datetime.now(UTC),
+        effects=tuple(effects),
+        intent=builder._intent,
+        traceparent=builder._traceparent,
+    )
+
+
+class OpenStage:
+    """A stage open before its plan is whole (:meth:`EscrowEngine.stage`, 1.6.0).
+
+    Add effects one at a time; each is checked as admission checks it, then
+    applied to the stage. :meth:`read` reads inside the stage, so it sees
+    them. :meth:`settle` hands the stage to the engine with the plan the
+    effects make; :meth:`discard` gives it back with nothing recorded. As a
+    context manager it discards on the way out unless it was settled.
+
+    One stage, one thread: the stage holds the substrate's write lock or its
+    private copy for as long as it is open.
+    """
+
+    __slots__ = ("_builder", "_done", "_engine", "_handle", "_outcomes")
+
+    def __init__(self, engine: EscrowEngine, builder: PlanBuilder, handle: StageHandle) -> None:
+        self._engine = engine
+        self._builder = builder
+        self._handle = handle
+        self._outcomes: list[EffectOutcome] = []
+        self._done = False
+
+    @property
+    def plan_id(self) -> PlanId:
+        return self._handle.plan_id
+
+    @property
+    def stage_id(self) -> uuid.UUID:
+        return self._handle.stage_id
+
+    @property
+    def substrate(self) -> ShadowSubstrate:
+        """The substrate the stage is open on."""
+        return self._engine._substrate
+
+    @property
+    def handle(self) -> StageHandle:
+        """The stage's handle, for the substrate's own stage calls."""
+        return self._handle
+
+    @property
+    def effects(self) -> tuple[Effect, ...]:
+        """The effects applied so far, in order."""
+        return tuple(self._builder._effects)
+
+    @property
+    def open(self) -> bool:
+        return not self._done
+
+    def add(
+        self,
+        kind: EffectKind,
+        *,
+        table: str,
+        statement: str,
+        parameters: Mapping[str, object] | None = None,
+        tenant_id: str | None = None,
+        stated_rows: int | None = None,
+        reversible: bool = True,
+        compensation: Compensation | None = None,
+        partitions: Mapping[str, str] | None = None,
+    ) -> EffectOutcome:
+        """Check one effect as admission would, and apply it to the stage.
+
+        An effect that is refused or fails is not part of the plan: the
+        stage stays open as it was before it, and the error says why.
+
+        :raises InterlockError: As :meth:`EscrowEngine.admit` and the
+            substrate's ``apply`` raise, with ``feedback`` for the agent.
+        """
+        self._live()
+        self._builder.add(
+            kind,
+            table=table,
+            statement=statement,
+            parameters=parameters,
+            tenant_id=tenant_id,
+            stated_rows=stated_rows,
+            reversible=reversible,
+            compensation=compensation,
+            partitions=partitions,
+        )
+        return self._apply()
+
+    def enqueue(self, **request: Any) -> EffectOutcome:
+        """Stage one outbound request, as :meth:`PlanBuilder.enqueue` takes it."""
+        self._live()
+        self._builder.enqueue(**request)
+        return self._apply()
+
+    def _apply(self) -> EffectOutcome:
+        effects = self._builder._effects
+        plan = _provisional(self._builder, effects)
+        substrate = self._engine._substrate
+        try:
+            self._engine.admit(plan)
+            outcome = substrate.apply(self._handle, effects[-1])
+        except BaseException as exc:
+            effects.pop()
+            if isinstance(exc, InterlockError) and exc.feedback is None:
+                exc.feedback = feedback_for_error(plan, exc, substrate=substrate.substrate_id)
+            raise
+        self._outcomes.append(outcome)
+        return outcome
+
+    def read(self, *args: Any, **kwargs: Any) -> Any:
+        """Read inside the stage, as the substrate reads (a query and its
+        parameters on SQL, a path in a directory or a repository): what the
+        stage has written is visible, and nothing a read does is kept.
+
+        :raises StageError: On a substrate whose stages cannot be read.
+        """
+        self._live()
+        reader = getattr(self._engine._substrate, "read", None)
+        if not callable(reader):
+            raise StageError(
+                f"a {self._engine._substrate.substrate_id} stage cannot be read: read the "
+                f"system itself"
+            )
+        return reader(self._handle, *args, **kwargs)
+
+    def settle(self, *, settle_cost: Decimal | str | None = None) -> StageResult | None:
+        """Run the plan the effects make through the engine, on this stage:
+        admitted, measured, judged, and committed or refused, exactly as
+        :meth:`EscrowEngine.execute` does a plan it stages itself.
+
+        :returns: The outcome; ``None`` when no effect was added, and the
+            stage was given back with nothing recorded.
+        """
+        self._live()
+        self._done = True
+        if not self._builder._effects:
+            self._engine._drop(self._handle)
+            return None
+        try:
+            plan = self._builder.build()
+        except BaseException:
+            self._engine._drop(self._handle)
+            raise
+        opened = _Opened(self._handle, tuple(self._outcomes))
+        return self._engine.execute(plan, settle_cost=settle_cost, _opened=opened)
+
+    def discard(self) -> None:
+        """Give the stage back. Nothing it did is kept, and nothing is recorded."""
+        if self._done:
+            return
+        self._done = True
+        self._engine._drop(self._handle)
+
+    def _live(self) -> None:
+        if self._done:
+            raise StageError(f"stage {self._handle.stage_id} is settled or discarded")
+
+    def __enter__(self) -> OpenStage:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.discard()
 
 
 def _coverage_note(substrate: ShadowSubstrate) -> str:

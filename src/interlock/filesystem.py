@@ -956,6 +956,36 @@ class FilesystemSubstrate:
             effect_id=effect.effect_id, rows_affected=len(touched), applied_at=datetime.now(UTC)
         )
 
+    def read(self, handle: StageHandle, path: str) -> bytes | None:
+        """A file's bytes as the open stage holds it (1.6.0): what the stage
+        has written is visible, the workspace is not consulted. ``None`` when
+        the stage holds no such file.
+
+        :raises ForbiddenStatementError: On a path a statement could not name.
+        """
+        stage = self._require(handle)
+        self._assert_live(handle)
+        problem = path_problem(path)
+        if problem is not None:
+            raise ForbiddenStatementError(
+                f"read refused: path {path[:120]!r} {problem}", reason="statement_kind"
+            )
+        target = self._inside(stage, "read", path)
+        if target.is_symlink() or not target.is_file():
+            return None
+        return target.read_bytes()
+
+    def paths(self, handle: StageHandle) -> list[str]:
+        """Every file the open stage holds, as paths relative to the
+        workspace, sorted (1.6.0)."""
+        stage = self._require(handle)
+        self._assert_live(handle)
+        return sorted(
+            found.relative_to(stage.tree).as_posix()
+            for found in stage.tree.rglob("*")
+            if found.is_file() and not found.is_symlink()
+        )
+
     def _operate(
         self, stage: _Stage, effect: Effect, verb: str, bound: Mapping[str, str]
     ) -> list[str]:

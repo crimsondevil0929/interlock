@@ -60,6 +60,16 @@ PINNED = {
     ),
     "sink_allowlist": "f01e9685cabc337393d5344ff2f279ddccf2c853cdab039fca62c4945ae79141",
     "table_allowlist": "ca3a4a2575706aa66669a4f926bb5153c198b417bf3b3ab9de59cd3c96a9a8e6",
+    # 1.6.0: the four checks under their names for every system. Each digests its own
+    # class name, so it differs from its SQL-named twin's, which is unchanged above.
+    "change_limit": "e01f2e550f72ffb3e6d12809e9dff237a749251f2f148a4dcd90974030e31bf9",
+    "kind_allowlist": "2dbcec8dad3e6fb7f55c73a51e827ab93b0bbbe5bda8b70fa46dd562011ba763",
+    "partition_isolation:tenant": (
+        "a1773ed1614d06472f5f1001d93236065cb2666982ffe7d72d3a238e7b01963a"
+    ),
+    "value_guard:orders.total": (
+        "3ba500af5a3e0944575bbb0bc997ffc8bc2860760b69c04df0cc3034c822e66d"
+    ),
 }
 
 
@@ -80,7 +90,7 @@ def _digests_under(seed: str) -> dict[str, str]:
 
 def test_every_built_in_checker_digests_the_same_under_every_hash_seed() -> None:
     seen = {seed: _digests_under(seed) for seed in SEEDS}
-    assert len(seen["0"]) == len(checkers()) == 18
+    assert len(seen["0"]) == len(checkers()) == 22
     for seed, found in seen.items():
         assert found == seen["0"], f"PYTHONHASHSEED={seed} digests differently"
     assert seen["0"] == digests()

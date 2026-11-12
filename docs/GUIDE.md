@@ -109,6 +109,81 @@ exactly as before. A rate window can also keep a history per patient, with
 Every threshold in `default_checkers` is an uncalibrated placeholder. Measure
 your own diffs and set the limits from the measurement.
 
+### The same model on every system (1.6.0)
+
+A measured change is a `Change`: its `kind` (the table, the path class, the Kubernetes kind,
+the resource type), its `id` within that kind (the primary key, the path, `namespace/name`),
+its `before` and `after` images, and its partition labels. `RowDelta` is the same class under
+the name it had before 1.6.0, and `table` and `primary_key` read the same two values, so
+nothing written against the SQL names changes. On a diff, `changes`, `change_count` and
+`kinds_touched` read what `deltas`, `blast_radius` and `tables_touched` read.
+
+Four built-in checkers have a name for every system beside their SQL one. The two are the
+same check and judge alike. Each records its own name on the verdict and in the receipt, so
+a deployment that keeps the SQL names keeps every digest it has issued.
+
+| For every system | The SQL name | Records |
+|---|---|---|
+| `ChangeLimit(8)` | `BlastRadius(8)` | `change_limit` / `blast_radius` |
+| `KindAllowlist([...])` | `TableAllowlist([...])` | `kind_allowlist` / `table_allowlist` |
+| `PartitionIsolation("tenant", max=1)` | `TenantIsolation(1)` | `partition_isolation:tenant` / `tenant_isolation` |
+| `ValueGuard(kind, field, ...)` | `ColumnValueGuard(table, column, ...)` | `value_guard:<kind>.<field>` / `column_value_guard:<table>.<column>` |
+
+`checker_family()` says which check a recorded name is, in either vocabulary, without its
+configuration: `change_limit` for both `blast_radius` and `change_limit`. An agent on a
+directory that is refused by `KindAllowlist` is told `kind_allowlist: the plan changed files
+in the scripts path class`, with no table in the sentence or the label.
+
+```python
+from interlock import ChangeLimit, KindAllowlist, NoDelete, PartitionIsolation, ValueGuard
+
+checkers = [
+    ChangeLimit(10),
+    KindAllowlist(["config", "docs"]),
+    NoDelete(),
+    PartitionIsolation("tenant", max=1, declared=True),
+    ValueGuard("orders", "total", max_drop_fraction=0.25),
+]
+```
+
+### A stage that opens before its plan (1.6.0)
+
+`execute()` takes a finished plan. Code that reads a row, decides, and writes another does
+not have one. `EscrowEngine.stage()` opens the stage first:
+
+<!-- readme-test: skip reason="needs the quickstart's engine and database; tests/test_open_stage.py makes the same calls" -->
+```python
+with engine.stage("support-agent", intent="discount order 500") as stage:
+    (order,) = stage.read("SELECT total FROM orders WHERE id = :id", {"id": 500})
+    stage.add(
+        EffectKind.UPDATE,
+        table="orders",
+        statement="UPDATE orders SET total = :total WHERE id = :id",
+        parameters={"total": str(order["total"] - 5), "id": 500},
+    )
+    result = stage.settle()
+```
+
+Each effect is checked as admission checks it and applied to the stage at once, and a read
+in the stage sees it. `settle()` turns the effects into an ordinary plan and runs it through
+the same lifecycle on the stage that is already open: admitted, measured, judged, then
+committed or refused. The chain reads exactly as it does for `execute()`, and it holds
+nothing until the settle. Leaving the `with` block without settling discards the stage, with
+nothing changed and nothing recorded. An effect that is refused or fails is not part of the
+plan.
+
+- **Reads.** On SQLite and PostgreSQL, `read(statement, parameters)` returns rows, and runs
+  inside a savepoint that is rolled back, so a statement that writes keeps nothing. On a
+  directory, `read(path)` returns the file's bytes as the stage holds it. Other systems'
+  stages hold predictions and nothing to read: read the system itself.
+- **One at a time.** The stage holds the database's write lock, or the directory's private
+  copy, for as long as it is open. Keep it short.
+- **Not with claim and settle.** When the ledger settles inside the stage's own transaction
+  (PostgreSQL, joined), a plan's hold is placed before its stage opens. `stage()` refuses
+  there.
+- **On PostgreSQL a failed effect ends the stage**, as a failed statement ends any
+  transaction. A failed read does not.
+
 ### Errors
 
 Every failure on the write path is an `InterlockError`. The AgentGov seam is

@@ -89,15 +89,22 @@ time, whatever each plan alone may do; an engine takes them as
     # column = "amount"               # ...and one of its columns
     # rows = "inserted"               # row_sum: or "net"
 
+A system that is not a database keeps Interlock's own records (the outbox,
+the inbox, window history) in a SQLite *control database* that ``interlock
+install`` sets up. Since 1.6.0 it need not be named: it is
+``.interlock/control.db`` beside this file, in a directory only its owner
+reads. ``state`` names another directory, and ``database`` still names the
+file outright; give at most one. A SQL substrate keeps its records in the
+database it stages, so ``state`` is refused there.
+
 A Git repository stages like a database (:mod:`interlock.git_substrate`):
-``substrate = "git"``, a ``[git]`` section, and ``database`` naming the SQLite
-control database that holds its outbox, inbox and window history (``interlock
-install`` sets it up). Its tables are its path classes, so it lists no
-``[[tables]]``; each has the columns ``path``, ``blob_sha``, ``mode``,
-``lines_added``, ``lines_deleted``, ``net_lines`` and ``secret_markers``::
+``substrate = "git"`` and a ``[git]`` section. Its tables are its path
+classes, so it lists no ``[[tables]]``; each has the columns ``path``,
+``blob_sha``, ``mode``, ``lines_added``, ``lines_deleted``, ``net_lines`` and
+``secret_markers``::
 
     substrate = "git"
-    database = "control.db"           # the control database: a SQLite file
+    # state = "var/interlock"         # optional: where the control database is kept
 
     [git]
     repository = "billing-service.git"  # relative to this file; bare, or main not checked out
@@ -171,12 +178,11 @@ those it names::
     void_status = "entered-in-error"  # what marks a created one void, its undo
 
 A directory stages like a database (:mod:`interlock.filesystem`, 1.5.0): ``substrate =
-"filesystem"``, a ``[filesystem]`` section, and ``database`` naming the SQLite control database.
-Its tables are its path classes, as Git's are, each with the columns ``path``, ``sha256``,
-``mode``, ``bytes``, ``lines_added``, ``lines_deleted``, ``net_lines`` and ``secret_markers``::
+"filesystem"`` and a ``[filesystem]`` section. Its tables are its path classes, as Git's are,
+each with the columns ``path``, ``sha256``, ``mode``, ``bytes``, ``lines_added``,
+``lines_deleted``, ``net_lines`` and ``secret_markers``::
 
     substrate = "filesystem"
-    database = "control.db"           # the control database: a SQLite file
 
     [filesystem]
     root = "workspace"                # relative to this file
@@ -912,6 +918,10 @@ class InterlockConfig:
     substrate: str
     database: str
     tables: tuple[TableSpec, ...]
+    state: str = ""
+    """The directory Interlock keeps its own records in, when the system it
+    stages is not a database (1.6.0): ``database`` is then the control
+    database inside it. ``""`` when ``database`` was named outright."""
     schema: str = "public"
     stage_roles: tuple[str, ...] = ()
     audit_roles: tuple[str, ...] = ()
@@ -1040,6 +1050,14 @@ def load_config(
         listed = ", ".join(repr(n) for n in SUBSTRATES[:-1])
         raise ConfigError(f"substrate must be {listed} or {SUBSTRATES[-1]!r}, not {substrate!r}")
     url = database or os.environ.get(DATABASE_ENV) or _string(raw, "database", default="")
+    state = _state(raw, Path(path), substrate)
+    if state and not (database or os.environ.get(DATABASE_ENV)):
+        url = str(Path(state) / STATE_FILE)
+    elif not url and require_database and substrate in _KEEPS_STATE:
+        # A system that is not a database keeps Interlock's own records beside
+        # the configuration, out of the way (1.6.0).
+        state = str((Path(path).parent / STATE_DIRECTORY).resolve())
+        url = str(Path(state) / STATE_FILE)
     # A Terraform substrate keeps nothing in a database: it has no control
     # database, so it needs none.
     if not url and require_database and substrate != "terraform":
@@ -1157,6 +1175,7 @@ def load_config(
     return InterlockConfig(
         substrate=substrate,
         database=url,
+        state=state if url == str(Path(state) / STATE_FILE) else "",
         tables=tuple(tables),
         schema=_string(raw, "schema", default="public"),
         stage_roles=tuple(_strings(raw, "stage_roles", required=False)),
@@ -1187,6 +1206,36 @@ def load_config(
         filesystem=filesystem,
         rest=rest,
     )
+
+
+STATE_DIRECTORY: Final = ".interlock"
+"""Where a system that is not a database keeps Interlock's records when the
+file names no ``state`` and no ``database``: beside the configuration."""
+STATE_FILE: Final = "control.db"
+_KEEPS_STATE: Final = frozenset({"git", "filesystem", "kubernetes", "fhir", "rest"})
+
+
+def _state(raw: Mapping[str, Any], path: Path, substrate: str) -> str:
+    """``state``: the directory that holds Interlock's own records (the
+    outbox, the inbox, rate windows) for a system that is not a database, as
+    an absolute path; ``""`` when the file names none."""
+    if "state" not in raw:
+        return ""
+    name = _string(raw, "state", default="")
+    if not name:
+        raise ConfigError("state names a directory: it cannot be empty")
+    if "database" in raw:
+        raise ConfigError(
+            "state and database both say where Interlock keeps its own records: give one"
+        )
+    if substrate == "terraform":
+        raise ConfigError("a Terraform substrate keeps no records of its own: remove state")
+    if substrate not in _KEEPS_STATE:
+        raise ConfigError(
+            f"a {substrate} substrate keeps Interlock's records in the database it stages: "
+            f"name it with database, and remove state"
+        )
+    return str((path.parent / Path(name).expanduser()).resolve())
 
 
 SUBSTRATES: Final = (

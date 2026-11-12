@@ -99,7 +99,10 @@ def adjudicate(
                 else:
                     if isinstance(candidate, FeedbackHint):
                         hint = candidate
-            hinted.append(HintedViolation(violation, hint, trusted))
+            label = getattr(type(checker), "LABEL", "") if trusted else ""
+            hinted.append(
+                HintedViolation(violation, hint, trusted, label if isinstance(label, str) else "")
+            )
     verdict = Verdict(
         plan_id=plan.plan_id,
         stage_id=stage_id,

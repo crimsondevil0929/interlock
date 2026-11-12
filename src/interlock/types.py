@@ -43,6 +43,7 @@ __all__ = [
     "OUTBOX_TARGET",
     "PARTITION",
     "TENANT",
+    "Change",
     "CommitReceipt",
     "Compensation",
     "Effect",
@@ -563,26 +564,85 @@ class EffectPlan:
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class RowDelta:
-    """One row's before and after image.
+_UNGIVEN: Final[Any] = object()
 
-    ``before is None`` is an insert. ``after is None`` is a delete.
 
-    :ivar tenant_id: The row's tenant, read from ``TableSpec.tenant_column``.
-    :ivar partitions: Its labels in the table's other partition dimensions,
-        read from ``TableSpec.partitions``: ``{"patient": "p-1182"}``.
+@dataclass(frozen=True, slots=True, init=False)
+class Change:
+    """One resource's before and after image: the public shape of a measured change (1.6.0).
+
+    ``before is None`` is a creation. ``after is None`` is a deletion.
+
+    A change is whatever the substrate counts one of: a row of a table, a file of a path
+    class, an object of a Kubernetes kind, a resource of a Terraform or FHIR type, a record of
+    an API's resource type. The names are the same on every system:
+
+    :ivar kind: What sort of thing changed: the table, the path class, the object kind, the
+        resource type. :attr:`table` reads the same value.
+    :ivar id: Which one, within its kind: the primary key, the path, ``namespace/name``, the
+        address. :attr:`primary_key` reads the same value.
+    :ivar tenant_id: Its tenant, read from ``TableSpec.tenant_column`` on SQL, or the owner a
+        substrate's own rule gives it.
+    :ivar partitions: Its labels in the kind's other partition dimensions:
+        ``{"patient": "p-1182"}``. :meth:`partition` reads any dimension, the tenant included.
+
+    :class:`RowDelta` is this class under the name it had before 1.6.0, and ``table=`` and
+    ``primary_key=`` are still accepted where a change is built, so nothing written against
+    the SQL names has to change. No hash moves: a diff, a verdict and a receipt digest the
+    same values in the same order as before.
     """
 
-    table: str
-    primary_key: str
+    kind: str
+    id: str
     before: Mapping[str, Any] | None
     after: Mapping[str, Any] | None
     tenant_id: str | None = None
     partitions: Mapping[str, str] = field(default_factory=dict)
 
+    def __init__(
+        self,
+        kind: str = _UNGIVEN,
+        id: str = _UNGIVEN,
+        before: Mapping[str, Any] | None = _UNGIVEN,
+        after: Mapping[str, Any] | None = _UNGIVEN,
+        tenant_id: str | None = None,
+        partitions: Mapping[str, str] | None = None,
+        *,
+        table: str = _UNGIVEN,
+        primary_key: str = _UNGIVEN,
+    ) -> None:
+        # The SQL names win when both are given: ``dataclasses.replace(change, table=...)``
+        # passes the change's own ``kind`` beside the new ``table``.
+        if table is not _UNGIVEN:
+            kind = table
+        if primary_key is not _UNGIVEN:
+            id = primary_key
+        missing = [
+            name
+            for name, value in (("kind", kind), ("id", id), ("before", before), ("after", after))
+            if value is _UNGIVEN
+        ]
+        if missing:
+            raise TypeError(f"Change() is missing {', '.join(missing)}")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "id", id)
+        object.__setattr__(self, "before", before)
+        object.__setattr__(self, "after", after)
+        object.__setattr__(self, "tenant_id", tenant_id)
+        object.__setattr__(self, "partitions", {} if partitions is None else partitions)
+
+    @property
+    def table(self) -> str:
+        """:attr:`kind`, under its SQL name."""
+        return self.kind
+
+    @property
+    def primary_key(self) -> str:
+        """:attr:`id`, under its SQL name."""
+        return self.id
+
     def partition(self, dimension: str) -> str | None:
-        """The row's label in ``dimension``: its tenant for :data:`TENANT`."""
+        """The change's label in ``dimension``: its tenant for :data:`TENANT`."""
         return self.tenant_id if dimension == TENANT else self.partitions.get(dimension)
 
     @property
@@ -593,11 +653,19 @@ class RowDelta:
             return "delete"
         return "update"
 
-    def changed_columns(self) -> tuple[str, ...]:
-        """Columns whose value actually moved. Empty for inserts and deletes."""
+    def changed_fields(self) -> tuple[str, ...]:
+        """The fields whose value actually moved. Empty for creations and deletions."""
         if self.before is None or self.after is None:
             return ()
         return tuple(sorted(k for k in self.after if self.before.get(k) != self.after.get(k)))
+
+    def changed_columns(self) -> tuple[str, ...]:
+        """:meth:`changed_fields`, under its SQL name."""
+        return self.changed_fields()
+
+
+RowDelta = Change
+"""The name :class:`Change` had before 1.6.0. The same class."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -755,6 +823,22 @@ class EffectDiff:
     @property
     def tables_touched(self) -> frozenset[str]:
         return frozenset(d.table for d in self.deltas)
+
+    @property
+    def changes(self) -> tuple[Change, ...]:
+        """:attr:`deltas`, under the name every substrate shares (1.6.0)."""
+        return self.deltas
+
+    @property
+    def change_count(self) -> int:
+        """:attr:`blast_radius`, under the name every substrate shares (1.6.0): captured
+        changes, so a resource changed twice in one plan counts twice."""
+        return len(self.deltas)
+
+    @property
+    def kinds_touched(self) -> frozenset[str]:
+        """:attr:`tables_touched`, under the name every substrate shares (1.6.0)."""
+        return frozenset(d.kind for d in self.deltas)
 
     @property
     def tenant_ids(self) -> frozenset[str]:
