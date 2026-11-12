@@ -141,6 +141,10 @@ row-level diff, not a summary.
   in-process. An operator override MUST be expressed as a new plan carrying an
   explicit waiver, so the override is itself a first-class recorded artifact
   rather than a mutable flag.
+  *Amended in 1.6.0:* an engine built `observe_only` records a violation
+  that would block as `observed` and admits the plan. That is fixed when the
+  engine is built, before any plan, and is recorded in every verdict's hash and on
+  the chain; it is not an override of a rejection, and there is still none.
 - **E1-5.** Every non-terminal state MUST carry an expiry. A stage that reaches
   `expires_at` transitions to `ORPHANED` regardless of owner liveness.
 - **E1-6.** `COMPENSATED` is reachable only from `COMMITTED`, and only for plans

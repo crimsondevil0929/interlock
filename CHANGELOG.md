@@ -47,6 +47,13 @@ in a configuration or in code, and no digest that an earlier release recorded mo
   until the settle and reads the same afterwards. A stage that is discarded changes nothing
   and records nothing. It is refused where the ledger settles inside the stage's own
   transaction (PostgreSQL, claim and settle).
+- **`EscrowEngine(observe_only=True)`**: watch and do not refuse. Every plan is staged,
+  measured and judged as on an enforcing engine, and commits. A violation that would have
+  refused it is recorded on the verdict with the new severity `observed`, which is in the
+  verdict's hash; the chain's `VERDICT` record names the checkers, `StageResult.would_refuse`
+  lists them, and the agent's feedback says each constraint was observed and not enforced.
+  `always_enforce` names checkers that still refuse. For trying a policy on real work before
+  it is enforced.
 - **Stage reads**: `SqliteSubstrate.read` and `PostgresSubstrate.read` run a query inside the
   open stage, in a savepoint that is rolled back, so a statement that writes keeps nothing.
   `FilesystemSubstrate.read` returns a file as the stage holds it, and `paths` lists the
@@ -54,7 +61,7 @@ in a configuration or in code, and no digest that an earlier release recorded mo
 
 ### Changed
 
-- `docs/ESCROW_SPEC.md`: E1-1, §2.4 and §2.5.1 are amended for the above, each marked
+- `docs/ESCROW_SPEC.md`: E1-1, E1-4, §2.4 and §2.5.1 are amended for the above, each marked
   "Amended in 1.6.0".
 
 ## [1.5.2] - 2026-11-11

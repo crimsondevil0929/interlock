@@ -184,6 +184,11 @@ class Severity(Enum):
     submitting a new plan that carries an explicit waiver, which is then itself
     a recorded artifact."""
 
+    OBSERVED = "observed"
+    """What an observe-only engine records in place of ``BLOCKING`` (1.6.0): the
+    checker would have refused the plan, and the engine was built to watch and
+    not refuse. On the verdict, and in its hash; does not block the commit."""
+
 
 # --------------------------------------------------------------------------
 # Plans: what the agent proposes
@@ -1262,6 +1267,12 @@ class Verdict:
     @property
     def admitted(self) -> bool:
         return not self.blocking
+
+    @property
+    def observed(self) -> tuple[InvariantViolation, ...]:
+        """What would have refused the plan, had its engine not been
+        observe-only (1.6.0)."""
+        return tuple(v for v in self.violations if v.severity is Severity.OBSERVED)
 
     def content_hash(self) -> str:
         return canonical_hash(

@@ -184,6 +184,36 @@ plan.
 - **On PostgreSQL a failed effect ends the stage**, as a failed statement ends any
   transaction. A failed read does not.
 
+### Observing before enforcing (1.6.0)
+
+A new policy is easier to trust after it has watched real work. An engine built with
+`observe_only=True` stages, measures and judges every plan exactly as an enforcing one does,
+and then commits it either way. A violation that would have refused the plan is recorded on
+the verdict with the severity `observed`.
+
+```python
+from interlock import ChangeLimit, EscrowEngine, KindAllowlist, SqliteSubstrate, TableSpec
+
+engine = EscrowEngine(
+    SqliteSubstrate("back_office.db", tables=[TableSpec("orders", columns=["id", "total"])]),
+    checkers=[ChangeLimit(1), KindAllowlist(["refunds"])],
+    observe_only=True,
+)
+```
+
+- `result.would_refuse` lists the checkers that would have refused, and
+  `result.verdict.observed` holds their violations, with the same messages a refusal carries.
+- The chain's `VERDICT` record reads `admitted; observed, not enforced: change_limit,...`.
+  The severity is in the verdict's hash, so a plan that committed under observation cannot be
+  presented as one an enforcing engine admitted clean.
+- The agent's feedback lists each constraint, followed by "Observed, not enforced: the plan
+  was not refused for it."
+- `always_enforce=[...]` names checkers that still refuse.
+
+Observing changes what a verdict does, and nothing else. A statement the substrate refuses to
+stage, a halted scope, a scope that cannot pay and a held outbound request all behave as they
+do on an enforcing engine.
+
 ### Errors
 
 Every failure on the write path is an `InterlockError`. The AgentGov seam is

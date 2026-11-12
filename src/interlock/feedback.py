@@ -287,6 +287,9 @@ class ConstraintFeedback:
     """The name a built-in checker gives the constraint when it is not the
     SQL one (1.6.0): ``change_limit`` where :data:`_LABELS` says
     ``blast_radius``. Never a custom checker's, and never configuration."""
+    observed: bool = False
+    """The constraint would have refused the plan, and its engine observes
+    without refusing (1.6.0). Never also ``blocking``."""
 
     @property
     def constraint(self) -> str:
@@ -295,7 +298,10 @@ class ConstraintFeedback:
     def render(self) -> str:
         """One sentence, from the kind's fixed template, in the substrate's nouns."""
         template = _NOUNS.get(self.substrate, {}).get(self.guidance, _TEMPLATES[self.guidance])
-        return f"{self.constraint}: {template(self)}"
+        said = f"{self.constraint}: {template(self)}"
+        if self.observed:
+            said += " Observed, not enforced: the plan was not refused for it."
+        return said
 
     def to_json(self) -> dict[str, Any]:
         named: dict[str, Any] = {"window": self.window} if self.window else {}
@@ -305,6 +311,8 @@ class ConstraintFeedback:
             named["substrate"] = self.substrate
         if self.dimension:
             named["dimension"] = self.dimension
+        if self.observed:
+            named["observed"] = True
         return {
             "constraint": self.constraint,
             "guidance": self.guidance.value,
@@ -939,6 +947,7 @@ def sanitize(
     trusted: bool,
     substrate: str = "",
     label: str = "",
+    observed: bool = False,
 ) -> ConstraintFeedback:
     """Reduce a hint to what the plan itself entitles the agent to see, in
     ``substrate``'s nouns."""
@@ -1013,6 +1022,7 @@ def sanitize(
         substrate=substrate if substrate in _NOUNS else "",
         dimension="" if dimension == TENANT else dimension,
         label=label if trusted and kind in NEUTRAL_LABELS.get(label, ()) else "",
+        observed=observed and not blocking,
     )
 
 
@@ -1035,12 +1045,13 @@ def agent_feedback(
             trusted=item.trusted,
             substrate=substrate,
             label=item.label,
+            observed=item.violation.severity is Severity.OBSERVED,
         )
         unique.setdefault(repr(constraint.to_json()), constraint)
     kinds = list(Guidance)
     ordered = sorted(
         unique.values(),
-        key=lambda c: (not c.blocking, kinds.index(c.guidance), c.render()),
+        key=lambda c: (not c.blocking, not c.observed, kinds.index(c.guidance), c.render()),
     )
     return AgentFeedback(
         outcome="committed" if committed else "refused",

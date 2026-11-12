@@ -189,6 +189,14 @@ class StageResult:
         return tuple(v.invariant for v in self.verdict.blocking)
 
     @property
+    def would_refuse(self) -> tuple[str, ...]:
+        """The checkers that would have refused the plan, on an observe-only
+        engine (1.6.0): each once, in the order they ran."""
+        if self.verdict is None:
+            return ()
+        return tuple(dict.fromkeys(v.invariant for v in self.verdict.observed))
+
+    @property
     def refusal(self) -> Refusal | None:
         """The refusal split by audience, or ``None`` when the plan committed."""
         if self.committed or self.feedback is None:
@@ -239,6 +247,15 @@ class EscrowEngine:
         (1.3.0): each signs a fact about the diff, which a
         :class:`~interlock.sensors.SensorAttestation` checker may require. See
         :mod:`interlock.sensors`.
+    :param observe_only: Watch and do not refuse (1.6.0): a violation that
+        would block is recorded on the verdict as ``observed``, the plan
+        commits, and the chain's ``VERDICT`` record names the checkers. For
+        trying a policy on real work before it is enforced. What the stage
+        itself cannot do (a statement the substrate refuses, a scope that is
+        halted or cannot pay) still fails.
+    :param always_enforce: Checker names that refuse even when
+        ``observe_only``: a check that the plan is this engine's to run at
+        all, say.
     :raises ValueError: If ``settle_cost`` is negative, ``chain`` is a
         read-only snapshot from :meth:`EscrowChain.load`, two windows share a
         name, or the substrate keeps no window history, or two meters
@@ -246,6 +263,7 @@ class EscrowEngine:
     """
 
     __slots__ = (
+        "_always",
         "_anchor",
         "_chain",
         "_checkers",
@@ -255,6 +273,7 @@ class EscrowEngine:
         "_inflight",
         "_meters",
         "_nouns",
+        "_observe_only",
         "_receipts",
         "_reserving",
         "_sensors",
@@ -278,8 +297,12 @@ class EscrowEngine:
         inbox: Keyring | None = None,
         meters: Sequence[Meter] = (),
         sensors: Sequence[Sensor] = (),
+        observe_only: bool = False,
+        always_enforce: Sequence[str] = (),
     ) -> None:
         self._substrate = substrate
+        self._observe_only = observe_only
+        self._always = frozenset(always_enforce)
         self._nouns = nouns(substrate.substrate_id)
         self._sensors = tuple(sensors)
         named = [s.name for s in self._sensors]
@@ -698,15 +721,29 @@ class EscrowEngine:
             # the hold was placed for.
             outbound_cost = self._price_outbound(plan, diff, quoted)
 
-            judged = adjudicate(plan, diff, self._checkers, stage_id=handle.stage_id)
+            judged = adjudicate(
+                plan,
+                diff,
+                self._checkers,
+                stage_id=handle.stage_id,
+                observe_only=self._observe_only,
+                enforced=self._always,
+            )
             verdict = judged.verdict
             blocked = ",".join(v.invariant for v in verdict.blocking)
+            watched = ",".join(dict.fromkeys(v.invariant for v in verdict.observed))
             self._record(
                 RecordType.VERDICT,
                 plan,
                 verdict.content_hash(),
                 stage=handle.stage_id,
-                note="admitted" if verdict.admitted else blocked,
+                note=(
+                    blocked
+                    if not verdict.admitted
+                    else f"admitted; observed, not enforced: {watched}"
+                    if watched
+                    else "admitted"
+                ),
             )
 
             if not verdict.admitted:
@@ -1106,7 +1143,14 @@ class EscrowEngine:
                     raise
                 except InterlockError as exc:
                     return Trial(kept=kept, admitted=False, error=exc)
-                judged = adjudicate(sub, diff, self._checkers, stage_id=handle.stage_id)
+                judged = adjudicate(
+                    sub,
+                    diff,
+                    self._checkers,
+                    stage_id=handle.stage_id,
+                    observe_only=self._observe_only,
+                    enforced=self._always,
+                )
                 return Trial(kept=kept, admitted=judged.admitted, adjudication=judged)
 
             result = search(candidates, evaluate, max_trials=max_trials)
