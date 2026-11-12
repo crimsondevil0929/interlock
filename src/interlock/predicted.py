@@ -27,6 +27,13 @@ substrate (:mod:`interlock.fhir`) builds its guarantee from exactly that:
    write changed is put back from the undo, the discrepancies are named, and
    the stage is recorded ``COMPENSATED`` (its receipt's outcome is
    ``compensated``, ARC1 1.4).
+6. **Never call a sent write aborted** (1.5.2). Once a write has gone out, a
+   failure of any kind (a dropped connection, a timeout, a read-back that
+   cannot be read) leaves the outcome unknown, not negative. The commit raises
+   :class:`~interlock.exceptions.CommitUnsettledError`, the intent stays open,
+   and ``resolve_intent`` settles it: at once if the system answers, at the
+   next recovery if not. It reads what the commit would have read (every
+   written resource and the whole scope) and applies the same rule as step 5.
 
 Every receipt of such a substrate's plans says ``coverage.measurement =
 "predicted"``: what was judged is a prediction, made true by a conditional
@@ -38,9 +45,33 @@ before it.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Final
 
-__all__ = ["PREDICTED"]
+__all__ = ["PREDICTED", "Settlement"]
 
 PREDICTED: Final = "predicted"
 """ARC1 1.3's ``coverage.measurement`` for a predicted and verified substrate."""
+
+
+@dataclass(frozen=True, slots=True)
+class Settlement:
+    """What a predicted substrate did when it settled a stage whose commit could not finish
+    (1.5.2): a crash, a write whose answer never came, or a read-back that failed. The engine
+    asks for it after ``resolve_intent`` answers ``False``, and writes it into the stage's
+    ``COMPENSATED`` record.
+
+    :ivar undo: The SHA-256 of the undo, as the commit intent named it.
+    :ivar applied: How many of the stage's writes had landed.
+    :ivar restored: How many resources were put back: those writes, and whatever the system
+        says the stage's request set off.
+    :ivar discrepancies: What the read-back found that the prediction does not say, in words.
+    :ivar foreign: Resources that differ and are not the stage's to put back: named for a
+        person.
+    """
+
+    undo: str
+    applied: int
+    restored: int
+    discrepancies: tuple[str, ...] = ()
+    foreign: tuple[str, ...] = ()

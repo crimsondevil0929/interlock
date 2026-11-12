@@ -965,7 +965,10 @@ def _keys_action(
                 logged = registry.revocation(key_id)
                 if key_id in revoked:
                     sealed = revoked[key_id]
-                    status = f"revoked {sealed.revoked_at.isoformat()}, {sealed.count} rows sealed"
+                    status = (
+                        f"revoked {sealed.revoked_at.isoformat()}, "
+                        f"{tally(sealed.count, 'row')} sealed"
+                    )
                 elif logged is not None and logged.applied is not None:
                     status = f"revoked by operator record {logged.intent.seq}"
                 else:
@@ -1003,7 +1006,7 @@ def _keys_action(
     print(
         f"signed by {operator.name}: intent {outcome.intent.seq}, {args.role} key "
         f"{args.key_id} revoked"
-        + (f"; {seal['count']} rows sealed ({seal['digest'][:16]})" if seal else ""),
+        + (f"; {tally(seal['count'], 'row')} sealed ({seal['digest'][:16]})" if seal else ""),
         file=out,
     )
     return EXIT_OK

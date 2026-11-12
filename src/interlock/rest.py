@@ -99,7 +99,7 @@ from interlock.exceptions import (
 )
 from interlock.fhir import _canonical_safe, _json, _merge, _thaw, _tokens, parse_compensation
 from interlock.planbound import UndoJournal
-from interlock.predicted import PREDICTED
+from interlock.predicted import PREDICTED, Settlement
 from interlock.substrate import SqliteSubstrate, TableSpec
 from interlock.text import tally
 from interlock.types import (
@@ -120,6 +120,7 @@ from interlock.windows import WindowCharge
 
 __all__ = [
     "COMPENSATIONS",
+    "MAX_PAGES",
     "MAX_RESPONSE_BYTES",
     "VERBS",
     "RestResource",
@@ -134,7 +135,10 @@ __all__ = [
 logger = logging.getLogger("interlock.rest")
 
 MAX_RESPONSE_BYTES: Final = 10 * 1024 * 1024
-"""Maximum HTTP response body read by default (10 MiB) before raising SubstrateUnavailableError."""
+"""The largest response body read, by default (10 MiB): a longer one is refused, not read."""
+
+MAX_PAGES: Final = 1000
+"""How many pages one listing follows, by default: a longer chain of ``next`` links is refused."""
 
 ID: Final = "id"
 """Every type's primary key column: the resource's id."""
@@ -475,6 +479,7 @@ class _Api:
 
     __slots__ = (
         "_context",
+        "_max_pages",
         "_max_response_bytes",
         "_opener",
         "_server",
@@ -490,11 +495,13 @@ class _Api:
         ca_file: str | None,
         timeout: float,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
+        max_pages: int = MAX_PAGES,
     ) -> None:
         self._server = server.rstrip("/")
         self._token = token
         self._timeout = timeout
         self._max_response_bytes = max_response_bytes
+        self._max_pages = max_pages
         handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
         if self._server.startswith("https://"):
             context = ssl.create_default_context(cafile=ca_file)
@@ -512,6 +519,10 @@ class _Api:
     @property
     def max_response_bytes(self) -> int:
         return self._max_response_bytes
+
+    @property
+    def max_pages(self) -> int:
+        return self._max_pages
 
     def call(
         self,
@@ -540,7 +551,8 @@ class _Api:
                 raw = reply.read(self._max_response_bytes + 1)
                 if len(raw) > self._max_response_bytes:
                     raise SubstrateUnavailableError(
-                        f"response from {url} exceeded {self._max_response_bytes} bytes"
+                        f"the answer from {url} is longer than {self._max_response_bytes} bytes "
+                        f"(max_response_bytes), so it was not read"
                     )
                 return _Reply(
                     int(reply.status), json.loads(raw) if raw else None, reply.headers.get("ETag")
@@ -549,15 +561,14 @@ class _Api:
             raw_err = exc.read(self._max_response_bytes + 1)
             if len(raw_err) > self._max_response_bytes:
                 raise SubstrateUnavailableError(
-                    f"error response from {url} exceeded {self._max_response_bytes} bytes"
+                    f"the HTTP {exc.code} answer from {url} is longer than "
+                    f"{self._max_response_bytes} bytes (max_response_bytes), so it was not read"
                 ) from exc
             try:
                 answer = json.loads(raw_err or b"null")
             except ValueError:
                 answer = None
             raise _RestError(exc.code, answer) from None
-        except SubstrateUnavailableError:
-            raise
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise SubstrateUnavailableError(f"cannot reach the API {self._server}: {exc}") from exc
 
@@ -576,29 +587,28 @@ class _Api:
         return reply.body, _version_of(kind, reply.body, reply.etag)
 
     def find(
-        self,
-        kind: RestResource,
-        parameter: str,
-        value: str,
-        *,
-        limit: int,
-        max_pages: int | None = None,
+        self, kind: RestResource, parameter: str, value: str, *, limit: int
     ) -> list[dict[str, Any]]:
         """Every resource of ``kind`` whose ``parameter`` is ``value``, following next pages, at
-        most ``limit``."""
-        max_pages = max(50, limit) if max_pages is None else max_pages
+        most ``limit`` resources and ``max_pages`` pages.
+
+        :raises StageError: If the list is longer than either, or a next link leads back to
+            a page already read.
+        """
         path: str | None = f"{kind.path}?{urlencode([(parameter, value)])}"
         found: list[dict[str, Any]] = []
-        seen_pages: set[str] = set()
-        pages = 0
+        seen: set[str] = set()
         while path:
-            if path in seen_pages or pages >= max_pages:
+            if path in seen:
                 raise StageError(
-                    f"listing {kind.path} encountered a repeating pagination cursor or "
-                    f"exceeded {max_pages} pages"
+                    f"listing {kind.path} leads back to a page already read ({path}): the "
+                    f"API's next links form a loop"
                 )
-            seen_pages.add(path)
-            pages += 1
+            if len(seen) >= self._max_pages:
+                raise StageError(
+                    f"listing {kind.path} runs past {tally(self._max_pages, 'page')} (max_pages)"
+                )
+            seen.add(path)
             reply = self.call("GET", path)
             items: Any = reply.body
             if kind.items:
@@ -651,6 +661,14 @@ class _Resource:
         return f"{self.kind.path}/{quote(self.resource_id, safe='')}"
 
 
+_Written = tuple["RestResource", Mapping[str, Any], str, "dict[str, Any] | None"]
+"""A write of an undo at recovery: its type, the undo's entry, its state now, and the resource
+as the API holds it."""
+_Stray = tuple[tuple[str, str], "Mapping[str, Any] | None", "dict[str, Any] | None"]
+"""A resource of the undo's scope that is not as the stage read it: its key, the undo's entry
+(``None`` when it was created since), and what the API holds now (``None`` when gone)."""
+
+
 @dataclass
 class _Stage:
     handle: StageHandle
@@ -666,6 +684,8 @@ class _Stage:
     done: bool = False
     unsettled: bool = False
     committing: bool = False
+    sent: bool = False
+    """A write of the commit has gone out: from here its outcome is never assumed."""
 
 
 class RestSubstrate:
@@ -682,6 +702,10 @@ class RestSubstrate:
     :param control: A SQLite file ``interlock install`` set up: the outbox, the inbox and rate
         windows' history.
     :param timeout: Seconds one API call may take.
+    :param max_response_bytes: The longest answer read (10 MiB): a longer one is refused,
+        not read, so one oversized page cannot exhaust memory.
+    :param max_pages: How many pages one listing follows (1,000). A next link that leads
+        back to a page already read is refused whatever this is.
     :raises SubstrateConfigurationError: On an API reached over plain HTTP other than loopback,
         or two types sharing a table.
     """
@@ -693,6 +717,7 @@ class RestSubstrate:
         "_header",
         "_journal",
         "_max_rows",
+        "_settlements",
         "_stage",
         "_stage_seconds",
         "_tenants",
@@ -715,6 +740,7 @@ class RestSubstrate:
         max_stage_seconds: float = 120.0,
         max_diff_rows: int = 50_000,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
+        max_pages: int = MAX_PAGES,
     ) -> None:
         tables = [r.table for r in resources]
         if not tables:
@@ -736,6 +762,7 @@ class RestSubstrate:
             ca_file=ca_file,
             timeout=timeout,
             max_response_bytes=max_response_bytes,
+            max_pages=max_pages,
         )
         self._journal = UndoJournal(journal)
         self._stage_seconds = max_stage_seconds
@@ -747,6 +774,7 @@ class RestSubstrate:
         )
         self._stage: _Stage | None = None
         self._compensated: dict[uuid.UUID, str] = {}
+        self._settlements: dict[uuid.UUID, Settlement] = {}
         self._undone: set[uuid.UUID] = set()
 
     # -- what it is -----------------------------------------------------------
@@ -789,6 +817,10 @@ class RestSubstrate:
     @property
     def max_response_bytes(self) -> int:
         return self._api.max_response_bytes
+
+    @property
+    def max_pages(self) -> int:
+        return self._api.max_pages
 
     @property
     def control(self) -> str | None:
@@ -1116,7 +1148,11 @@ class RestSubstrate:
                 "id": obj.resource_id,
                 "action": obj.action,
                 "before": obj.live,
-                "after": {FINGERPRINT: fingerprint(obj.desired or {}, obj.kind.ignored)},
+                # The prediction whole, so recovery can say how a write differs from it.
+                "after": {
+                    FINGERPRINT: fingerprint(obj.desired or {}, obj.kind.ignored),
+                    "image": obj.desired,
+                },
             }
             for obj in self._writes(stage)
         ]
@@ -1126,6 +1162,9 @@ class RestSubstrate:
                     "table": table,
                     "id": resource_id,
                     "fingerprint": fingerprint(resource, self._types[table].ignored),
+                    # Whole, so that recovery can put back a resource the stage's request
+                    # changed without writing it (1.5.2).
+                    "image": resource,
                 }
                 for (table, resource_id), resource in sorted(found.items())
             ]
@@ -1150,8 +1189,12 @@ class RestSubstrate:
             version is gone (``412``/``409``): nothing is written.
         :raises CompensatedError: If a later write failed, or the read-back was not the
             prediction: what was written is put back.
-        :raises CommitUnsettledError: If the put-back failed too: the undo journal stays for
-            recovery, and the intent stays open.
+        :raises CommitUnsettledError: If the put-back failed too, or (1.5.2) anything else
+            failed after a write was sent: a connection that dropped, a write that timed
+            out, a read-back that could not be read. What the API holds is then unknown, so
+            the undo journal stays, the intent stays open, and :meth:`resolve_intent`
+            settles it. Never reported as a plain failure, which the engine would record
+            as aborted.
         """
         stage = self._require(handle)
         self._assert_live(handle)
@@ -1185,8 +1228,20 @@ class RestSubstrate:
             stage.committing = False
             raise
         except CommitUnsettledError:
-            stage.unsettled = True
+            self._leave_unsettled(stage)
             raise
+        except Exception as exc:
+            if not stage.sent:
+                # Nothing went out: the failure is the whole story.
+                redo.unlink(missing_ok=True)
+                stage.committing = False
+                raise
+            self._leave_unsettled(stage)
+            raise CommitUnsettledError(
+                f"stage {handle.stage_id}: {exc}. A write had been sent, so what the API "
+                f"holds is not verified. The undo journal stays, and recovery reads the "
+                f"tenant back and settles it"
+            ) from exc
         redo.unlink(missing_ok=True)
         stage.committing = False
         stage.done = True
@@ -1198,6 +1253,14 @@ class RestSubstrate:
             verdict_hash="",
             substrate_txn_id=f"rest:{handle.stage_id}" if writes else None,
         )
+
+    def _leave_unsettled(self, stage: _Stage) -> None:
+        """Mark the stage unsettled, and let go of the control database: its rows are in the
+        redo record, and :meth:`resolve_intent` writes them again if the stage stands. Held,
+        the control stage's write lock would block that."""
+        stage.unsettled = True
+        if self._control is not None and stage.control is not None:
+            self._control.abort(stage.control)
 
     def _headers(
         self, stage_id: uuid.UUID, kind: RestResource, version: str | None, *, create: bool
@@ -1241,6 +1304,7 @@ class RestSubstrate:
         for obj in writes:
             assert obj.desired is not None
             method, body, content_type = self._body(obj.kind, obj.live, obj.desired, obj.version)
+            stage.sent = True
             try:
                 landed = self._api.call(
                     method,
@@ -1463,32 +1527,43 @@ class RestSubstrate:
         return self._journal.directory / f"{stage_id}.redo.json"
 
     def resolve_intent(self, stage_id: uuid.UUID, *, txid: str | None = None) -> bool | None:
-        """Whether a stage a crash interrupted was written, from each resource as the API holds
-        it now: as predicted, it was written; as it was read, it was not. All written, ``True``
-        (and the control rows written again if they were lost); none, ``False``; some, put back
-        from the undo, then ``False`` (and :meth:`compensated` names the undo). ``None`` when a
-        resource is neither, or no undo of the stage is left: something else wrote it, and only
-        an operator can say."""
+        """Settle a stage whose commit could not finish: a crash, a write whose answer never
+        came, or a read-back that failed. It reads what the commit would have read, each
+        resource the stage writes and every tenant it listed, and applies the commit's rule
+        (E4-14): every written resource as predicted, every other one as it was read.
+
+        ``True`` when that holds: the stage stands, and its control rows are written again
+        if they were lost. ``False`` when nothing of it stands: no write landed, or there
+        was a difference and what landed was put back, with whatever the API says the
+        stage's request set off (:meth:`compensated` then names the undo, and
+        :meth:`settlement` says what was found). ``None`` when it cannot be settled yet, or
+        here: the API cannot be read, a written resource is neither as written nor as it
+        was, a put-back failed, or no undo of the stage is left. The intent then stays
+        open, and a later recovery asks again.
+        """
         found = self._journal.read(stage_id)
         if found is None:
             return None
         document, digest = found
-        states: list[tuple[RestResource, Mapping[str, Any], str]] = []
-        for entry in document.get("writes", ()):
-            kind = self._types.get(str(entry.get("table")))
-            if kind is None:
-                return None
-            try:
-                read = self._api.read(kind, str(entry["id"]))
-            except (_RestError, SubstrateUnavailableError):
-                return None
-            current = None if read is None else read[0]
-            state = self._state_of(kind, entry, current)
-            if state is None:
-                return None
-            states.append((kind, entry, state))
+        ours = str(stage_id)
+        try:
+            states = self._written_states(document, ours)
+            strays = None if states is None else self._strays(document, states)
+        except (_RestError, StageError) as exc:
+            logger.warning("stage %s cannot be settled yet: %s", stage_id, exc)
+            return None
+        if states is None or strays is None:
+            logger.warning(
+                "stage %s cannot be settled here: a resource it wrote is neither as written "
+                "nor as it was (another request wrote it since), or its type is no longer "
+                "configured. A person has to look",
+                stage_id,
+            )
+            return None
+        # Landed: as predicted, or rewritten by what the stage's own request set off.
+        applied = [(k, e) for k, e, s, _ in states if s != "untouched"]
         redo = self._redo_path(stage_id)
-        if states and all(s == "applied" for _, _, s in states):
+        if states and all(s == "applied" for _, _, s, _ in states) and not strays:
             if redo.exists() and self._control is not None:
                 record = json.loads(redo.read_bytes())
                 replay(
@@ -1500,35 +1575,168 @@ class RestSubstrate:
             redo.unlink(missing_ok=True)
             self._journal.discard(stage_id)
             return True
-        applied = [(k, e) for k, e, s in states if s == "applied"]
-        if applied:
-            problems = [
-                p
-                for kind, entry in reversed(applied)
-                if (p := self._restore(stage_id, kind, str(entry["id"]), entry.get("before")))
-                is not None
-            ]
-            if problems:
-                logger.warning(
-                    "stage %s: a partial write could not be put back yet: %s",
-                    stage_id,
-                    "; ".join(problems),
+        # A write that landed in part, or a tenant that is not the prediction: nothing of the
+        # stage may stand. Put back what is the stage's, newest first, and name the rest.
+        problems: list[str] = []
+        foreign: list[str] = []
+        restored = 0
+        for key, was, now in reversed(strays):
+            kind = self._types[key[0]]
+            named = f"{key[0]}/{key[1]}"
+            source = None
+            if now is not None and kind.source is not None:
+                _, value = field_value(now, kind.source)
+                source = None if value is None else str(value)
+            if source != ours:
+                foreign.append(named)
+                continue
+            before = None if was is None else was.get("image")
+            if was is not None and before is None:
+                problems.append(
+                    f"{named}: the stage's request changed it, and this undo holds no image of it"
                 )
-                return None
+                continue
+            problem = self._restore(stage_id, kind, key[1], before)
+            if problem is None:
+                restored += 1
+            else:
+                problems.append(problem)
+        for kind, entry in reversed(applied):
+            problem = self._restore(stage_id, kind, str(entry["id"]), entry.get("before"))
+            if problem is None:
+                restored += 1
+            else:
+                problems.append(problem)
+        if restored:
             self._undone.add(stage_id)
+        if problems:
+            logger.warning(
+                "stage %s: what it wrote could not be put back yet: %s",
+                stage_id,
+                "; ".join(problems),
+            )
+            return None
+        if foreign:
+            logger.warning(
+                "stage %s: %s differ from what the stage read and are not its own to put "
+                "back: left as they are, for a person to review",
+                stage_id,
+                ", ".join(sorted(foreign)),
+            )
         if stage_id in self._undone:
             self._undone.discard(stage_id)
             self._compensated[stage_id] = digest
+            self._settlements[stage_id] = Settlement(
+                undo=digest,
+                applied=len(applied),
+                restored=restored,
+                discrepancies=tuple(self._settled_words(states, strays)) if applied else (),
+                foreign=tuple(sorted(foreign)),
+            )
         redo.unlink(missing_ok=True)
         self._journal.discard(stage_id)
         return False
 
+    def _written_states(self, document: Mapping[str, Any], ours: str) -> list[_Written] | None:
+        """Each write of the undo with its state now (:meth:`_state_of`) and the resource as
+        the API holds it; ``None`` when someone else wrote one since, or its type is not
+        configured."""
+        states: list[_Written] = []
+        for entry in document.get("writes", ()):
+            kind = self._types.get(str(entry.get("table")))
+            if kind is None:
+                return None
+            read = self._api.read(kind, str(entry["id"]))
+            current = None if read is None else read[0]
+            state = self._state_of(kind, entry, current, ours)
+            if state is None:
+                return None
+            states.append((kind, entry, state, current))
+        return states
+
+    def _strays(
+        self,
+        document: Mapping[str, Any],
+        states: Sequence[_Written],
+    ) -> list[_Stray] | None:
+        """Every resource of the undo's tenants, other than the ones the stage writes, that
+        is not as the stage read it: its key, the undo's entry for it (``None`` when it was
+        created since) and what the API holds now (``None`` when it is gone). ``None`` when a
+        type the undo lists is not configured."""
+        written = {(k.table, str(e["id"])) for k, e, _, _ in states}
+        strays: list[_Stray] = []
+        for tenant, listed in sorted((document.get("scope") or {}).items()):
+            then = {(str(e["table"]), str(e["id"])): e for e in listed}
+            if any(table not in self._types for table, _ in then):
+                return None
+            current = self._list_tenant(str(tenant))
+            for key in sorted((set(then) | set(current)) - written):
+                was, now = then.get(key), current.get(key)
+                if (
+                    was is not None
+                    and now is not None
+                    and was.get("fingerprint") == fingerprint(now, self._types[key[0]].ignored)
+                ):
+                    continue
+                strays.append((key, was, now))
+        return strays
+
+    def _settled_words(self, states: Sequence[_Written], strays: Sequence[_Stray]) -> list[str]:
+        """What recovery's read-back found that the prediction does not say, in the words the
+        commit's read-back uses: a write that is not as predicted, then each stray."""
+        words = []
+        for kind, entry, state, current in states:
+            if state != "rewritten" or current is None:
+                continue
+            named = f"{kind.table}/{entry['id']}"
+            predicted = (entry.get("after") or {}).get("image")
+            changed = []
+            if isinstance(predicted, Mapping):
+                wanted, held = kind.image(predicted), kind.image(current)
+                changed = [
+                    f"{c} {wanted.get(c)!r} -> {held.get(c)!r}"
+                    for c in sorted(set(wanted) - {FINGERPRINT})
+                    if wanted.get(c) != held.get(c)
+                ]
+            words.append(
+                f"{named}: "
+                + (", ".join(changed) if changed else "a field no column names")
+                + ", not as predicted"
+            )
+        for key, was, now in strays:
+            named = f"{key[0]}/{key[1]}"
+            if was is None:
+                words.append(f"{named} was created, and the plan created no such resource")
+            elif now is None:
+                words.append(f"{named} is gone")
+            else:
+                kind = self._types[key[0]]
+                image = was.get("image")
+                changed = []
+                if isinstance(image, Mapping):
+                    wanted, held = kind.image(image), kind.image(now)
+                    changed = [
+                        f"{c} {wanted.get(c)!r} -> {held.get(c)!r}"
+                        for c in sorted(set(wanted) - {FINGERPRINT})
+                        if wanted.get(c) != held.get(c)
+                    ]
+                words.append(
+                    f"{named}: "
+                    + (", ".join(changed) if changed else "a field no column names")
+                    + ", which the plan did not change"
+                )
+        return words
+
     @staticmethod
     def _state_of(
-        kind: RestResource, entry: Mapping[str, Any], current: Mapping[str, Any] | None
+        kind: RestResource,
+        entry: Mapping[str, Any],
+        current: Mapping[str, Any] | None,
+        ours: str,
     ) -> str | None:
-        """``applied``, ``untouched``, or ``None`` when the resource is neither as written nor as
-        it was."""
+        """``applied`` (as predicted), ``untouched`` (as it was), ``rewritten`` (neither, and
+        the API says the stage's own request wrote it last: its write landed, and something
+        that write set off wrote it again), or ``None`` when someone else wrote it since."""
         before = entry.get("before")
         if current is None:
             return "untouched" if entry.get("action") == "create" else None
@@ -1539,11 +1747,19 @@ class RestSubstrate:
             before, kind.ignored
         ):
             return "untouched"
+        if kind.source is not None:
+            _, value = field_value(current, kind.source)
+            if value is not None and str(value) == ours:
+                return "rewritten"
         return None
 
     def compensated(self, stage_id: uuid.UUID) -> str | None:
-        """The undo recovery put a partial write back from, if it did."""
+        """The undo recovery put the stage's writes back from, if it did."""
         return self._compensated.pop(stage_id, None)
+
+    def settlement(self, stage_id: uuid.UUID) -> Settlement | None:
+        """What recovery found and put back when it settled the stage, if it did (1.5.2)."""
+        return self._settlements.pop(stage_id, None)
 
     # -- savepoints ----------------------------------------------------------------
 

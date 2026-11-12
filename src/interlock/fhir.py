@@ -113,7 +113,7 @@ from interlock.exceptions import (
     SubstrateUnavailableError,
 )
 from interlock.planbound import UndoJournal
-from interlock.predicted import PREDICTED
+from interlock.predicted import PREDICTED, Settlement
 from interlock.substrate import SqliteSubstrate, TableSpec
 from interlock.text import tally
 from interlock.types import (
@@ -771,6 +771,9 @@ class _Stage:
     done: bool = False
     unsettled: bool = False
     committing: bool = False
+    sent: bool = False
+    """A write of the commit has gone out: from here its outcome is never
+    assumed."""
 
 
 class FhirSubstrate:
@@ -797,6 +800,7 @@ class FhirSubstrate:
         "_journal",
         "_max_rows",
         "_patients",
+        "_settlements",
         "_stage",
         "_stage_seconds",
         "_types",
@@ -837,6 +841,7 @@ class FhirSubstrate:
         )
         self._stage: _Stage | None = None
         self._compensated: dict[uuid.UUID, str] = {}
+        self._settlements: dict[uuid.UUID, Settlement] = {}
         self._undone: set[uuid.UUID] = set()
 
     # -- what it is -----------------------------------------------------------
@@ -1233,13 +1238,22 @@ class FhirSubstrate:
                 "id": obj.resource_id,
                 "action": obj.action,
                 "before": obj.live,
-                "after": {FINGERPRINT: fingerprint(obj.desired or {})},
+                # The prediction whole, so recovery can say how a write differs
+                # from it.
+                "after": {FINGERPRINT: fingerprint(obj.desired or {}), "image": obj.desired},
             }
             for obj in self._writes(stage)
         ]
         scope = {
             patient: [
-                {"table": table, "id": resource_id, "version": _version(resource)}
+                # Whole, so that recovery can put back a resource the stage's
+                # request changed without writing it (1.5.2).
+                {
+                    "table": table,
+                    "id": resource_id,
+                    "version": _version(resource),
+                    "image": resource,
+                }
                 for (table, resource_id), resource in sorted(found.items())
             ]
             for patient, found in sorted(stage.scope.items())
@@ -1267,8 +1281,13 @@ class FhirSubstrate:
             first write's version is gone (``412``): nothing is written.
         :raises CompensatedError: If a later write failed, or the read-back
             was not the prediction: what was written is put back.
-        :raises CommitUnsettledError: If the put-back failed too: the undo
-            journal stays for recovery, and the intent stays open.
+        :raises CommitUnsettledError: If the put-back failed too, or (1.5.2)
+            anything else failed after a write was sent: a connection that
+            dropped, a write that timed out, a read-back that could not be
+            read. What the server holds is then unknown, so the undo journal
+            stays, the intent stays open, and :meth:`resolve_intent` settles
+            it. Never reported as a plain failure, which the engine would
+            record as aborted.
         """
         stage = self._require(handle)
         self._assert_live(handle)
@@ -1302,8 +1321,20 @@ class FhirSubstrate:
             stage.committing = False
             raise
         except CommitUnsettledError:
-            stage.unsettled = True
+            self._leave_unsettled(stage)
             raise
+        except Exception as exc:
+            if not stage.sent:
+                # Nothing went out: the failure is the whole story.
+                redo.unlink(missing_ok=True)
+                stage.committing = False
+                raise
+            self._leave_unsettled(stage)
+            raise CommitUnsettledError(
+                f"stage {handle.stage_id}: {exc}. A write had been sent, so what the server "
+                f"holds is not verified. The undo journal stays, and recovery reads the chart "
+                f"back and settles it"
+            ) from exc
         redo.unlink(missing_ok=True)
         stage.committing = False
         stage.done = True
@@ -1315,6 +1346,15 @@ class FhirSubstrate:
             verdict_hash="",
             substrate_txn_id=f"fhir:{handle.stage_id}" if writes else None,
         )
+
+    def _leave_unsettled(self, stage: _Stage) -> None:
+        """Mark the stage unsettled, and let go of the control database: its
+        rows are in the redo record, and :meth:`resolve_intent` writes them
+        again if the stage stands. Held, the control stage's write lock would
+        block that."""
+        stage.unsettled = True
+        if self._control is not None and stage.control is not None:
+            self._control.abort(stage.control)
 
     @staticmethod
     def _headers(stage_id: uuid.UUID, if_match: str | None) -> dict[str, str]:
@@ -1351,6 +1391,7 @@ class FhirSubstrate:
         applied: list[_Resource] = []
         for obj in writes:
             assert obj.desired is not None
+            stage.sent = True
             try:
                 landed = self._api.call(
                     "PUT",
@@ -1580,34 +1621,46 @@ class FhirSubstrate:
         return self._journal.directory / f"{stage_id}.redo.json"
 
     def resolve_intent(self, stage_id: uuid.UUID, *, txid: str | None = None) -> bool | None:
-        """Whether a stage a crash interrupted was written, from each resource
-        as the server holds it now: tagged with the stage and as predicted, it
-        was written; at the version read, it was not. All written, ``True``
-        (and the control rows written again if they were lost); none,
-        ``False``; some, put back from the undo, then ``False`` (and
-        :meth:`compensated` names the undo). ``None`` when a resource is
-        neither, or no undo of the stage is left: something else wrote it,
-        and only an operator can say. A rule's writes elsewhere in the chart
-        are caught by the commit's read-back, not here."""
+        """Settle a stage whose commit could not finish: a crash, a write
+        whose answer never came, or a read-back that failed. It reads what the
+        commit would have read, each resource the stage writes and every chart
+        it read, and applies the commit's rule (E4-14): every written resource
+        tagged with the stage and as predicted, every other one at the version
+        read.
+
+        ``True`` when that holds: the stage stands, and its control rows are
+        written again if they were lost. ``False`` when nothing of it stands:
+        no write landed, or there was a difference and what landed was put
+        back, with whatever the server says the stage's request wrote
+        (:meth:`compensated` then names the undo, and :meth:`settlement` says
+        what was found). ``None`` when it cannot be settled yet, or here: the
+        server cannot be read, a written resource is neither as written nor as
+        it was, a put-back failed, or no undo of the stage is left. The intent
+        then stays open, and a later recovery asks again.
+        """
         found = self._journal.read(stage_id)
         if found is None:
             return None
         document, digest = found
-        states: list[tuple[FhirType, Mapping[str, Any], str, dict[str, Any] | None]] = []
-        for entry in document.get("writes", ()):
-            kind = self._types.get(str(entry.get("table")))
-            if kind is None:
-                return None
-            try:
-                current = self._api.read(kind.resource_type, str(entry["id"]))
-            except (_FhirError, SubstrateUnavailableError):
-                return None
-            state = self._state_of(entry, current, str(stage_id))
-            if state is None:
-                return None
-            states.append((kind, entry, state, current))
+        try:
+            states = self._written_states(document, stage_id)
+            strays = None if states is None else self._strays(document, states)
+        except (_FhirError, StageError) as exc:
+            logger.warning("stage %s cannot be settled yet: %s", stage_id, exc)
+            return None
+        if states is None or strays is None:
+            logger.warning(
+                "stage %s cannot be settled here: a resource it wrote is neither as written "
+                "nor as it was (another request wrote it since), or its type is no longer "
+                "configured. A person has to look",
+                stage_id,
+            )
+            return None
+        # Landed: as predicted, or rewritten by what the stage's own request
+        # set off.
+        applied = [(k, e, c) for k, e, s, c in states if s != "untouched"]
         redo = self._redo_path(stage_id)
-        if states and all(s == "applied" for _, _, s, _ in states):
+        if states and all(s == "applied" for _, _, s, _ in states) and not strays:
             if redo.exists() and self._control is not None:
                 record = json.loads(redo.read_bytes())
                 replay(
@@ -1619,43 +1672,182 @@ class FhirSubstrate:
             redo.unlink(missing_ok=True)
             self._journal.discard(stage_id)
             return True
-        applied = [(k, e, c) for k, e, s, c in states if s == "applied"]
-        if applied:
-            problems = [
-                p
-                for kind, entry, current in reversed(applied)
-                if current is not None
-                and (
-                    p := self._restore(
-                        stage_id, kind, str(entry["id"]), entry.get("before"), current
-                    )
+        # A write that landed in part, or a chart that is not the prediction:
+        # nothing of the stage may stand. Put back what is the stage's, newest
+        # first, and name the rest.
+        ours = f"#{stage_id}"
+        problems: list[str] = []
+        foreign: list[str] = []
+        restored = 0
+        for key, was, now in reversed(strays):
+            kind = self._types[key[0]]
+            named = f"{kind.resource_type}/{key[1]}"
+            source = "" if now is None else str((now.get("meta") or {}).get("source") or "")
+            if now is None or not source.endswith(ours):
+                foreign.append(named)
+                continue
+            before = None if was is None else was.get("image")
+            if was is not None and before is None:
+                problems.append(
+                    f"{named}: the stage's request changed it, and this undo holds no image of it"
                 )
-                is not None
-            ]
-            if problems:
-                logger.warning(
-                    "stage %s: a partial write could not be put back yet: %s",
-                    stage_id,
-                    "; ".join(problems),
-                )
-                return None
+                continue
+            problem = self._restore(stage_id, kind, key[1], before, now)
+            if problem is None:
+                restored += 1
+            else:
+                problems.append(problem)
+        for kind, entry, current in reversed(applied):
+            if current is None:
+                continue
+            problem = self._restore(stage_id, kind, str(entry["id"]), entry.get("before"), current)
+            if problem is None:
+                restored += 1
+            else:
+                problems.append(problem)
+        if restored:
             self._undone.add(stage_id)
+        if problems:
+            logger.warning(
+                "stage %s: what it wrote could not be put back yet: %s",
+                stage_id,
+                "; ".join(problems),
+            )
+            return None
+        if foreign:
+            logger.warning(
+                "stage %s: %s differ from what the stage read and are not its own to put "
+                "back: left as they are, for a person to review",
+                stage_id,
+                ", ".join(sorted(foreign)),
+            )
         if stage_id in self._undone:
             self._undone.discard(stage_id)
             self._compensated[stage_id] = digest
+            self._settlements[stage_id] = Settlement(
+                undo=digest,
+                applied=len(applied),
+                restored=restored,
+                discrepancies=tuple(self._settled_words(states, strays)) if applied else (),
+                foreign=tuple(sorted(foreign)),
+            )
         redo.unlink(missing_ok=True)
         self._journal.discard(stage_id)
         return False
+
+    def _written_states(
+        self, document: Mapping[str, Any], stage_id: uuid.UUID
+    ) -> list[tuple[FhirType, Mapping[str, Any], str, dict[str, Any] | None]] | None:
+        """Each write of the undo with its state now (``applied`` or
+        ``untouched``) and the resource as held; ``None`` when one is neither,
+        or its type is not configured."""
+        states: list[tuple[FhirType, Mapping[str, Any], str, dict[str, Any] | None]] = []
+        for entry in document.get("writes", ()):
+            kind = self._types.get(str(entry.get("table")))
+            if kind is None:
+                return None
+            current = self._api.read(kind.resource_type, str(entry["id"]))
+            state = self._state_of(entry, current, str(stage_id))
+            if state is None:
+                return None
+            states.append((kind, entry, state, current))
+        return states
+
+    def _strays(
+        self,
+        document: Mapping[str, Any],
+        states: Sequence[tuple[FhirType, Mapping[str, Any], str, dict[str, Any] | None]],
+    ) -> list[tuple[tuple[str, str], Mapping[str, Any] | None, dict[str, Any] | None]] | None:
+        """Every resource of the undo's charts, other than the ones the stage
+        writes, that is not as the stage read it (its version, or failing
+        that its content): its key, the undo's entry for it (``None`` when it
+        was created since) and what the server holds now (``None`` when it is
+        gone). ``None`` when a type the undo lists is not configured."""
+        written = {(k.table, str(e["id"])) for k, e, _, _ in states}
+        strays: list[tuple[tuple[str, str], Mapping[str, Any] | None, dict[str, Any] | None]] = []
+        for patient, listed in sorted((document.get("scope") or {}).items()):
+            then = {(str(e["table"]), str(e["id"])): e for e in listed}
+            if any(table not in self._types for table, _ in then):
+                return None
+            current: dict[tuple[str, str], dict[str, Any]] = {}
+            for kind in self._types.values():
+                for held in self._compartment(kind, str(patient)):
+                    current[(kind.table, str(held.get("id")))] = held
+            for key in sorted((set(then) | set(current)) - written):
+                was, now = then.get(key), current.get(key)
+                if was is not None and now is not None:
+                    image = was.get("image")
+                    if was.get("version") == _version(now) or (
+                        isinstance(image, Mapping) and fingerprint(image) == fingerprint(now)
+                    ):
+                        continue  # as read, or already put back to it
+                strays.append((key, was, now))
+        return strays
+
+    def _settled_words(
+        self,
+        states: Sequence[tuple[FhirType, Mapping[str, Any], str, dict[str, Any] | None]],
+        strays: Sequence[tuple[tuple[str, str], Mapping[str, Any] | None, dict[str, Any] | None]],
+    ) -> list[str]:
+        """What recovery's read-back found that the prediction does not say, in
+        the words the commit's read-back uses: a write that is not as
+        predicted, then each stray."""
+        words = []
+        for kind, entry, state, current in states:
+            if state != "rewritten" or current is None:
+                continue
+            named = f"{kind.resource_type}/{entry['id']}"
+            predicted = (entry.get("after") or {}).get("image")
+            changed = []
+            if isinstance(predicted, Mapping):
+                wanted, held = kind.image(predicted), kind.image(current)
+                changed = [
+                    f"{c} {wanted.get(c)!r} -> {held.get(c)!r}"
+                    for c in sorted(set(wanted) - {FINGERPRINT})
+                    if wanted.get(c) != held.get(c)
+                ]
+            words.append(
+                f"{named}: "
+                + (", ".join(changed) if changed else "a field no column names")
+                + ", not as predicted"
+            )
+        for key, was, now in strays:
+            kind = self._types[key[0]]
+            named = f"{kind.resource_type}/{key[1]}"
+            if was is None:
+                words.append(f"{named} was created, and the plan created no such resource")
+            elif now is None:
+                words.append(f"{named} is gone")
+            else:
+                image = was.get("image")
+                changed = []
+                if isinstance(image, Mapping):
+                    wanted, held = kind.image(image), kind.image(now)
+                    changed = [
+                        f"{c} {wanted.get(c)!r} -> {held.get(c)!r}"
+                        for c in sorted(set(wanted) - {FINGERPRINT})
+                        if wanted.get(c) != held.get(c)
+                    ]
+                words.append(
+                    f"{named}: "
+                    + (", ".join(changed) if changed else "a field no column names")
+                    + ", which the plan did not change"
+                )
+        return words
 
     @staticmethod
     def _state_of(
         entry: Mapping[str, Any], current: Mapping[str, Any] | None, marker: str
     ) -> str | None:
-        """``applied``, ``untouched``, or ``None`` when the resource is
-        neither as written nor as it was."""
+        """``applied`` (tagged with the stage and as predicted), ``untouched``
+        (at the version read), ``rewritten`` (neither, and the server says the
+        stage's own request wrote it last: its write landed, and a rule that
+        write set off wrote it again), or ``None`` when someone else wrote it
+        since."""
         if current is None:
             return "untouched" if entry.get("action") == "create" else None
-        tags = (current.get("meta") or {}).get("tag") or ()
+        meta = current.get("meta") or {}
+        tags = meta.get("tag") or ()
         marked = any(
             isinstance(t, Mapping) and t.get("system") == STAGE_TAG and t.get("code") == marker
             for t in tags
@@ -1664,13 +1856,24 @@ class FhirSubstrate:
         if marked and fingerprint(current) == predicted:
             return "applied"
         before = entry.get("before")
-        if before is not None and _version(current) == _version(before):
+        if before is not None and (
+            _version(current) == _version(before) or fingerprint(current) == fingerprint(before)
+        ):
+            # At the version read, or put back to what was read by an earlier
+            # try at this (a put-back makes a new version of the old content).
             return "untouched"
+        if str(meta.get("source") or "").endswith(f"#{marker}"):
+            return "rewritten"
         return None
 
     def compensated(self, stage_id: uuid.UUID) -> str | None:
-        """The undo recovery put a partial write back from, if it did."""
+        """The undo recovery put the stage's writes back from, if it did."""
         return self._compensated.pop(stage_id, None)
+
+    def settlement(self, stage_id: uuid.UUID) -> Settlement | None:
+        """What recovery found and put back when it settled the stage, if it
+        did (1.5.2)."""
+        return self._settlements.pop(stage_id, None)
 
     # -- savepoints ----------------------------------------------------------------
 

@@ -737,11 +737,77 @@ _REST: Final[Mapping[Guidance, Any]] = {
 }
 """A REST API's nouns (1.5.0): records, accounts and automations."""
 
+_KUBERNETES: Final[Mapping[Guidance, Any]] = {
+    Guidance.ROW_LIMIT: lambda c: (
+        f"the plan changes {c.measured or 'too many'} objects, counting what the cluster's "
+        f"admission webhooks changed; the limit is {c.limit or 'lower'}. Change fewer objects, "
+        f"or split the work."
+    ),
+    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="changes objects of", kind="kind"),
+    Guidance.NO_DELETE: lambda c: _no_delete(c, rows="objects", kind="kind"),
+    Guidance.TRUNCATED: lambda c: (
+        f"the plan changes more objects than can be measured ({c.measured or 'too many'}). "
+        f"Split the work."
+    ),
+    Guidance.STATED_FOOTPRINT: lambda c: (
+        f"the plan stated {tally(c.limit, 'object') if c.limit else 'a number of objects'}; the "
+        f"cluster's dry run measured {c.measured or 'more'}."
+    ),
+    Guidance.STATEMENT_KIND: lambda c: (
+        "a statement is not one this cluster stages: scale, set, merge-patch, apply, delete "
+        "or expect-version, on an object of a kind and namespace the deployment observes."
+    ),
+    Guidance.STATEMENT_FAILED: lambda c: (
+        "the cluster refused the change in its dry run: an object that is not there, a field "
+        "that cannot change, or an admission policy that denied it."
+    ),
+    Guidance.CONFLICT: lambda c: (
+        "an object changed in the cluster after the plan measured it; nothing was applied. "
+        "Read the object again before planning."
+    ),
+    Guidance.UNAVAILABLE: lambda c: "the cluster's API server could not be reached.",
+}
+"""Kubernetes' nouns (1.5.2): objects and kinds."""
+
+_TERRAFORM: Final[Mapping[Guidance, Any]] = {
+    Guidance.ROW_LIMIT: lambda c: (
+        f"the plan changes {c.measured or 'too many'} resources, as Terraform's own plan "
+        f"counts them; the limit is {c.limit or 'lower'}. Change fewer resources, or split the "
+        f"work."
+    ),
+    Guidance.TABLE_SCOPE: lambda c: _outside(c, did="changes resources of", kind="resource type"),
+    Guidance.NO_DELETE: lambda c: _no_delete(c, rows="resources", kind="resource type"),
+    Guidance.TRUNCATED: lambda c: (
+        f"the plan changes more resources than can be measured ({c.measured or 'too many'}). "
+        f"Split the work."
+    ),
+    Guidance.STATED_FOOTPRINT: lambda c: (
+        f"the plan stated {tally(c.limit, 'resource') if c.limit else 'a number of resources'}; "
+        f"Terraform's plan measured {c.measured or 'more'}."
+    ),
+    Guidance.STATEMENT_KIND: lambda c: (
+        "a statement is not one this configuration stages: set a variable, or pin the state's "
+        "serial."
+    ),
+    Guidance.STATEMENT_FAILED: lambda c: (
+        "Terraform could not plan the change: a variable the configuration does not declare, "
+        "or a plan that failed."
+    ),
+    Guidance.CONFLICT: lambda c: (
+        "the state changed after the plan was saved (its serial moved); nothing was applied. "
+        "Plan again."
+    ),
+    Guidance.UNAVAILABLE: lambda c: "Terraform, or its state, could not be reached.",
+}
+"""Terraform's nouns (1.5.2): resources and resource types."""
+
 _NOUNS: Final[Mapping[str, Mapping[Guidance, Any]]] = {
     "git": _GIT,
     "fhir": _FHIR,
     "filesystem": _FILES,
     "rest": _REST,
+    "kubernetes": _KUBERNETES,
+    "terraform": _TERRAFORM,
 }
 """Each substrate whose nouns are not SQL's, and the templates it says them in.
 A kind it does not name keeps the SQL template."""
