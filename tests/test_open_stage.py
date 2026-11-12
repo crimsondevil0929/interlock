@@ -216,7 +216,7 @@ def test_a_stage_on_a_directory_reads_its_own_files(tmp_path: Path) -> None:
     workspace = tmp_path / "notes"
     workspace.mkdir()
     (workspace / "todo.md").write_text("- ship\n")
-    substrate = FilesystemSubstrate(workspace, ignore=[".git/**"])
+    substrate = FilesystemSubstrate(workspace, ignore=["build/**"])
     run = EscrowEngine(
         substrate,
         checkers=[KindAllowlist(["docs"]), NoDelete(), ChangeLimit(3)],
@@ -245,7 +245,7 @@ def test_a_stage_on_a_directory_reads_its_own_files(tmp_path: Path) -> None:
         with pytest.raises(ForbiddenStatementError, match="read refused"):
             stage.read("../outside.txt")
         with pytest.raises(ForbiddenStatementError, match="is ignored"):
-            stage.read(".git/config")
+            stage.read("build/out.txt")
         result = stage.settle()
     assert result is not None and result.committed
     assert (workspace / "todo.md").read_text() == "- ship\n- test\n"
