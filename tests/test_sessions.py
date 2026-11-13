@@ -445,3 +445,124 @@ def test_the_settings_send_every_event_to_one_command() -> None:
     assert hooks["SessionEnd"][0]["matcher"] == "prompt_input_exit|logout|other"
     commands = {h["command"] for e in hooks.values() for g in e for h in g["hooks"]}
     assert commands == {"interlock hook claude-code --config /x/interlock.toml"}
+
+
+def test_the_command_line_lists_shows_discards_and_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from interlock.operators import generate_key
+
+    path = _config(tmp_path, '[sessions]\nsandbox = "none"\n')
+    assert main(["install", "--config", str(path)], out=io.StringIO()) == 0
+    out = io.StringIO()
+    assert main(["stage", "list", "--config", str(path)], out=out) == 0
+    assert "no sessions" in out.getvalue()
+    out = io.StringIO()
+    assert main(["stage", "open", "--config", str(path), "--json"], out=out) == 0
+    opened = json.loads(out.getvalue())
+    tree = Path(opened["tree"])
+    out = io.StringIO()
+    assert main(["stage", "list", "--config", str(path), "--json"], out=out) == 0
+    assert [s["name"] for s in json.loads(out.getvalue())] == [opened["name"]]
+    monkeypatch.chdir(tmp_path)
+    assert main(["run", "--config", str(path), "--"], out=io.StringIO()) == 2
+    # Nothing changed: a check says so, and a signed promotion closes it empty.
+    out = io.StringIO()
+    assert main(["promote", "--config", str(path), "--check"], out=out) == 0
+    assert "empty" in out.getvalue()
+    second = io.StringIO()
+    assert main(["stage", "open", "--config", str(path), "--name", "keep"], out=second) == 0
+    (tmp_path / ".ws.interlock" / "sessions" / "keep" / "tree" / "docs" / "README.md").write_text(
+        "# kept\n"
+    )
+    key = tmp_path / "promote.key"
+    generate_key(key)
+    out = io.StringIO()
+    argv = ["promote", "--config", str(path), "--session", "keep", "--key", str(key)]
+    assert main(argv, out=out) == 0
+    assert "receipt (signed)" in out.getvalue()
+    out = io.StringIO()
+    assert (
+        main(["stage", "discard", "--config", str(path), "--session", opened["name"]], out=out) == 0
+    )
+    assert "discarded" in out.getvalue() and not tree.exists()
+    # The hook through the command line: an event Claude Code sends that needs nothing.
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"hook_event_name": "Notification"})))
+    assert main(["hook", "claude-code", "--config", str(path)], out=io.StringIO()) == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+    assert main(["hook", "claude-code", "--config", str(path)], out=io.StringIO()) == 2
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO(json.dumps({"hook_event_name": "WorktreeCreate", "name": "from-hook"})),
+    )
+    out = io.StringIO()
+    assert main(["hook", "claude-code", "--config", str(path)], out=out) == 0
+    assert Path(out.getvalue().strip()).name == "tree"
+
+
+def test_a_session_ends_when_it_expires_or_is_named_wrong(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from interlock.session import current_session, load_session
+
+    substrate = _fs(tmp_path)
+    session = substrate.open_session(name="old", lifetime=60)
+    session.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    session.save()
+    with pytest.raises(SessionError, match="expired"):
+        promote(_engine(substrate, tmp_path), Session.load(session.directory), scope_id="s")
+    with pytest.raises(SessionError, match="no session"):
+        load_session(substrate, "missing")
+    substrate.open_session(name="a")
+    substrate.open_session(name="b")
+    with pytest.raises(SessionError, match="name one"):
+        current_session(substrate, None, tmp_path)
+    assert current_session(substrate, "a", tmp_path).name == "a"
+    from interlock.session import sessions_of
+    from interlock.substrate import SqliteSubstrate
+
+    with pytest.raises(SessionError, match="holds no sessions"):
+        sessions_of(SqliteSubstrate(str(tmp_path / "x.db"), tables=()))
+    with pytest.raises(SessionError, match="no command"):
+        run_command(Session.load(substrate.sessions / "a"), [], sandbox="none")
+
+
+def test_hooks_outside_a_session_do_nothing_or_say_how_to_start(tmp_path: Path) -> None:
+    substrate = _fs(tmp_path)
+    context = HookContext(
+        substrate=lambda: substrate,
+        promote=lambda session, check: promote(
+            _engine(substrate, tmp_path), session, scope_id="s", check=check
+        ),
+        lifetime=3600,
+    )
+    elsewhere = str(tmp_path)
+    code, out, _ = _hook(context, hook_event_name="SessionStart", cwd=elsewhere)
+    assert "EnterWorktree" in json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert _hook(context, hook_event_name="Stop", cwd=elsewhere) == (0, "", "")
+    assert _hook(context, hook_event_name="SessionEnd", cwd=elsewhere, reason="other") == (
+        0,
+        "",
+        "",
+    )
+    assert _hook(context, hook_event_name="WorktreeRemove", worktree_path=elsewhere)[0] == 0
+    assert _hook(context, hook_event_name="Elicitation", cwd=elsewhere) == (0, "", "")
+    session = substrate.open_session(name="done")
+    promote(_engine(substrate, tmp_path), session, scope_id="s")  # empty: closed
+    code, _, err = _hook(context, hook_event_name="WorktreeCreate", name="done", cwd=elsewhere)
+    assert code == 1 and "exists" in err
+
+
+def test_the_chooser_takes_only_a_sandbox_that_works(monkeypatch: pytest.MonkeyPatch) -> None:
+    from interlock import sandbox
+
+    monkeypatch.setattr(sandbox, "_works", lambda kind: kind == "none")
+    with pytest.raises(SandboxUnavailableError, match="--sandbox none"):
+        sandbox.choose("auto")
+    with pytest.raises(SandboxUnavailableError, match="does not work"):
+        sandbox.choose("bwrap")
+    assert sandbox.choose("none") == "none" and sandbox.available() == ("none",)
+    assert Sandbox("seatbelt", writable=(Path("/w"),)).argv(["ls"], Path("/w"))[:2] == [
+        "sandbox-exec",
+        "-p",
+    ]
