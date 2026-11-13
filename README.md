@@ -73,6 +73,18 @@ writes a signed receipt with the input and output trees, the command log and eve
 `interlock hook claude-code` does all of this from Claude Code's own hooks
 ([GUIDE](docs/GUIDE.md#coding-sessions-one-stage-for-a-whole-session-170)).
 
+## What the agent read before it asked (1.8.0)
+
+A refund within the agent's cap is still the wrong refund when the agent asked for it because
+a stranger's email told it to. A plan can carry the labels of what its session had read
+(`untrusted`, `secret`, one tenant's data), and `ProvenanceGate` decides by them: after
+untrusted input, the kinds and sinks you list take the principals' approval; labeled data
+leaves only by the sinks cleared for it; and the "rule of two" refuses a plan that would make
+a session have read untrusted input, read sensitive data and changed something, all three.
+Interlock trusts the labels it is given; Fiduciary labels each session from its tools and
+records each label in a signed record
+([GUIDE](docs/GUIDE.md#what-the-session-read-before-the-plan-180)).
+
 ## Why authorization does not catch this
 
 A prompt-injected agent is a fully authorized agent. It is doing something it has

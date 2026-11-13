@@ -118,6 +118,7 @@ from interlock.invariants import (
     NoDelete,
     NoSchemaChange,
     PartitionIsolation,
+    ProvenanceGate,
     StatedFootprint,
     TableAllowlist,
     TenantDrawdownGuard,
@@ -213,7 +214,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 __all__ = [
     "CHECKER_ALIASES",
@@ -312,6 +313,7 @@ __all__ = [
     "PoolExhaustedError",
     "PostgresSubstrate",
     "Progress",
+    "ProvenanceGate",
     "RateWindow",
     "RateWindowCheck",
     "ReceiptIssuer",
