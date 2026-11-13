@@ -54,7 +54,7 @@ from interlock.chain import EscrowChain, EscrowRecord, RecordType
 from interlock.checker_packs import CheckerPack, CheckerPackError, PackPin, load_pack, pack_digest
 from interlock.daemon import Application, build_supervisor, load_application
 from interlock.deliveries import verify_delivery_log
-from interlock.engine import EscrowEngine, StageResult
+from interlock.engine import EscrowEngine, OpenStage, StageResult
 from interlock.exceptions import (
     AdmissionError,
     AnchorError,
@@ -107,18 +107,24 @@ from interlock.inbox import (
     verify_inbox,
 )
 from interlock.invariants import (
+    CHECKER_ALIASES,
     BlastRadius,
+    ChangeLimit,
     ColumnValueGuard,
     CrossEffectAgreement,
     FactAgreement,
     InvariantChecker,
+    KindAllowlist,
     NoDelete,
     NoSchemaChange,
+    PartitionIsolation,
     StatedFootprint,
     TableAllowlist,
     TenantDrawdownGuard,
     TenantIsolation,
     TruncationGuard,
+    ValueGuard,
+    checker_family,
     default_checkers,
 )
 from interlock.kubernetes import KubeKind, KubernetesSubstrate
@@ -178,6 +184,7 @@ from interlock.telemetry import Metrics
 from interlock.terraform import TerraformSubstrate, TfResource
 from interlock.trace import child_traceparent, new_traceparent, parse_traceparent
 from interlock.types import (
+    Change,
     Compensation,
     Effect,
     EffectDiff,
@@ -206,9 +213,10 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 __all__ = [
+    "CHECKER_ALIASES",
     "AdmissionError",
     "AgentContext",
     "AgentFeedback",
@@ -221,6 +229,8 @@ __all__ = [
     "CascadeReport",
     "ChainInUseError",
     "ChainIntegrityError",
+    "Change",
+    "ChangeLimit",
     "Channel",
     "CheckerPack",
     "CheckerPackError",
@@ -269,6 +279,7 @@ __all__ = [
     "InterlockSupervisor",
     "InvariantChecker",
     "InvariantViolation",
+    "KindAllowlist",
     "KubeKind",
     "KubernetesSubstrate",
     "LedgerAnchor",
@@ -284,6 +295,7 @@ __all__ = [
     "NoBreaker",
     "NoDelete",
     "NoSchemaChange",
+    "OpenStage",
     "OperationSpec",
     "OperatorEvidence",
     "OutboundCount",
@@ -291,6 +303,7 @@ __all__ = [
     "OutboundRequestError",
     "OutboundTenantIsolation",
     "PackPin",
+    "PartitionIsolation",
     "PayloadAmountCap",
     "PlanBuilder",
     "PlanError",
@@ -368,11 +381,13 @@ __all__ = [
     "Vacuum",
     "VacuumReport",
     "VacuumService",
+    "ValueGuard",
     "Verdict",
     "WindowMeasure",
     "__version__",
     "build_supervisor",
     "check_anchors",
+    "checker_family",
     "child_traceparent",
     "default_checkers",
     "load_application",

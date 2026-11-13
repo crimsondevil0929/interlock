@@ -7,9 +7,10 @@ sub-plan it tries. Both have to decide the same way.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -61,6 +62,8 @@ def adjudicate(
     checkers: Sequence[InvariantChecker],
     *,
     stage_id: uuid.UUID,
+    observe_only: bool = False,
+    enforced: Collection[str] = (),
 ) -> Adjudication:
     """Run every checker and union the violations.
 
@@ -68,7 +71,21 @@ def adjudicate(
     not finish has not approved anything. A hint that raises, or is not a
     :class:`FeedbackHint`, becomes the generic operator-constraint hint: the
     agent loses detail, never the refusal.
+
+    With ``observe_only``, a blocking violation is recorded as
+    :attr:`~interlock.types.Severity.OBSERVED` and does not refuse the plan,
+    unless its checker's name is in ``enforced`` (1.6.0).
     """
+
+    def recorded(violation: InvariantViolation) -> InvariantViolation:
+        if (
+            observe_only
+            and violation.severity is Severity.BLOCKING
+            and violation.invariant not in enforced
+        ):
+            return dataclasses.replace(violation, severity=Severity.OBSERVED)
+        return violation
+
     violations: list[InvariantViolation] = []
     hinted: list[HintedViolation] = []
     names: list[str] = []
@@ -78,14 +95,17 @@ def adjudicate(
             found = tuple(checker.check(plan, diff))
         except Exception as exc:  # a broken checker must never approve
             logger.exception("invariant %s raised", checker.name)
-            broken = InvariantViolation(
-                invariant=checker.name,
-                severity=Severity.BLOCKING,
-                message=f"checker raised {type(exc).__name__}: {exc}",
+            broken = recorded(
+                InvariantViolation(
+                    invariant=checker.name,
+                    severity=Severity.BLOCKING,
+                    message=f"checker raised {type(exc).__name__}: {exc}",
+                )
             )
             violations.append(broken)
             hinted.append(HintedViolation(broken, FeedbackHint(kind=Guidance.OPERATOR)))
             continue
+        found = tuple(recorded(violation) for violation in found)
         violations.extend(found)
         trusted = type(checker) in BUILT_IN_CHECKERS
         offer = getattr(checker, "hint", None)
@@ -99,7 +119,10 @@ def adjudicate(
                 else:
                     if isinstance(candidate, FeedbackHint):
                         hint = candidate
-            hinted.append(HintedViolation(violation, hint, trusted))
+            label = getattr(type(checker), "LABEL", "") if trusted else ""
+            hinted.append(
+                HintedViolation(violation, hint, trusted, label if isinstance(label, str) else "")
+            )
     verdict = Verdict(
         plan_id=plan.plan_id,
         stage_id=stage_id,

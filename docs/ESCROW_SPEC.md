@@ -127,6 +127,11 @@ row-level diff, not a summary.
 ### 1.2.2 Transition requirements
 
 - **E1-1.** A plan MUST NOT touch a substrate before reaching `PLANNED`.
+  *Amended in 1.6.0:* a stage opened before its plan is whole
+  (`EscrowEngine.stage()`) applies an effect only after the plan so far, with that
+  effect, passes admission. The stage is private: until the whole plan is admitted
+  at the settle, nothing is recorded on the chain and nothing can commit, and a
+  plan admission then refuses gives the stage back unchanged.
 - **E1-2.** `diff()` MUST be callable only in `STAGED` or `VERIFIED`. Calling it
   in `STAGING` is an error, because the diff would be partial and a partial diff
   presented as complete is worse than no diff.
@@ -136,6 +141,10 @@ row-level diff, not a summary.
   in-process. An operator override MUST be expressed as a new plan carrying an
   explicit waiver, so the override is itself a first-class recorded artifact
   rather than a mutable flag.
+  *Amended in 1.6.0:* an engine built `observe_only` records a violation
+  that would block as `observed` and admits the plan. That is fixed when the
+  engine is built, before any plan, and is recorded in every verdict's hash and on
+  the chain; it is not an override of a rejection, and there is still none.
 - **E1-5.** Every non-terminal state MUST carry an expiry. A stage that reaches
   `expires_at` transitions to `ORPHANED` regardless of owner liveness.
 - **E1-6.** `COMPENSATED` is reachable only from `COMMITTED`, and only for plans
@@ -503,6 +512,10 @@ Requirements:
 The measured consequence. This is the artifact a human reviews and an invariant
 evaluates, and it is the thing that gets hashed into the chain.
 
+*Amended in 1.6.0:* the class below is `Change`, with the fields `kind` and `id`.
+`RowDelta` is the same class, and `table` and `primary_key` read the same two
+values. The hash covers the same values in the same order, so no digest moved.
+
 ```python
 @dataclass(frozen=True, slots=True)
 class RowDelta:
@@ -639,6 +652,13 @@ Requirements:
 | `no_ddl` | BLOCKING | No effect has `kind == DDL` |
 | `truncation_guard` | BLOCKING | `not diff.truncated` |
 | `distribution_shift` | ADVISORY | `blast_radius` within *k* MAD of the historical median for this `(scope_id, table)` pair |
+
+*Amended in 1.6.0:* `blast_radius`, `tenant_isolation`, `table_allowlist` and
+`column_value_guard` each have a second built-in class that records a name for
+every system (`change_limit`, `partition_isolation:<dimension>`, `kind_allowlist`,
+`value_guard:<kind>.<field>`). The predicate is the same. A checker records the
+name of the class it was built from, so a verdict or a receipt made under either
+name verifies under that name.
 
 `distribution_shift` is advisory in v1 because its threshold is uncalibrated.
 Promoting it to blocking requires the same empirical treatment the cognitive
@@ -1283,7 +1303,7 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 
 | Req | Status | Where | Proven by |
 |---|---|---|---|
-| E1-1: no substrate before `PLANNED` | Implemented | `EscrowEngine.admit` runs before `substrate.open` | `test_engine`, `test_outbound` |
+| E1-1: no substrate before `PLANNED` | Implemented | `EscrowEngine.admit` runs before `substrate.open`; in a stage opened first (`stage()`, 1.6.0), before each effect is applied and again on the whole plan at the settle | `test_engine`, `test_outbound`, `test_open_stage` |
 | E1-2: `diff()` only when staged | Partial | The engine calls `diff()` only after every effect is applied; a substrate's own `diff()` does not refuse a call mid-staging | `test_engine` |
 | E1-3: commit only from `VERIFIED` | Implemented | `EscrowEngine._execute`: no path reaches `commit` without the verdict | `test_engine`, `test_core_guarantees` |
 | E1-4: `REJECTED` not overridable | Implemented | No override surface; an operator's change is a new plan (a checked repair is one, admitted only as recorded) | `test_repair` |

@@ -16,17 +16,21 @@ from agentgov import BudgetManager, Unit
 from interlock.invariants import (
     BUILT_IN_CHECKERS,
     BlastRadius,
+    ChangeLimit,
     ColumnValueGuard,
     CrossEffectAgreement,
     FactAgreement,
     InvariantChecker,
+    KindAllowlist,
     NoDelete,
     NoSchemaChange,
+    PartitionIsolation,
     StatedFootprint,
     TableAllowlist,
     TenantDrawdownGuard,
     TenantIsolation,
     TruncationGuard,
+    ValueGuard,
 )
 from interlock.meters import Meter, MeterCheck
 from interlock.outbound_checks import (
@@ -91,6 +95,11 @@ def checkers() -> tuple[InvariantChecker, ...]:
         TruncationGuard(),
         StatedFootprint(tolerance=2.0, severity=Severity.BLOCKING),
         NoSchemaChange(),
+        # 1.6.0: the same four checks under their names for every system
+        ChangeLimit(8),
+        PartitionIsolation("tenant", max=2, declared=True),
+        KindAllowlist(["orders", "refunds", "customers", "ledger", "items"]),
+        ValueGuard("orders", "total", max_drop_fraction=0.3),
     )
     assert {type(c) for c in built} == set(BUILT_IN_CHECKERS)
     return built

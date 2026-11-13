@@ -1097,6 +1097,40 @@ class SqliteSubstrate:
         finally:
             conn.close()
 
+    def read(
+        self, handle: StageHandle, statement: str, parameters: Mapping[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Run a query inside the open stage and return its rows (1.6.0): it
+        sees what the stage has written and nothing else has committed since.
+
+        The statement passes the stage's authorizer like any other, and
+        whatever it changes is rolled back before this returns, so a read
+        never adds to the diff. Placeholders are named (``:id``).
+
+        :raises ForbiddenStatementError: On a statement the authorizer denies.
+        :raises StageError: On a statement that fails.
+        """
+        conn = self._require(handle)
+        self._assert_live(handle)
+        mark = "interlock_read"
+        self._savepoint_statement(handle, "SAVEPOINT", mark)
+        self._denied = None
+        try:
+            cursor = conn.execute(statement, dict(parameters or {}))
+            rows = [dict(row) for row in cursor.fetchall()] if cursor.description else []
+        except sqlite3.Error as exc:
+            denied, self._denied = self._denied, None
+            if denied is not None:
+                text, reason, table = denied
+                raise ForbiddenStatementError(
+                    f"read refused: {text}", reason=reason, table=table
+                ) from exc
+            raise StageError(f"read failed: {exc}") from exc
+        finally:
+            self._savepoint_statement(handle, "ROLLBACK TO", mark)
+            self._savepoint_statement(handle, "RELEASE", mark)
+        return rows
+
     def savepoint(self, handle: StageHandle, name: str) -> None:
         """Mark the stage's state now, to return to with :meth:`rollback_to`.
 

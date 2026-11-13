@@ -453,6 +453,11 @@ def _vouch(config: InterlockConfig, signer: Any, legacy: Any, out: TextIO) -> No
 
 def _install_schema(config: InterlockConfig, out: TextIO) -> tuple[int, Any]:
     names = ", ".join(t.name for t in config.tables)
+    if config.state:
+        # Interlock's own records, for a system that is not a database: a
+        # directory only this user reads (1.6.0).
+        Path(config.state).mkdir(mode=0o700, parents=True, exist_ok=True)
+        print(f"state: {config.state}", file=out)
     if config.plan_bound or config.predicted:
         return _install_plan_bound(config, out)
     if config.git is not None or config.filesystem is not None:

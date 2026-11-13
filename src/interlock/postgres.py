@@ -1748,6 +1748,38 @@ class PostgresSubstrate:
             )
         return None
 
+    def read(
+        self, handle: StageHandle, statement: str, parameters: Mapping[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Run a query inside the open stage and return its rows (1.6.0): it
+        sees what the stage has written, as the stage role may read it.
+
+        Whatever the statement changes is rolled back before this returns, so
+        a read never adds to the diff, and a query that fails does not end
+        the stage. Placeholders are psycopg's (``%(id)s``).
+
+        :raises StageError: On a statement that fails.
+        """
+        import psycopg
+
+        conn = self._require(handle)
+        self._assert_live(handle)
+        mark = "interlock_read"
+        self._savepoint_statement(handle, "SAVEPOINT", mark)
+        try:
+            conn.execute(self._timeouts())
+            cursor = conn.execute(statement, dict(parameters or {}), binary=True)
+            names = [column.name for column in cursor.description or ()]
+            rows = (
+                [dict(zip(names, row, strict=True)) for row in cursor.fetchall()] if names else []
+            )
+        except psycopg.Error as exc:
+            raise StageError(f"read failed: {exc}") from exc
+        finally:
+            self._savepoint_statement(handle, "ROLLBACK TO SAVEPOINT", mark)
+            self._savepoint_statement(handle, "RELEASE SAVEPOINT", mark)
+        return rows
+
     def savepoint(self, handle: StageHandle, name: str) -> None:
         """Mark the stage's state now, to return to with :meth:`rollback_to`.
 

@@ -2,6 +2,34 @@
 
 How Interlock stages, measures and commits on each kind of system, beyond the SQLite of the [README](../../README.md): PostgreSQL, Git, Kubernetes and Terraform, FHIR servers, and outbound requests through the transactional outbox; and the daemon that runs every part in one process. The engine itself is in [GUIDE.md](../GUIDE.md). Every Python block here runs in CI.
 
+## One vocabulary for every system (1.6.0)
+
+Every system below measures the same thing, a list of `Change`s, and the built-in checkers
+read it the same way. What `kind` and `id` mean on each:
+
+| System | A change is | Its `kind` | Its `id` |
+|---|---|---|---|
+| SQLite, PostgreSQL | a row | the table | the primary key |
+| Git, a directory | a file | the path class (`config`, `src`, `secrets`) | the path |
+| Kubernetes | an object | the kind (`deployments`) | `namespace/name` |
+| Terraform | a resource | the resource type | the address |
+| FHIR | a resource | the resource type | the resource id |
+| REST | a record | the resource type | the record id |
+
+The sections below still say `TableAllowlist` and `BlastRadius` in places. `KindAllowlist`
+and `ChangeLimit` are the same checks under names that fit a directory or a cluster, and
+[the guide](GUIDE.md#the-same-model-on-every-system-160) lists all four pairs.
+
+**Where Interlock keeps its own records.** A SQL database holds the outbox, the inbox and
+rate-window history itself. A system that is not a database needs somewhere transactional to
+keep them: a small SQLite file, the *control database*. Since 1.6.0 you do not have to name
+it. With no `database` line, a Git, directory, Kubernetes, FHIR or REST configuration keeps
+it in `.interlock/control.db` beside `interlock.toml`, and `interlock install` creates the
+directory, readable by its owner only. `state = "var/interlock"` puts it somewhere else.
+`database = "control.db"` still works, and still wins when the command line or
+`INTERLOCK_DATABASE` gives one. `state` with a SQL substrate is refused: that database keeps
+its own records.
+
 ## PostgreSQL
 
 `PostgresSubstrate` stages each plan in a `REPEATABLE READ` transaction and measures it with
@@ -165,15 +193,15 @@ plan = (
 engine.execute(plan)
 ```
 
-Or configure it in `interlock.toml`, as SQLite and PostgreSQL are. `database` then names
-the control database, a SQLite file for the outbox, the inbox and window history (see
-below). `interlock install` sets it up, `interlock check` reads the branch's head through
+Or configure it in `interlock.toml`, as SQLite and PostgreSQL are. The control database, a
+SQLite file for the outbox, the inbox and window history (see below), is kept in
+`.interlock/` beside the file unless `state` or `database` names another place.
+`interlock install` sets it up, `interlock check` reads the branch's head through
 the substrate, and `EscrowRuntime.from_config`, the daemon and Fiduciary's service all stage
 on the repository:
 
 ```toml
 substrate = "git"
-database = "control.db"
 
 [git]
 repository = "billing-service.git"   # relative to this file
@@ -275,7 +303,7 @@ one: what commits is exactly what was measured, or nothing commits.
   is a row: its path class is the table (`secrets` for `.env`, `.ssh/` and key files, then
   `workflows`, `governance`, `infra`, `deps`, `scripts`, `tests`, `src`, `config`, `docs`,
   `other`), and its columns are `sha256`, `mode`, `bytes`, `lines_added`, `lines_deleted`,
-  `net_lines` and `secret_markers`. `TableAllowlist`, `NoDelete` and `BlastRadius` read it
+  `net_lines` and `secret_markers`. `KindAllowlist`, `NoDelete` and `ChangeLimit` read it
   as they read rows.
 - **Commit.** Under the workspace's commit lock, every file the diff touches must still be at
   its base hash. If a person or another agent edited one in the meantime, nothing is written.
@@ -287,7 +315,7 @@ one: what commits is exactly what was measured, or nothing commits.
 
 <!-- readme-test: skip reason="needs a workspace on disk; tests/test_filesystem.py makes the same calls" -->
 ```python
-from interlock import BlastRadius, EscrowEngine, NoDelete, PlanBuilder, TableAllowlist
+from interlock import ChangeLimit, EscrowEngine, KindAllowlist, NoDelete, PlanBuilder
 from interlock.filesystem import FilesystemSubstrate
 
 workspace = FilesystemSubstrate(
@@ -296,7 +324,7 @@ workspace = FilesystemSubstrate(
     control="/var/lib/interlock/control.db",
 )
 engine = EscrowEngine(
-    workspace, checkers=[BlastRadius(10), TableAllowlist(["config", "docs"]), NoDelete()]
+    workspace, checkers=[ChangeLimit(10), KindAllowlist(["config", "docs"]), NoDelete()]
 )
 plan = PlanBuilder("ops-agent", intent="raise the checkout timeout").update(
     table="config",

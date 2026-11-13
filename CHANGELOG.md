@@ -9,6 +9,61 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-12
+
+One model for every system. Interlock began on SQL, and its public names stayed SQL's: a
+change to a file or a cluster object was a `RowDelta` with a `table`, judged by
+`TableAllowlist` and `BlastRadius`. This release gives the model names that fit a directory, a
+cluster or an API as well as a database, and keeps every old name working. Nothing to change
+in a configuration or in code, and no digest that an earlier release recorded moves.
+
+### Added
+
+- **`Change`**: the public shape of one measured change, with `kind` (the table, the path
+  class, the Kubernetes kind, the resource type) and `id` (the primary key, the path,
+  `namespace/name`). `RowDelta` is the same class, `table` and `primary_key` read the same two
+  values, and both spellings are accepted where a change is built. On a diff, `changes`,
+  `change_count` and `kinds_touched` read what `deltas`, `blast_radius` and `tables_touched`
+  read. A diff hashes exactly as it did.
+- **Four checkers under names for every system**: `ChangeLimit`, `KindAllowlist`,
+  `PartitionIsolation` and `ValueGuard`, beside `BlastRadius`, `TableAllowlist`,
+  `TenantIsolation` and `ColumnValueGuard`. Each pair is one check. A checker records the name
+  of the class it was built from (`change_limit`, `kind_allowlist`,
+  `partition_isolation:<dimension>`, `value_guard:<kind>.<field>`), so a deployment that keeps
+  the SQL names keeps the digests its receipts carry. `checker_family()` and `CHECKER_ALIASES`
+  say when two recorded names are the same check. An agent refused by a neutral checker is
+  told its name: `kind_allowlist: the plan changed files in the scripts path class`.
+- **`state`** in `interlock.toml`: the directory where a system that is not a database keeps
+  Interlock's own records (the outbox, the inbox, window history). With neither `state` nor
+  `database`, a Git, directory, Kubernetes, FHIR or REST configuration keeps them in
+  `.interlock/control.db` beside the file, and `interlock install` creates that directory
+  readable by its owner only. Such a file was refused before ("no database"). `database`
+  still names the control database outright, and the command line and `INTERLOCK_DATABASE`
+  still override the file.
+- **`EscrowEngine.stage()`**: a stage that opens before its plan is whole, for code that reads,
+  decides and then writes. Each effect is checked as admission checks it and applied at once,
+  `read()` reads inside the stage, and `settle()` runs the plan the effects make through the
+  same lifecycle as `execute()` on the stage that is already open. The chain holds nothing
+  until the settle and reads the same afterwards. A stage that is discarded changes nothing
+  and records nothing. It is refused where the ledger settles inside the stage's own
+  transaction (PostgreSQL, claim and settle).
+- **`EscrowEngine(observe_only=True)`**: watch and do not refuse. Every plan is staged,
+  measured and judged as on an enforcing engine, and commits. A violation that would have
+  refused it is recorded on the verdict with the new severity `observed`, which is in the
+  verdict's hash; the chain's `VERDICT` record names the checkers, `StageResult.would_refuse`
+  lists them, and the agent's feedback says each constraint was observed and not enforced.
+  `always_enforce` names checkers that still refuse. For trying a policy on real work before
+  it is enforced.
+- **Stage reads**: `SqliteSubstrate.read` and `PostgresSubstrate.read` run a query inside the
+  open stage, in a savepoint that is rolled back, so a statement that writes keeps nothing.
+  `FilesystemSubstrate.read` returns a file as the stage holds it, and `paths` lists the
+  stage's files.
+
+### Changed
+
+- `docs/ESCROW_SPEC.md`: E1-1, E1-4, §2.4 and §2.5.1 are amended for the above, each marked
+  "Amended in 1.6.0".
+
 ## [1.5.2] - 2026-11-11
 
 Two faults in how a predicted (class V) commit is settled when it cannot finish, on FHIR
