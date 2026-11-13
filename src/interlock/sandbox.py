@@ -7,6 +7,8 @@ under the operating system's own sandbox:
   writable directories, and every network operation.
 - **bwrap** (Linux): bubblewrap, with the root file system mounted read-only, the writable
   directories bound read-write over it, and a network namespace of its own with no route out.
+  The command's ``/tmp`` is a private, empty directory: what it writes there is discarded
+  when it exits (its ``TMPDIR`` is the session's own temporary directory, which is kept).
 - **none**: no sandbox. Only when asked for by name; the command log and the promotion receipt
   record it, so a reader knows the commands ran unconfined.
 

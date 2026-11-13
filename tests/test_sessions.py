@@ -8,6 +8,7 @@ import io
 import json
 import os
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -178,17 +179,26 @@ def test_a_command_writes_only_in_the_session_and_reaches_no_network(tmp_path: P
     outside = tmp_path / "outside.txt"
     assert run_command(session, ["sh", "-c", "echo ok > src/new.py"], sandbox=SANDBOX) == 0
     assert (session.tree / "src" / "new.py").read_text() == "ok\n"
-    assert run_command(session, ["sh", "-c", f"echo no > {outside}"], sandbox=SANDBOX) != 0
+    # Outside the session nothing lands. Seatbelt refuses the write; bubblewrap gives the
+    # command a private /tmp (where pytest's directories are), whose writes are discarded.
+    run_command(session, ["sh", "-c", f"echo no > {outside}"], sandbox=SANDBOX)
     assert not outside.exists()
+    home = Path.home() / f".interlock-sandbox-probe-{uuid.uuid4().hex}"
+    try:
+        assert run_command(session, ["sh", "-c", f"echo no > {home}"], sandbox=SANDBOX) != 0
+        assert not home.exists()
+    finally:
+        home.unlink(missing_ok=True)
     # The workspace itself is outside the session, and so are the session's own records.
     target = tmp_path / "ws" / "src" / "app.py"
-    assert run_command(session, ["sh", "-c", f"echo no > {target}"], sandbox=SANDBOX) != 0
+    run_command(session, ["sh", "-c", f"echo no > {target}"], sandbox=SANDBOX)
+    assert target.read_text() == "print('hi')\n"
     record = session.directory / "session.json"
     assert run_command(session, ["cat", str(record)], sandbox=SANDBOX) != 0
     network = "import socket; socket.create_connection(('1.1.1.1', 53), 3)"
     assert run_command(session, ["python3", "-c", network], sandbox=SANDBOX) != 0
     log = session.commands()
-    assert [c["exit"] == 0 for c in log] == [True, False, False, False, False]
+    assert len(log) == 6 and log[0]["exit"] == 0 and log[2]["exit"] != 0
     assert {c["sandbox"] for c in log} == {SANDBOX}
     assert all(c["profile"].startswith("sha256:") for c in log)
 
