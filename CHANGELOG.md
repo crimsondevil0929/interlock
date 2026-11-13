@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.8.0] - Unreleased
+## [1.8.0] - 2026-11-13
 
 What the session read before the plan. A refund within an agent's cap is still the wrong
 refund when the agent asked for it because a stranger's email told it to. A plan now carries
