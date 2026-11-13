@@ -1278,11 +1278,9 @@ class GitSubstrate:
     def _commit_object(self, stage: _Stage, at: datetime) -> str:
         subject = re.sub(r"\s+", " ", stage.plan.intent).strip()[:72] or "a staged plan"
         plan = re.sub(r"[^A-Za-z0-9._:-]", "_", str(stage.plan.plan_id))[:128]
-        message = (
-            f"interlock: {subject}\n\n"
-            f"{PLAN_TRAILER}: {plan}\n"
-            f"{STAGE_TRAILER}: {stage.handle.stage_id}\n"
-        )
+        # A promotion's intent says "interlock promote ..." itself (1.7.0).
+        title = subject if subject.startswith("interlock ") else f"interlock: {subject}"
+        message = f"{title}\n\n{PLAN_TRAILER}: {plan}\n{STAGE_TRAILER}: {stage.handle.stage_id}\n"
         name, email = self._author
         stamp = f"{int(at.timestamp())} +0000"
         identity = {

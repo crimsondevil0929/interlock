@@ -35,6 +35,7 @@ from interlock.session import (
     find_session,
     sessions_of,
 )
+from interlock.text import tally
 
 __all__ = ["EDIT_TOOLS", "HookContext", "claude_code"]
 
@@ -198,7 +199,7 @@ def _promote(session: Session, context: HookContext, err: TextIO) -> Promotion:
     if done.outcome == "committed":
         commit = (done.receipt or {}).get("commit")
         print(
-            f"session {session.name}: {done.changes} files promoted to {context.target}"
+            f"session {session.name}: {tally(done.changes, 'file')} promoted to {context.target}"
             + (f" as {str(commit)[:12]}" if commit else ""),
             file=err,
         )
