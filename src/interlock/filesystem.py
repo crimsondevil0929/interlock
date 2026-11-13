@@ -95,7 +95,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from interlock.control import capture, durable_write, replay
 from interlock.exceptions import (
@@ -127,6 +127,9 @@ from interlock.types import (
     WindowMeasure,
 )
 from interlock.windows import WindowCharge
+
+if TYPE_CHECKING:
+    from interlock.session import Session
 
 try:  # POSIX: the commit lock is an advisory flock on the state directory's lock file
     import fcntl
@@ -285,6 +288,7 @@ _COMMITS: Final = "commits"
 _STAGES: Final = "stages"
 _LOCK: Final = "lock"
 _PARENTS: Final = "parents"
+_SESSIONS: Final = "sessions"
 
 
 # --------------------------------------------------------------------------
@@ -604,6 +608,9 @@ class _Stage:
     control: StageHandle | None = None
     done: bool = False
     unsettled: bool = False
+    keep: bool = False
+    """A session's stage (1.7.0): its copy is the session's, kept when the plan is refused."""
+    committed: bool = False
 
 
 class FilesystemSubstrate:
@@ -1298,6 +1305,7 @@ class FilesystemSubstrate:
             ) from exc
         self._journal_path(handle.stage_id).unlink(missing_ok=True)
         stage.done = True
+        stage.committed = True
         return CommitReceipt(
             stage_id=handle.stage_id,
             plan_id=handle.plan_id,
@@ -1684,9 +1692,147 @@ class FilesystemSubstrate:
         self.abort(handle)
         if self._control is not None and stage.control is not None:
             self._control.close(stage.control)
-        if not stage.unsettled and not self._journal_path(handle.stage_id).exists():
+        settled = not stage.unsettled and not self._journal_path(handle.stage_id).exists()
+        if stage.keep:
+            # A session's records stay; its copies go once what they held is in the workspace.
+            if stage.committed and settled:
+                for part in ("tree", "base", "backup", "savepoints"):
+                    shutil.rmtree(stage.directory / part, ignore_errors=True)
+        elif settled:
             shutil.rmtree(stage.directory, ignore_errors=True)
         self._stage = None
+
+    # -- sessions (1.7.0) -------------------------------------------------------------------
+
+    @property
+    def sessions(self) -> Path:
+        """Where sessions are kept: ``sessions/`` in the state directory, outside the workspace."""
+        return self._state / _SESSIONS
+
+    def open_session(self, *, name: str | None = None, lifetime: float = 86400.0) -> Session:
+        """Copy the workspace into a session of its own (:mod:`interlock.session`): a ``base``
+        copy as it was, and a ``tree`` copy to work in.
+
+        :raises SessionError: When a session of that name exists.
+        """
+        from interlock.session import SessionError, manifest_digest, new_session, session_name
+
+        chosen = session_name(name)
+        directory = self.sessions / chosen
+        if directory.exists():
+            raise SessionError(f"session {chosen} exists, at {directory}")
+        self._settle()
+        directory.mkdir(parents=True)
+        base_tree, tree = directory / "base", directory / "tree"
+        try:
+            with self._lock(exclusive=False):
+                if self._mode == "swap":
+                    source = self._current_version()
+                    version: str | None = source.name
+                else:
+                    source, version = self._root, None
+                _copy_tree(source, base_tree, self._ignore, self._limits)
+            _copy_tree(base_tree, tree, self._ignore, self._limits)
+            base = _manifest(base_tree, self._ignore, self._limits)
+            (directory / "base.json").write_text(
+                json.dumps({p: list(f) for p, f in base.items()}, sort_keys=True), encoding="utf-8"
+            )
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        digest = manifest_digest(base)
+        return new_session(
+            directory,
+            session_id=uuid.uuid4(),
+            name=chosen,
+            substrate=self.substrate_id,
+            tree=tree,
+            base=digest,
+            input_tree=digest,
+            lifetime=lifetime,
+            version=version,
+        )
+
+    @staticmethod
+    def _session_base(session: Session) -> dict[str, _File]:
+        raw = json.loads((session.directory / "base.json").read_text(encoding="utf-8"))
+        return {p: _File(str(v[0]), str(v[1]), int(v[2])) for p, v in raw.items()}
+
+    def session_changes(self, session: Session) -> list[tuple[str, str]]:
+        """Each file the session changed, with the SHA-256 it had when the session opened
+        (``absent`` for a new one)."""
+        base = self._session_base(session)
+        now = _manifest(session.tree, self._ignore, self._limits)
+        return [
+            (p, base[p].sha256 if p in base else ABSENT)
+            for p in sorted(set(base) | set(now))
+            if base.get(p) != now.get(p)
+        ]
+
+    def session_plan(self, session: Session, scope_id: str, intent: str) -> EffectPlan:
+        """The plan a promotion runs: an ``expect-hash`` of each changed file at the hash the
+        session started from, so the commit lands only on that state."""
+        from interlock.builder import PlanBuilder
+
+        builder = PlanBuilder(scope_id, intent=intent)
+        for path, sha in self.session_changes(session):
+            builder.add(
+                EffectKind.UPDATE,
+                table=self.classify(path),
+                statement="expect-hash :path :sha256",
+                parameters={"path": path, "sha256": sha},
+                tenant_id=self.owner(path),
+                stated_rows=1,
+            )
+        return builder.build()
+
+    def adopt(self, session: Session, plan: EffectPlan) -> StageHandle:
+        """Open ``session``'s copy as this substrate's stage, for ``plan``: measured, judged and
+        committed as any stage is. Its base is the workspace as the session found it.
+
+        :raises StageConflictError: If a stage is already open here.
+        """
+        if self._stage is not None:
+            raise StageConflictError(
+                f"substrate {self.substrate_id!r} already has stage "
+                f"{self._stage.handle.stage_id} open"
+            )
+        self._settle()
+        opened = datetime.now(UTC)
+        handle = StageHandle(
+            stage_id=uuid.uuid4(),
+            plan_id=plan.plan_id,
+            substrate_id=self.substrate_id,
+            opened_at=opened,
+            expires_at=opened + timedelta(seconds=self._stage_seconds),
+        )
+        self._stage = _Stage(
+            handle,
+            plan,
+            session.directory,
+            session.tree,
+            session.directory / "base",
+            self._session_base(session),
+            session.version,
+            session.home,
+            keep=True,
+        )
+        return handle
+
+    def output_tree(self, session: Session) -> str:
+        """The digest of the session's tree as it is now."""
+        from interlock.session import manifest_digest
+
+        return manifest_digest(_manifest(session.tree, self._ignore, self._limits))
+
+    def landed(self, session: Session) -> str:
+        """What a committed promotion is known by here."""
+        return f"fs:{session.session_id}"
+
+    def discard_session(self, session: Session) -> None:
+        """Remove the session's copies; its records stay."""
+        for part in ("tree", "base", "backup", "savepoints"):
+            shutil.rmtree(session.directory / part, ignore_errors=True)
 
     # -- internals ------------------------------------------------------------------------
 

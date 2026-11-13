@@ -1013,6 +1013,47 @@ class EscrowEngine:
         handle = self._substrate.open(_provisional(builder, ()))
         return OpenStage(self, builder, handle)
 
+    def preview(self, plan: EffectPlan, *, handle: StageHandle) -> StageResult:
+        """Measure and judge ``plan`` on a stage already open for it (a session's,
+        1.7.0), then give the stage back: what :meth:`execute` would decide,
+        with nothing recorded on the chain, nothing charged and nothing
+        committed.
+
+        The result's state is ``VERIFIED`` when the plan would commit and
+        ``REJECTED`` when it would be refused; ``committed`` is always false.
+
+        :raises InterlockError: As admission and the substrate's ``diff`` raise.
+        """
+        try:
+            self.admit(plan)
+            diff = self._windowed(handle, plan, self._substrate.diff(handle))
+            diff = sense(self._sensors, plan, diff)
+            judged = adjudicate(
+                plan,
+                diff,
+                self._checkers,
+                stage_id=handle.stage_id,
+                observe_only=self._observe_only,
+                enforced=self._always,
+            )
+        except InterlockError as exc:
+            if exc.feedback is None:
+                exc.feedback = feedback_for_error(plan, exc, substrate=self._substrate.substrate_id)
+            raise
+        finally:
+            self._drop(handle)
+        return StageResult(
+            plan=plan,
+            state=StageState.VERIFIED if judged.verdict.admitted else StageState.REJECTED,
+            diff=diff,
+            verdict=judged.verdict,
+            outcomes=(),
+            chain_head=self._chain.head_hash,
+            anchored_to="",
+            committed=False,
+            feedback=judged.feedback(committed=False),
+        )
+
     def _drop(self, handle: StageHandle) -> None:
         """Give an open stage back, whatever state it is in."""
         try:

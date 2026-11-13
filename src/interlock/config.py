@@ -113,6 +113,7 @@ classes, so it lists no ``[[tables]]``; each has the columns ``path``,
     owners = [{ glob = "src/sdk/**", owner = "sdk-team" }]
     # stage_root = "stages"           # stages' worktrees; in the Git directory by default
     # author = { name = "interlock", email = "interlock@localhost" }
+    # checked_out = "follow"          # 1.7.0: move a checked-out branch by fast-forwarding it
 
     [[git.classes]]                   # replaces the default classes when given; first match wins
     name = "workflows"
@@ -125,6 +126,21 @@ classes, so it lists no ``[[tables]]``; each has the columns ``path``,
     sources = ["tools/codegen.py"]    # files it runs: a plan may not write them
     timeout_seconds = 60
     env = { CODEGEN_TARGET = "clients" }
+
+A coding session (:mod:`interlock.session`, 1.7.0) works in a stage of its own on a Git or
+filesystem substrate for as long as the work takes, then is promoted as one plan.
+``[sessions]`` says how long one lasts, which sandbox its commands run under, and what a
+promotion through ``interlock promote`` checks (an application's checkers, ``--app``, are
+added to these)::
+
+    [sessions]
+    lifetime_hours = 24               # a session older than this is not promoted
+    sandbox = "auto"                  # seatbelt (macOS), bwrap (Linux), or none, by name only
+    hidden = ["secrets"]              # directories a command may not read, relative to this file
+    scope = "coding-session"          # the scope a promotion's plan is charged to
+    kinds = ["src", "tests", "docs"]  # the path classes a promotion may change; any when absent
+    max_changes = 200                 # the most files one promotion may change
+    no_delete = false                 # true: a promotion may delete no file
 
 A Kubernetes cluster stages plan-bound (:mod:`interlock.kubernetes`, 1.3.0):
 ``substrate = "kubernetes"``, a ``[kubernetes]`` section, and, for an outbox,
@@ -782,6 +798,36 @@ class GitConfig:
     author: tuple[str, str] = ("interlock", "interlock@localhost")
     max_file_bytes: int = 4 * 1024 * 1024
     max_scan_bytes: int = 1024 * 1024
+    checked_out: str = "refuse"
+    """``follow`` (1.7.0): a branch a worktree has checked out is moved by fast-forwarding
+    that worktree (:class:`~interlock.git_substrate.GitSubstrate`)."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionsConfig:
+    """``[sessions]``: coding sessions on a Git or filesystem substrate (1.7.0,
+    :mod:`interlock.session`)."""
+
+    lifetime_hours: float = 24.0
+    sandbox: str = "auto"
+    hidden: tuple[Path, ...] = ()
+    scope: str = "coding-session"
+    kinds: tuple[str, ...] = ()
+    max_changes: int | None = None
+    no_delete: bool = False
+
+    def checkers(self) -> list[Any]:
+        """The checks ``interlock promote`` runs on a promotion's plan."""
+        from interlock.invariants import ChangeLimit, KindAllowlist, NoDelete
+
+        found: list[Any] = []
+        if self.kinds:
+            found.append(KindAllowlist(self.kinds))
+        if self.max_changes is not None:
+            found.append(ChangeLimit(self.max_changes))
+        if self.no_delete:
+            found.append(NoDelete())
+        return found
 
 
 @dataclass(frozen=True, slots=True)
@@ -967,6 +1013,8 @@ class InterlockConfig:
     """``[filesystem]``: the directory, when ``substrate = "filesystem"`` (1.5.0)."""
     rest: RestConfig | None = None
     """``[rest]``: the API, when ``substrate = "rest"`` (1.5.0)."""
+    sessions: SessionsConfig = SessionsConfig()
+    """``[sessions]``: coding sessions, on a Git or filesystem substrate (1.7.0)."""
 
     @property
     def plan_bound(self) -> bool:
@@ -1205,6 +1253,7 @@ def load_config(
         fhir=fhir,
         filesystem=filesystem,
         rest=rest,
+        sessions=_sessions(raw.get("sessions"), Path(path).parent, substrate),
     )
 
 
@@ -1504,6 +1553,7 @@ _GIT_KEYS = frozenset(
         "author",
         "max_file_bytes",
         "max_scan_bytes",
+        "checked_out",
     }
 )
 _HOOK_KEYS = frozenset({"name", "argv", "when", "sources", "env", "timeout_seconds"})
@@ -1544,6 +1594,55 @@ def _git(raw: object, base: Path, substrate: str) -> GitConfig | None:
         author=(_string(author, "name"), _string(author, "email")),
         max_file_bytes=sizes["max_file_bytes"],
         max_scan_bytes=sizes["max_scan_bytes"],
+        checked_out=_checked_out(raw),
+    )
+
+
+def _checked_out(raw: Mapping[str, Any]) -> str:
+    value = _string(raw, "checked_out", default="refuse")
+    if value not in ("refuse", "follow"):
+        raise ConfigError(f"[git]: checked_out is 'refuse' or 'follow', not {value!r}")
+    return value
+
+
+_SESSIONS_KEYS = frozenset(
+    {"lifetime_hours", "sandbox", "hidden", "scope", "kinds", "max_changes", "no_delete"}
+)
+
+
+def _sessions(raw: object, base: Path, substrate: str) -> SessionsConfig:
+    if raw is None:
+        return SessionsConfig()
+    if substrate not in ("git", "filesystem"):
+        raise ConfigError(
+            f"[sessions] are for a directory (filesystem) or a repository (git), and substrate "
+            f"is {substrate!r}"
+        )
+    if not isinstance(raw, dict):
+        raise ConfigError("'sessions' must be a table ([sessions])")
+    unknown = sorted(set(raw) - _SESSIONS_KEYS)
+    if unknown:
+        raise ConfigError(f"[sessions]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
+    hours = raw.get("lifetime_hours", 24)
+    if isinstance(hours, bool) or not isinstance(hours, int | float) or hours <= 0:
+        raise ConfigError("[sessions]: lifetime_hours is a positive number")
+    sandbox = _string(raw, "sandbox", default="auto")
+    if sandbox not in ("auto", "seatbelt", "bwrap", "none"):
+        raise ConfigError(f"[sessions]: sandbox is auto, seatbelt, bwrap or none, not {sandbox!r}")
+    limit = raw.get("max_changes")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ConfigError("[sessions]: max_changes is a positive integer")
+    no_delete = raw.get("no_delete", False)
+    if not isinstance(no_delete, bool):
+        raise ConfigError("[sessions]: no_delete is true or false")
+    return SessionsConfig(
+        lifetime_hours=float(hours),
+        sandbox=sandbox,
+        hidden=tuple(base / h for h in _strings(raw, "hidden", required=False)),
+        scope=_string(raw, "scope", default="coding-session"),
+        kinds=tuple(_strings(raw, "kinds", required=False)),
+        max_changes=limit,
+        no_delete=no_delete,
     )
 
 

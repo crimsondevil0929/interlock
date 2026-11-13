@@ -9,6 +9,43 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-13
+
+Coding sessions. A coding agent works for an hour with its own editor and shell, and only the
+result matters: this release gives that work one stage for its whole length, runs its commands
+in an operating-system sandbox, and promotes the result as one measured, checked plan.
+
+### Added
+
+- **Sessions** (`interlock.session`) on a directory or a Git branch: `interlock stage open`
+  copies the workspace or checks out a detached worktree; `interlock run -- <command>` runs a
+  command there under the OS sandbox; `interlock promote` measures everything the session
+  changed against its base, checks it, and commits it on that exact base, or refuses it and
+  keeps the session for the agent to fix (`--check` decides without committing). A file or a
+  branch someone else moved meanwhile refuses the commit, with nothing written (`conflict`).
+  `interlock stage list | show | discard` manage them.
+- **The sandbox** (`interlock.sandbox`): Seatbelt (`sandbox-exec`) on macOS, bubblewrap on
+  Linux. A command writes only in the session's tree and its own temporary directory, reads
+  neither the session's records nor `[sessions] hidden`, and has no network. `--sandbox none`
+  runs unconfined only when asked for by name, and the command log and the receipt say so.
+- **Promotion receipts** (`ILPR1`, `promotion.json`): the input and output trees, the command
+  log's digest, each command's exit code and sandbox profile digest, the plan, diff and verdict
+  hashes, the escrow chain's head and the commit; signed with `--key`, `--signer` or
+  `[receipts]`'s key, and checked by `interlock.session.verify_receipt`.
+- **`interlock hook claude-code`** (`interlock.hooks`): one command answers Claude Code's
+  `WorktreeCreate` (opens a session and gives Claude Code its tree to work in), `SessionStart`,
+  `PreToolUse` (an edit outside the tree is refused), `Stop` (a session that would be refused
+  keeps the agent working, once per stop), `SessionEnd` and `WorktreeRemove` (promote).
+  Nothing rewrites a tool call's input.
+- **`[sessions]`** in `interlock.toml`: lifetime, sandbox, hidden directories, the scope a
+  promotion is charged to, and the checks `interlock promote` runs (`kinds`, `max_changes`,
+  `no_delete`).
+- **`[git] checked_out = "follow"`**: a branch a worktree has checked out is moved by
+  fast-forwarding that worktree, only from the stage's base. The default, `refuse`, is
+  unchanged.
+- **`EscrowEngine.preview`**: measure and judge a plan on a stage already open, with nothing
+  recorded, charged or committed.
+
 ## [1.6.0] - 2026-11-12
 
 One model for every system. Interlock began on SQL, and its public names stayed SQL's: a

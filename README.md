@@ -1,4 +1,14 @@
-# Interlock
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo.svg" width="72" height="72" alt="">
+  </picture>
+</p>
+
+<h1 align="center">Interlock</h1>
+
+<p align="center">Stage what an agent's write does, measure it, and commit it once or not at all.<br>
+Part of the stack with <a href="https://github.com/crimsondevil0929/agentgov">AgentGov</a> and <a href="https://github.com/crimsondevil0929/fiduciary">Fiduciary</a>.</p>
 
 **A reference monitor for agent side effects.** An agent proposes a plan. It holds no
 credentials and cannot execute. Interlock applies the plan against a real but uncommitted
@@ -33,9 +43,9 @@ uv run python demo.py
 
 ## Start here
 
-**See the whole stack working:** <https://crimsondevil0929.github.io/fiduciary/>. Six
-industries run on one engine, a real model's recorded turns are replayed on the current
-release, and 16 audit bundles can be verified in your browser.
+**See the whole stack working:** <https://crimsondevil0929.github.io/fiduciary/>. Eight
+agent workflows on six kinds of system run on one engine, a real model's recorded turns are
+replayed on the current release, and 20 audit bundles can be verified in your browser.
 
 A gateway decides whether an agent may call a tool. This stack decides whether what the call
 changed may be kept, and produces evidence for someone who trusts neither the agent nor the
@@ -49,6 +59,19 @@ operator. It is three packages:
 
 New here? [Put it in front of your agent in 30 minutes](https://github.com/crimsondevil0929/fiduciary/blob/main/docs/QUICKSTART.md),
 and read [what it does and does not protect against](https://github.com/crimsondevil0929/fiduciary/blob/main/docs/THREAT_MODEL.md).
+
+## Coding agents: one stage for a whole session (1.7.0)
+
+A coding agent edits files with its own tools and runs the build and tests for an hour, and
+only the result matters. `interlock stage open` gives that work a stage of its own: a copy of a
+directory, or a Git worktree at the branch's head. `interlock run -- <command>` runs each
+command there under the operating system's sandbox (Seatbelt on macOS, bubblewrap on Linux),
+which lets it write only inside the session and reach no network. `interlock promote` measures
+everything the session changed as one plan, checks it, and commits it on the exact base the
+session started from, or refuses it and keeps the session for the agent to fix. Each promotion
+writes a signed receipt with the input and output trees, the command log and every exit code.
+`interlock hook claude-code` does all of this from Claude Code's own hooks
+([GUIDE](docs/GUIDE.md#coding-sessions-one-stage-for-a-whole-session-170)).
 
 ## Why authorization does not catch this
 

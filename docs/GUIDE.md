@@ -214,6 +214,62 @@ Observing changes what a verdict does, and nothing else. A statement the substra
 stage, a halted scope, a scope that cannot pay and a held outbound request all behave as they
 do on an enforcing engine.
 
+### Coding sessions: one stage for a whole session (1.7.0)
+
+A coding agent does not make one tool call and stop. It edits files with its own tools, runs
+the build and the tests, and edits again, for an hour. A *session* gives that work one stage
+for its whole length, on a directory (`substrate = "filesystem"`) or a Git branch
+(`substrate = "git"`), and promotes the result as one plan:
+
+```bash
+interlock install --config interlock.toml          # once: the control database
+interlock stage open --config interlock.toml --name fix-timeouts
+cd "$(interlock stage open ... | tail -1)"         # the path is the last line it prints
+interlock run --config interlock.toml -- pytest -q # sandboxed: writes only here, no network
+interlock promote --config interlock.toml --check  # what promotion would decide; commits nothing
+interlock promote --config interlock.toml          # commit on the session's base, or refuse
+```
+
+- **Open.** A directory is copied into `sessions/<name>/tree` in the substrate's state
+  directory, with a copy of the base beside it. A Git branch gets a worktree with a detached
+  HEAD at the branch's head, in `.git/interlock/sessions/<name>/worktree`. The session records
+  its *base* (the commit, or a digest of the files) and its *input tree*.
+- **Work.** The agent edits the tree with whatever tools it has. `interlock run -- <command>`
+  runs each command under the operating system's sandbox (`interlock.sandbox`): Seatbelt on
+  macOS, bubblewrap on Linux. It may write only in the session's tree and its own temporary
+  directory, it may not read the session's records or the directories `[sessions] hidden`
+  lists, and it has no network. `--sandbox none` runs a command unconfined, only when asked
+  for by name, and the log says so. Each command is logged with its exit code and the digest
+  of the profile it ran under.
+- **Promote.** Everything the session changed is measured against its base as one plan and
+  checked. A directory's plan holds an `expect-hash` of each changed file at the hash the
+  session started from; a branch's, an `expect-head` of the base commit. A plan that passes
+  commits on that exact base. One that is refused leaves the session open, with its tree as it
+  was, for the agent to fix and promote again. If someone changed the same files (or moved the
+  branch) since the session opened, nothing is written and the outcome is `conflict`.
+- **Receipt.** Each promotion writes `promotion.json` (`ILPR1`) into the session: the input and
+  output trees, the command log's digest, each command's exit code, the sandboxes and profile
+  digests, the plan, diff and verdict hashes, the chain's head and the commit. With `--key`,
+  `--signer` or `[receipts]`'s key it is signed; `interlock.session.verify_receipt` checks it.
+
+On a Git repository whose branch you have checked out yourself, set `checked_out = "follow"` in
+`[git]`: a promotion then moves the branch by fast-forwarding your checkout, only when the
+checkout is at the session's base, and refuses (moving nothing) when it is not.
+
+`[sessions]` sets a session's lifetime, its sandbox, the directories its commands may not read,
+and, for `interlock promote`, the path classes a promotion may change and how many files.
+`--app module:callable` adds an application's checkers. Fiduciary promotes a session under a
+signed mandate instead (`fiduciary init --claude-code`).
+
+**Claude Code.** `interlock hook claude-code --config interlock.toml` answers the hooks a
+session needs, with the event on stdin (`interlock.hooks.settings` writes them):
+`WorktreeCreate` opens a session and hands Claude Code its tree as the working directory
+(`claude --worktree`, or the EnterWorktree tool), `SessionStart` tells the agent how the session
+ends, `PreToolUse` refuses an edit outside the tree, `Stop` checks the session and, when it
+would be refused, keeps the agent working with the refusal, and `SessionEnd` and
+`WorktreeRemove` promote it. No tool call's input is rewritten: the tree is where Claude Code
+works.
+
 ### Errors
 
 Every failure on the write path is an `InterlockError`. The AgentGov seam is
