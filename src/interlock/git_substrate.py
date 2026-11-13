@@ -89,7 +89,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from interlock.chain import EscrowRecord
 from interlock.control import capture, durable_write, replay
@@ -121,6 +121,9 @@ from interlock.types import (
     SubstrateCapabilities,
     WindowMeasure,
 )
+
+if TYPE_CHECKING:
+    from interlock.session import Session
 from interlock.windows import WindowCharge
 
 __all__ = [
@@ -566,6 +569,14 @@ class _Stage:
     """The tree :meth:`GitSubstrate.diff` measured, once it has."""
     control: StageHandle | None = None
     done: bool = False
+    keep: bool = False
+    """A session's stage (1.7.0): its worktree is the session's, kept when the plan is
+    refused."""
+    committed: bool = False
+
+
+CHECKED_OUT: Final = ("refuse", "follow")
+"""What a substrate does with a branch some worktree has checked out (1.7.0)."""
 
 
 class GitSubstrate:
@@ -590,6 +601,13 @@ class GitSubstrate:
     :param max_file_bytes: The largest file a ``write``, ``replace`` or
         ``patch`` may leave.
     :param max_scan_bytes: How much of a file the secret scan reads.
+    :param checked_out: ``refuse`` (the default): a branch some worktree has
+        checked out is refused, since moving it would leave that worktree
+        behind. ``follow`` (1.7.0): the commit moves it by fast-forwarding
+        that worktree (``git merge --ff-only``), only when the worktree is
+        at the stage's base, and is refused, with nothing moved, when it is
+        not or when the worktree's own changes stand in the way. For a
+        developer's checkout, where a coding session's promotion lands.
     :raises SubstrateConfigurationError: If ``git`` cannot be found, the
         repository cannot be read, or the branch is not a branch.
     """
@@ -600,6 +618,7 @@ class GitSubstrate:
         "_classes",
         "_common",
         "_control",
+        "_follow",
         "_git",
         "_hooks",
         "_max_file",
@@ -632,7 +651,13 @@ class GitSubstrate:
         max_diff_rows: int = 50_000,
         max_file_bytes: int = 4 * 1024 * 1024,
         max_scan_bytes: int = 1024 * 1024,
+        checked_out: str = "refuse",
     ) -> None:
+        if checked_out not in CHECKED_OUT:
+            raise SubstrateConfigurationError(
+                f"checked_out is 'refuse' or 'follow', not {checked_out!r}"
+            )
+        self._follow = checked_out == "follow"
         executable = shutil.which(git)
         if executable is None:
             raise SubstrateConfigurationError(f"cannot find the git executable {git!r}")
@@ -803,7 +828,8 @@ class GitSubstrate:
                 f"{self._stage.handle.stage_id} open"
             )
         self._settle_redo()
-        self._refuse_checked_out()
+        if not self._follow:
+            self._refuse_checked_out()
         base = self.head()
         stage_id = uuid.uuid4()
         root = self._stage_root / str(stage_id)
@@ -1236,6 +1262,7 @@ class GitSubstrate:
         if self._control is not None:
             self._redo_path(handle.stage_id).unlink(missing_ok=True)
         stage.done = True
+        stage.committed = True
         return CommitReceipt(
             stage_id=handle.stage_id,
             plan_id=handle.plan_id,
@@ -1251,11 +1278,9 @@ class GitSubstrate:
     def _commit_object(self, stage: _Stage, at: datetime) -> str:
         subject = re.sub(r"\s+", " ", stage.plan.intent).strip()[:72] or "a staged plan"
         plan = re.sub(r"[^A-Za-z0-9._:-]", "_", str(stage.plan.plan_id))[:128]
-        message = (
-            f"interlock: {subject}\n\n"
-            f"{PLAN_TRAILER}: {plan}\n"
-            f"{STAGE_TRAILER}: {stage.handle.stage_id}\n"
-        )
+        # A promotion's intent says "interlock promote ..." itself (1.7.0).
+        title = subject if subject.startswith("interlock ") else f"interlock: {subject}"
+        message = f"{title}\n\n{PLAN_TRAILER}: {plan}\n{STAGE_TRAILER}: {stage.handle.stage_id}\n"
         name, email = self._author
         stamp = f"{int(at.timestamp())} +0000"
         identity = {
@@ -1280,6 +1305,10 @@ class GitSubstrate:
         return done.stdout.decode().strip()
 
     def _swap(self, stage: _Stage, new: str) -> None:
+        holder = self._checkout_of_branch() if self._follow else None
+        if holder is not None:
+            self._fast_forward(stage, holder, new)
+            return
         done = self._git.run(
             self._repository,
             "update-ref",
@@ -1295,6 +1324,34 @@ class GitSubstrate:
             raise StageConflictError(
                 f"stage {stage.handle.stage_id}: {self._ref} moved since the stage measured it "
                 f"at {stage.base[:12]}; nothing was committed. "
+                + done.stderr.decode("utf-8", "replace").strip()[:300]
+            )
+
+    def _checkout_of_branch(self) -> Path | None:
+        """The worktree that has the branch checked out, if one does."""
+        listing = self._git.text(self._repository, "worktree", "list", "--porcelain")
+        current: str | None = None
+        for line in listing.splitlines():
+            if line.startswith("worktree "):
+                current = line[len("worktree ") :]
+            elif line == f"branch {self._ref}" and current is not None:
+                return Path(current)
+        return None
+
+    def _fast_forward(self, stage: _Stage, holder: Path, new: str) -> None:
+        """Move the branch a worktree has checked out by fast-forwarding that worktree to
+        ``new``, only from the stage's base (``checked_out = "follow"``, 1.7.0)."""
+        at = self._git.text(holder, "rev-parse", "HEAD")
+        if at != stage.base:
+            raise StageConflictError(
+                f"stage {stage.handle.stage_id}: {self._ref} moved to {at[:12]} since the stage "
+                f"measured it at {stage.base[:12]}; nothing was committed"
+            )
+        done = self._git.run(holder, "merge", "--ff-only", "--no-edit", "-q", new, check=False)
+        if done.returncode != 0:
+            raise StageConflictError(
+                f"stage {stage.handle.stage_id}: the checkout at {holder} could not move to the "
+                f"commit, and nothing was committed: "
                 + done.stderr.decode("utf-8", "replace").strip()[:300]
             )
 
@@ -1466,14 +1523,140 @@ class GitSubstrate:
         self.abort(handle)
         if self._control is not None and stage.control is not None:
             self._control.close(stage.control)
+        if stage.keep:
+            # A session's records stay; its worktree goes once the commit holds what it did.
+            if stage.committed:
+                self._remove_worktree(stage.worktree)
+            self._stage = None
+            return
+        self._remove_worktree(stage.worktree)
+        shutil.rmtree(stage.root, ignore_errors=True)
+        self._stage = None
+
+    def _remove_worktree(self, worktree: Path) -> None:
         with contextlib.suppress(StageError, SubstrateUnavailableError):
             self._git.run(
-                self._repository, "worktree", "remove", "--force", str(stage.worktree), check=False
+                self._repository, "worktree", "remove", "--force", str(worktree), check=False
             )
-        shutil.rmtree(stage.root, ignore_errors=True)
+        shutil.rmtree(worktree, ignore_errors=True)
         with contextlib.suppress(StageError, SubstrateUnavailableError):
             self._git.run(self._repository, "worktree", "prune", check=False)
-        self._stage = None
+
+    # -- sessions (1.7.0) -----------------------------------------------------
+
+    @property
+    def sessions(self) -> Path:
+        """Where sessions are kept: in the repository's Git directory, beside the stages."""
+        return self._common / "interlock" / "sessions"
+
+    def open_session(self, *, name: str | None = None, lifetime: float = 86400.0) -> Session:
+        """Check a worktree out at the branch's head for a session of its own
+        (:mod:`interlock.session`). Its HEAD is detached: the branch moves only when the
+        session is promoted.
+
+        :raises SessionError: When a session of that name exists.
+        :raises SubstrateConfigurationError: If the branch is checked out somewhere and the
+            substrate does not follow it.
+        """
+        from interlock.session import SessionError, new_session, session_name
+
+        chosen = session_name(name)
+        directory = self.sessions / chosen
+        if directory.exists():
+            raise SessionError(f"session {chosen} exists, at {directory}")
+        self._settle_redo()
+        if not self._follow:
+            self._refuse_checked_out()
+        base = self.head()
+        worktree = directory / "worktree"
+        directory.mkdir(parents=True)
+        try:
+            self._git.run(self._repository, "worktree", "prune")
+            self._git.run(self._repository, "worktree", "add", "--detach", str(worktree), base)
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        return new_session(
+            directory,
+            session_id=uuid.uuid4(),
+            name=chosen,
+            substrate=self.substrate_id,
+            tree=worktree,
+            base=base,
+            input_tree=self._tree_of(base),
+            lifetime=lifetime,
+        )
+
+    def session_changes(self, session: Session) -> list[tuple[str, str]]:
+        """Each path the session changed against its base commit, with the blob it had there
+        (all zeros for a new one), ignored files apart."""
+        self._git.run(session.tree, "add", "--all")
+        changes = _raw_changes(
+            self._git.run(
+                session.tree,
+                "diff-index",
+                "--cached",
+                "--raw",
+                "-z",
+                "--no-renames",
+                "--no-abbrev",
+                session.base,
+            ).stdout
+        )
+        return [(c.path, c.old_sha) for c in changes]
+
+    def session_plan(self, session: Session, scope_id: str, intent: str) -> EffectPlan:
+        """The plan a promotion runs: an ``expect-head`` of the commit the session started
+        from, so the branch moves only from there."""
+        from interlock.builder import PlanBuilder
+
+        changes = self.session_changes(session)
+        builder = PlanBuilder(scope_id, intent=intent)
+        builder.add(
+            EffectKind.UPDATE,
+            table=self.classify(changes[0][0]) if changes else FALLBACK_CLASS,
+            statement="expect-head :commit",
+            parameters={"commit": session.base},
+            stated_rows=len(changes),
+        )
+        return builder.build()
+
+    def adopt(self, session: Session, plan: EffectPlan) -> StageHandle:
+        """Open ``session``'s worktree as this substrate's stage, for ``plan``.
+
+        :raises StageConflictError: If a stage is already open here.
+        """
+        if self._stage is not None:
+            raise StageConflictError(
+                f"substrate {self.substrate_id!r} already has stage "
+                f"{self._stage.handle.stage_id} open"
+            )
+        self._settle_redo()
+        opened = datetime.now(UTC)
+        handle = StageHandle(
+            stage_id=uuid.uuid4(),
+            plan_id=plan.plan_id,
+            substrate_id=self.substrate_id,
+            opened_at=opened,
+            expires_at=opened + timedelta(seconds=self._stage_seconds),
+        )
+        self._stage = _Stage(
+            handle, plan, session.base, session.directory, session.tree, session.home, keep=True
+        )
+        return handle
+
+    def output_tree(self, session: Session) -> str:
+        """The tree the session's worktree holds now, as Git writes it."""
+        self._git.run(session.tree, "add", "--all")
+        return self._git.text(session.tree, "write-tree")
+
+    def landed(self, session: Session) -> str:
+        """The commit a promotion made: the branch's head once it moved."""
+        return self.head()
+
+    def discard_session(self, session: Session) -> None:
+        """Remove the session's worktree; its records stay."""
+        self._remove_worktree(session.tree)
 
     # -- internals ------------------------------------------------------------
 

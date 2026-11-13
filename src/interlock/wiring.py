@@ -137,6 +137,7 @@ def open_git(config: InterlockConfig, *, control: str | None = None) -> GitSubst
         max_stage_seconds=config.engine.max_stage_seconds,
         max_file_bytes=settings.max_file_bytes,
         max_scan_bytes=settings.max_scan_bytes,
+        checked_out=settings.checked_out,
     )
 
 

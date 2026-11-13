@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 32 32" role="img" aria-label="Interlock">
+<title>Interlock</title>
+<style>
+.i{fill:#ecebe6}.o{fill:none;stroke:#ecebe6}.f{fill:#ecebe6;fill-opacity:.24}.a{fill:#86acf2}
+</style>
+<clipPath id="il"><path d="M0 0H16V8.6L12.4 7.4V13.6L16 12.4V19.6L19.6 18.4V24.6L16 23.4V32H0Z"/></clipPath><clipPath id="ir"><path d="M32 0H16V8.6L12.4 7.4V13.6L16 12.4V19.6L19.6 18.4V24.6L16 23.4V32H32Z"/></clipPath><mask id="im" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32"><rect width="32" height="32" fill="#fff"/><path d="M16 0V8.6L12.4 7.4V13.6L16 12.4V19.6L19.6 18.4V24.6L16 23.4V32" stroke="#000" stroke-width="1.7" fill="none"/></mask><g mask="url(#im)"><g clip-path="url(#il)"><rect class="f" x="3" y="3" width="26" height="26" rx="3.2"/><rect class="o" x="3.8" y="3.8" width="24.4" height="24.4" rx="2.4" stroke-width="1.6" stroke-dasharray="2.3 1.7" stroke-dashoffset="1"/></g><rect class="a" x="3" y="3" width="26" height="26" rx="3.2" clip-path="url(#ir)"/></g>
+</svg>

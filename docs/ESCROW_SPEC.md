@@ -1110,6 +1110,28 @@ only on the files that were measured.
   (in place) or from the version history (swap), and receipts MUST say
   `coverage.measurement = "transactional"`.
 
+## 4.8 Sessions (added in 1.7.0)
+
+A session is a stage on a directory or a Git branch that outlives the process that opened it:
+a coding agent works in it with its own tools, and it is promoted as one plan.
+
+- **E4-20.** A session MUST record its base (the commit, or the files' hashes) when it opens,
+  and its promotion MUST be measured, judged and committed as a stage opened on that base is:
+  the diff from the session's tree, never from its commands, and a commit only on the base
+  (E4-17 for a directory; the branch's compare-and-swap for Git). A refused or conflicting
+  promotion MUST leave the workspace or branch unwritten, and the session's tree as it was.
+- **E4-21.** A promotion's plan MUST be admitted on the chain like any plan, with an intent
+  that begins `interlock promote <session>`, and its effects MUST pin the base: an
+  `expect-hash` per changed file, or an `expect-head` of the base commit.
+- **E4-22.** A command run in a session MUST either run under an operating-system sandbox that
+  confines its writes to the session and denies it the network, or be recorded as having run
+  without one. Each command's exit code and sandbox profile digest MUST be logged, and the
+  promotion receipt MUST carry the log's digest, the exit codes and the profile digests beside
+  the input and output trees.
+- **E4-23.** A branch a worktree has checked out MAY be moved only by fast-forwarding that
+  worktree from the stage's base (`checked_out = "follow"`); otherwise it MUST be refused, as
+  before.
+
 ---
 
 # 5. Architecture of `interlock` 0.5.0

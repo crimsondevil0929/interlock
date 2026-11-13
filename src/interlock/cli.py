@@ -152,6 +152,10 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
             return _keys(config, args, stream)
         if args.command == "vacuum":
             return _vacuum(config, args, stream)
+        if args.command in ("stage", "run", "promote", "hook"):
+            from interlock.session_cli import dispatch
+
+            return dispatch(config, args, stream)
         return _check(config, stream)
     except ChainIntegrityError as exc:
         print(f"interlock: {exc}", file=sys.stderr)
@@ -398,6 +402,9 @@ def _parser() -> argparse.ArgumentParser:
                 help="Git: the commit the branch was at when the substrate took it over, or "
                 "when it last reconciled clean (required on Git)",
             )
+    from interlock.session_cli import add_commands
+
+    add_commands(commands, _common)
     return parser
 
 

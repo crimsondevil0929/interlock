@@ -1,6 +1,6 @@
 [project]
 name = "interlock-escrow"
-version = "1.6.0"
+version = "1.7.0"
 description = "A reference monitor for agent side effects: stage, measure, adjudicate, commit."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -107,6 +107,7 @@ ignore = ["S101"]
 # secrets they make up, which name nothing real (S105, S106).
 "tests/**/*.py" = ["S101", "S105", "S106", "S608"]
 "tests/test_git_substrate.py" = ["S101", "S105", "S106", "S603", "S607", "S608"]
+"tests/test_sessions.py" = ["S101", "S603", "S607", "S108"]
 "tests/test_filesystem.py" = ["S101", "S105", "S106", "S603", "S608"]
 # The plan-bound substrates' tests run the stand-in commands and call the
 # loopback API server they start themselves (1.3.0).

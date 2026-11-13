@@ -53,6 +53,16 @@ jobs:
       - name: Install the project
         run: uv sync --frozen --python ${{ matrix.python-version }}
 
+      # Coding sessions run their commands under bubblewrap on Linux (1.7.0): installed,
+      # with unprivileged user namespaces allowed, so the sandbox tests run here rather
+      # than skip. macOS has Seatbelt already.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / --dev /dev --unshare-net true && echo "bubblewrap works"
+
       - name: Lint (ruff check)
         run: uv run ruff check .
 
@@ -133,6 +143,16 @@ jobs:
           docker run -d --name pgbouncer --network "${{ job.services.postgres.network }}" \
             -p 6432:6432 -v "$RUNNER_TEMP/pgbouncer:/etc/pgbouncer:ro" \
             edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
+
+      # Coding sessions run their commands under bubblewrap on Linux (1.7.0): installed,
+      # with unprivileged user namespaces allowed, so the sandbox tests run here rather
+      # than skip. macOS has Seatbelt already.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / --dev /dev --unshare-net true && echo "bubblewrap works"
 
       - name: Tests with coverage, PostgreSQL required
         run: uv run pytest -v --cov=interlock --cov-report=term-missing
