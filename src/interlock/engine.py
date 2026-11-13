@@ -976,6 +976,7 @@ class EscrowEngine:
         trajectory_id: str | None = None,
         intent: str = "",
         traceparent: str | None = None,
+        provenance: Sequence[str] = (),
     ) -> OpenStage:
         """Open a stage before its plan is whole (1.6.0).
 
@@ -1009,6 +1010,7 @@ class EscrowEngine:
             plan_id=new_plan_id(),
             created_at=datetime.now(UTC),
             traceparent=traceparent,
+            provenance=provenance,
         )
         handle = self._substrate.open(_provisional(builder, ()))
         return OpenStage(self, builder, handle)
@@ -2004,6 +2006,7 @@ def _provisional(builder: PlanBuilder, effects: Sequence[Effect]) -> EffectPlan:
         effects=tuple(effects),
         intent=builder._intent,
         traceparent=builder._traceparent,
+        provenance=builder._provenance,
     )
 
 

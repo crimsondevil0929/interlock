@@ -127,6 +127,9 @@ class Guidance(StrEnum):
     STATED_FOOTPRINT = "stated_footprint"
     SCHEMA_CHANGE = "schema_change"
     OPERATOR = "operator"
+    PROVENANCE = "provenance"
+    """What the session had read before the plan (1.8.0): untrusted input, or labeled
+    data, after which the mandate wants the principals' approval."""
     # Raised before or during staging, by admission or the substrate.
     STATEMENT_KIND = "statement_kind"
     UNOBSERVED_WRITE = "unobserved_write"
@@ -180,6 +183,7 @@ _LABELS: Final[Mapping[Guidance, str]] = {
     Guidance.METER_BUDGET: "meter",
     Guidance.SCHEMA_CHANGE: "no_schema_change",
     Guidance.OPERATOR: "operator_constraint",
+    Guidance.PROVENANCE: "provenance_gate",
     Guidance.STATEMENT_KIND: "statement_kind",
     Guidance.UNOBSERVED_WRITE: "unobserved_write",
     Guidance.CASCADE: "cascade",
@@ -499,6 +503,21 @@ _TEMPLATES: Final[Mapping[Guidance, Any]] = {
         "an effect is declared as a schema change, which cannot be staged."
     ),
     Guidance.OPERATOR: lambda c: "an operator-defined check refused the plan.",
+    Guidance.PROVENANCE: lambda c: (
+        "this session read something earlier that the mandate does not let a plan act on "
+        "alone (input from outside, or data marked secret or for one party): "
+        + " and ".join(
+            p
+            for p in (
+                f"changing {_tables(c)}" if c.tables else "",
+                f"sending to {_sinks(c)}" if c.sinks else "",
+            )
+            if p
+        )
+        + (" takes" if c.tables or c.sinks else "this takes")
+        + " the principals' approval. It was not refused for what it does: do not retry it, "
+        "and do not try another way to the same result."
+    ),
     Guidance.STATEMENT_KIND: lambda c: (
         "a statement is of a kind that cannot be staged; only row statements "
         "(SELECT, INSERT, UPDATE, DELETE) run in a plan."

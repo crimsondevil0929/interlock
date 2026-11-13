@@ -25,6 +25,7 @@ from interlock.invariants import (
     NoDelete,
     NoSchemaChange,
     PartitionIsolation,
+    ProvenanceGate,
     StatedFootprint,
     TableAllowlist,
     TenantDrawdownGuard,
@@ -98,6 +99,13 @@ def checkers() -> tuple[InvariantChecker, ...]:
         # 1.6.0: the same four checks under their names for every system
         ChangeLimit(8),
         PartitionIsolation("tenant", max=2, declared=True),
+        # 1.8.0: what the session had read before the plan
+        ProvenanceGate(
+            untrusted_kinds=["refunds", "orders", "customers"],
+            untrusted_sinks=["stripe", "mail", "slack"],
+            egress={"secret": ["vault", "audit", "mail"], "partition:*": ["mail", "a", "b"]},
+            rule_of_two=True,
+        ),
         KindAllowlist(["orders", "refunds", "customers", "ledger", "items"]),
         ValueGuard("orders", "total", max_drop_fraction=0.3),
     )

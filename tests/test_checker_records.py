@@ -70,6 +70,8 @@ PINNED = {
     "value_guard:orders.total": (
         "3ba500af5a3e0944575bbb0bc997ffc8bc2860760b69c04df0cc3034c822e66d"
     ),
+    # 1.8.0
+    "provenance_gate": "858fee9e88515e3622ce2cc19219348e8e0ab868ca0ea7d2c9abdcac4c551797",
 }
 
 
@@ -90,7 +92,7 @@ def _digests_under(seed: str) -> dict[str, str]:
 
 def test_every_built_in_checker_digests_the_same_under_every_hash_seed() -> None:
     seen = {seed: _digests_under(seed) for seed in SEEDS}
-    assert len(seen["0"]) == len(checkers()) == 22
+    assert len(seen["0"]) == len(checkers()) == 23
     for seed, found in seen.items():
         assert found == seen["0"], f"PYTHONHASHSEED={seed} digests differently"
     assert seen["0"] == digests()

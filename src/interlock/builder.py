@@ -89,6 +89,7 @@ class PlanBuilder:
         "_facts",
         "_intent",
         "_plan_id",
+        "_provenance",
         "_scope_id",
         "_traceparent",
         "_trajectory_id",
@@ -103,6 +104,7 @@ class PlanBuilder:
         plan_id: PlanId | None = None,
         created_at: datetime | None = None,
         traceparent: str | None = None,
+        provenance: Sequence[str] = (),
     ) -> None:
         if created_at is not None and created_at.tzinfo is None:
             raise PlanError(
@@ -115,6 +117,7 @@ class PlanBuilder:
             except ValueError as exc:
                 raise PlanError(str(exc)) from exc
         self._traceparent = traceparent
+        self._provenance = tuple(sorted(set(provenance)))
         self._scope_id = scope_id
         self._trajectory_id = trajectory_id or f"traj-{uuid.uuid4().hex[:12]}"
         self._intent = intent
@@ -316,6 +319,7 @@ class PlanBuilder:
             effects=tuple(self._effects),
             intent=self._intent,
             facts=tuple(self._facts),
+            provenance=self._provenance,
             traceparent=self._traceparent,
         )
         try:

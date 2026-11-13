@@ -325,6 +325,7 @@ class EffectPlan:
     trajectory_id: str
     created_at: datetime
     effects: tuple[Effect, ...]
+    provenance: tuple[str, ...] = ()  # added in 1.8.0: what its session had read (4.9)
 
     def topological_order(self) -> tuple[Effect, ...]:
         """Effects in a valid execution order.
@@ -652,6 +653,7 @@ Requirements:
 | `no_ddl` | BLOCKING | No effect has `kind == DDL` |
 | `truncation_guard` | BLOCKING | `not diff.truncated` |
 | `distribution_shift` | ADVISORY | `blast_radius` within *k* MAD of the historical median for this `(scope_id, table)` pair |
+| `provenance_gate` (added in 1.8.0) | BLOCKING | What the plan changes and sends is allowed after what its session had read (section 4.9) |
 
 *Amended in 1.6.0:* `blast_radius`, `tenant_isolation`, `table_allowlist` and
 `column_value_guard` each have a second built-in class that records a name for
@@ -1132,6 +1134,40 @@ a coding agent works in it with its own tools, and it is promoted as one plan.
   worktree from the stage's base (`checked_out = "follow"`); otherwise it MUST be refused, as
   before.
 
+## 4.9 Provenance (added in 1.8.0)
+
+A checker judges a plan by what it would do. Some plans are fine or not depending on what the
+agent had read before it asked: a refund within its cap, asked for after reading an email from
+a stranger that said to refund it. A plan carries the labels of what its session had read, and
+`ProvenanceGate` reads them against the measured diff.
+
+The labels are short lower-case strings (`[a-z][a-z0-9_.:=-]{0,95}`): `untrusted` (input from
+anyone outside the deployment), `secret`, `partition:<dimension>=<value>` (one tenant's data),
+`quarantined:<tool>` (a reader sub-agent's typed result) and `cleared` (the principals approved
+this exact plan with its labels). Interlock gives them no other meaning; the code that served
+the reads puts them on the plan (Fiduciary's bridge and SDK record each one in a signed session
+record).
+
+- **E4-24.** `EffectPlan.provenance` MUST be sorted and hold each label once, and a label that
+  does not match the pattern MUST be refused when the plan is built. The labels MUST be in the
+  plan's content hash when there are any, and a plan with none MUST hash as it did before 1.8.0.
+- **E4-25.** `ProvenanceGate` MUST refuse a plan labeled `untrusted` that changes a kind its
+  `untrusted_kinds` lists or sends to a sink its `untrusted_sinks` lists (`*` lists all); a plan
+  labeled `secret` or with a partition label that sends to a sink its `egress` rules do not
+  clear for that label (`partition:*` stands for every partition label); and, with
+  `rule_of_two`, a plan labeled both `untrusted` and sensitive (`secret` or a partition label)
+  that changes or sends anything. A plan labeled `cleared` MUST be admitted by it, and
+  `quarantined:<tool>` MUST count as none of these.
+- **E4-26.** Each violation MUST name its rule (`untrusted`, `egress` or `rule_of_two`), the
+  plan's labels, the label it read, and the kinds and sinks it caught, and the feedback MUST
+  say that the change takes the principals' approval (`Guidance.PROVENANCE`).
+- **E4-27.** A stage opened before its plan (`EscrowEngine.stage(..., provenance=)`) MUST carry
+  the labels it was opened with onto the plan it settles.
+
+What the gate does not do: it trusts the labels it is given, and it cannot tell what a model
+did with what it read, only that it had read it. A read that no label marks is not seen.
+Fiduciary's check V13 compares the labels with its signed session records offline.
+
 ---
 
 # 5. Architecture of `interlock` 0.5.0
@@ -1396,6 +1432,14 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-17: commit only onto the files measured, under the commit lock | Implemented (1.5.0) | `FilesystemSubstrate._verify` (`fcntl` lock; per-file hashes in place, the whole version for swap) | `test_filesystem` |
 | E4-18: rename over each file, journaled; a crash finished, a failure put back; swap in one rename | Implemented (1.5.0) | `_write_in_place`, `_settle`, `_put_back`, `_swap`, `prepare_swap` | `test_filesystem` (a child process killed mid-commit) |
 | E4-19: markers and version history; transactional receipts | Implemented (1.5.0) | `resolve_intent`, `commits/`, `parents/` | `test_filesystem` |
+| E4-20: a session's base recorded; its promotion measured, judged and committed on that base | Implemented (1.7.0) | `interlock.session` (`open_session`, `promote`) | `test_sessions` |
+| E4-21: a promotion admitted on the chain, its effects pinned to the base | Implemented (1.7.0) | `promote` (`expect-hash`, `expect-head`) | `test_sessions` |
+| E4-22: commands sandboxed or recorded as not; the log's digest in the receipt | Implemented (1.7.0) | `interlock.sandbox`, `run_command`, `verify_receipt` | `test_sessions` |
+| E4-23: a checked-out branch moved only by fast-forwarding its worktree | Implemented (1.7.0) | `GitSubstrate` (`checked_out = "follow"`) | `test_sessions` |
+| E4-24: labels sorted, checked, hashed only when present | Implemented (1.8.0) | `EffectPlan.__post_init__`, `EffectPlan.content_hash` | `test_provenance` |
+| E4-25: the three rules; `cleared` admits; `quarantined:` counts as none | Implemented (1.8.0) | `ProvenanceGate` | `test_provenance` |
+| E4-26: each violation names its rule and labels; plain feedback | Implemented (1.8.0) | `ProvenanceGate.check`, `ProvenanceGate.hint`, `Guidance.PROVENANCE` | `test_provenance` |
+| E4-27: a stage carries its labels onto its plan | Implemented (1.8.0) | `EscrowEngine.stage`, `PlanBuilder(provenance=)` | `test_provenance` |
 
 ## Beyond sections 1 to 4
 

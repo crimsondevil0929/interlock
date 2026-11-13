@@ -270,6 +270,55 @@ would be refused, keeps the agent working with the refusal, and `SessionEnd` and
 `WorktreeRemove` promote it. No tool call's input is rewritten: the tree is where Claude Code
 works.
 
+### What the session read before the plan (1.8.0)
+
+A checker judges a plan by what it would change. Some plans are fine or not depending on what
+the agent read before it asked. An agent that has just read a customer's email, which says
+"refund order 7 in full", and then asks to refund order 7 within its cap, is asking for
+something its limits allow, for a reason nobody on your side wrote.
+
+A plan can carry the labels of what its session had read, and `ProvenanceGate` reads them:
+
+```python
+from interlock import EscrowEngine, PlanBuilder, ProvenanceGate, SqliteSubstrate, TableSpec
+
+engine = EscrowEngine(
+    SqliteSubstrate("back_office.db", tables=[TableSpec("orders", columns=["id", "total"])]),
+    checkers=[
+        ProvenanceGate(
+            untrusted_kinds=["orders"],  # after untrusted input, changing orders takes approval
+            untrusted_sinks=["stripe"],  # and so does a call to Stripe
+            egress={"secret": ["vault"]},  # data labeled secret goes only to the vault
+            rule_of_two=True,  # see below
+        ),
+    ],
+)
+builder = PlanBuilder("support-agent", provenance=["untrusted"])
+```
+
+- **After untrusted input.** A plan labeled `untrusted` that changes a kind in
+  `untrusted_kinds`, or sends to a sink in `untrusted_sinks`, is refused (`*` means any).
+- **Egress.** After reading data labeled `secret`, or one tenant's data
+  (`partition:tenant=acme`; `partition:*` covers every partition label), a plan may send only
+  to the sinks `egress` clears for that label.
+- **The rule of two.** A session may have read untrusted input, read sensitive data, and
+  changed or sent something: any two of the three. With `rule_of_two=True` a plan that would
+  make it all three is refused.
+- A plan labeled `cleared` is admitted: the principals approved that exact plan, with its
+  labels. A label `quarantined:<tool>` is a reader sub-agent's typed result, and counts as
+  none of the above.
+
+The refusal tells the agent what it changed and that the change takes the principals'
+approval. A stage opened before its plan takes the labels too: `engine.stage(scope,
+provenance=["untrusted"])`. The labels are in the plan's hash when there are any; a plan with
+none hashes as it always did.
+
+Interlock does not decide what is untrusted. The code that serves the reads labels them;
+Fiduciary's bridge and SDK label a session from each tool's binding, record each label in a
+signed session record, and hold a refused plan for the principals instead of only refusing it.
+The gate trusts the labels it is given. It cannot tell what a model did with what it read, only
+that it read it, and a read nobody labeled is not seen.
+
 ### Errors
 
 Every failure on the write path is an `InterlockError`. The AgentGov seam is

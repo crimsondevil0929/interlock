@@ -467,6 +467,10 @@ class Effect:
         return canonical_hash(fields)
 
 
+PROVENANCE_LABEL: Final = re.compile(r"[a-z][a-z0-9_.:=-]{0,95}")
+"""A provenance label (1.8.0): ``untrusted``, ``secret``, ``partition:tenant=acme``."""
+
+
 @dataclass(frozen=True, slots=True)
 class EffectPlan:
     """A complete unit of intended change.
@@ -502,6 +506,24 @@ class EffectPlan:
     carried to every request it enqueues, and sent with each. Outside the
     plan's hash, as outside every other: the same plan, traced or not, hashes
     the same (``docs/EPIC7_DESIGN.md`` §1.2)."""
+    provenance: tuple[str, ...] = ()
+    """What the session that made the plan had read before it, as labels (1.8.0):
+    ``untrusted`` (input nobody on the deployment's side wrote), ``secret``,
+    ``partition:<label>``, ``quarantined:<tool>`` (a reader's typed result), and
+    ``cleared`` (the principals approved this exact plan after its labels). Sorted,
+    each once. :class:`~interlock.invariants.ProvenanceGate` reads them. In the plan's
+    hash when there are any, so a receipt's plan hash binds them; a plan with none hashes
+    as it always has."""
+
+    def __post_init__(self) -> None:
+        for label in self.provenance:
+            if not isinstance(label, str) or not PROVENANCE_LABEL.fullmatch(label):
+                raise ValueError(
+                    f"provenance label {label!r} is not lower-case letters, digits and "
+                    f"'_.:-=', at most 96 characters"
+                )
+        if tuple(sorted(set(self.provenance))) != self.provenance:
+            object.__setattr__(self, "provenance", tuple(sorted(set(self.provenance))))
 
     def topological_order(self) -> tuple[Effect, ...]:
         """Effects in a deterministic execution order.
@@ -561,6 +583,9 @@ class EffectPlan:
         # Likewise the facts it consumes.
         if self.facts:
             fields.append(["facts", sorted(str(f) for f in self.facts)])
+        # And what its session had read (1.8.0).
+        if self.provenance:
+            fields.append(["provenance", list(self.provenance)])
         return canonical_hash(fields)
 
 

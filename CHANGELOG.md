@@ -9,6 +9,31 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.8.0] - Unreleased
+
+What the session read before the plan. A refund within an agent's cap is still the wrong
+refund when the agent asked for it because a stranger's email told it to. A plan now carries
+the labels of what its session had read, and a checker decides by them.
+
+### Added
+
+- **`EffectPlan.provenance`**: the labels of what the plan's session had read (`untrusted`,
+  `secret`, `partition:<dimension>=<value>`, `quarantined:<tool>`, `cleared`), sorted, each
+  once, checked against `PROVENANCE_LABEL` when the plan is built. They are in the plan's
+  hash when there are any; a plan with none hashes as before, so every existing plan, verdict
+  and receipt keeps its hash. `PlanBuilder(provenance=)` and `EscrowEngine.stage(...,
+  provenance=)` set them.
+- **`ProvenanceGate`** (`provenance_gate`, built in): after untrusted input, the kinds
+  `untrusted_kinds` and sinks `untrusted_sinks` list take the principals' approval; data
+  labeled `secret` or with a partition label leaves only by the sinks `egress` clears for it;
+  with `rule_of_two`, a plan that would make a session have read untrusted input, read
+  sensitive data and changed something is refused. `cleared` admits; `quarantined:<tool>`
+  counts as none of these. Each violation names its rule, labels, kinds and sinks.
+- **`Guidance.PROVENANCE`**: the refusal says, in plain words, what the plan changed and
+  that it takes the principals' approval.
+- Spec section 4.9 (E4-24 to E4-27); traceability rows for E4-20 to E4-27; the guide's
+  section "What the session read before the plan".
+
 ## [1.7.0] - 2026-11-13
 
 Coding sessions. A coding agent works for an hour with its own editor and shell, and only the

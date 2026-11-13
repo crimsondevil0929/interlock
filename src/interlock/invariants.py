@@ -48,9 +48,17 @@ from interlock.types import field_path as _path
 from interlock.types import value_at as _at
 from interlock.windows import RateWindowCheck
 
+UNTRUSTED: Final = "untrusted"
+SECRET: Final = "secret"  # noqa: S105 - a label's name, not a credential
+CLEARED: Final = "cleared"
+"""The provenance labels :class:`ProvenanceGate` gives a meaning to (1.8.0)."""
+
 __all__ = [
     "BUILT_IN_CHECKERS",
     "CHECKER_ALIASES",
+    "CLEARED",
+    "SECRET",
+    "UNTRUSTED",
     "BlastRadius",
     "ChangeLimit",
     "ColumnValueGuard",
@@ -61,6 +69,7 @@ __all__ = [
     "NoDelete",
     "NoSchemaChange",
     "PartitionIsolation",
+    "ProvenanceGate",
     "StatedFootprint",
     "TableAllowlist",
     "TenantDrawdownGuard",
@@ -486,6 +495,141 @@ class NoDelete:
         return FeedbackHint(
             kind=Guidance.NO_DELETE, tables=tuple(sorted(offenders)), measured=count
         )
+
+
+class ProvenanceGate:
+    """Refuse a plan for what its session had read before it (1.8.0).
+
+    A gateway judges a call by the call. This judges it by what came before: an agent
+    that read a poisoned email and then asks for a refund within its cap is asking for
+    something the mandate allows, for a reason nobody on the deployment's side wrote. The
+    plan carries its session's labels (:attr:`~interlock.types.EffectPlan.provenance`),
+    put there by the code that served the reads (fiduciary's bridge and SDK), and three
+    rules read them against the measured diff:
+
+    - **after untrusted input** (the label ``untrusted``), the plan may not change the
+      kinds ``untrusted_kinds`` lists, nor send to the sinks ``untrusted_sinks`` lists
+      (``*``: any);
+    - **egress**: after reading data labeled ``label`` (``secret``, or a partition's
+      ``partition:<dimension>=<value>``; ``partition:*`` stands for every partition label),
+      the plan may send only to the sinks ``egress[label]`` clears;
+    - **the rule of two** (``rule_of_two``): a session may have read untrusted input, read
+      sensitive data (``secret`` or a partition label), and changed or sent something, any
+      two of the three; a plan that would make it all three is refused.
+
+    A plan labeled ``cleared`` is admitted: its labels were approved by the principals
+    for this exact plan (fiduciary's ``provenance`` ticket). A label ``quarantined:<tool>``
+    is a reader sub-agent's typed result, and counts as none of the above.
+
+    What this does not do: it trusts the labels it is given. It cannot tell what a model
+    did with what it read, only that it had read it; and a read no label marks is not
+    seen. Fiduciary's V13 checks the labels against the signed session records offline.
+    """
+
+    __slots__ = ("_egress", "_rule_of_two", "_untrusted_kinds", "_untrusted_sinks")
+
+    LABEL: ClassVar[str] = "provenance_gate"
+
+    def __init__(
+        self,
+        *,
+        untrusted_kinds: Sequence[str] = (),
+        untrusted_sinks: Sequence[str] = (),
+        egress: Mapping[str, Sequence[str]] | None = None,
+        rule_of_two: bool = False,
+    ) -> None:
+        self._untrusted_kinds = tuple(sorted(set(untrusted_kinds)))
+        self._untrusted_sinks = tuple(sorted(set(untrusted_sinks)))
+        self._egress = tuple(sorted((k, tuple(sorted(set(v)))) for k, v in (egress or {}).items()))
+        self._rule_of_two = bool(rule_of_two)
+
+    @property
+    def name(self) -> str:
+        return "provenance_gate"
+
+    def _cleared(self, label: str) -> tuple[str, ...] | None:
+        rules = dict(self._egress)
+        if label in rules:
+            return rules[label]
+        if label.startswith("partition:") and "partition:*" in rules:
+            return rules["partition:*"]
+        return None
+
+    def _found(
+        self, plan: EffectPlan, diff: EffectDiff
+    ) -> list[tuple[str, str, list[str], list[str]]]:
+        """Each rule broken: ``(rule, label, kinds, sinks)``."""
+        labels = set(plan.provenance)
+        if CLEARED in labels:
+            return []
+        kinds = set(diff.kinds_touched)
+        sinks = {o.sink for o in diff.outbound}
+        found: list[tuple[str, str, list[str], list[str]]] = []
+        if UNTRUSTED in labels:
+            hit_kinds = sorted(
+                k for k in kinds if "*" in self._untrusted_kinds or k in self._untrusted_kinds
+            )
+            hit_sinks = sorted(
+                s for s in sinks if "*" in self._untrusted_sinks or s in self._untrusted_sinks
+            )
+            if hit_kinds or hit_sinks:
+                found.append(("untrusted", UNTRUSTED, hit_kinds, hit_sinks))
+        for label in sorted(labels):
+            allowed = self._cleared(label)
+            if allowed is None:
+                continue
+            stray = sorted(s for s in sinks if s not in allowed)
+            if stray:
+                found.append(("egress", label, [], stray))
+        sensitive = sorted(x for x in labels if x == SECRET or x.startswith("partition:"))
+        if self._rule_of_two and UNTRUSTED in labels and sensitive and (kinds or sinks):
+            found.append(("rule_of_two", ",".join(sensitive), sorted(kinds), sorted(sinks)))
+        return found
+
+    def check(self, plan: EffectPlan, diff: EffectDiff) -> tuple[InvariantViolation, ...]:
+        said = {
+            "untrusted": "the session read untrusted input before this plan, and after that",
+            "egress": "the session read data labeled",
+            "rule_of_two": "the session read untrusted input and sensitive data before this plan;",
+        }
+        out = []
+        for rule, label, kinds, sinks in self._found(plan, diff):
+            what = " and ".join(
+                part
+                for part in (
+                    f"changing {', '.join(kinds)}" if kinds else "",
+                    f"sending to {', '.join(sinks)}" if sinks else "",
+                )
+                if part
+            )
+            if rule == "untrusted":
+                message = f"{said[rule]} {what} takes the principals' approval"
+            elif rule == "egress":
+                message = f"{said[rule]} {label}, which may not be sent to {', '.join(sinks)}"
+            else:
+                message = f"{said[rule]} {what} as well takes the principals' approval"
+            out.append(
+                InvariantViolation(
+                    invariant=self.name,
+                    severity=Severity.BLOCKING,
+                    message=message,
+                    evidence={
+                        "rule": rule,
+                        "labels": ",".join(plan.provenance),
+                        "label": label,
+                        "kinds": ",".join(kinds),
+                        "sinks": ",".join(sinks),
+                    },
+                )
+            )
+        return tuple(out)
+
+    def hint(
+        self, plan: EffectPlan, diff: EffectDiff, violation: InvariantViolation
+    ) -> FeedbackHint:
+        kinds = tuple(k for k in violation.evidence.get("kinds", "").split(",") if k)
+        sinks = tuple(s for s in violation.evidence.get("sinks", "").split(",") if s)
+        return FeedbackHint(kind=Guidance.PROVENANCE, tables=kinds, sinks=sinks)
 
 
 class _Guard:
@@ -1514,6 +1658,7 @@ BUILT_IN_CHECKERS: frozenset[type] = frozenset(
         TruncationGuard,
         StatedFootprint,
         NoSchemaChange,
+        ProvenanceGate,
     }
 )
 """The checkers whose feedback hints are trusted with numbers. Exact types:
