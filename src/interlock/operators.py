@@ -625,6 +625,35 @@ class Operator:
             raise OperatorRefusedError(f"no message of scope {scope_id!r} is held")
         return self.release(held, reason=reason or f"scope {scope_id}")
 
+    def release_turn(self, turn: str, *, reason: str | None = None) -> Outcome | None:
+        """Release every message held for ``turn`` (1.9.0), under one intent: the
+        turn finished with every plan committed. ``None`` when it holds none."""
+        held = self._outbox.turn_held(turn).get(turn, [])
+        if not held:
+            return None
+        return self.release(held, reason=reason or f"turn {turn} committed")
+
+    def cancel_turn(self, turn: str, *, reason: str | None = None) -> Outcome | None:
+        """Cancel every message held for ``turn`` (1.9.0), under one intent: a plan
+        of the turn was refused, or the turn was abandoned, so none of its
+        requests is made. ``None`` when it holds none."""
+        held = self._outbox.turn_held(turn).get(turn, [])
+        if not held:
+            return None
+        why = reason or f"turn {turn} did not finish: its requests are not made"
+        return self._act(
+            "cancel",
+            held,
+            why,
+            lambda target, authority: self._outbox.cancel(
+                target.message_id,
+                actor=self.actor,
+                reason=why,
+                authority=authority,
+                expected_head=target.head,
+            ),
+        )
+
     def cancel(
         self,
         message_id: uuid.UUID,

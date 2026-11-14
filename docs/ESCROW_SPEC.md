@@ -1168,6 +1168,38 @@ What the gate does not do: it trusts the labels it is given, and it cannot tell 
 did with what it read, only that it had read it. A read that no label marks is not seen.
 Fiduciary's check V13 compares the labels with its signed session records offline.
 
+## 4.10 Turns, delivery in the caller's process, and MCP's revisions (added in 1.9.0)
+
+An agent's turn makes several calls, and each call is a plan judged on its own. Without a
+turn, a request a plan enqueues is sent once its plan commits, even when the next call of the
+same turn is refused. A plan may now name its turn, and its requests wait for it.
+
+- **E4-28.** `EffectPlan.turn`, when set, MUST match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}` and be
+  in the plan's content hash; a plan without one MUST hash as it did before 1.9.0. A stage
+  opened before its plan (`EscrowEngine.stage(..., turn=)`) MUST carry it onto the plan.
+- **E4-29.** A request of a plan with a turn, that no warrant holds, MUST enter the outbox
+  held, in the stage's own transaction, with the reason `held for turn <id>` and a log row
+  that says so. One held for a warrant MUST stay held for the warrant. `held(scope)` MUST NOT
+  list a request held for its turn; `turn_held(turn)` MUST list exactly those, matching the
+  turn's id exactly.
+- **E4-30.** A turn's requests MUST be released or cancelled only by an operator's signed
+  intent (`Operator.release_turn`, `Operator.cancel_turn`), as any held request is, so the
+  operator-log audit holds every one of them to its intent.
+- **E4-31.** `Relay.deliver(message)` MUST make one committed request through the same claim,
+  breaker, call record and signed outcome as any relay, so that it and a relay elsewhere never
+  both make it. The response body it returns (`DeliveryResult.body`) MUST NOT be stored,
+  logged or attested: the delivery log keeps its digest, as before.
+- **E4-32.** An MCP client here MUST probe a server with `server/discover` (2026-07-28) and fall
+  back to `initialize` on any answer that is not a modern one, as the revision's backward
+  compatibility asks; a modern server MUST be sent its revision, the client's capabilities and
+  its name in every request's `_meta`. An `input_required` result MUST NOT count as delivered.
+- **E4-33.** An MCP write's number arguments MUST be recorded as decimal strings (no float is
+  hashed) and sent to the server as the JSON numbers they record (`McpAdapter(numbers=)`).
+
+What a turn does not do: put back what its committed plans changed. A refused call leaves the
+earlier calls' changes made; only the requests wait. MCP has no turn of its own: the caller
+names one (Fiduciary's `gov.turn()`, and Claude Code's hooks).
+
 ---
 
 # 5. Architecture of `interlock` 0.5.0
@@ -1440,6 +1472,12 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-25: the three rules; `cleared` admits; `quarantined:` counts as none | Implemented (1.8.0) | `ProvenanceGate` | `test_provenance` |
 | E4-26: each violation names its rule and labels; plain feedback | Implemented (1.8.0) | `ProvenanceGate.check`, `ProvenanceGate.hint`, `Guidance.PROVENANCE` | `test_provenance` |
 | E4-27: a stage carries its labels onto its plan | Implemented (1.8.0) | `EscrowEngine.stage`, `PlanBuilder(provenance=)` | `test_provenance` |
+| E4-28: a turn checked, hashed only when set, carried by a stage | Implemented (1.9.0) | `EffectPlan.turn`, `PlanBuilder(turn=)`, `EscrowEngine.stage(turn=)` | `test_wave15` |
+| E4-29: a turn's requests held in the stage's transaction, apart from a warrant's | Implemented (1.9.0) | `enqueue(turn=)`, `interlock.outbox_turn_hold`, `held`, `turn_held` | `test_wave15` |
+| E4-30: a turn released or cancelled by a signed intent | Implemented (1.9.0) | `Operator.release_turn`, `Operator.cancel_turn` | `test_wave15` |
+| E4-31: one request delivered now, under the relay's claim; the body never stored | Implemented (1.9.0) | `Relay.deliver`, `DeliveryResult.body`, `ReadableOutboxStore` | `test_wave15` |
+| E4-32: `server/discover`, then `initialize`; `_meta` on a modern server's requests | Implemented (1.9.0) | `interlock.mcp.handshake`, `Era`, `StdioServer` | `test_wave15` |
+| E4-33: number arguments recorded as decimal strings, sent as numbers | Implemented (1.9.0) | `decimals`, `numbers_on_the_wire`, `McpAdapter(numbers=)` | `test_wave15` |
 
 ## Beyond sections 1 to 4
 

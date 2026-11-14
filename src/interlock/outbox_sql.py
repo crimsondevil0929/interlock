@@ -564,6 +564,48 @@ BEGIN
 END
 $fn$;
 
+-- A request that waits for its turn (1.9.0): the stage that enqueued it holds
+-- it, in its own transaction, until every plan of the turn has committed. Only
+-- a pending request of this stage is held so; one already held for a warrant
+-- stays held for the warrant. Released or cancelled as any held message is, by
+-- an operator's signed intent. Granted to stage roles. Whether it held it.
+CREATE OR REPLACE FUNCTION interlock.outbox_turn_hold(
+    p_token bytea, p_message uuid, p_turn text)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    stage uuid;
+    expected bytea;
+BEGIN
+    SELECT s.stage_id, s.enqueue_hash INTO stage, expected
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL OR expected IS NULL
+       OR pg_catalog.sha256(p_token) IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'interlock: this transaction''s stage did not authorize a turn hold'
+            USING ERRCODE = 'IL002';
+    END IF;
+    IF p_turn IS NULL OR p_turn !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' THEN
+        RAISE EXCEPTION 'interlock: % is not a turn id', p_turn USING ERRCODE = '22023';
+    END IF;
+    PERFORM 1 FROM interlock.outbox o
+      JOIN interlock.outbox_state st ON st.message_id = o.message_id
+     WHERE o.message_id = p_message AND o.stage_id = stage AND st.state = 'pending'
+       FOR UPDATE OF st;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    PERFORM interlock.outbox_log(
+        p_message, NULL, 'held', 'outbox', NULL, NULL,
+        'waits for turn ' || p_turn || ': sent only once every plan of the turn has committed',
+        'held');
+    PERFORM interlock.outbox_settle(p_message, 'held', 'held for turn ' || p_turn);
+    RETURN true;
+END
+$fn$;
+
 -- interlock.stripe.compensation_problem, word for word: what is wrong with
 -- the refund a Stripe charge carries, or NULL when it undoes exactly it.
 CREATE OR REPLACE FUNCTION interlock.stripe_compensation_problem(

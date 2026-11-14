@@ -577,6 +577,7 @@ _STAGE_FUNCTIONS: Final = (
     "interlock.stage_facts(bigint)",
     "interlock.outbox_trace(bytea, text)",
     "interlock.inbox_pending_traces(text)",
+    "interlock.outbox_turn_hold(bytea, uuid, text)",
 )
 
 _OUTBOX_TABLES: Final = (
@@ -977,6 +978,7 @@ class PostgresSubstrate:
         "_tables",
         "_token",
         "_traceparent",
+        "_turn",
         "_xid",
     )
 
@@ -1112,6 +1114,7 @@ class PostgresSubstrate:
         self._facts: tuple[uuid.UUID, ...] = ()
         self._traceparent: str | None = None
         self._enqueued = 0
+        self._turn: str | None = None
 
     def transaction_id(self, handle: StageHandle) -> str | None:
         """The stage's ``pg_current_xact_id()``, for the commit intent."""
@@ -1238,6 +1241,7 @@ class PostgresSubstrate:
         self._reset_outbound()
         self._token = token
         self._scope = plan.scope_id
+        self._turn = plan.turn
         self._traceparent = plan.traceparent
         return handle
 
@@ -1302,13 +1306,14 @@ class PostgresSubstrate:
             if request.compensation is None
             else canonical_bytes(request.compensation.to_json()).decode("utf-8")
         )
+        message_id = uuid.uuid4()
         try:
             conn.execute(self._timeouts())
             conn.execute(
                 f"SELECT {_ENQUEUE_CALL}",
                 (
                     self._token,
-                    uuid.uuid4(),
+                    message_id,
                     effect.effect_id,
                     self._order.next_seq(),
                     sorted(self._order.waits_for(effect.depends_on)),
@@ -1323,6 +1328,17 @@ class PostgresSubstrate:
                     self._scope,
                 ),
             )
+            if self._turn is not None:
+                # It waits for its turn (1.9.0), in this same transaction.
+                conn.execute(
+                    "SELECT interlock.outbox_turn_hold(%s, %s, %s)",
+                    (self._token, message_id, self._turn),
+                )
+        except psycopg.errors.UndefinedFunction as exc:
+            raise SubstrateConfigurationError(
+                f"effect {effect.effect_id!r} is part of turn {self._turn}, and Interlock in "
+                f"this database predates turns: run `interlock install` (1.9.0) to add them"
+            ) from exc
         except psycopg.Error as exc:
             raise self._enqueue_error(effect, exc) from exc
         self._enqueued += 1

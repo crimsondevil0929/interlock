@@ -30,6 +30,7 @@ from agentgov.receipts.canonical import loads_strict
 
 from interlock.exceptions import OutboundRequestError
 from interlock.text import tally
+from interlock.types import TURN_HELD
 
 if TYPE_CHECKING:
     import psycopg
@@ -572,7 +573,12 @@ class OutboxOperations(OutboxReader, Protocol):
         ...
 
     def held(self, scope_id: str) -> list[uuid.UUID]:
-        """The held messages of a scope, oldest first."""
+        """The held messages of a scope, oldest first: those a warrant or the
+        breaker holds, not those waiting for their turn (1.9.0)."""
+        ...
+
+    def turn_held(self, turn: str | None = None) -> dict[str, list[uuid.UUID]]:
+        """The messages held for their turn, by turn, oldest first (1.9.0)."""
         ...
 
     def plan_of(self, message_id: uuid.UUID) -> str | None: ...
@@ -880,10 +886,23 @@ class PostgresReader:
             for r in self._conn.execute(
                 "SELECT o.message_id FROM interlock.outbox o "
                 "JOIN interlock.outbox_state s USING (message_id) "
-                "WHERE o.scope_id = %s AND s.state = 'held' ORDER BY o.enqueued_at, o.seq",
-                (scope_id,),
+                "WHERE o.scope_id = %s AND s.state = 'held' "
+                "AND coalesce(s.reason, '') NOT LIKE %s ORDER BY o.enqueued_at, o.seq",
+                (scope_id, TURN_HELD + "%"),
             )
         ]
+
+    def turn_held(self, turn: str | None = None) -> dict[str, list[uuid.UUID]]:
+        found: dict[str, list[uuid.UUID]] = {}
+        for message, reason in self._conn.execute(
+            "SELECT o.message_id, s.reason FROM interlock.outbox o "
+            "JOIN interlock.outbox_state s USING (message_id) "
+            "WHERE s.state = 'held' AND (s.reason LIKE %s AND %s::text IS NULL OR s.reason = %s) "
+            "ORDER BY o.enqueued_at, o.seq",
+            (TURN_HELD + "%", turn, TURN_HELD + (turn or "")),
+        ):
+            found.setdefault(str(reason)[len(TURN_HELD) :], []).append(message)
+        return found
 
     def plan_of(self, message_id: uuid.UUID) -> str | None:
         row = self._conn.execute(

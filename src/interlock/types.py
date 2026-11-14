@@ -470,6 +470,12 @@ class Effect:
 PROVENANCE_LABEL: Final = re.compile(r"[a-z][a-z0-9_.:=-]{0,95}")
 """A provenance label (1.8.0): ``untrusted``, ``secret``, ``partition:tenant=acme``."""
 
+TURN_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+"""A turn's id (1.9.0): the plans of one agent turn share it."""
+TURN_HELD: Final = "held for turn "
+"""The reason a request held for its turn carries, followed by the turn's id: what
+tells it from one held for a warrant."""
+
 
 @dataclass(frozen=True, slots=True)
 class EffectPlan:
@@ -515,7 +521,19 @@ class EffectPlan:
     hash when there are any, so a receipt's plan hash binds them; a plan with none hashes
     as it always has."""
 
+    turn: str | None = None
+    """The agent turn this plan is part of (1.9.0). Its outbound requests enter the
+    outbox held for the turn (:data:`TURN_HELD`), sent only once every plan of the
+    turn has committed, and cancelled when one has not, so a request is never made
+    for a turn that failed after it. In the plan's hash when set."""
+
     def __post_init__(self) -> None:
+        if self.turn is not None and not (
+            isinstance(self.turn, str) and TURN_ID.fullmatch(self.turn)
+        ):
+            raise ValueError(
+                f"turn {self.turn!r} is not letters, digits and '._:-', at most 128 characters"
+            )
         for label in self.provenance:
             if not isinstance(label, str) or not PROVENANCE_LABEL.fullmatch(label):
                 raise ValueError(
@@ -586,6 +604,9 @@ class EffectPlan:
         # And what its session had read (1.8.0).
         if self.provenance:
             fields.append(["provenance", list(self.provenance)])
+        # And the turn it is part of (1.9.0).
+        if self.turn is not None:
+            fields.append(["turn", self.turn])
         return canonical_hash(fields)
 
 

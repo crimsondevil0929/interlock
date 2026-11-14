@@ -9,6 +9,51 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.9.0] - Unreleased
+
+A turn of an agent makes several calls, and the requests they enqueue now wait for the turn.
+An MCP proxy can make a write and give the agent the server's own answer in the same call.
+And the MCP client speaks the 2026-07-28 revision, with its fallback for older servers.
+
+### Added
+
+- **Turns.** `EffectPlan.turn` (`PlanBuilder(turn=)`, `EscrowEngine.stage(..., turn=)`): every
+  request of a plan with a turn, that no warrant holds, enters the outbox held for the turn,
+  in the stage's own transaction (`held for turn <id>`, on SQLite and PostgreSQL alike).
+  `Operator.release_turn` sends them once every plan of the turn has committed;
+  `Operator.cancel_turn` cancels them, so a request is never made for a turn that failed
+  after it. Both act under one signed intent, as any operator action does. `turn_held(turn)`
+  lists a turn's requests; `held(scope)` no longer lists them, so nothing raises a ticket for
+  a request that only waits for its turn. The turn is in the plan's hash when set; a plan
+  without one hashes as before.
+- **`Relay.deliver(message_id)`**: one committed request delivered now, in the caller's
+  process, through the same claim, breaker, call record and signed outcome as any relay, so it
+  and a relay elsewhere never both make it. It returns `Delivered`: the state, and what the
+  sink answered, with the response body (`DeliveryResult.body`), which is kept in memory for
+  the caller alone and never stored, logged or attested. The stores here implement the reads
+  it needs (`ReadableOutboxStore.state_of`, `due_in`).
+- **MCP 2026-07-28.** `interlock.mcp.handshake` probes a server with `server/discover` and
+  falls back to `initialize` for a server that does not answer it (restarting one the probe
+  stopped); a modern server is sent its revision, the client's capabilities and its name in
+  every request's `_meta` (`Era`). `initialize` now asks for 2025-11-25. An `input_required`
+  result is not a delivery.
+- **Number arguments.** `decimals` and `numbers_on_the_wire`: an MCP write's number arguments
+  are recorded as decimal strings, so no float is hashed, and sent as numbers
+  (`McpAdapter(numbers=)`, `numbers = {...}` on an `mcp` relay endpoint).
+- Spec section 4.10 (E4-28 to E4-33).
+
+### Fixed
+
+- A file claim released by its finalizer while the interpreter shuts down no longer prints
+  "Exception ignored ... sys.meta_path is None": `fcntl` (`msvcrt` on Windows) is imported
+  once, with the module, not inside the release.
+
+### Upgrading
+
+- On PostgreSQL, `interlock install` adds `interlock.outbox_turn_hold`. Only a plan with a turn
+  needs it; one on a database installed before 1.9.0 is refused with that instruction, and
+  every other plan stages as before.
+
 ## [1.8.0] - 2026-11-13
 
 What the session read before the plan. A refund within an agent's cap is still the wrong
