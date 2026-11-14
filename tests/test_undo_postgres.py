@@ -89,4 +89,7 @@ def test_an_installation_before_undo_is_named(pg: Pg) -> None:
     with pytest.raises(SubstrateConfigurationError, match="run `interlock install`"):
         EscrowEngine(sub, checkers=[]).execute(mistake())
     assert rows(pg.admin) == before
+    with psycopg.connect(pg.admin) as conn:
+        conn.execute("DROP FUNCTION interlock.undo_images_of(text)")
     assert PostgresSubstrate(pg.agent, tables=specs(*OBSERVED), undo=WEEK).kept("x") is None
+    assert PostgresSubstrate(pg.agent, tables=specs(*OBSERVED)).kept("x") is None

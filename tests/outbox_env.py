@@ -152,12 +152,13 @@ NO_INBOX: dict[str, Any] = {
                 "interlock.stage_facts",
                 "interlock.outbox_trace",
                 "interlock.outbox_turn_hold",
+                "interlock.undo_",
             )
         )
     ),
 }
 """What an install by a version before the inbox (5), and so before trace
-context (6) and turns (1.9.0), leaves out, patched over the current installer
+context (6), turns (1.9.0) and undo (1.10.0), leaves out, patched over the current installer
 with that version's own SQL (``tests/outbox_v2.py``...)."""
 
 
