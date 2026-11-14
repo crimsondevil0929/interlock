@@ -287,6 +287,14 @@ def test_an_unsupported_version_error_is_a_modern_server_not_a_fallback() -> Non
         handshake(request, lambda _: None, _client(), timeout=1.0)
 
 
+def test_a_probe_answered_with_no_revisions_is_an_older_server() -> None:
+    request, sent = _server(
+        {"server/discover": {}, "initialize": {"protocolVersion": "2025-03-26"}}
+    )
+    assert handshake(request, lambda _: None, _client(), timeout=1.0) == Era("2025-03-26", False)
+    assert [m for m, _ in sent] == ["server/discover", "initialize"]
+
+
 @pytest.mark.parametrize(
     "probe",
     [

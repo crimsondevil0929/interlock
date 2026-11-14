@@ -208,7 +208,9 @@ def handshake(
         except McpCallError as exc:
             if not exc.sent:
                 raise
-    if found is not None:
+    # A result with no list of revisions is no DiscoverResult: an older server that answers
+    # whatever it is sent. It is spoken to as one.
+    if found is not None and isinstance(found.get("supportedVersions"), list):
         return _modern(found.get("supportedVersions"))
     answer = request(
         "initialize",
