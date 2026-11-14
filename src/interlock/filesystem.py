@@ -108,6 +108,7 @@ from interlock.exceptions import (
     StageExpiredError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
+    UndoError,
 )
 from interlock.git_substrate import GitHook, PathClass, glob_match, path_problem, secret_markers
 from interlock.substrate import SqliteSubstrate, TableSpec
@@ -116,6 +117,7 @@ from interlock.types import (
     CommitReceipt,
     Effect,
     EffectDiff,
+    EffectId,
     EffectKind,
     EffectOutcome,
     EffectPlan,
@@ -126,6 +128,7 @@ from interlock.types import (
     SubstrateCapabilities,
     WindowMeasure,
 )
+from interlock.undo import Kept
 from interlock.windows import WindowCharge
 
 if TYPE_CHECKING:
@@ -288,6 +291,18 @@ _COMMITS: Final = "commits"
 _STAGES: Final = "stages"
 _LOCK: Final = "lock"
 _PARENTS: Final = "parents"
+_UNDO: Final = "undo"
+UNDO_FIELDS: Final = ("sha256", "mode", "bytes")
+"""What a file is, for an undo: its content, mode and size (1.10.0)."""
+
+
+def _undo_name(plan_id: str) -> str:
+    """A plan's directory under ``undo/``: its id, or its digest when the id is no file name."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", plan_id):
+        return plan_id
+    return hashlib.sha256(plan_id.encode("utf-8")).hexdigest()
+
+
 _SESSIONS: Final = "sessions"
 
 
@@ -611,6 +626,8 @@ class _Stage:
     keep: bool = False
     """A session's stage (1.7.0): its copy is the session's, kept when the plan is refused."""
     committed: bool = False
+    keeping: Path | None = None
+    """What undoes the stage, written before its commit and made the plan's after it (1.10.0)."""
 
 
 class FilesystemSubstrate:
@@ -655,6 +672,7 @@ class FilesystemSubstrate:
         "_stage",
         "_stage_seconds",
         "_state",
+        "_undo",
         "_versions",
         "_workspace",
     )
@@ -679,7 +697,14 @@ class FilesystemSubstrate:
         max_bytes: int = 256 * 1024 * 1024,
         max_file_bytes: int = 4 * 1024 * 1024,
         max_scan_bytes: int = 1024 * 1024,
+        undo: timedelta | None = None,
     ) -> None:
+        """:param undo: Keep each commit's file images, and the content of every file it
+        changed or removed, in the state directory beside the workspace (``undo/``), for
+        this long, so the plan can be undone (1.10.0). ``None`` keeps nothing."""
+        if undo is not None and undo <= timedelta(0):
+            raise ValueError("an undo window is a positive time")
+        self._undo = undo
         if fcntl is None:  # pragma: no cover - Windows
             raise SubstrateConfigurationError(
                 "the filesystem substrate needs POSIX file locks (fcntl), which this platform "
@@ -1201,6 +1226,182 @@ class FilesystemSubstrate:
             "secret_markers": markers,
         }
 
+    # -- undo (1.10.0) ------------------------------------------------------------------
+
+    @property
+    def keeps_undo(self) -> bool:
+        """Whether each commit keeps what undoes it (``undo=``)."""
+        return self._undo is not None
+
+    def undo_fields(self) -> dict[str, tuple[str, ...]]:
+        """A file is its content, mode and size: its line counts describe a change."""
+        return {name: UNDO_FIELDS for name in self._by_name}
+
+    def keep(self, handle: StageHandle, changes: Sequence[RowDelta], key: bytes) -> None:
+        """Copy the content each change replaces or removes out of the stage's base, beside
+        the workspace, before the commit overwrites it; the commit makes it the plan's."""
+        stage = self._require(handle)
+        if self._undo is None:
+            return
+        root = self._state / _UNDO
+        self._purge_undo(root)
+        pending = root / f".{handle.stage_id}"
+        blobs = pending / "blobs"
+        blobs.mkdir(parents=True, exist_ok=True)
+        for change in changes:
+            if change.before is None or change.before.get("mode") == LINK:
+                continue
+            target = blobs / str(change.before["sha256"])
+            if not target.exists():
+                shutil.copyfile(stage.base_tree / change.id, target)
+        (pending / "kept.json").write_text(
+            json.dumps(
+                {
+                    "plan_id": str(handle.plan_id),
+                    "key": key.hex(),
+                    "changes": [
+                        {
+                            "kind": c.kind,
+                            "id": c.id,
+                            "before": c.before,
+                            "after": c.after,
+                            "tenant": c.tenant_id,
+                        }
+                        for c in changes
+                    ],
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        stage.keeping = pending
+
+    def _kept_committed(self, stage: _Stage, committed_at: datetime) -> None:
+        if stage.keeping is None or self._undo is None:
+            return
+        record = json.loads((stage.keeping / "kept.json").read_text(encoding="utf-8"))
+        record["committed_at"] = committed_at.isoformat()
+        record["expires_at"] = (committed_at + self._undo).isoformat()
+        (stage.keeping / "kept.json").write_text(json.dumps(record, sort_keys=True))
+        final = stage.keeping.parent / _undo_name(str(stage.handle.plan_id))
+        shutil.rmtree(final, ignore_errors=True)
+        os.replace(stage.keeping, final)
+        stage.keeping = None
+
+    def _purge_undo(self, root: Path) -> None:
+        """Delete what is past its window, and what a stage that never committed left."""
+        if not root.is_dir():
+            return
+        now = datetime.now(UTC)
+        for entry in root.iterdir():
+            try:
+                record = json.loads((entry / "kept.json").read_text(encoding="utf-8"))
+                gone = datetime.fromisoformat(record["expires_at"]) <= now
+            except (OSError, ValueError, KeyError):
+                gone = entry.name.startswith(".") and (
+                    now - datetime.fromtimestamp(entry.stat().st_mtime, UTC)
+                ) > timedelta(hours=1)
+            if gone:
+                shutil.rmtree(entry, ignore_errors=True)
+
+    def kept(self, plan_id: str) -> Kept | None:
+        """What the commit of ``plan_id`` kept, if it is still within the window."""
+        if self._undo is None:
+            return None
+        where = self._state / _UNDO / _undo_name(plan_id)
+        try:
+            record = json.loads((where / "kept.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        expires = datetime.fromisoformat(record["expires_at"])
+        if expires <= datetime.now(UTC):
+            return None
+        return Kept(
+            plan_id=plan_id,
+            substrate_id=self.substrate_id,
+            changes=tuple(
+                RowDelta(
+                    table=c["kind"],
+                    primary_key=c["id"],
+                    before=c["before"],
+                    after=c["after"],
+                    tenant_id=c["tenant"],
+                )
+                for c in record["changes"]
+            ),
+            key=bytes.fromhex(record["key"]),
+            committed_at=datetime.fromisoformat(record["committed_at"]),
+            expires_at=expires,
+            fields=self.undo_fields(),
+            payload={"blobs": str(where / "blobs")},
+        )
+
+    def inverse(self, kept: Kept) -> list[Effect]:
+        """Statements that put each file back, latest first. A file the workspace no longer
+        holds as the plan left it gets none: the undo's measurement then lacks it, and the
+        whole undo is refused, naming it.
+
+        :raises UndoError: For what the statement language cannot write back: a symbolic
+            link, a file that is not UTF-8 text, a mode outside :data:`MODES`.
+        """
+        blobs = Path(str(kept.payload["blobs"]))
+        effects: list[Effect] = []
+
+        def add(statement: str, **parameters: str) -> None:
+            n = len(effects) + 1
+            effects.append(
+                Effect(
+                    effect_id=EffectId(f"undo-{n:05d}"),
+                    kind=EffectKind.APPLY,
+                    target=f"{self.substrate_id}:{kind}",
+                    statement=statement,
+                    parameters=parameters,
+                    depends_on=(EffectId(f"undo-{n - 1:05d}"),) if n > 1 else (),
+                    tenant_id=tenant,
+                )
+            )
+
+        for change in reversed(kept.changes):
+            kind, path, tenant = change.kind, change.id, change.tenant_id
+            if not self._as_left(path, change.after):
+                continue
+            before = change.before
+            if before is None:
+                add("delete :path", path=path)
+                continue
+            if before["mode"] == LINK:
+                raise UndoError(f"{path} was a symbolic link: an undo cannot write one back")
+            if before["mode"] not in MODES:
+                raise UndoError(f"{path} had mode {before['mode']}, which an undo cannot set")
+            after = change.after
+            if after is None or after["sha256"] != before["sha256"]:
+                try:
+                    text = (blobs / str(before["sha256"])).read_bytes().decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise UndoError(
+                        f"{path} is not UTF-8 text: an undo cannot write it back"
+                    ) from exc
+                except OSError as exc:
+                    raise UndoError(f"the kept content of {path} cannot be read: {exc}") from exc
+                add("write :path :text", path=path, text=text)
+            if after is None or after["mode"] != before["mode"]:
+                add("mode :path :mode", path=path, mode=str(before["mode"]))
+        return effects
+
+    def _as_left(self, path: str, after: Mapping[str, Any] | None) -> bool:
+        """Whether the workspace holds ``path`` as an image left it (``None``: no file)."""
+        try:
+            found = _entry(self._root / path)
+        except StageError:
+            return False
+        if after is None:
+            return found is None
+        return found is not None and (found.sha256, found.mode, found.size) == (
+            after["sha256"],
+            after["mode"],
+            after["bytes"],
+        )
+
     # -- the control database -------------------------------------------------------
 
     def _control_stage(self, stage: _Stage) -> StageHandle:
@@ -1306,6 +1507,7 @@ class FilesystemSubstrate:
         self._journal_path(handle.stage_id).unlink(missing_ok=True)
         stage.done = True
         stage.committed = True
+        self._kept_committed(stage, committed_at)
         return CommitReceipt(
             stage_id=handle.stage_id,
             plan_id=handle.plan_id,

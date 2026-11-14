@@ -41,6 +41,7 @@ __all__ = [
     "SupervisorStoppedError",
     "ToolRevokedError",
     "UncompensatableEffectError",
+    "UndoError",
 ]
 
 
@@ -117,6 +118,11 @@ class UncompensatableEffectError(PlanError):
     Raised at admission, not at commit: the undo has to exist before the effect
     is staged.
     """
+
+
+class UndoError(PlanError):
+    """A plan cannot be undone here (1.10.0): its substrate keeps no undo, or kept none of
+    it (another substrate's plan, one that changed nothing, one older than the window)."""
 
 
 class OutboundRequestError(PlanError):

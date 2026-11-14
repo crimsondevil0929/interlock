@@ -107,12 +107,14 @@ def open_substrate(
             acknowledge_cascades=config.acknowledge_cascades,
             metrics=metrics,
             application_name=application_name,
+            undo=config.undo,
         )
     return SqliteSubstrate(
         dsn,
         tables=config.tables,
         max_stage_seconds=config.engine.max_stage_seconds,
         acknowledge_cascades=config.acknowledge_cascades,
+        undo=config.undo,
     )
 
 
@@ -138,6 +140,7 @@ def open_git(config: InterlockConfig, *, control: str | None = None) -> GitSubst
         max_file_bytes=settings.max_file_bytes,
         max_scan_bytes=settings.max_scan_bytes,
         checked_out=settings.checked_out,
+        undo=config.undo,
     )
 
 
@@ -182,6 +185,7 @@ def open_fhir(config: InterlockConfig, *, control: str | None = None) -> FhirSub
         control=control if control is not None else (config.database or None),
         timeout=settings.timeout_seconds,
         max_stage_seconds=config.engine.max_stage_seconds,
+        undo=config.undo,
     )
 
 
@@ -212,6 +216,7 @@ def open_filesystem(config: InterlockConfig, *, control: str | None = None) -> F
         max_bytes=settings.max_bytes,
         max_file_bytes=settings.max_file_bytes,
         max_scan_bytes=settings.max_scan_bytes,
+        undo=config.undo,
     )
 
 
@@ -236,6 +241,7 @@ def open_rest(config: InterlockConfig, *, control: str | None = None) -> RestSub
         max_stage_seconds=config.engine.max_stage_seconds,
         max_response_bytes=settings.max_response_bytes,
         max_pages=settings.max_pages,
+        undo=config.undo,
     )
 
 

@@ -111,6 +111,7 @@ from interlock.exceptions import (
     StageExpiredError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
+    UndoError,
 )
 from interlock.planbound import UndoJournal
 from interlock.predicted import PREDICTED, Settlement
@@ -118,8 +119,10 @@ from interlock.substrate import SqliteSubstrate, TableSpec
 from interlock.text import tally
 from interlock.types import (
     CommitReceipt,
+    Compensation,
     Effect,
     EffectDiff,
+    EffectId,
     EffectKind,
     EffectOutcome,
     EffectPlan,
@@ -130,6 +133,7 @@ from interlock.types import (
     SubstrateCapabilities,
     WindowMeasure,
 )
+from interlock.undo import Kept, KeptRecords, template_literal
 from interlock.windows import WindowCharge
 
 __all__ = [
@@ -241,6 +245,11 @@ def _reference_id(value: Any) -> str | None:
 def fingerprint(resource: Mapping[str, Any]) -> str:
     """A digest of the resource less its bookkeeping: its version, when it
     was updated, the stage's tag, and its generated narrative."""
+    return hashlib.sha256(canonical_bytes(_canonical_safe(_bare(resource)))).hexdigest()
+
+
+def _bare(resource: Mapping[str, Any]) -> dict[str, Any]:
+    """The resource less its bookkeeping (:func:`fingerprint`)."""
     body = copy.deepcopy(dict(resource))
     body.pop("text", None)
     meta = dict(body.get("meta") or {})
@@ -259,7 +268,7 @@ def fingerprint(resource: Mapping[str, Any]) -> str:
         body["meta"] = meta
     else:
         body.pop("meta", None)
-    return hashlib.sha256(canonical_bytes(_canonical_safe(body))).hexdigest()
+    return body
 
 
 def _canonical_safe(value: Any) -> Any:
@@ -774,6 +783,8 @@ class _Stage:
     sent: bool = False
     """A write of the commit has gone out: from here its outcome is never
     assumed."""
+    keeping: Path | None = None
+    """What undoes the stage, written before its commit (1.10.0)."""
 
 
 class FhirSubstrate:
@@ -804,6 +815,7 @@ class FhirSubstrate:
         "_stage",
         "_stage_seconds",
         "_types",
+        "_undo",
         "_undone",
     )
 
@@ -820,7 +832,14 @@ class FhirSubstrate:
         timeout: float = 15.0,
         max_stage_seconds: float = 120.0,
         max_diff_rows: int = 50_000,
+        undo: timedelta | None = None,
     ) -> None:
+        """:param undo: Keep each commit's before images, each changed resource whole,
+        beside the undo journal (``kept/``) for this long, so the plan can be undone
+        (1.10.0). ``None`` keeps nothing."""
+        if undo is not None and undo <= timedelta(0):
+            raise ValueError("an undo window is a positive time")
+        self._undo = undo
         tables = [t.table for t in types]
         if not tables:
             raise SubstrateConfigurationError("a FHIR substrate observes at least one type")
@@ -1338,14 +1357,143 @@ class FhirSubstrate:
         redo.unlink(missing_ok=True)
         stage.committing = False
         stage.done = True
+        committed_at = datetime.now(UTC)
+        if stage.keeping is not None and self._undo is not None:
+            self._kept_records().commit(
+                stage.keeping, str(handle.plan_id), committed_at, self._undo
+            )
+            stage.keeping = None
         return CommitReceipt(
             stage_id=handle.stage_id,
             plan_id=handle.plan_id,
-            committed_at=datetime.now(UTC),
+            committed_at=committed_at,
             diff_hash="",
             verdict_hash="",
             substrate_txn_id=f"fhir:{handle.stage_id}" if writes else None,
         )
+
+    # -- undo (1.10.0) ----------------------------------------------------------------
+
+    @property
+    def keeps_undo(self) -> bool:
+        """Whether each commit keeps what undoes it (``undo=``)."""
+        return self._undo is not None
+
+    def undo_fields(self) -> dict[str, tuple[str, ...]]:
+        """Every column of a resource's image, its fingerprint among them, is its state."""
+        return {}
+
+    def _kept_records(self) -> KeptRecords:
+        return KeptRecords(self._journal.directory / "kept")
+
+    def keep(self, handle: StageHandle, changes: Sequence[RowDelta], key: bytes) -> None:
+        """Keep ``changes``, and each changed resource whole as the stage read it, for the
+        commit to make the plan's."""
+        stage = self._require(handle)
+        if self._undo is None:
+            return
+        stage.keeping = self._kept_records().pending(
+            str(handle.stage_id),
+            {
+                "plan_id": str(handle.plan_id),
+                "key": key.hex(),
+                "changes": [
+                    {
+                        "kind": c.kind,
+                        "id": c.id,
+                        "before": c.before,
+                        "after": c.after,
+                        "tenant": c.tenant_id,
+                        "partitions": dict(c.partitions),
+                    }
+                    for c in changes
+                ],
+                "bodies": {
+                    f"{t}/{i}": obj.live
+                    for (t, i), obj in stage.resources.items()
+                    if obj.live is not None
+                },
+            },
+        )
+
+    def kept(self, plan_id: str) -> Kept | None:
+        """What the commit of ``plan_id`` kept, if it is still within the window."""
+        record = self._kept_records().read(plan_id) if self._undo is not None else None
+        if record is None:
+            return None
+        return Kept(
+            plan_id=plan_id,
+            substrate_id=self.substrate_id,
+            changes=tuple(
+                RowDelta(
+                    table=c["kind"],
+                    primary_key=c["id"],
+                    before=c["before"],
+                    after=c["after"],
+                    tenant_id=c["tenant"],
+                    partitions=c["partitions"],
+                )
+                for c in record["changes"]
+            ),
+            key=bytes.fromhex(record["key"]),
+            committed_at=datetime.fromisoformat(record["committed_at"]),
+            expires_at=datetime.fromisoformat(record["expires_at"]),
+            payload={"bodies": record["bodies"]},
+        )
+
+    def inverse(self, kept: Kept) -> list[Effect]:
+        """A merge patch for each resource, latest first, from what the server holds now back
+        to the resource the plan found, its bookkeeping (version, narrative, the stage's tag)
+        left alone. A resource the server no longer holds as the plan left it gets none: the
+        undo's measurement then lacks it, and the whole undo is refused, naming it.
+
+        :raises UndoError: For a resource the plan created: a clinical record is voided
+            (``entered-in-error``), never deleted, and void is not the state before.
+        """
+        from interlock.rest import _sets_null, merge_diff
+
+        bodies: Mapping[str, Any] = kept.payload["bodies"]
+        effects: list[Effect] = []
+        for change in reversed(kept.changes):
+            kind = self._types.get(change.kind)
+            if kind is None:
+                raise UndoError(f"{change.kind} is no resource type observed here")
+            if change.before is None:
+                raise UndoError(
+                    f"plan {kept.plan_id} created {kind.resource_type} {change.id}: a clinical "
+                    f"record is voided, never deleted, and void is not the state before. "
+                    f"Void it with its compensation instead"
+                )
+            current = self._api.read(kind.resource_type, change.id)
+            if current is None or change.after is None:
+                continue
+            if fingerprint(current) != change.after.get(FINGERPRINT):
+                continue
+            target = _bare(bodies[f"{change.kind}/{change.id}"])
+            if _sets_null(target):
+                raise UndoError(
+                    f"{kind.resource_type} {change.id} held a null field, which a merge patch "
+                    f"cannot write back"
+                )
+            patch = merge_diff(_bare(current), target)
+            try:
+                literal = template_literal(patch)
+            except ValueError as exc:
+                raise UndoError(f"{kind.resource_type} {change.id}: {exc}") from exc
+            n = len(effects) + 1
+            effects.append(
+                Effect(
+                    effect_id=EffectId(f"undo-{n:05d}"),
+                    kind=EffectKind.UPDATE,
+                    target=f"{self.substrate_id}:{change.kind}",
+                    statement=f"patch {change.kind} :id {literal}",
+                    parameters={"id": change.id},
+                    depends_on=(EffectId(f"undo-{n - 1:05d}"),) if n > 1 else (),
+                    tenant_id=change.tenant_id,
+                    compensation=Compensation(f"restore {change.kind}"),
+                )
+            )
+        return effects
 
     def _leave_unsettled(self, stage: _Stage) -> None:
         """Mark the stage unsettled, and let go of the control database: its
