@@ -43,7 +43,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
@@ -54,7 +54,7 @@ from agentgov.receipts.signing import Signer
 
 from interlock.anchor import _halted, _head
 from interlock.exceptions import KeyRevokedError, SubstrateUnavailableError
-from interlock.outbox_store import OutboxStore, PostgresOutboxStore
+from interlock.outbox_store import OutboxStore, PostgresOutboxStore, ReadableOutboxStore
 from interlock.telemetry import Metrics, NullMetrics
 
 if TYPE_CHECKING:
@@ -67,6 +67,7 @@ __all__ = [
     "UNKNOWN",
     "Breaker",
     "BreakerReading",
+    "Delivered",
     "Delivery",
     "DeliveryResult",
     "Lease",
@@ -149,6 +150,10 @@ class DeliveryResult:
     :ivar remote_ref: The id of what a delivered call created (a Stripe
         payment intent's ``pi_...``), recorded in the delivery log: what a
         compensation is bound to.
+    :ivar body: The response body itself (1.9.0), for the caller of
+        :meth:`Relay.deliver` alone: held in memory for the one call that asked,
+        never stored, never logged and in no attestation. ``response_digest``
+        is what the delivery log keeps of it.
     """
 
     outcome: str
@@ -157,6 +162,7 @@ class DeliveryResult:
     detail: str = ""
     retry_after: float | None = None
     remote_ref: str | None = None
+    body: bytes | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.outcome not in _OUTCOMES:
@@ -398,6 +404,30 @@ class RelayReport:
         return replace(self, **{field_: getattr(self, field_) + 1})
 
 
+@dataclass(frozen=True, slots=True)
+class Delivered:
+    """What :meth:`Relay.deliver` found when it returned (1.9.0).
+
+    :ivar state: The message's delivery state: ``delivered``; ``pending`` (a
+        retry is scheduled, or another relay has not finished); ``leased``
+        (another relay holds it); ``held`` (it waits for a warrant, or for its
+        turn); ``dead`` or ``cancelled``; ``unknown`` when the store has no
+        such message.
+    :ivar result: What the sink answered, when this relay made the call: its
+        :attr:`DeliveryResult.body` is the response. ``None`` when another
+        relay made it, or nobody has yet.
+    """
+
+    message_id: uuid.UUID
+    state: str
+    result: DeliveryResult | None = None
+    reason: str | None = None
+
+    @property
+    def delivered(self) -> bool:
+        return self.state == DELIVERED
+
+
 class Relay:
     """Delivers committed outbound requests, at least once (see the module).
 
@@ -447,6 +477,7 @@ class Relay:
         "_signer",
         "_store",
         "_timeout",
+        "_watch",
         "metrics",
     )
 
@@ -494,6 +525,7 @@ class Relay:
         self._store.checkpoint = self._reached
         self.metrics: Metrics = metrics if metrics is not None else NullMetrics()
         """What the relay measures into (:mod:`interlock.telemetry`)."""
+        self._watch: dict[uuid.UUID, DeliveryResult] | None = None
 
     @property
     def relay_id(self) -> str:
@@ -562,6 +594,67 @@ class Relay:
             if report.claimed == 0:
                 stop.wait(poll)
         return total
+
+    def deliver(
+        self,
+        message_id: uuid.UUID,
+        *,
+        wait: timedelta = timedelta(seconds=30),
+        poll: float = 0.05,
+    ) -> Delivered:
+        """Deliver one committed message now, in this process, and say what the
+        sink answered (1.9.0).
+
+        For a caller that commits a plan and wants its request's answer in the
+        same call: an MCP proxy whose agent expects the tool's result. The
+        message is delivered as any relay delivers it, through the same claim,
+        breaker, call record and signed outcome, so a relay running elsewhere
+        and this call never both make it: whichever claims it first does, and
+        the other finds it leased or delivered. Whatever else is due for this
+        relay's sinks is delivered on the way, in the order a claim takes it.
+
+        Returns once the message is delivered, dead, cancelled or held, once
+        this relay's call has an answer that is not a success and no retry is
+        due within ``wait``, or when ``wait`` runs out.
+
+        :raises ValueError: If the message is for a sink this relay has no
+            adapter for: it could never claim it.
+        :raises SubstrateUnavailableError: If the database is lost.
+        """
+        store = self._store
+        if not isinstance(store, ReadableOutboxStore):
+            raise TypeError(f"{type(store).__name__} cannot say where one message stands")
+        reading = store.state_of(message_id)
+        if reading is None:
+            return Delivered(message_id, "unknown", reason="no such message in the outbox")
+        state, reason, sink = reading
+        if sink not in self._adapters:
+            raise ValueError(
+                f"message {message_id} is for sink {sink!r}, which this relay has no adapter for"
+            )
+        deadline = time.monotonic() + wait.total_seconds()
+        self._watch = {}
+        try:
+            while True:
+                if state in (DELIVERED, "dead", "cancelled", HELD):
+                    return Delivered(message_id, state, self._watch.get(message_id), reason)
+                answered = self._watch.get(message_id)
+                if answered is not None and answered.outcome != DELIVERED:
+                    # A retry is scheduled: wait for it only if it falls due in time.
+                    due_in = store.due_in(message_id)
+                    if due_in is None or time.monotonic() + due_in > deadline:
+                        return Delivered(message_id, state, answered, reason)
+                if time.monotonic() >= deadline:
+                    return Delivered(message_id, state, answered, reason)
+                report = self.run_once()
+                reading = store.state_of(message_id)
+                if reading is None:  # compacted away: it was settled
+                    return Delivered(message_id, DELIVERED, self._watch.get(message_id))
+                state, reason, _ = reading
+                if report.claimed == 0 and state not in (DELIVERED, "dead", "cancelled", HELD):
+                    time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+        finally:
+            self._watch = None
 
     # -- one message -----------------------------------------------------------
 
@@ -644,6 +737,8 @@ class Relay:
         )
         self.metrics.inc("interlock_deliveries_total", sink=lease.sink, outcome=result.outcome)
         self._reached("called", lease)
+        if self._watch is not None:
+            self._watch[lease.message_id] = result
         delay = (
             retry_delay(
                 attempt - lease.attempt_floor,

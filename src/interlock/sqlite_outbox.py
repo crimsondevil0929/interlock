@@ -83,7 +83,7 @@ from interlock.inbox_sql import (
 )
 from interlock.outbound import bind, placeholders, typed_sink
 from interlock.outbox_store import Checkpoint, milliseconds
-from interlock.types import InboundFact, OutboundDelta, _frozen
+from interlock.types import TURN_HELD, TURN_ID, InboundFact, OutboundDelta, _frozen
 
 if TYPE_CHECKING:
     from interlock.inbox import DeliveredRef, InboundEvent, InboundSource
@@ -886,9 +886,14 @@ def enqueue(
     seq: int,
     waits_for: Iterable[str],
     idempotency_key: str,
+    turn: str | None = None,
 ) -> uuid.UUID:
     """Write one request, its delivery state and its log's genesis, inside the
     stage's transaction: it commits with the stage's marker, or not at all.
+
+    With ``turn`` (1.9.0), a request no warrant holds enters the outbox held for
+    the turn: sent only once an operator releases it, which a caller does when
+    every plan of the turn has committed, and cancelled when one has not.
 
     The sink, the operation, the size and the hash are checked against this
     file's own registry, as PostgreSQL's ``enqueue`` checks its own; the price
@@ -1030,6 +1035,23 @@ def enqueue(
         conn.execute(
             f"UPDATE {STATE} SET state = 'held', reason = ? WHERE message_id = ?",
             ("held for a warrant", str(message_id)),
+        )
+    elif turn is not None:
+        if not TURN_ID.fullmatch(turn):
+            raise ValueError(f"{turn!r} is not a turn id")
+        register(conn)
+        _append_log(
+            conn,
+            str(message_id),
+            None,
+            "held",
+            "outbox",
+            state_after="held",
+            detail=f"waits for turn {turn}: sent only once every plan of the turn has committed",
+        )
+        conn.execute(
+            f"UPDATE {STATE} SET state = 'held', reason = ? WHERE message_id = ?",
+            (TURN_HELD + turn, str(message_id)),
         )
     return message_id
 
@@ -2121,10 +2143,23 @@ class SqliteOutboxStore:
             for r in self._conn.execute(
                 f"SELECT s.message_id FROM {STATE} AS s JOIN {OUTBOX} AS o "
                 f"ON o.message_id = s.message_id WHERE o.scope_id = ? AND s.state = 'held' "
-                f"ORDER BY o.enqueued_at, o.seq",
-                (scope_id,),
+                f"AND coalesce(s.reason, '') NOT LIKE ? ORDER BY o.enqueued_at, o.seq",
+                (scope_id, TURN_HELD + "%"),
             ).fetchall()
         ]
+
+    def turn_held(self, turn: str | None = None) -> dict[str, list[uuid.UUID]]:
+        """The messages held for their turn (1.9.0), by turn, oldest first: one
+        turn's, or every turn's."""
+        found: dict[str, list[uuid.UUID]] = {}
+        for message, reason in self._conn.execute(
+            f"SELECT s.message_id, s.reason FROM {STATE} AS s JOIN {OUTBOX} AS o "
+            f"ON o.message_id = s.message_id WHERE s.state = 'held' "
+            f"AND (s.reason LIKE ? AND ? IS NULL OR s.reason = ?) ORDER BY o.enqueued_at, o.seq",
+            (TURN_HELD + "%", turn, TURN_HELD + (turn or "")),
+        ).fetchall():
+            found.setdefault(str(reason)[len(TURN_HELD) :], []).append(uuid.UUID(str(message)))
+        return found
 
     def plan_of(self, message_id: uuid.UUID) -> str | None:
         row = self._conn.execute(
@@ -2431,6 +2466,23 @@ class SqliteOutboxStore:
         from interlock.inbox_store import sqlite_raw
 
         return sqlite_raw(self._conn, source, through)
+
+    def state_of(self, message_id: uuid.UUID) -> tuple[str, str | None, str] | None:
+        """A message's delivery state, its reason and its sink (1.9.0)."""
+        row = self._conn.execute(
+            f"SELECT s.state, s.reason, o.sink FROM {STATE} AS s "
+            f"JOIN {OUTBOX} AS o ON o.message_id = s.message_id WHERE s.message_id = ?",
+            (str(message_id),),
+        ).fetchone()
+        return None if row is None else (str(row[0]), row[1], str(row[2]))
+
+    def due_in(self, message_id: uuid.UUID) -> float | None:
+        """Seconds until a pending message is next due (1.9.0)."""
+        row = self._conn.execute(
+            f"SELECT next_attempt_at FROM {STATE} WHERE message_id = ? AND state = 'pending'",
+            (str(message_id),),
+        ).fetchone()
+        return None if row is None else max(0.0, (int(row[0]) - now_us()) / 1_000_000)
 
     def heads(self, message_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, str]:
         """Each message's delivery-log head, as an operator sees it."""

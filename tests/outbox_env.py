@@ -146,12 +146,19 @@ NO_INBOX: dict[str, Any] = {
     "_STAGE_FUNCTIONS": tuple(
         f
         for f in installer._STAGE_FUNCTIONS
-        if not f.startswith(("interlock.inbox_", "interlock.stage_facts", "interlock.outbox_trace"))
+        if not f.startswith(
+            (
+                "interlock.inbox_",
+                "interlock.stage_facts",
+                "interlock.outbox_trace",
+                "interlock.outbox_turn_hold",
+            )
+        )
     ),
 }
 """What an install by a version before the inbox (5), and so before trace
-context (6), leaves out, patched over the current installer with that
-version's own SQL (``tests/outbox_v2.py``...)."""
+context (6) and turns (1.9.0), leaves out, patched over the current installer
+with that version's own SQL (``tests/outbox_v2.py``...)."""
 
 
 def vouch(source: object, log: Path) -> LegacyVouch:
@@ -527,12 +534,13 @@ class Outbox:
         independent: bool = True,
         not_after: timedelta | None = None,
         traceparent: str | None = None,
+        turn: str | None = None,
     ) -> tuple[EffectPlan, list[uuid.UUID]]:
         """Commit one plan that enqueues ``requests``, independent of each
         other unless ``independent`` is false (then each waits for the one
-        before it), in ``traceparent``'s trace when given. Returns the plan
-        and its messages, in order."""
-        builder = PlanBuilder(scope, traceparent=traceparent)
+        before it), in ``traceparent``'s trace when given, part of ``turn``
+        when given. Returns the plan and its messages, in order."""
+        builder = PlanBuilder(scope, traceparent=traceparent, turn=turn)
         for index, request in enumerate(requests):
             builder.enqueue(
                 sink=request.sink,

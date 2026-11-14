@@ -560,32 +560,29 @@ def _read_holder(fd: int) -> str:
         return ""
 
 
+# The locking module is imported once, here, and not inside the functions: a claim
+# released by its finalizer while the interpreter shuts down cannot import anything
+# then ("sys.meta_path is None"), and the lock would be left to the process's exit.
 if sys.platform == "win32":  # pragma: no cover - not exercised in CI
+    import msvcrt
 
     def _lock_exclusive_nonblocking(fd: int) -> None:
-        import msvcrt
-
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             raise BlockingIOError(str(exc)) from exc
 
     def _unlock(fd: int) -> None:
-        import msvcrt
-
         os.lseek(fd, 0, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
 else:
+    import fcntl
 
     def _lock_exclusive_nonblocking(fd: int) -> None:
-        import fcntl
-
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def _unlock(fd: int) -> None:
-        import fcntl
-
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 

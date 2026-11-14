@@ -423,6 +423,7 @@ class SqliteSubstrate:
         "_tables",
         "_target",
         "_traceparent",
+        "_turn",
     )
 
     def __init__(
@@ -474,6 +475,7 @@ class SqliteSubstrate:
         self._facts: tuple[uuid.UUID, ...] = ()
         self._traceparent: str | None = None
         self._enqueued = 0
+        self._turn: str | None = None
 
     @property
     def substrate_id(self) -> str:
@@ -658,6 +660,7 @@ class SqliteSubstrate:
         self._handle = handle
         self._order = EnqueueOrder()
         self._scope = plan.scope_id
+        self._turn = plan.turn
         self._charges = ()
         self._facts = ()
         self._traceparent = plan.traceparent
@@ -787,6 +790,7 @@ class SqliteSubstrate:
                     seq=self._order.next_seq(),
                     waits_for=self._order.waits_for(effect.depends_on),
                     idempotency_key=outbound_key(handle.plan_id, effect.effect_id),
+                    turn=self._turn,
                 )
             except sqlite3.Error as exc:
                 raise StageError(

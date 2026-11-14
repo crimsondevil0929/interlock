@@ -39,6 +39,7 @@ from interlock.text import noun
 from interlock.trace import require_traceparent
 from interlock.types import (
     OUTBOX_TARGET,
+    TURN_ID,
     Compensation,
     Effect,
     EffectId,
@@ -81,6 +82,8 @@ class PlanBuilder:
     :param traceparent: The W3C trace context the plan continues
         (:mod:`interlock.trace`), sent with every request it enqueues. Outside
         the plan's hash.
+    :param turn: The agent turn the plan is part of (1.9.0): its requests wait
+        for the turn (:attr:`~interlock.types.EffectPlan.turn`). In the plan's hash.
     """
 
     __slots__ = (
@@ -93,6 +96,7 @@ class PlanBuilder:
         "_scope_id",
         "_traceparent",
         "_trajectory_id",
+        "_turn",
     )
 
     def __init__(
@@ -105,6 +109,7 @@ class PlanBuilder:
         created_at: datetime | None = None,
         traceparent: str | None = None,
         provenance: Sequence[str] = (),
+        turn: str | None = None,
     ) -> None:
         if created_at is not None and created_at.tzinfo is None:
             raise PlanError(
@@ -116,8 +121,11 @@ class PlanBuilder:
                 require_traceparent(traceparent)
             except ValueError as exc:
                 raise PlanError(str(exc)) from exc
+        if turn is not None and not TURN_ID.fullmatch(turn):
+            raise PlanError(f"turn {turn!r} is not letters, digits and '._:-', at most 128")
         self._traceparent = traceparent
         self._provenance = tuple(sorted(set(provenance)))
+        self._turn = turn
         self._scope_id = scope_id
         self._trajectory_id = trajectory_id or f"traj-{uuid.uuid4().hex[:12]}"
         self._intent = intent
@@ -321,6 +329,7 @@ class PlanBuilder:
             facts=tuple(self._facts),
             provenance=self._provenance,
             traceparent=self._traceparent,
+            turn=self._turn,
         )
         try:
             plan.topological_order()

@@ -319,6 +319,41 @@ signed session record, and hold a refused plan for the principals instead of onl
 The gate trusts the labels it is given. It cannot tell what a model did with what it read, only
 that it read it, and a read nobody labeled is not seen.
 
+### A turn: requests that wait for it (1.9.0)
+
+An agent's turn often makes several calls, and each is a plan judged on its own. Without a
+turn, the email a plan enqueues is sent as soon as its plan commits, even when the next call of
+the same turn is refused. A plan can name its turn:
+
+```python
+from interlock import PlanBuilder
+
+builder = PlanBuilder("support-agent", turn="turn-42")
+builder.enqueue(sink="mail", operation="send", payload={"to": "c-1", "template": "refunded"})
+plan = builder.build()
+assert plan.turn == "turn-42"
+```
+
+Every request of such a plan, that no warrant holds, enters the outbox held, with the reason
+`held for turn turn-42`, in the stage's own transaction. Nothing sends it while the turn is
+open. When the turn ends, an operator acts on all of them under one signed intent:
+
+- `Operator.release_turn("turn-42")` when every plan of the turn committed: the relay makes
+  them;
+- `Operator.cancel_turn("turn-42")` when one was refused, or the turn was abandoned: none is
+  made.
+
+A request held for a warrant stays held for the warrant, and `turn_held(turn)` lists only a
+turn's own (`held(scope)` leaves them out, so nothing asks a person about a request that only
+waits for its turn). The turn is in the plan's hash. What a turn does not do is put back what
+its committed plans changed: a refused call leaves the earlier calls' changes made.
+
+`Relay.deliver(message)` makes one committed request now, in the caller's process: the same
+claim, breaker, call record and signed outcome as any relay, so it and a relay elsewhere never
+both make it. Its result carries the sink's response body, for the caller alone: the delivery
+log keeps only its digest, as before. Fiduciary's protected MCP proxy uses it to give the agent
+the server's own answer to a write.
+
 ### Errors
 
 Every failure on the write path is an `InterlockError`. The AgentGov seam is

@@ -977,8 +977,10 @@ class EscrowEngine:
         intent: str = "",
         traceparent: str | None = None,
         provenance: Sequence[str] = (),
+        turn: str | None = None,
     ) -> OpenStage:
-        """Open a stage before its plan is whole (1.6.0).
+        """Open a stage before its plan is whole (1.6.0); with ``turn`` (1.9.0), its
+        requests wait for the turn (:attr:`~interlock.types.EffectPlan.turn`).
 
         For a caller that works out what to change as it goes: code that
         reads a row, decides, and writes another. Each effect is applied to
@@ -1011,6 +1013,7 @@ class EscrowEngine:
             created_at=datetime.now(UTC),
             traceparent=traceparent,
             provenance=provenance,
+            turn=turn,
         )
         handle = self._substrate.open(_provisional(builder, ()))
         return OpenStage(self, builder, handle)
@@ -2007,6 +2010,7 @@ def _provisional(builder: PlanBuilder, effects: Sequence[Effect]) -> EffectPlan:
         intent=builder._intent,
         traceparent=builder._traceparent,
         provenance=builder._provenance,
+        turn=builder._turn,
     )
 
 

@@ -22,9 +22,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from interlock.exceptions import SubstrateConfigurationError, SubstrateUnavailableError
 
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
     from interlock.relay import DeliveryResult, Lease
 
-__all__ = ["Checkpoint", "OutboxStore", "PostgresOutboxStore"]
+__all__ = ["Checkpoint", "OutboxStore", "PostgresOutboxStore", "ReadableOutboxStore"]
 
 logger = logging.getLogger("interlock.outbox_store")
 
@@ -101,6 +102,22 @@ class OutboxStore(Protocol):
 
 def milliseconds(span: timedelta) -> int:
     return int(span / timedelta(milliseconds=1))
+
+
+@runtime_checkable
+class ReadableOutboxStore(OutboxStore, Protocol):
+    """A store that can also say where one message stands (1.9.0), which
+    :meth:`interlock.relay.Relay.deliver` needs. Both stores here are one."""
+
+    def state_of(self, message_id: uuid.UUID) -> tuple[str, str | None, str] | None:
+        """A message's delivery state, the reason recorded with it, and its sink;
+        ``None`` when the outbox has no such message."""
+        ...
+
+    def due_in(self, message_id: uuid.UUID) -> float | None:
+        """Seconds until a pending message is next due (0 when it is due now);
+        ``None`` when it is not pending."""
+        ...
 
 
 class PostgresOutboxStore:
@@ -222,6 +239,42 @@ class PostgresOutboxStore:
         except psycopg.OperationalError as exc:
             raise self._lost(exc) from exc
         return bool(row and row[0])
+
+    def state_of(self, message_id: uuid.UUID) -> tuple[str, str | None, str] | None:
+        import psycopg
+
+        try:
+            row = (
+                self.connection()
+                .execute(
+                    "SELECT s.state, s.reason, o.sink FROM interlock.outbox_state AS s "
+                    "JOIN interlock.outbox AS o ON o.message_id = s.message_id "
+                    "WHERE s.message_id = %s",
+                    (message_id,),
+                )
+                .fetchone()
+            )
+        except psycopg.OperationalError as exc:
+            raise self._lost(exc) from exc
+        return None if row is None else (str(row[0]), row[1], str(row[2]))
+
+    def due_in(self, message_id: uuid.UUID) -> float | None:
+        import psycopg
+
+        try:
+            row = (
+                self.connection()
+                .execute(
+                    "SELECT greatest(0, extract(epoch FROM s.next_attempt_at "
+                    "- clock_timestamp()))::float8 FROM interlock.outbox_state AS s "
+                    "WHERE s.message_id = %s AND s.state = 'pending'",
+                    (message_id,),
+                )
+                .fetchone()
+            )
+        except psycopg.OperationalError as exc:
+            raise self._lost(exc) from exc
+        return None if row is None else float(row[0])
 
     def _traces(self, conn: psycopg.Connection[Any], messages: list[Any]) -> dict[Any, str]:
         """Each leased request's trace context, its plan's

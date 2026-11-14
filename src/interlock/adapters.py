@@ -189,7 +189,7 @@ def _classify(
 ) -> DeliveryResult:
     digest = hashlib.sha256(body).hexdigest()
     if 200 <= status < 300:
-        return DeliveryResult(DELIVERED, status_code=status, response_digest=digest)
+        return DeliveryResult(DELIVERED, status_code=status, response_digest=digest, body=body)
     if status in retryable:
         return DeliveryResult(
             RETRYABLE,
@@ -199,7 +199,9 @@ def _classify(
             retry_after=retry_after_seconds(retry_after),
         )
     detail = f"HTTP {status}" + (" (redirects are not followed)" if 300 <= status < 400 else "")
-    return DeliveryResult(PERMANENT, status_code=status, response_digest=digest, detail=detail)
+    return DeliveryResult(
+        PERMANENT, status_code=status, response_digest=digest, detail=detail, body=body
+    )
 
 
 def retry_after_seconds(retry_after: str | None) -> float | None:

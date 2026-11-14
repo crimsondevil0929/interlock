@@ -85,6 +85,19 @@ Interlock trusts the labels it is given; Fiduciary labels each session from its 
 records each label in a signed record
 ([GUIDE](docs/GUIDE.md#what-the-session-read-before-the-plan-180)).
 
+## A turn, and a write answered in the call (1.9.0)
+
+An agent's turn makes several calls: refund the order, email the customer, update the ticket.
+Each is a plan, judged on its own. A plan can now name its turn (`PlanBuilder(turn=)`), and
+every request it enqueues waits in the outbox, held for the turn, until an operator's signed
+intent releases the turn (every plan committed) or cancels it (one did not): the email is never
+sent for a turn whose next call was refused. What the committed plans changed stays changed;
+only the requests wait. `Relay.deliver(message)` makes one committed request now, in the
+caller's process, under the same claim and signed outcome as any relay, and returns what the
+sink answered: an MCP proxy gives the agent the server's own result in the same call. The MCP
+client speaks 2026-07-28 and falls back to `initialize` for older servers
+([GUIDE](docs/GUIDE.md#a-turn-requests-that-wait-for-it-190)).
+
 ## Why authorization does not catch this
 
 A prompt-injected agent is a fully authorized agent. It is doing something it has
