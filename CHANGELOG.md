@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.9.0] - Unreleased
+## [1.9.0] - 2026-11-14
 
 A turn of an agent makes several calls, and the requests they enqueue now wait for the turn.
 An MCP proxy can make a write and give the agent the server's own answer in the same call.
