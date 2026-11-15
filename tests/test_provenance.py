@@ -82,6 +82,23 @@ def test_the_rule_of_two_refuses_the_third() -> None:
     assert gate.check(_plan("untrusted", "quarantined:triage"), _diff({"refunds"})) == ()
 
 
+def test_private_data_is_sensitive_as_a_secret_is() -> None:
+    """1.11.0: ``private`` (a deployment's own systems: a private repository, a mailbox)
+    counts for the rule of two and leaves only by the sinks cleared for it."""
+    from interlock.invariants import PRIVATE, is_sensitive
+
+    assert is_sensitive(PRIVATE) and is_sensitive("secret") and is_sensitive("partition:t=a")
+    assert not is_sensitive("untrusted") and not is_sensitive("quarantined:triage")
+    gate = ProvenanceGate(rule_of_two=True, egress={"private": ["github_private"]})
+    assert gate.check(_plan("private"), _diff(set(), {"github_private"})) == ()
+    (stray,) = gate.check(_plan("private"), _diff(set(), {"github_public"}))
+    assert stray.evidence["rule"] == "egress" and stray.evidence["label"] == "private"
+    found = gate.check(_plan("private", "untrusted"), _diff(set(), {"github_private"}))
+    (violation,) = found
+    assert violation.evidence["rule"] == "rule_of_two" and violation.evidence["label"] == "private"
+    assert ProvenanceGate(rule_of_two=True).check(_plan("private"), _diff({"refunds"})) == ()
+
+
 def test_the_engine_refuses_and_tells_the_agent_in_plain_words(tmp_path: Path) -> None:
     db = tmp_path / "desk.db"
     with closing(sqlite3.connect(db)) as conn:

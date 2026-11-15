@@ -9,6 +9,19 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.11.0] - Unreleased
+
+What a deployment's own systems hold can be marked as such, and leaves only where the
+principals cleared it (ESCROW_SPEC §4.9, E4-25 amended).
+
+### Added
+
+- **`private`.** A provenance label for what is not for everyone but is no credential: a
+  private repository, a mailbox, a database's rows. `ProvenanceGate` treats it as sensitive,
+  as it treats `secret`: it counts for the rule of two, and `egress={"private": [...]}` says
+  where it may be sent. `interlock.invariants.is_sensitive(label)` says which labels count.
+  Fiduciary 1.19.0 puts the label on what a closed-world or signed-in tool returns.
+
 ## [1.10.0] - 2026-11-14
 
 A committed plan can be undone: put back exactly, by a plan of its own, judged like any other,

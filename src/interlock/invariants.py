@@ -50,13 +50,16 @@ from interlock.windows import RateWindowCheck
 
 UNTRUSTED: Final = "untrusted"
 SECRET: Final = "secret"  # noqa: S105 - a label's name, not a credential
+PRIVATE: Final = "private"
 CLEARED: Final = "cleared"
-"""The provenance labels :class:`ProvenanceGate` gives a meaning to (1.8.0)."""
+"""The provenance labels :class:`ProvenanceGate` gives a meaning to (1.8.0; ``private``,
+1.11.0)."""
 
 __all__ = [
     "BUILT_IN_CHECKERS",
     "CHECKER_ALIASES",
     "CLEARED",
+    "PRIVATE",
     "SECRET",
     "UNTRUSTED",
     "BlastRadius",
@@ -78,6 +81,7 @@ __all__ = [
     "ValueGuard",
     "checker_family",
     "default_checkers",
+    "is_sensitive",
 ]
 
 
@@ -497,6 +501,12 @@ class NoDelete:
         )
 
 
+def is_sensitive(label: str) -> bool:
+    """Whether ``label`` marks sensitive data for the rule of two: ``secret``, ``private``
+    (1.11.0), or a partition's label."""
+    return label in (SECRET, PRIVATE) or label.startswith("partition:")
+
+
 class ProvenanceGate:
     """Refuse a plan for what its session had read before it (1.8.0).
 
@@ -510,12 +520,15 @@ class ProvenanceGate:
     - **after untrusted input** (the label ``untrusted``), the plan may not change the
       kinds ``untrusted_kinds`` lists, nor send to the sinks ``untrusted_sinks`` lists
       (``*``: any);
-    - **egress**: after reading data labeled ``label`` (``secret``, or a partition's
-      ``partition:<dimension>=<value>``; ``partition:*`` stands for every partition label),
-      the plan may send only to the sinks ``egress[label]`` clears;
+    - **egress**: after reading data labeled ``label`` (``secret``, ``private``, or a
+      partition's ``partition:<dimension>=<value>``; ``partition:*`` stands for every
+      partition label), the plan may send only to the sinks ``egress[label]`` clears;
     - **the rule of two** (``rule_of_two``): a session may have read untrusted input, read
-      sensitive data (``secret`` or a partition label), and changed or sent something, any
-      two of the three; a plan that would make it all three is refused.
+      sensitive data (``secret``, ``private`` or a partition label), and changed or sent
+      something, any two of the three; a plan that would make it all three is refused.
+
+    ``private`` (1.11.0) is what a deployment's own systems hold that is not for everyone:
+    a private repository, a mailbox, a database. It is sensitive as ``secret`` is.
 
     A plan labeled ``cleared`` is admitted: its labels were approved by the principals
     for this exact plan (fiduciary's ``provenance`` ticket). A label ``quarantined:<tool>``
@@ -581,7 +594,7 @@ class ProvenanceGate:
             stray = sorted(s for s in sinks if s not in allowed)
             if stray:
                 found.append(("egress", label, [], stray))
-        sensitive = sorted(x for x in labels if x == SECRET or x.startswith("partition:"))
+        sensitive = sorted(x for x in labels if is_sensitive(x))
         if self._rule_of_two and UNTRUSTED in labels and sensitive and (kinds or sinks):
             found.append(("rule_of_two", ",".join(sensitive), sorted(kinds), sorted(sinks)))
         return found
