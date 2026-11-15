@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.10.0] - Unreleased
+## [1.10.0] - 2026-11-14
 
 A committed plan can be undone: put back exactly, by a plan of its own, judged like any other,
 from what its commit kept in the system it changed (ESCROW_SPEC §4.11).
