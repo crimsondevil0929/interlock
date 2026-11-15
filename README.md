@@ -98,6 +98,26 @@ sink answered: an MCP proxy gives the agent the server's own result in the same 
 client speaks 2026-07-28 and falls back to `initialize` for older servers
 ([GUIDE](docs/GUIDE.md#a-turn-requests-that-wait-for-it-190)).
 
+## Undo: a committed plan put back exactly (1.10.0)
+
+<!-- readme-test: skip reason="an excerpt: TABLES, engine and plan_id are the quickstart's" -->
+```python
+substrate = SqliteSubstrate("app.db", tables=TABLES, undo=timedelta(days=7))
+...
+result = engine.undo(plan_id, scope_id="support-agent")
+```
+
+With `undo=` (or `[undo] days = 7` in `interlock.toml`), each commit keeps its rows' before and
+after images in the system it changed, for the window: a table in the same SQLite or PostgreSQL
+database, copies beside a workspace, a record beside a Git repository (the content is its own
+history), or each changed resource beside a REST or FHIR substrate's undo journal. None of it
+goes into the chain, which names only keyed digests of each change. `EscrowEngine.undo` builds
+the inverse, stages it like any plan, and commits it only if the measured change is exactly the
+inverse: every row back as it was, nothing else touched. Then it is not held to the size
+limits, which would otherwise refuse undoing a large mistake. A row someone changed since makes
+the whole undo refused, and the row is named. See ESCROW_SPEC §4.11 for what it cannot put
+back.
+
 ## Why authorization does not catch this
 
 A prompt-injected agent is a fully authorized agent. It is doing something it has

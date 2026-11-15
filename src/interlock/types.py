@@ -527,6 +527,12 @@ class EffectPlan:
     turn has committed, and cancelled when one has not, so a request is never made
     for a turn that failed after it. In the plan's hash when set."""
 
+    undoes: PlanId | None = None
+    """The committed plan this one undoes (1.10.0), when it is the inverse
+    :meth:`~interlock.engine.EscrowEngine.undo` built from what that plan's commit kept
+    (:mod:`interlock.undo`). It commits only as exactly that inverse. In the plan's hash
+    when set."""
+
     def __post_init__(self) -> None:
         if self.turn is not None and not (
             isinstance(self.turn, str) and TURN_ID.fullmatch(self.turn)
@@ -607,6 +613,9 @@ class EffectPlan:
         # And the turn it is part of (1.9.0).
         if self.turn is not None:
             fields.append(["turn", self.turn])
+        # And the plan it undoes (1.10.0).
+        if self.undoes is not None:
+            fields.append(["undoes", self.undoes])
         return canonical_hash(fields)
 
 

@@ -42,9 +42,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import secrets
 import threading
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -76,6 +77,7 @@ from interlock.exceptions import (
     SubstrateConfigurationError,
     SubstrateUnavailableError,
     UncompensatableEffectError,
+    UndoError,
 )
 from interlock.feedback import AgentFeedback, OperatorEvidence, Refusal, feedback_for_error
 from interlock.invariants import InvariantChecker
@@ -102,6 +104,17 @@ from interlock.types import (
     StageState,
     Verdict,
     outbound_key,
+)
+from interlock.undo import (
+    UNDO_EXACT,
+    ChangeDigest,
+    Kept,
+    UndoExact,
+    change_digests,
+    changes_hash,
+    inverse_problems,
+    net,
+    waived,
 )
 from interlock.windows import RateWindow, RateWindowCheck, charges
 
@@ -143,6 +156,9 @@ all, and its spend will name this record. Precedes the marker suffix, which
 recovery reads."""
 
 _UNDO = "; undo "
+_CHANGES = "; changes "
+"""What a COMMITTED record names its plan's change digests by, when its undo was kept
+(1.10.0): the SHA-256 :func:`~interlock.undo.changes_hash` gives."""
 """Infix on a ``COMMIT_INTENT`` note: the SHA-256 of the undo a plan-bound
 substrate wrote down before applying (:mod:`interlock.planbound`). Precedes the
 marker suffix, which recovery reads."""
@@ -181,6 +197,12 @@ class StageResult:
     was adjudicated. ``None`` also when issuing it failed after a commit, which
     is logged: the effects stand, and the terminal record names the receipt id
     that was meant to exist."""
+    changes: tuple[ChangeDigest, ...] = ()
+    """The plan's change digests, when its substrate kept its undo (1.10.0): what its
+    ``COMMITTED`` record names by hash (:func:`~interlock.undo.changes_hash`)."""
+    undid: tuple[ChangeDigest, ...] = ()
+    """For an undo (1.10.0), the change digests of the plan it undid, as that plan's
+    commit kept them: :attr:`changes` is exactly their inverse."""
 
     @property
     def blocked_by(self) -> tuple[str, ...]:
@@ -572,6 +594,7 @@ class EscrowEngine:
         *,
         settle_cost: Decimal | str | None = None,
         _opened: _Opened | None = None,
+        _undo: Kept | None = None,
     ) -> StageResult:
         """Run one plan through the full lifecycle.
 
@@ -610,6 +633,7 @@ class EscrowEngine:
                     repairs=repairs,
                     receipt_id=receipt_id,
                     opened=_opened,
+                    undo=_undo,
                 )
         except InterlockError as exc:
             if exc.feedback is None:
@@ -628,11 +652,17 @@ class EscrowEngine:
         repairs: str | None,
         receipt_id: str | None,
         opened: _Opened | None = None,
+        undo: Kept | None = None,
     ) -> StageResult:
         try:
             cost = self._settle_cost if settle_cost is None else Decimal(str(settle_cost))
             if cost < 0:
                 raise PlanError(f"settle_cost cannot be negative, got {cost}")
+            if plan.undoes is not None and (undo is None or undo.plan_id != plan.undoes):
+                raise PlanError(
+                    f"plan {plan.plan_id} says it undoes {plan.undoes}: an undo is built by "
+                    f"EscrowEngine.undo, from what that plan's commit kept"
+                )
             self.admit(plan)
             # Charged at commit with the plan: what producing it cost, and what
             # each request it enqueues costs, as the operator's registry prices
@@ -642,7 +672,9 @@ class EscrowEngine:
                 RecordType.PLAN_ADMITTED,
                 plan,
                 plan.content_hash(),
-                note=(f"repair of {plan.repair_of}: " if plan.repair_of else "") + plan.intent[:80],
+                note=(f"repair of {plan.repair_of}: " if plan.repair_of else "")
+                + (f"undo of {plan.undoes}: " if plan.undoes else "")
+                + plan.intent[:80],
             )
             stamp = f"; receipt {receipt_id}" if receipt_id else ""
             terminal: EscrowRecord | None = None
@@ -677,6 +709,7 @@ class EscrowEngine:
         diff: EffectDiff | None = None
         verdict: Verdict | None = None
         judged: Adjudication | None = None
+        changes: tuple[ChangeDigest, ...] = ()
         state = StageState.STAGING
         committed = False
         lost_reply = False
@@ -721,13 +754,22 @@ class EscrowEngine:
             # the hold was placed for.
             outbound_cost = self._price_outbound(plan, diff, quoted)
 
+            checkers: Sequence[InvariantChecker] = self._checkers
+            enforced: Collection[str] = self._always
+            if undo is not None:
+                # An exact inverse is not held to the size bounds; an inexact one is no
+                # undo, refused in shadow mode too (1.10.0).
+                if not inverse_problems(undo, diff):
+                    checkers = [c for c in checkers if not waived(c.name)]
+                checkers = [*checkers, UndoExact(undo)]
+                enforced = {*enforced, UNDO_EXACT}
             judged = adjudicate(
                 plan,
                 diff,
-                self._checkers,
+                checkers,
                 stage_id=handle.stage_id,
                 observe_only=self._observe_only,
-                enforced=self._always,
+                enforced=enforced,
             )
             verdict = judged.verdict
             blocked = ",".join(v.invariant for v in verdict.blocking)
@@ -785,7 +827,10 @@ class EscrowEngine:
                     # A plan-bound substrate cannot roll a partial apply
                     # back: it writes its undo down first, and the intent
                     # names it, before the first write goes out.
-                    undo = _write_undo(self._substrate, handle)
+                    undo_digest = _write_undo(self._substrate, handle)
+                    # What lets the plan be undone later stays in the system it changed,
+                    # for the window (1.10.0); the chain names its change digests.
+                    changes = self._keep(handle, diff, undo)
                     self._inflight.add(handle.stage_id)
                     intent = self._record(
                         RecordType.COMMIT_INTENT,
@@ -795,7 +840,7 @@ class EscrowEngine:
                         note=f"about to commit {tally(diff.blast_radius, self._nouns.row)}"
                         + (f"{_TXID}{txid}" if txid else "")
                         + (f"{_OUTBOUND}{len(diff.outbound)}" if diff.outbound else "")
-                        + (f"{_UNDO}{undo}" if undo else "")
+                        + (f"{_UNDO}{undo_digest}" if undo_digest else "")
                         + (_SETTLEMENT_CLAIMED if ledger is not None else "")
                         + (_MARKER_ARMED if armed else ""),
                     )
@@ -830,6 +875,8 @@ class EscrowEngine:
                         else "; the commit's reply was lost; its commit marker is present"
                     )
                 raced = self._anchor.halted_after_commit(plan.scope_id) if self._anchor else ""
+                if changes:
+                    note += f"{_CHANGES}{changes_hash(changes)}"
                 terminal = self._record(
                     RecordType.COMMITTED,
                     plan,
@@ -967,7 +1014,71 @@ class EscrowEngine:
             committed=committed,
             feedback=judged.feedback(committed=committed) if judged is not None else None,
             receipt=receipt,
+            changes=changes if committed else (),
+            undid=undo.digests() if undo is not None and committed else (),
         )
+
+    def _keep(
+        self, handle: StageHandle, diff: EffectDiff, undo: Kept | None
+    ) -> tuple[ChangeDigest, ...]:
+        """Have the substrate keep what undoes this stage, when it keeps undo (1.10.0), and
+        the plan's change digests. An undo's are made under the key of the plan it undoes,
+        so the two compare; and its own undo (a redo) keeps that key."""
+        keep = getattr(self._substrate, "keep", None)
+        if keep is None or not getattr(self._substrate, "keeps_undo", False):
+            return ()
+        netted = net(diff.deltas)
+        if not netted:
+            return ()
+        key = undo.key if undo is not None else secrets.token_bytes(32)
+        fields: Mapping[str, tuple[str, ...]] = getattr(
+            self._substrate, "undo_fields", lambda: {}
+        )()
+        keep(handle, netted, key)
+        return change_digests(key, netted, fields)
+
+    def undo(
+        self,
+        plan_id: str,
+        *,
+        scope_id: str,
+        trajectory_id: str | None = None,
+        intent: str = "",
+        turn: str | None = None,
+        settle_cost: Decimal | str | None = None,
+    ) -> StageResult:
+        """Undo a committed plan, from what its commit kept (:mod:`interlock.undo`): its
+        inverse, staged, measured and judged like any plan, committed only as exactly that
+        inverse, and then without the size bounds. A resource changed since makes the
+        measurement differ, and the whole undo is refused, naming it.
+
+        :raises UndoError: When the substrate keeps no undo, or kept none of ``plan_id``
+            (another substrate's plan, one that changed nothing, or one older than the
+            window).
+        """
+        kept_of = getattr(self._substrate, "kept", None)
+        if kept_of is None or not getattr(self._substrate, "keeps_undo", False):
+            raise UndoError(
+                f"{self._substrate.substrate_id} keeps no undo: build its substrate with undo="
+            )
+        kept = kept_of(plan_id)
+        if kept is None:
+            raise UndoError(
+                f"nothing is kept to undo plan {plan_id}: it was not committed here, changed "
+                f"nothing, or is older than the undo window"
+            )
+        effects = tuple(self._substrate.inverse(kept))  # type: ignore[attr-defined]
+        plan = EffectPlan(
+            plan_id=PlanId(str(uuid.uuid4())),
+            scope_id=scope_id,
+            trajectory_id=trajectory_id or f"undo-{plan_id}",
+            created_at=datetime.now(UTC),
+            effects=effects,
+            intent=intent or f"put back what plan {plan_id} changed",
+            turn=turn,
+            undoes=PlanId(plan_id),
+        )
+        return self.execute(plan, settle_cost=settle_cost, _undo=kept)
 
     def stage(
         self,

@@ -29,7 +29,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Final, Protocol, runtime_checkable
 
 from interlock.cascade import (
     CascadeReport,
@@ -46,6 +46,7 @@ from interlock.exceptions import (
     StageExpiredError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
+    UndoError,
 )
 from interlock.inbox_sql import (
     SQLITE_CONSUMED,
@@ -71,9 +72,11 @@ from interlock.text import noun
 from interlock.types import (
     PARTITION,
     TENANT,
+    Change,
     CommitReceipt,
     Effect,
     EffectDiff,
+    EffectId,
     EffectKind,
     EffectOutcome,
     EffectPlan,
@@ -84,6 +87,7 @@ from interlock.types import (
     WindowMeasure,
     outbound_key,
 )
+from interlock.undo import Kept
 from interlock.windows import WindowCharge
 
 __all__ = [
@@ -345,6 +349,140 @@ def _assert_identifier(name: str) -> None:
         raise ValueError(f"unsafe SQL identifier: {name!r}")
 
 
+UNDO_TABLE: Final = "_interlock_undo"
+"""Where a SQLite database keeps each commit's before and after images, for the undo window
+(1.10.0)."""
+_UNDO_DDL: Final = (
+    f"CREATE TABLE IF NOT EXISTS main.{UNDO_TABLE} ("
+    "plan_id TEXT NOT NULL, stage_id TEXT NOT NULL, seq INTEGER NOT NULL, "
+    "tbl TEXT NOT NULL, pk TEXT NOT NULL, before TEXT, after TEXT, tenant TEXT, "
+    "partitions TEXT NOT NULL, key TEXT NOT NULL, committed_at TEXT NOT NULL, "
+    "expires_at TEXT NOT NULL, PRIMARY KEY (plan_id, seq))"
+)
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _keep_rows(
+    conn: sqlite3.Connection,
+    handle: StageHandle,
+    keeping: tuple[str, tuple[Change, ...], bytes],
+    committed_at: datetime,
+    window: timedelta,
+) -> None:
+    """Write a stage's net changes into ``_interlock_undo``, in its transaction, and drop
+    what is past its window."""
+    plan_id, changes, key = keeping
+    conn.execute(_UNDO_DDL)
+    conn.execute(
+        f"DELETE FROM main.{UNDO_TABLE} WHERE expires_at <= ?", (committed_at.isoformat(),)
+    )
+    expires = (committed_at + window).isoformat()
+    conn.executemany(
+        f"INSERT INTO main.{UNDO_TABLE} (plan_id, stage_id, seq, tbl, pk, before, after, "
+        f"tenant, partitions, key, committed_at, expires_at) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                plan_id,
+                str(handle.stage_id),
+                seq,
+                c.kind,
+                c.id,
+                None if c.before is None else json.dumps(dict(c.before), sort_keys=True),
+                None if c.after is None else json.dumps(dict(c.after), sort_keys=True),
+                c.tenant_id,
+                json.dumps(dict(c.partitions), sort_keys=True),
+                key.hex(),
+                committed_at.isoformat(),
+                expires,
+            )
+            for seq, c in enumerate(changes, start=1)
+        ],
+    )
+
+
+def sql_inverse(
+    substrate_id: str,
+    kept: Kept,
+    tables: Mapping[str, TableSpec],
+    *,
+    placeholder: Callable[[str], str] = lambda name: f":{name}",
+    text: str = "TEXT",
+) -> list[Effect]:
+    """The statements that undo ``kept`` on a SQL database (:meth:`SqliteSubstrate.inverse`):
+    latest change first. ``placeholder`` writes a parameter as the driver takes it."""
+    effects: list[Effect] = []
+    for n, change in enumerate(reversed(kept.changes), start=1):
+        spec = tables.get(change.kind)
+        if spec is None:
+            raise UndoError(
+                f"{change.kind} is no table observed here: plan {kept.plan_id} "
+                f"cannot be undone on this substrate"
+            )
+        pk = spec.primary_key
+        params: dict[str, object] = {"pk": change.id}
+        where = [f"CAST({pk} AS {text}) = {placeholder('pk')}"]
+        if change.after is not None:
+            for i, column in enumerate(sorted(change.after)):
+                params[f"a{i}"] = change.after[column]
+                where.append(
+                    f"{column} IS NOT DISTINCT FROM {placeholder(f'a{i}')}"
+                    if text != "TEXT"
+                    else f"{column} IS {placeholder(f'a{i}')}"
+                )
+        if change.before is None:
+            kind, statement = (
+                EffectKind.DELETE,
+                (f"DELETE FROM {change.kind} WHERE {' AND '.join(where)}"),
+            )
+        elif change.after is None:
+            columns = sorted(change.before)
+            names = columns if pk in columns else [pk, *columns]
+            values = []
+            for i, column in enumerate(names):
+                params[f"b{i}"] = (
+                    change.id if column == pk and pk not in columns else (change.before[column])
+                )
+                values.append(placeholder(f"b{i}"))
+            kind, statement = (
+                EffectKind.INSERT,
+                (
+                    f"INSERT INTO {change.kind} ({', '.join(names)}) SELECT {', '.join(values)} "
+                    f"WHERE NOT EXISTS (SELECT 1 FROM {change.kind} WHERE {where[0]})"
+                ),
+            )
+        else:
+            sets = []
+            for i, column in enumerate(sorted(change.before)):
+                params[f"b{i}"] = change.before[column]
+                sets.append(f"{column} = {placeholder(f'b{i}')}")
+            kind, statement = (
+                EffectKind.UPDATE,
+                (f"UPDATE {change.kind} SET {', '.join(sets)} WHERE {' AND '.join(where)}"),
+            )
+        effects.append(
+            Effect(
+                effect_id=EffectId(f"undo-{n:05d}"),
+                kind=kind,
+                target=f"{substrate_id}:{change.kind}",
+                statement=statement,
+                parameters=params,
+                depends_on=(EffectId(f"undo-{n - 1:05d}"),) if n > 1 else (),
+                tenant_id=change.tenant_id,
+                stated_rows=1,
+            )
+        )
+    return effects
+
+
 class SqliteSubstrate:
     """Transactional staging over SQLite.
 
@@ -411,6 +549,7 @@ class SqliteSubstrate:
         "_internal",
         "_journal_start",
         "_journal_triggers",
+        "_keeping",
         "_markers",
         "_max_rows",
         "_order",
@@ -424,6 +563,7 @@ class SqliteSubstrate:
         "_target",
         "_traceparent",
         "_turn",
+        "_undo",
     )
 
     def __init__(
@@ -436,7 +576,16 @@ class SqliteSubstrate:
         enforce_table_access: bool = True,
         commit_markers: bool = True,
         acknowledge_cascades: Collection[str] = (),
+        undo: timedelta | None = None,
     ) -> None:
+        """:param undo: Keep each commit's before and after images in this database, in
+        ``_interlock_undo``, for this long, so the plan can be undone
+        (:meth:`~interlock.engine.EscrowEngine.undo`, 1.10.0). ``None`` keeps nothing.
+        """
+        if undo is not None and undo <= timedelta(0):
+            raise ValueError("an undo window is a positive time")
+        self._undo = undo
+        self._keeping: tuple[str, tuple[Change, ...], bytes] | None = None
         self._path = path
         self._tables = tuple(tables)
         self._by_name = {t.name: t for t in tables}
@@ -661,6 +810,7 @@ class SqliteSubstrate:
         self._order = EnqueueOrder()
         self._scope = plan.scope_id
         self._turn = plan.turn
+        self._keeping = None
         self._charges = ()
         self._facts = ()
         self._traceparent = plan.traceparent
@@ -1037,6 +1187,8 @@ class SqliteSubstrate:
                         f"VALUES (?, ?, ?)",
                         (str(handle.stage_id), handle.plan_id, committed_at.isoformat()),
                     )
+                if self._keeping is not None and self._undo is not None:
+                    _keep_rows(conn, handle, self._keeping, committed_at, self._undo)
                 if prepare is not None:
                     prepare(conn)
                 conn.execute("COMMIT")
@@ -1050,6 +1202,73 @@ class SqliteSubstrate:
             verdict_hash="",
             substrate_txn_id=None,
         )
+
+    # -- undo (1.10.0) ---------------------------------------------------------------
+
+    @property
+    def keeps_undo(self) -> bool:
+        """Whether each commit keeps what undoes it (``undo=``)."""
+        return self._undo is not None
+
+    def undo_fields(self) -> dict[str, tuple[str, ...]]:
+        """Every captured column is a row's state."""
+        return {}
+
+    def keep(self, handle: StageHandle, changes: Sequence[Change], key: bytes) -> None:
+        """Keep ``changes`` (net, one per row) for the stage's commit to write into
+        ``_interlock_undo``, in its own transaction."""
+        self._require(handle)
+        self._keeping = (str(handle.plan_id), tuple(changes), key)
+
+    def kept(self, plan_id: str) -> Kept | None:
+        """What the commit of ``plan_id`` kept, if it is still within the window."""
+        if self._undo is None:
+            return None
+        try:
+            conn = sqlite3.connect(self._path, timeout=30)
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(f"cannot read {self._path}: {exc}") from exc
+        try:
+            if not _has_table(conn, UNDO_TABLE):
+                return None
+            rows = conn.execute(
+                f"SELECT tbl, pk, before, after, tenant, partitions, key, committed_at, "
+                f"expires_at FROM main.{UNDO_TABLE} WHERE plan_id = ? AND expires_at > ? "
+                f"ORDER BY seq",
+                (plan_id, datetime.now(UTC).isoformat()),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise SubstrateUnavailableError(f"cannot read {UNDO_TABLE}: {exc}") from exc
+        finally:
+            conn.close()
+        if not rows:
+            return None
+        return Kept(
+            plan_id=plan_id,
+            substrate_id=self.substrate_id,
+            changes=tuple(
+                Change(
+                    kind=str(r[0]),
+                    id=str(r[1]),
+                    before=_load(r[2]),
+                    after=_load(r[3]),
+                    tenant_id=r[4],
+                    partitions=json.loads(r[5]),
+                )
+                for r in rows
+            ),
+            key=bytes.fromhex(str(rows[0][6])),
+            committed_at=datetime.fromisoformat(str(rows[0][7])),
+            expires_at=datetime.fromisoformat(str(rows[0][8])),
+        )
+
+    def inverse(self, kept: Kept) -> list[Effect]:
+        """SQL that puts each row back, latest first: a created row is deleted, a changed
+        row is set back, a deleted row is inserted again. Each statement finds its row only
+        as the plan left it, every observed column as the after image holds it: a row
+        changed since is not found, so the undo's measurement is not exact and the whole
+        undo is refused."""
+        return sql_inverse(self.substrate_id, kept, self._by_name)
 
     @staticmethod
     def _trace(conn: sqlite3.Connection, handle: StageHandle, traceparent: str) -> None:

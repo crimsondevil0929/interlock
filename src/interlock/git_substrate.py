@@ -75,6 +75,7 @@ substrate refuses to.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -103,6 +104,7 @@ from interlock.exceptions import (
     StageExpiredError,
     SubstrateConfigurationError,
     SubstrateUnavailableError,
+    UndoError,
 )
 from interlock.reconcile import Reconciliation, UnmediatedWrite, _stage_findings
 from interlock.substrate import SqliteSubstrate
@@ -111,6 +113,7 @@ from interlock.types import (
     CommitReceipt,
     Effect,
     EffectDiff,
+    EffectId,
     EffectKind,
     EffectOutcome,
     EffectPlan,
@@ -121,6 +124,7 @@ from interlock.types import (
     SubstrateCapabilities,
     WindowMeasure,
 )
+from interlock.undo import Kept
 
 if TYPE_CHECKING:
     from interlock.session import Session
@@ -177,6 +181,22 @@ _COMMIT: Final = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _NAME: Final = re.compile(r"[a-z][a-z0-9_-]{0,62}")
 _CLASS_NAME: Final = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,62}")
 _MODES: Final = {"100644": 0o644, "100755": 0o755}
+UNDO_FIELDS: Final = ("blob_sha", "mode")
+"""What a path is, for an undo: its blob and mode (1.10.0)."""
+
+
+def _blob_mode(image: Mapping[str, Any] | None) -> tuple[str, str] | None:
+    return None if image is None else (str(image["blob_sha"]), str(image["mode"]))
+
+
+def _undo_name(plan_id: str) -> str:
+    """A plan's record name under ``interlock/undo/``: its id, or its digest when the id is
+    no file name."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", plan_id):
+        return plan_id
+    return hashlib.sha256(plan_id.encode("utf-8")).hexdigest()
+
+
 _ZERO: Final = re.compile(r"0+")
 _EMPTY_BLOB: Final = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 
@@ -573,6 +593,8 @@ class _Stage:
     """A session's stage (1.7.0): its worktree is the session's, kept when the plan is
     refused."""
     committed: bool = False
+    keeping: dict[str, Any] | None = None
+    """What undoes the stage, recorded once it commits (1.10.0)."""
 
 
 CHECKED_OUT: Final = ("refuse", "follow")
@@ -631,6 +653,7 @@ class GitSubstrate:
         "_stage",
         "_stage_root",
         "_stage_seconds",
+        "_undo",
         "_workspace",
     )
 
@@ -652,7 +675,14 @@ class GitSubstrate:
         max_file_bytes: int = 4 * 1024 * 1024,
         max_scan_bytes: int = 1024 * 1024,
         checked_out: str = "refuse",
+        undo: timedelta | None = None,
     ) -> None:
+        """:param undo: Record each commit's path images under the repository's common
+        directory (``interlock/undo/``) for this long, so the plan can be undone
+        (1.10.0); the content is the repository's own objects. ``None`` keeps nothing."""
+        if undo is not None and undo <= timedelta(0):
+            raise ValueError("an undo window is a positive time")
+        self._undo = undo
         if checked_out not in CHECKED_OUT:
             raise SubstrateConfigurationError(
                 f"checked_out is 'refuse' or 'follow', not {checked_out!r}"
@@ -1263,6 +1293,8 @@ class GitSubstrate:
             self._redo_path(handle.stage_id).unlink(missing_ok=True)
         stage.done = True
         stage.committed = True
+        if stage.keeping is not None and self._undo is not None and new is not None:
+            self._record_undo(stage, committed_at, new)
         return CommitReceipt(
             stage_id=handle.stage_id,
             plan_id=handle.plan_id,
@@ -1271,6 +1303,154 @@ class GitSubstrate:
             verdict_hash="",
             substrate_txn_id=new,
         )
+
+    # -- undo (1.10.0) -------------------------------------------------------------
+
+    @property
+    def keeps_undo(self) -> bool:
+        """Whether each commit keeps what undoes it (``undo=``)."""
+        return self._undo is not None
+
+    def undo_fields(self) -> dict[str, tuple[str, ...]]:
+        """A path is its blob and mode: its line counts describe a change."""
+        return {name: UNDO_FIELDS for name in self._by_name}
+
+    def keep(self, handle: StageHandle, changes: Sequence[RowDelta], key: bytes) -> None:
+        """Keep ``changes`` for the stage's commit to record: the content they replace is
+        the base commit's, so only the images are written down."""
+        stage = self._require(handle)
+        stage.keeping = {
+            "plan_id": str(handle.plan_id),
+            "key": key.hex(),
+            "changes": [
+                {
+                    "kind": c.kind,
+                    "id": c.id,
+                    "before": c.before,
+                    "after": c.after,
+                    "tenant": c.tenant_id,
+                }
+                for c in changes
+            ],
+        }
+
+    def _undo_dir(self) -> Path:
+        return self._common / "interlock" / "undo"
+
+    def _record_undo(self, stage: _Stage, committed_at: datetime, new: str) -> None:
+        assert stage.keeping is not None and self._undo is not None
+        directory = self._undo_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(UTC)
+        for old in directory.glob("*.json"):
+            try:
+                if datetime.fromisoformat(json.loads(old.read_text())["expires_at"]) <= now:
+                    old.unlink()
+            except (OSError, ValueError, KeyError):
+                continue
+        record = {
+            **stage.keeping,
+            "base": stage.base,
+            "commit": new,
+            "committed_at": committed_at.isoformat(),
+            "expires_at": (committed_at + self._undo).isoformat(),
+        }
+        name = _undo_name(str(stage.handle.plan_id))
+        (directory / f"{name}.json").write_text(json.dumps(record, sort_keys=True))
+        stage.keeping = None
+
+    def kept(self, plan_id: str) -> Kept | None:
+        """What the commit of ``plan_id`` recorded, if it is still within the window."""
+        if self._undo is None:
+            return None
+        try:
+            record = json.loads((self._undo_dir() / f"{_undo_name(plan_id)}.json").read_text())
+        except (OSError, ValueError):
+            return None
+        expires = datetime.fromisoformat(record["expires_at"])
+        if expires <= datetime.now(UTC):
+            return None
+        return Kept(
+            plan_id=plan_id,
+            substrate_id=self.substrate_id,
+            changes=tuple(
+                RowDelta(
+                    table=c["kind"],
+                    primary_key=c["id"],
+                    before=c["before"],
+                    after=c["after"],
+                    tenant_id=c["tenant"],
+                )
+                for c in record["changes"]
+            ),
+            key=bytes.fromhex(record["key"]),
+            committed_at=datetime.fromisoformat(record["committed_at"]),
+            expires_at=expires,
+            fields=self.undo_fields(),
+            payload={"base": record["base"], "commit": record["commit"]},
+        )
+
+    def inverse(self, kept: Kept) -> list[Effect]:
+        """Statements that put each path back, latest first, from the repository's own
+        objects. A path the branch no longer holds as the plan left it gets none: the
+        undo's measurement then lacks it, and the whole undo is refused, naming it.
+
+        :raises UndoError: For what the statement language cannot write back: a symbolic
+            link or submodule, a file that is not UTF-8 text.
+        """
+        effects: list[Effect] = []
+
+        def add(statement: str, **parameters: str) -> None:
+            n = len(effects) + 1
+            effects.append(
+                Effect(
+                    effect_id=EffectId(f"undo-{n:05d}"),
+                    kind=EffectKind.APPLY,
+                    target=f"{self.substrate_id}:{kind}",
+                    statement=statement,
+                    parameters=parameters,
+                    depends_on=(EffectId(f"undo-{n - 1:05d}"),) if n > 1 else (),
+                    tenant_id=tenant,
+                )
+            )
+
+        for change in reversed(kept.changes):
+            kind, path, tenant = change.kind, change.id, change.tenant_id
+            if self._at_head(path) != _blob_mode(change.after):
+                continue
+            before = change.before
+            if before is None:
+                add("delete :path", path=path)
+                continue
+            if before["mode"] not in _MODES:
+                raise UndoError(
+                    f"{path} was mode {before['mode']} (a link or a submodule): an undo cannot "
+                    f"write it back"
+                )
+            after = change.after
+            if after is None or after["blob_sha"] != before["blob_sha"]:
+                done = self._git.run(self._repository, "cat-file", "blob", before["blob_sha"])
+                try:
+                    text = done.stdout.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise UndoError(
+                        f"{path} is not UTF-8 text: an undo cannot write it back"
+                    ) from exc
+                add("write :path :text", path=path, text=text)
+            fresh_mode = "100644" if after is None else after["mode"]
+            if before["mode"] != fresh_mode:
+                add("mode :path :mode", path=path, mode=str(before["mode"]))
+        return effects
+
+    def _at_head(self, path: str) -> tuple[str, str] | None:
+        """The branch's ``(blob, mode)`` at ``path`` now; ``None`` when it holds none."""
+        listing = self._git.text(self._repository, "ls-tree", self._ref, "--", path)
+        if not listing:
+            return None
+        mode, _, rest = listing.partition(" ")
+        _, _, rest = rest.partition(" ")
+        blob = rest.split("\t", 1)[0]
+        return (blob, mode)
 
     def _tree_of(self, commit: str) -> str:
         return self._git.text(self._repository, "rev-parse", f"{commit}^{{tree}}")

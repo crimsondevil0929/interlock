@@ -85,6 +85,7 @@ from interlock.exceptions import (
     SupervisorStoppedError,
     ToolRevokedError,
     UncompensatableEffectError,
+    UndoError,
 )
 from interlock.extension import (
     BudgetGuard,
@@ -214,7 +215,7 @@ from interlock.windows import (
     RowSum,
 )
 
-__version__ = "1.9.0"
+__version__ = "1.10.0"
 
 __all__ = [
     "CHECKER_ALIASES",
@@ -379,6 +380,7 @@ __all__ = [
     "TripKind",
     "TruncationGuard",
     "UncompensatableEffectError",
+    "UndoError",
     "UnknownValue",
     "Vacuum",
     "VacuumReport",

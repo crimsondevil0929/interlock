@@ -91,10 +91,11 @@ from interlock.outbox_sql import (
     OUTBOX_TRIGGER_NAMES,
     OUTBOX_TRIGGERS,
 )
-from interlock.substrate import TableSpec, _verb_reason, leading_verb
+from interlock.substrate import TableSpec, _verb_reason, leading_verb, sql_inverse
 from interlock.telemetry import Metrics, NullMetrics
 from interlock.text import noun
 from interlock.types import (
+    Change,
     CommitReceipt,
     Effect,
     EffectDiff,
@@ -111,6 +112,7 @@ from interlock.types import (
     _frozen,
     outbound_key,
 )
+from interlock.undo import Kept
 from interlock.windows import WindowCharge, window_lock
 
 if TYPE_CHECKING:
@@ -547,6 +549,76 @@ CREATE TABLE IF NOT EXISTS interlock.window_ledger (
 CREATE INDEX IF NOT EXISTS window_ledger_by_key
     ON interlock.window_ledger (window_name, key, at);
 REVOKE ALL ON interlock.window_ledger FROM PUBLIC;
+
+-- 1.10.0: each committed plan's net before and after images, kept for its undo window in
+-- this database, under its own access control (interlock.undo). No role writes or reads
+-- them but through interlock.undo_keep and interlock.undo_images_of; a row past its window
+-- is deleted by the next commit that keeps one. Created by any install; written only by a
+-- substrate built with undo=, so the installation's version is unchanged.
+CREATE TABLE IF NOT EXISTS interlock.undo_images (
+    plan_id text NOT NULL,
+    stage_id uuid NOT NULL REFERENCES interlock.stages (stage_id),
+    seq integer NOT NULL,
+    tbl text NOT NULL,
+    pk text NOT NULL,
+    before jsonb,
+    after jsonb,
+    tenant text,
+    partitions jsonb NOT NULL,
+    key bytea NOT NULL,
+    committed_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (plan_id, seq)
+);
+CREATE INDEX IF NOT EXISTS undo_images_by_expiry ON interlock.undo_images (expires_at);
+REVOKE ALL ON interlock.undo_images FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION interlock.undo_keep(
+    p_token bytea, p_plan text, p_rows text, p_key bytea, p_seconds bigint
+)
+RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+DECLARE
+    stage uuid;
+    expected bytea;
+BEGIN
+    SELECT s.stage_id, s.enqueue_hash INTO stage, expected
+      FROM interlock.stages s
+     WHERE s.xid = pg_catalog.pg_current_xact_id();
+    IF stage IS NULL OR expected IS NULL
+       OR pg_catalog.sha256(p_token) IS DISTINCT FROM expected THEN
+        RAISE EXCEPTION 'interlock: this transaction''s stage keeps no undo'
+            USING ERRCODE = 'IL002';
+    END IF;
+    IF p_seconds IS NULL OR p_seconds <= 0 THEN
+        RAISE EXCEPTION 'interlock: an undo window is a positive time' USING ERRCODE = 'IL002';
+    END IF;
+    DELETE FROM interlock.undo_images WHERE expires_at <= pg_catalog.now();
+    INSERT INTO interlock.undo_images (plan_id, stage_id, seq, tbl, pk, before, after, tenant,
+                                       partitions, key, committed_at, expires_at)
+    SELECT p_plan, stage, r.n::integer, r.v ->> 'tbl', r.v ->> 'pk',
+           NULLIF(r.v -> 'before', 'null'::jsonb), NULLIF(r.v -> 'after', 'null'::jsonb),
+           r.v ->> 'tenant', coalesce(r.v -> 'partitions', '{}'::jsonb), p_key,
+           pg_catalog.now(), pg_catalog.now() + pg_catalog.make_interval(secs => p_seconds)
+      FROM pg_catalog.jsonb_array_elements(p_rows::jsonb) WITH ORDINALITY AS r(v, n);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION interlock.undo_images_of(p_plan text)
+RETURNS TABLE (out_tbl text, out_pk text, out_before text, out_after text, out_tenant text,
+               out_partitions text, out_key bytea, out_committed timestamptz,
+               out_expires timestamptz)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $fn$
+    SELECT u.tbl, u.pk, u.before::text, u.after::text, u.tenant, u.partitions::text, u.key,
+           u.committed_at, u.expires_at
+      FROM interlock.undo_images u
+     WHERE u.plan_id = p_plan AND u.expires_at > pg_catalog.now()
+     ORDER BY u.seq
+$fn$;
 """
 
 _PRUNED_WINDOW: Final = (
@@ -578,6 +650,8 @@ _STAGE_FUNCTIONS: Final = (
     "interlock.outbox_trace(bytea, text)",
     "interlock.inbox_pending_traces(text)",
     "interlock.outbox_turn_hold(bytea, uuid, text)",
+    "interlock.undo_keep(bytea, text, text, bytea, bigint)",
+    "interlock.undo_images_of(text)",
 )
 
 _OUTBOX_TABLES: Final = (
@@ -966,6 +1040,7 @@ class PostgresSubstrate:
         "_facts",
         "_folded",
         "_handle",
+        "_keeping",
         "_lock_seconds",
         "_max_rows",
         "_metrics",
@@ -979,6 +1054,7 @@ class PostgresSubstrate:
         "_token",
         "_traceparent",
         "_turn",
+        "_undo",
         "_xid",
     )
 
@@ -996,8 +1072,17 @@ class PostgresSubstrate:
         pool_timeout_seconds: float | None = None,
         metrics: Metrics | None = None,
         application_name: str = "interlock",
+        undo: timedelta | None = None,
     ) -> None:
+        """:param undo: Keep each commit's before and after images in this database,
+        ``interlock.undo_images``, for this long, so the plan can be undone (1.10.0).
+        ``None`` keeps nothing.
+        """
         _identifier(schema)
+        if undo is not None and undo <= timedelta(0):
+            raise ValueError("an undo window is a positive time")
+        self._undo = undo
+        self._keeping: tuple[str, tuple[Change, ...], bytes] | None = None
         pool = lock_timeout_seconds if pool_timeout_seconds is None else pool_timeout_seconds
         if pool <= 0:
             raise ValueError("pool_timeout_seconds is positive")
@@ -1107,6 +1192,7 @@ class PostgresSubstrate:
         return self._require(handle)
 
     def _reset_outbound(self) -> None:
+        self._keeping = None
         self._token: bytes | None = None
         self._scope: str | None = None
         self._order = EnqueueOrder()
@@ -1690,6 +1776,33 @@ class PostgresSubstrate:
                 )
             except psycopg.Error as exc:
                 raise StageError(f"could not keep the plan's trace context: {exc}") from exc
+        if self._keeping is not None and self._undo is not None:
+            plan_id, changes, key = self._keeping
+            try:
+                conn.execute(
+                    "SELECT interlock.undo_keep(%s, %s, %s, %s, %s)",
+                    (
+                        self._token,
+                        plan_id,
+                        _json(
+                            [
+                                {
+                                    "tbl": c.kind,
+                                    "pk": c.id,
+                                    "before": None if c.before is None else dict(c.before),
+                                    "after": None if c.after is None else dict(c.after),
+                                    "tenant": c.tenant_id,
+                                    "partitions": dict(c.partitions),
+                                }
+                                for c in changes
+                            ]
+                        ),
+                        key,
+                        int(self._undo.total_seconds()),
+                    ),
+                )
+            except psycopg.Error as exc:
+                raise StageError(f"could not keep the plan's undo: {exc}") from exc
         try:
             cursor = conn.execute("COMMIT")
         except psycopg.Error as exc:
@@ -1710,6 +1823,88 @@ class PostgresSubstrate:
             diff_hash="",
             verdict_hash="",
             substrate_txn_id=self._xid,
+        )
+
+    # -- undo (1.10.0) ---------------------------------------------------------------
+
+    @property
+    def keeps_undo(self) -> bool:
+        """Whether each commit keeps what undoes it (``undo=``)."""
+        return self._undo is not None
+
+    def undo_fields(self) -> dict[str, tuple[str, ...]]:
+        """Every captured column is a row's state."""
+        return {}
+
+    def keep(self, handle: StageHandle, changes: Sequence[Change], key: bytes) -> None:
+        """Keep ``changes`` (net, one per row) for the stage's commit to write, through
+        ``interlock.undo_keep``, in its own transaction.
+
+        :raises SubstrateConfigurationError: When the installation predates undo: run
+            ``interlock install`` again.
+        """
+        import psycopg
+
+        conn = self._require(handle)
+        try:
+            found = conn.execute(
+                "SELECT pg_catalog.to_regprocedure("
+                "'interlock.undo_keep(bytea, text, text, bytea, bigint)') IS NOT NULL"
+            ).fetchone()
+        except psycopg.Error as exc:
+            raise StageError(f"could not look for interlock.undo_keep: {exc}") from exc
+        if found is None or not found[0]:
+            raise SubstrateConfigurationError(
+                "this database's installation predates undo (interlock 1.10.0): run "
+                "`interlock install` to add interlock.undo_images"
+            )
+        self._keeping = (str(handle.plan_id), tuple(changes), key)
+
+    def kept(self, plan_id: str) -> Kept | None:
+        """What the commit of ``plan_id`` kept, if it is still within the window."""
+        import psycopg
+
+        if self._undo is None:
+            return None
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM interlock.undo_images_of(%s)", (plan_id,)
+                ).fetchall()
+        except (psycopg.errors.UndefinedFunction, psycopg.errors.UndefinedTable):
+            return None
+        except psycopg.Error as exc:
+            raise SubstrateUnavailableError(f"cannot read what was kept to undo: {exc}") from exc
+        if not rows:
+            return None
+        return Kept(
+            plan_id=plan_id,
+            substrate_id=self.substrate_id,
+            changes=tuple(
+                Change(
+                    kind=str(r[0]),
+                    id=str(r[1]),
+                    before=_load(r[2]),
+                    after=_load(r[3]),
+                    tenant_id=None if r[4] is None else str(r[4]),
+                    partitions=json.loads(str(r[5])),
+                )
+                for r in rows
+            ),
+            key=bytes(rows[0][6]),
+            committed_at=rows[0][7],
+            expires_at=rows[0][8],
+        )
+
+    def inverse(self, kept: Kept) -> list[Effect]:
+        """SQL that puts each row back, latest first, each found only as the plan left it
+        (:func:`interlock.substrate.sql_inverse`)."""
+        return sql_inverse(
+            self.substrate_id,
+            kept,
+            {t.name: t for t in self._tables},
+            placeholder=lambda name: f"%({name})s",
+            text="text",
         )
 
     def resolve_intent(self, stage_id: uuid.UUID, *, txid: str | None = None) -> bool | None:
@@ -2201,6 +2396,22 @@ def _json_detail(raw: object) -> Mapping[str, object]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _json(value: Any) -> str:
+    """``value`` as JSON text, a :class:`~decimal.Decimal` written as the number it is, so a
+    kept image comes back with the precision it was captured at."""
+    if isinstance(value, Decimal):
+        return format(value, "f") if value.is_finite() else json.dumps(str(value))
+    if isinstance(value, Mapping):
+        return (
+            "{"
+            + ",".join(f"{json.dumps(str(k))}:{_json(v)}" for k, v in sorted(value.items()))
+            + "}"
+        )
+    if isinstance(value, list | tuple):
+        return "[" + ",".join(_json(v) for v in value) + "]"
+    return json.dumps(value)
 
 
 def _load(raw: object) -> Mapping[str, Any] | None:

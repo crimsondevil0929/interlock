@@ -1198,7 +1198,58 @@ same turn is refused. A plan may now name its turn, and its requests wait for it
 
 What a turn does not do: put back what its committed plans changed. A refused call leaves the
 earlier calls' changes made; only the requests wait. MCP has no turn of its own: the caller
-names one (Fiduciary's `gov.turn()`, and Claude Code's hooks).
+names one (Fiduciary's `gov.turn()`, and Claude Code's hooks). *(Amended in 1.10.0:* a
+caller can put them back with an undo of each, §4.11.)
+
+## 4.11 Undo (added in 1.10.0)
+
+A committed plan can be put back, exactly, by a plan of its own (`interlock.undo`).
+
+- **E4-34.** A substrate built with `undo=` (`interlock.toml` `[undo] days`) MUST keep, at each
+  commit, every resource's net before and after image (`net`: one per resource, before its
+  first change and after its last; a resource left as it was is not kept), in the system it
+  changed and under that system's access control, for the window, and MUST NOT write them to
+  the chain or anything a bundle carries. SQLite: `_interlock_undo`, in the stage's own
+  transaction. PostgreSQL: `interlock.undo_images`, written in the stage's transaction through
+  the token-gated `interlock.undo_keep` and read through `interlock.undo_images_of`, which
+  the stage role may run and nothing else. A directory: the images and the content of each
+  file a commit replaced or removed, in the state directory beside the workspace. Git: the
+  images under the repository's common directory; the content is its own objects. A REST API
+  and a FHIR server: the images and each changed resource whole, beside the undo journal.
+  What is past its window is deleted by the next commit that keeps.
+- **E4-35.** Each commit that keeps MUST name its change digests in its `COMMITTED` record
+  (`; changes <sha256>`, `changes_hash`): for each resource, `(kind, id, before, after)`, its
+  images' state as HMAC-SHA256 under a key kept with the images (`change_digests`), sorted.
+  The state of an image is the fields a substrate declares (`undo_fields`: a file's content,
+  mode and size, not its line counts), every field otherwise.
+- **E4-36.** `EscrowEngine.undo(plan_id)` MUST build the inverse from what was kept (each
+  substrate's `inverse`, latest change first), as a plan whose `undoes` names the plan
+  (hashed only when set), and stage, measure and judge it as any plan. A resource that is not
+  as the plan left it gets no statement (SQL statements find a row only as the after image
+  holds every observed column; the others read the system first). A plan that names `undoes`
+  and was not built by `undo` MUST be refused at admission.
+- **E4-37.** An undo MUST commit only when its measurement is exactly the inverse of what was
+  kept (`inverse_problems`): every kept resource measured from its after image to its before
+  image, and nothing else changed, and the measurement complete. `undo_exact` holds it, in
+  shadow mode too, naming each resource that is not put back. An exact inverse MUST NOT be
+  held to the size bounds (`WAIVED`: change and blast-radius limits, no-delete, the value and
+  drawdown guards, stated footprints, by the checker's name before a colon); every other
+  check applies to it as to any plan.
+- **E4-38.** An undo's change digests MUST be made under the key of the plan it undoes, so
+  `digest_problems(original, undo)` is empty exactly when the undo's digests are the
+  original's with before and after swapped; and its own commit keeps that key, so an undo of
+  an undo puts the plan's change back. The result carries both (`StageResult.changes`,
+  `StageResult.undid`).
+
+What it cannot put back, it says before staging (`UndoError`): a plan its substrate kept nothing
+of (another substrate's, one older than the window, one that changed nothing); a symbolic link,
+a submodule, a mode the language cannot set, a file that is not UTF-8 text; a resource an API
+plan created (no delete in that language; a FHIR record is voided, never deleted); a field a
+merge patch cannot write back (`null`). A trigger that writes on every change (an audit table)
+makes the undo's measurement differ from the inverse, and the undo is refused. A deleted row
+comes back with the columns Interlock observes, and the table's defaults for any others. A
+request a relay delivered is not unsent: compensating it is the caller's (Fiduciary's
+`fiduciary undo`).
 
 ---
 
@@ -1478,6 +1529,11 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-31: one request delivered now, under the relay's claim; the body never stored | Implemented (1.9.0) | `Relay.deliver`, `DeliveryResult.body`, `ReadableOutboxStore` | `test_wave15` |
 | E4-32: `server/discover`, then `initialize`; `_meta` on a modern server's requests | Implemented (1.9.0) | `interlock.mcp.handshake`, `Era`, `StdioServer` | `test_wave15` |
 | E4-33: number arguments recorded as decimal strings, sent as numbers | Implemented (1.9.0) | `decimals`, `numbers_on_the_wire`, `McpAdapter(numbers=)` | `test_wave15` |
+| E4-34: images kept in the system they came from, for the window, never in the chain | Implemented (1.10.0) | `keep`, `kept` on each substrate; `_interlock_undo`, `interlock.undo_images`, `KeptRecords` | `test_undo`, `test_undo_postgres`, `test_undo_rest`, `test_undo_fhir` |
+| E4-35: a commit names its change digests | Implemented (1.10.0) | `change_digests`, `changes_hash`, the `COMMITTED` note | `test_undo` |
+| E4-36: the inverse, built from what was kept, as a plan that undoes | Implemented (1.10.0) | `EscrowEngine.undo`, each substrate's `inverse`, `EffectPlan.undoes` | `test_undo` |
+| E4-37: exact or refused; the size bounds waived for an exact inverse | Implemented (1.10.0) | `UndoExact`, `inverse_problems`, `WAIVED`, `waived` | `test_undo` |
+| E4-38: an undo's digests under the plan's key; a redo | Implemented (1.10.0) | `EscrowEngine._keep`, `digest_problems`, `StageResult.undid` | `test_undo` |
 
 ## Beyond sections 1 to 4
 

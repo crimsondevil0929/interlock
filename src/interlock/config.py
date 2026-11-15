@@ -11,6 +11,9 @@ TOML, so the standard library reads it::
     settler_roles = ["interlock_settle"]  # PostgreSQL install only; interlock.settlement
     acknowledge_cascades = []
 
+    [undo]                            # keep what undoes each commit (1.10.0); none by default
+    days = 7                          # in the system it changed: interlock.undo
+
     [[tables]]
     name = "orders"
     primary_key = "id"
@@ -985,6 +988,9 @@ class InterlockConfig:
     """``[[windows]]``: the rate windows, as an engine takes them."""
     vacuum: VacuumConfig = VacuumConfig()
     """``[vacuum]``: what a vacuum keeps."""
+    undo: timedelta | None = None
+    """``[undo] days``: how long each commit keeps what undoes it, in the system it changed
+    (1.10.0, :mod:`interlock.undo`); ``None``, the default, keeps nothing."""
     inbox: InboxConfig = InboxConfig()
     """``[inbox]``: the inbox, and the keys its facts verify under."""
     inbox_roles: tuple[str, ...] = ()
@@ -1202,6 +1208,7 @@ def load_config(
     relays = _relays(raw.get("relays"))
     windows = _windows(raw.get("windows", []), tuple(tables), sinks)
     vacuum = _vacuum(raw.get("vacuum"), Path(path).parent)
+    undo = _undo(raw.get("undo"))
     inbox = _inbox(raw.get("inbox"), Path(path).parent)
     engine = _engine(raw.get("engine"), Path(path).parent, substrate)
     receipts = _receipts(raw.get("receipts"), Path(path).parent)
@@ -1237,6 +1244,7 @@ def load_config(
         relays=relays,
         windows=windows,
         vacuum=vacuum,
+        undo=undo,
         inbox=inbox,
         inbox_roles=inbox_roles,
         engine=engine,
@@ -1920,6 +1928,22 @@ def _signers(raw: object) -> dict[str, SignerConfig]:
             version=version,
         )
     return signers
+
+
+def _undo(raw: object) -> timedelta | None:
+    """``[undo]``: ``days`` (a positive number, at most 366) that each commit keeps what undoes
+    it (1.10.0)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("'undo' must be a table ([undo])")
+    unknown = sorted(set(raw) - {"days"})
+    if unknown:
+        raise ConfigError(f"[undo]: unknown {noun(len(unknown), 'key')} {', '.join(unknown)}")
+    days = raw.get("days")
+    if isinstance(days, bool) or not isinstance(days, int | float) or not 0 < days <= 366:
+        raise ConfigError("[undo]: days is a number of days, more than 0 and at most 366")
+    return timedelta(days=days)
 
 
 def _vacuum(raw: object, base: Path) -> VacuumConfig:

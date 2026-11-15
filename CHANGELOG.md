@@ -9,6 +9,46 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-11-14
+
+A committed plan can be undone: put back exactly, by a plan of its own, judged like any other,
+from what its commit kept in the system it changed (ESCROW_SPEC §4.11).
+
+### Added
+
+- **Undo.** `EscrowEngine.undo(plan_id)` builds the inverse of a committed plan from what its
+  commit kept and stages it as a plan that `undoes` it. It commits only if what was measured is
+  exactly the inverse: every resource the plan changed, found as the plan left it and put back
+  as it was, and nothing else. A resource someone changed since refuses the whole undo, named
+  (`undo_exact`, enforced in shadow mode too). An exact inverse is not held to the size bounds,
+  which would otherwise refuse undoing a large mistake; every other check applies.
+- **What is kept, and where.** A substrate built with `undo=` (`[undo] days = 7` in
+  `interlock.toml`) keeps each commit's net before and after images for the window, in the
+  system they came from and under its access control: SQLite's `_interlock_undo` and
+  PostgreSQL's `interlock.undo_images` (written in the stage's own transaction, read only
+  through the install's functions), a directory's replaced content beside the workspace, a
+  record under a Git repository's common directory (the content is its own objects), and each
+  changed resource beside a REST or FHIR substrate's undo journal. Nothing of it goes to the
+  chain or a bundle.
+- **Change digests.** A commit that keeps names its change digests in its `COMMITTED` record:
+  each resource's before and after state as an HMAC under a key kept with the images. An
+  undo's digests are made under the same key, so `interlock.undo.digest_problems` shows an
+  undo is the exact inverse without the data. `StageResult.changes` and `StageResult.undid`.
+- `EffectPlan.undoes` (in the plan's hash only when set); `UndoError`; `interlock.undo`
+  (`Kept`, `net`, `change_digests`, `inverse_problems`, `digest_problems`, `UndoExact`,
+  `WAIVED`, `KeptRecords`).
+
+### Limits
+
+- A REST or FHIR resource the plan created is not undone (neither language deletes; a FHIR
+  record is voided, never deleted); a symbolic link, a binary file or a mode the statement
+  language cannot set is not written back. Each is said before anything is staged.
+- A table trigger that writes on every change (an audit table) makes an undo inexact, and it is
+  refused. A request a relay delivered is not unsent.
+- PostgreSQL: `interlock install` again adds `interlock.undo_images` and its functions; the
+  installation's version is unchanged, and a substrate built with `undo=` on an older install
+  says so.
+
 ## [1.9.0] - 2026-11-14
 
 A turn of an agent makes several calls, and the requests they enqueue now wait for the turn.
