@@ -1142,7 +1142,9 @@ a stranger that said to refund it. A plan carries the labels of what its session
 `ProvenanceGate` reads them against the measured diff.
 
 The labels are short lower-case strings (`[a-z][a-z0-9_.:=-]{0,95}`): `untrusted` (input from
-anyone outside the deployment), `secret`, `partition:<dimension>=<value>` (one tenant's data),
+anyone outside the deployment), `secret`, `private` (*added in 1.11.0*: what the deployment's
+own systems hold that is not for everyone, such as a private repository or a mailbox),
+`partition:<dimension>=<value>` (one tenant's data),
 `quarantined:<tool>` (a reader sub-agent's typed result) and `cleared` (the principals approved
 this exact plan with its labels). Interlock gives them no other meaning; the code that served
 the reads puts them on the plan (Fiduciary's bridge and SDK record each one in a signed session
@@ -1153,10 +1155,11 @@ record).
   plan's content hash when there are any, and a plan with none MUST hash as it did before 1.8.0.
 - **E4-25.** `ProvenanceGate` MUST refuse a plan labeled `untrusted` that changes a kind its
   `untrusted_kinds` lists or sends to a sink its `untrusted_sinks` lists (`*` lists all); a plan
-  labeled `secret` or with a partition label that sends to a sink its `egress` rules do not
-  clear for that label (`partition:*` stands for every partition label); and, with
-  `rule_of_two`, a plan labeled both `untrusted` and sensitive (`secret` or a partition label)
-  that changes or sends anything. A plan labeled `cleared` MUST be admitted by it, and
+  labeled `secret`, `private` or with a partition label that sends to a sink its `egress`
+  rules do not clear for that label (`partition:*` stands for every partition label); and,
+  with `rule_of_two`, a plan labeled both `untrusted` and sensitive (`secret`, `private` or a
+  partition label) that changes or sends anything. *(Amended in 1.11.0: `private` is
+  sensitive, as `secret` is; `is_sensitive` says which labels are.)* A plan labeled `cleared` MUST be admitted by it, and
   `quarantined:<tool>` MUST count as none of these.
 - **E4-26.** Each violation MUST name its rule (`untrusted`, `egress` or `rule_of_two`), the
   plan's labels, the label it read, and the kinds and sinks it caught, and the feedback MUST
@@ -1520,7 +1523,7 @@ written; **partial** says what is missing; **unimplemented** is stated plainly.
 | E4-22: commands sandboxed or recorded as not; the log's digest in the receipt | Implemented (1.7.0) | `interlock.sandbox`, `run_command`, `verify_receipt` | `test_sessions` |
 | E4-23: a checked-out branch moved only by fast-forwarding its worktree | Implemented (1.7.0) | `GitSubstrate` (`checked_out = "follow"`) | `test_sessions` |
 | E4-24: labels sorted, checked, hashed only when present | Implemented (1.8.0) | `EffectPlan.__post_init__`, `EffectPlan.content_hash` | `test_provenance` |
-| E4-25: the three rules; `cleared` admits; `quarantined:` counts as none | Implemented (1.8.0) | `ProvenanceGate` | `test_provenance` |
+| E4-25: the three rules; `cleared` admits; `quarantined:` counts as none; `private` is sensitive (1.11.0) | Implemented (1.8.0; amended 1.11.0) | `ProvenanceGate`, `is_sensitive` | `test_provenance` |
 | E4-26: each violation names its rule and labels; plain feedback | Implemented (1.8.0) | `ProvenanceGate.check`, `ProvenanceGate.hint`, `Guidance.PROVENANCE` | `test_provenance` |
 | E4-27: a stage carries its labels onto its plan | Implemented (1.8.0) | `EscrowEngine.stage`, `PlanBuilder(provenance=)` | `test_provenance` |
 | E4-28: a turn checked, hashed only when set, carried by a stage | Implemented (1.9.0) | `EffectPlan.turn`, `PlanBuilder(turn=)`, `EscrowEngine.stage(turn=)` | `test_wave15` |

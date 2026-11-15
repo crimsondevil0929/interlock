@@ -19,9 +19,52 @@ measurement, and only then commits or rolls back.
 > [how AgentGov, Interlock and Fiduciary fit together](#start-here) ·
 > [put it in front of your agent in 30 minutes](https://github.com/crimsondevil0929/fiduciary/blob/main/docs/QUICKSTART.md)
 
-```bash
-uv run python demo.py
+An agent asked to clear a build cache plans to delete the runbook too. The plan runs on a
+private copy of the directory, the deletions are measured there, and the two checks the
+runbook trips refuse it:
+
+```python
+import tempfile
+from pathlib import Path
+
+from interlock import ChangeLimit, EscrowEngine, FilesystemSubstrate, KindAllowlist, NoDelete
+from interlock import PlanBuilder
+from interlock.git_substrate import PathClass
+
+root = Path(tempfile.mkdtemp()) / "site"
+(root / ".cache").mkdir(parents=True)
+for i in range(3):
+    (root / ".cache" / f"build-{i}.tmp").write_text("stale\n")
+(root / "docs").mkdir()
+(root / "docs" / "runbook.md").write_text("# Restoring the database\n")
+
+classes = [PathClass("cache", (".cache/**",)), PathClass("docs", ("docs/**",))]
+engine = EscrowEngine(
+    FilesystemSubstrate(root, classes=classes),
+    checkers=[ChangeLimit(5), KindAllowlist(["cache"]), NoDelete(["cache"])],
+)
+plan = PlanBuilder("site-agent")
+for table, path in [
+    ("cache", ".cache/build-0.tmp"),
+    ("cache", ".cache/build-1.tmp"),
+    ("cache", ".cache/build-2.tmp"),
+    ("docs", "docs/runbook.md"),
+]:
+    plan.delete(table=table, statement=f"delete '{path}'")
+result = engine.execute(plan.build())
+print(result.feedback.render() if result.feedback else "committed")
+print("the runbook is still there:", (root / "docs" / "runbook.md").exists())
 ```
+
+```
+The plan was refused and rolled back; nothing changed.
+- kind_allowlist: the plan changed files in the docs path class, which it may not write.
+- no_delete: the plan deletes files from the docs path class, where deletes are not allowed.
+the runbook is still there: True
+```
+
+The same engine on a database (`uv run python demo.py`), where a prompt-injected plan reaches
+four tenants:
 
 ```
   SCENARIO 2  The identical plan, through Interlock.
@@ -47,9 +90,10 @@ uv run python demo.py
 agent workflows on six kinds of system run on one engine, a real model's recorded turns are
 replayed on the current release, and 20 audit bundles can be verified in your browser.
 
-A gateway decides whether an agent may call a tool. This stack decides whether what the call
+A gateway decides whether an agent may call a tool. Fiduciary decides whether what the call
 changed may be kept, and produces evidence for someone who trusts neither the agent nor the
-operator. It is three packages:
+operator. Interlock (this repository) is its staging engine and AgentGov its budget engine;
+each also works alone:
 
 | Package | On PyPI | What it answers |
 |---|---|---|
@@ -77,7 +121,8 @@ writes a signed receipt with the input and output trees, the command log and eve
 
 A refund within the agent's cap is still the wrong refund when the agent asked for it because
 a stranger's email told it to. A plan can carry the labels of what its session had read
-(`untrusted`, `secret`, one tenant's data), and `ProvenanceGate` decides by them: after
+(`untrusted`, `secret`, `private` since 1.11.0, one tenant's data), and `ProvenanceGate`
+decides by them: after
 untrusted input, the kinds and sinks you list take the principals' approval; labeled data
 leaves only by the sinks cleared for it; and the "rule of two" refuses a plan that would make
 a session have read untrusted input, read sensitive data and changed something, all three.

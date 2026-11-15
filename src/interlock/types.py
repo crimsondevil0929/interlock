@@ -468,7 +468,8 @@ class Effect:
 
 
 PROVENANCE_LABEL: Final = re.compile(r"[a-z][a-z0-9_.:=-]{0,95}")
-"""A provenance label (1.8.0): ``untrusted``, ``secret``, ``partition:tenant=acme``."""
+"""A provenance label (1.8.0): ``untrusted``, ``secret``, ``private`` (1.11.0),
+``partition:tenant=acme``."""
 
 TURN_ID: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 """A turn's id (1.9.0): the plans of one agent turn share it."""
