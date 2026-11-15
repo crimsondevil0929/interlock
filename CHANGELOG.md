@@ -9,7 +9,7 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
-## [1.11.0] - Unreleased
+## [1.11.0] - 2026-11-15
 
 What a deployment's own systems hold can be marked as such, and leaves only where the
 principals cleared it (ESCROW_SPEC §4.9, E4-25 amended).
