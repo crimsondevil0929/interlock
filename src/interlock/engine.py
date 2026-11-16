@@ -863,7 +863,9 @@ class EscrowEngine:
                         # The COMMIT went out and no answer came back. The
                         # marker says what the server did; it returns only
                         # if the stage committed.
-                        self._settle_lost_commit(handle.stage_id, txid, armed=armed, lost=lost)
+                        self._settle_lost_commit(
+                            handle.stage_id, txid, armed=armed, lost=lost, plan=plan
+                        )
                         lost_reply = True
                     committed = True
                 state = StageState.COMMITTED
@@ -1805,6 +1807,7 @@ class EscrowEngine:
         *,
         armed: bool,
         lost: CommitUnsettledError,
+        plan: EffectPlan | None = None,
     ) -> None:
         """Ask the commit marker what the server did with a commit whose
         answer never arrived.
@@ -1820,6 +1823,7 @@ class EscrowEngine:
         """
         resolve = getattr(self._substrate, "resolve_intent", None)
         if not armed or not callable(resolve):
+            self._halt_on_residual(plan, stage_id, lost)
             raise lost
         outcome: bool | None = None
         try:
@@ -1827,6 +1831,7 @@ class EscrowEngine:
         except InterlockError:
             logger.warning("stage %s: its commit marker could not be read", stage_id, exc_info=True)
         if outcome is None:
+            self._halt_on_residual(plan, stage_id, lost)
             raise lost
         if not outcome:
             undone = _compensated(self._substrate, stage_id)
@@ -1868,6 +1873,39 @@ class EscrowEngine:
                 f"commit failed: the connection was lost and stage {stage_id} left no "
                 f"commit marker; the server rolled it back"
             ) from lost
+
+    def _halt_on_residual(
+        self, plan: EffectPlan | None, stage_id: uuid.UUID, lost: CommitUnsettledError
+    ) -> None:
+        """A predicted stage whose put-back failed and left changes on the system (1.12.0):
+        never called a rollback. The intent stays open (``lost`` is raised by the caller),
+        ``lost.residual`` says what is left, and the plan's scope is halted in AgentGov with
+        it as the trip's memo, so nothing more commits there until a person has put it right
+        and reset the breaker. A put-back retried at once that then succeeded leaves no
+        residual, and halts nothing."""
+        found = _residual(self._substrate, stage_id) or lost.residual
+        if not found or plan is None:
+            return
+        lost.residual = tuple(found)
+        reason = (
+            f"interlock: stage {stage_id} of plan {plan.plan_id} could not be put back after "
+            f"its write; {tally(lost.restored, 'resource')} restored, and left as it is now: "
+            + "; ".join(found[:50])
+            + (f"; and {len(found) - 50} more" if len(found) > 50 else "")
+            + ". Its commit intent stays open: put these right, then reset the breaker"
+        )[:60000]
+        tripped = False
+        if self._anchor is not None:
+            try:
+                tripped = self._anchor.trip(plan.scope_id, reason)
+            except InterlockError:
+                logger.exception("stage %s: the scope's breaker could not be tripped", stage_id)
+        logger.critical(
+            "stage %s: put-back incomplete; %s%s",
+            stage_id,
+            "; ".join(found),
+            f"; scope {plan.scope_id} halted" if tripped else "",
+        )
 
     def _joined_connection(self, handle: StageHandle) -> object | None:
         """The stage connection the ledger joins, in same-transaction mode."""
@@ -2340,6 +2378,15 @@ def _settles_by_read_back(substrate: ShadowSubstrate) -> bool:
     """Whether the substrate settles an unfinished commit by reading the system back (a
     predicted substrate, 1.5.2), not by a commit marker inside a transaction."""
     return callable(getattr(substrate, "settlement", None))
+
+
+def _residual(substrate: ShadowSubstrate, stage_id: uuid.UUID) -> tuple[str, ...]:
+    """What a predicted substrate's last put-back of the stage could not restore (1.12.0)."""
+    reader = getattr(substrate, "residual", None)
+    if not callable(reader):
+        return ()
+    found = reader(stage_id)
+    return tuple(str(x) for x in found) if found else ()
 
 
 def _settlement(substrate: ShadowSubstrate, stage_id: uuid.UUID) -> Settlement | None:

@@ -724,17 +724,22 @@ def test_a_refused_write_is_never_put_back_over_someone_elses(tmp_path: Path) ->
 def test_a_put_back_that_fails_once_is_finished_at_once(
     server: LoopbackFhirServer, tmp_path: Path
 ) -> None:
-    """Since 1.5.2 the engine settles an unsettled commit right away: a put-back the server
-    refused once is tried again, and the stage is recorded compensated."""
+    """Since 1.5.2 the engine settles a transient failure; since 1.12.0 a put-back the server
+    refused once with 503 is retried in place on the fresh version, and the stage is recorded
+    compensated."""
 
     def refuse_the_undo(ctx: RuleContext, change: Change) -> None:
         if change.after.get("status") == "stopped" and change.actor == AGENT:
             server.fail_next("MedicationRequest", "2", 503)
 
     server.add_rule(refuse_the_undo)
-    run = engine(substrate(server, tmp_path), tmp_path)
-    with pytest.raises(CompensatedError, match="the system was read back"):
+    sub = substrate(server, tmp_path)
+    waits: list[float] = []
+    sub._sleep = waits.append
+    run = engine(sub, tmp_path)
+    with pytest.raises(CompensatedError, match="not what was predicted"):
         run.execute(plan(stop("1")))
+    assert waits == [0.25]
     assert run.chain.records()[-1].record_type is RecordType.COMPENSATED
     assert statuses(server) == {"1": "active", "2": "active", "3": "active"}
     assert not list((tmp_path / "journal").glob("*.undo.json"))
@@ -1334,3 +1339,150 @@ def test_a_request_is_queued_once_when_the_commit_is_settled_by_reading_back(
     again = substrate(server, tmp_path, control=control)
     handle = again.open(plan(create()))  # the control database is not left locked
     again.close(handle)
+
+
+# -- a put-back that fails is retried, then named, then halts the scope (1.12.0) --------------
+
+
+class _PutBackApi:
+    """Wrap FHIR ``_Api`` to inject put-back faults or concurrent clinician edits."""
+
+    def __init__(self, inner: Any, on_call: Any) -> None:
+        self._inner = inner
+        self._on_call = on_call
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def read(self, resource_type: str, resource_id: str) -> Any:
+        return self._inner.read(resource_type, resource_id)
+
+    def search(self, query: str, *, limit: int) -> Any:
+        return self._inner.search(query, limit=limit)
+
+    def call(self, method: str, path: str, body: Any = None, **kwargs: Any) -> Any:
+        self._on_call(method, path)
+        return self._inner.call(method, path, body, **kwargs)
+
+
+def test_a_put_back_retries_429_retry_after_and_persistent_503_or_412_trips_the_breaker(
+    server: LoopbackFhirServer, tmp_path: Path
+) -> None:
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from agentgov import BudgetManager, money
+
+    from interlock.anchor import LedgerAnchor
+    from interlock.fhir import _Api, _FhirError
+
+    # 0. Real HTTP Retry-After header parsing in FHIR _Api
+    class _RateHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            self.send_response(429)
+            self.send_header("Retry-After", "2")
+            self.send_header("Content-Type", "application/fhir+json")
+            self.end_headers()
+            self.wfile.write(
+                b'{"resourceType":"OperationOutcome","issue":[{"diagnostics":"slow"}]}'
+            )
+
+    http = HTTPServer(("127.0.0.1", 0), _RateHandler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = http.server_address[:2]
+        shown = host.decode() if isinstance(host, bytes) else str(host)
+        api = _Api(f"http://{shown}:{port}/fhir", token=None, ca_file=None, timeout=5.0)
+        with pytest.raises(_FhirError) as caught_http:
+            api.call("GET", "/MedicationRequest/1")
+        assert caught_http.value.status == 429 and caught_http.value.retry_after == 2.0
+    finally:
+        http.shutdown()
+        http.server_close()
+
+    # 1. Transient 429 with Retry-After succeeds on retry
+    sub1 = substrate(server, tmp_path / "retry429")
+    waits1: list[float] = []
+    sub1._sleep = waits1.append
+    failed_once = False
+
+    def fail_429_once(method: str, path: str) -> None:
+        nonlocal failed_once
+        if method == "PUT" and path == "/MedicationRequest/2" and not failed_once:
+            failed_once = True
+            raise _FhirError(429, {"issue": [{"diagnostics": "rate limit"}]}, retry_after=1.25)
+
+    sub1._api = _PutBackApi(sub1._api, fail_429_once)  # type: ignore[assignment]
+    with pytest.raises(CompensatedError, match="not what was predicted"):
+        engine(sub1, tmp_path / "retry429").execute(plan(stop("1")))
+    assert waits1 == [1.25]
+    assert statuses(server) == {"1": "active", "2": "active", "3": "active"}
+
+    # 2. Persistent 503 exhausts retries, leaves intent open, and trips AgentGov breaker
+    gov2 = BudgetManager()
+    gov2.open_root("med-rec-agent", money("10.00"))
+    anchor2 = LedgerAnchor(governed=gov2)
+    sub2 = substrate(server, tmp_path / "persist503")
+    waits2: list[float] = []
+    sub2._sleep = waits2.append
+
+    def always_503(method: str, path: str) -> None:
+        if method == "PUT" and path == "/MedicationRequest/2":
+            raise _FhirError(503, {"issue": [{"diagnostics": "unavailable"}]}, retry_after=0.5)
+
+    sub2._api = _PutBackApi(sub2._api, always_503)  # type: ignore[assignment]
+    run2 = engine(sub2, tmp_path / "persist503", anchor=anchor2)
+    with pytest.raises(CommitUnsettledError, match="could not put everything back") as caught2:
+        run2.execute(plan(stop("1")))
+
+    assert caught2.value.restored == 3
+    assert caught2.value.residual == ("MedicationRequest/2: HTTP 503: unavailable (tried 4 times)",)
+    assert waits2 == [0.5] * 6
+    assert gov2.is_halted("med-rec-agent") is True
+    memo2 = gov2.ledger.entries()[-1].memo
+    assert "3 resources restored" in memo2 and "MedicationRequest/2: HTTP 503" in memo2
+    (intent2,) = run2.chain.unresolved_intents()
+    assert intent2.stage_id is not None
+    assert sub2.residual(intent2.stage_id) == caught2.value.residual
+    # Put server back to clean active state for part 3
+    order2 = server.get("MedicationRequest", "2")
+    assert order2 is not None
+    server.write({**order2, "status": "active"}, actor="Practitioner/reset")
+
+    # 3. Concurrent 412 during put-back does not retry and trips the breaker
+    gov3 = BudgetManager()
+    gov3.open_root("med-rec-agent", money("10.00"))
+    anchor3 = LedgerAnchor(governed=gov3)
+    sub3 = substrate(server, tmp_path / "conflict412")
+    waits3: list[float] = []
+    sub3._sleep = waits3.append
+    put_count = 0
+
+    def race_412(method: str, path: str) -> None:
+        nonlocal put_count
+        if method == "PUT" and path == "/MedicationRequest/1":
+            put_count += 1
+            if put_count == 2:
+                cur = server.get("MedicationRequest", "1")
+                assert cur is not None
+                server.write({**cur, "status": "on-hold"}, actor="Practitioner/rn-04")
+
+    sub3._api = _PutBackApi(sub3._api, race_412)  # type: ignore[assignment]
+    run3 = engine(sub3, tmp_path / "conflict412", anchor=anchor3)
+    with pytest.raises(CommitUnsettledError, match="could not put everything back") as caught3:
+        run3.execute(plan(stop("1")))
+
+    assert waits3 == []
+    assert caught3.value.restored == 3
+    assert len(caught3.value.residual) == 1
+    assert "MedicationRequest/1: HTTP 412:" in caught3.value.residual[0]
+    assert "tried" not in caught3.value.residual[0]
+    assert gov3.is_halted("med-rec-agent") is True
+    assert "MedicationRequest/1: HTTP 412" in gov3.ledger.entries()[-1].memo
+    assert len(run3.chain.unresolved_intents()) == 1
+    cur1 = server.get("MedicationRequest", "1")
+    assert cur1 is not None and cur1["status"] == "on-hold"

@@ -72,10 +72,11 @@ import logging
 import re
 import sqlite3
 import ssl
+import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -100,7 +101,7 @@ from interlock.exceptions import (
 )
 from interlock.fhir import _canonical_safe, _json, _merge, _thaw, _tokens, parse_compensation
 from interlock.planbound import UndoJournal
-from interlock.predicted import PREDICTED, Settlement
+from interlock.predicted import PREDICTED, Settlement, retry_after, wait_before_retry
 from interlock.substrate import SqliteSubstrate, TableSpec
 from interlock.text import tally
 from interlock.types import (
@@ -452,9 +453,11 @@ def _fill(template: Any, parameters: Mapping[str, object]) -> Any:
 
 
 class _RestError(Exception):
-    def __init__(self, status: int, body: object) -> None:
+    def __init__(self, status: int, body: object, retry_after: float | None = None) -> None:
         self.status = status
         self.body = body
+        self.retry_after = retry_after
+        """What the server's ``Retry-After`` asked, in seconds (1.12.0)."""
         super().__init__(self.message)
 
     @property
@@ -583,7 +586,8 @@ class _Api:
                 answer = json.loads(raw_err or b"null")
             except ValueError:
                 answer = None
-            raise _RestError(exc.code, answer) from None
+            asked = retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+            raise _RestError(exc.code, answer, asked) from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise SubstrateUnavailableError(f"cannot reach the API {self._server}: {exc}") from exc
 
@@ -734,7 +738,9 @@ class RestSubstrate:
         "_header",
         "_journal",
         "_max_rows",
+        "_residuals",
         "_settlements",
+        "_sleep",
         "_stage",
         "_stage_seconds",
         "_tenants",
@@ -801,6 +807,9 @@ class RestSubstrate:
         self._compensated: dict[uuid.UUID, str] = {}
         self._settlements: dict[uuid.UUID, Settlement] = {}
         self._undone: set[uuid.UUID] = set()
+        self._residuals: dict[uuid.UUID, tuple[str, ...]] = {}
+        self._sleep: Callable[[float], None] = time.sleep
+        """How a put-back waits before it is tried again (1.12.0): tests pass their own."""
 
     # -- what it is -----------------------------------------------------------
 
@@ -1634,9 +1643,12 @@ class RestSubstrate:
             self._undone.add(stage.handle.stage_id)
         if failures:
             stage.unsettled = True
+            self._residuals[stage.handle.stage_id] = tuple(failures)
             raise CommitUnsettledError(
                 f"stage {stage.handle.stage_id}: {why}, and the undo could not put everything "
-                f"back: {'; '.join(failures)}. The undo journal stays for recovery"
+                f"back: {'; '.join(failures)}. The undo journal stays for recovery",
+                residual=tuple(failures),
+                restored=restored,
             )
         return restored
 
@@ -1648,26 +1660,47 @@ class RestSubstrate:
         before: Mapping[str, Any] | None,
     ) -> str | None:
         """Put one resource back as ``before``, or void it when it was created; a problem, or
-        ``None`` when it is back."""
+        ``None`` when it is back. A transient failure (``429``, ``503``, the API out of
+        reach) is tried again, reading the version afresh each time (1.12.0,
+        :func:`interlock.predicted.wait_before_retry`)."""
+        attempt = 0
+        while True:
+            try:
+                return self._restore_once(stage_id, kind, resource_id, before)
+            except (_RestError, SubstrateUnavailableError) as exc:
+                status = exc.status if isinstance(exc, _RestError) else None
+                asked = exc.retry_after if isinstance(exc, _RestError) else None
+                wait = wait_before_retry(status, asked, attempt)
+                if wait is None:
+                    tries = f" (tried {attempt + 1} times)" if attempt else ""
+                    shown = f"HTTP {exc.status}: {exc}" if isinstance(exc, _RestError) else exc
+                    return f"{kind.table}/{resource_id}: {shown}{tries}"
+                self._sleep(wait)
+                attempt += 1
+
+    def _restore_once(
+        self,
+        stage_id: uuid.UUID,
+        kind: RestResource,
+        resource_id: str,
+        before: Mapping[str, Any] | None,
+    ) -> str | None:
         named = f"{kind.table}/{resource_id}"
         path = f"{kind.path}/{quote(resource_id, safe='')}"
-        try:
-            read = self._api.read(kind, resource_id)
-            if read is None:
-                return None if before is None else f"{named} is gone"
-            now, version = read
-            headers = self._headers(stage_id, kind, version, create=False)
-            if before is None:
-                if kind.void is None:
-                    self._api.call("DELETE", path, headers=headers)
-                    return None
-                target = _merge(now, dict(kind.void))
-            else:
-                target = dict(before)
-            method, body, content_type = self._body(kind, now, target, version)
-            landed = self._api.call(method, path, body, headers=headers, content_type=content_type)
-        except (_RestError, SubstrateUnavailableError) as exc:
-            return f"{named}: {exc}"
+        read = self._api.read(kind, resource_id)
+        if read is None:
+            return None if before is None else f"{named} is gone"
+        now, version = read
+        headers = self._headers(stage_id, kind, version, create=False)
+        if before is None:
+            if kind.void is None:
+                self._api.call("DELETE", path, headers=headers)
+                return None
+            target = _merge(now, dict(kind.void))
+        else:
+            target = dict(before)
+        method, body, content_type = self._body(kind, now, target, version)
+        landed = self._api.call(method, path, body, headers=headers, content_type=content_type)
         if (
             before is not None
             and isinstance(landed.body, dict)
@@ -1763,12 +1796,14 @@ class RestSubstrate:
         if restored:
             self._undone.add(stage_id)
         if problems:
+            self._residuals[stage_id] = tuple(problems)
             logger.warning(
                 "stage %s: what it wrote could not be put back yet: %s",
                 stage_id,
                 "; ".join(problems),
             )
             return None
+        self._residuals.pop(stage_id, None)
         if foreign:
             logger.warning(
                 "stage %s: %s differ from what the stage read and are not its own to put "
@@ -1913,6 +1948,11 @@ class RestSubstrate:
     def settlement(self, stage_id: uuid.UUID) -> Settlement | None:
         """What recovery found and put back when it settled the stage, if it did (1.5.2)."""
         return self._settlements.pop(stage_id, None)
+
+    def residual(self, stage_id: uuid.UUID) -> tuple[str, ...]:
+        """What the stage's last put-back could not restore, and why, in words (1.12.0); empty
+        when it put everything back, or was never tried."""
+        return self._residuals.get(stage_id, ())
 
     # -- savepoints ----------------------------------------------------------------
 

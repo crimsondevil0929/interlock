@@ -457,6 +457,24 @@ class LedgerAnchor:
             logger.warning("recovered a pending settlement claim: %s", entry.memo)
         return booked
 
+    def trip(self, scope_id: str, reason: str) -> bool:
+        """Halt ``scope_id`` in AgentGov, with ``reason`` as the trip's memo (1.12.0): a
+        signed, hash-chained entry, after which every commit on the scope is refused until a
+        person resets it. The engine trips it when a put-back failed and left changes behind.
+
+        :returns: Whether it tripped: ``False`` with no governed manager (an audit view
+            writes nothing), or when the scope is halted already.
+        :raises AnchorError: If AgentGov cannot be written.
+        """
+        governed = self._governed
+        if governed is None:
+            return False
+        with _barrier("a breaker trip"):
+            if governed.is_halted(scope_id, fresh=True):
+                return False
+            governed.trip(scope_id, reason)
+        return True
+
     def halted_after_commit(self, scope_id: str) -> str:
         """Describe a halt that raced a commit through an audit view, if any.
 

@@ -87,10 +87,11 @@ import logging
 import re
 import sqlite3
 import ssl
+import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -114,7 +115,7 @@ from interlock.exceptions import (
     UndoError,
 )
 from interlock.planbound import UndoJournal
-from interlock.predicted import PREDICTED, Settlement
+from interlock.predicted import PREDICTED, Settlement, retry_after, wait_before_retry
 from interlock.substrate import SqliteSubstrate, TableSpec
 from interlock.text import tally
 from interlock.types import (
@@ -623,9 +624,13 @@ def _resolved(document: Any, answers: Mapping[str, str]) -> Any:
 
 
 class _FhirError(Exception):
-    def __init__(self, status: int, outcome: Mapping[str, Any]) -> None:
+    def __init__(
+        self, status: int, outcome: Mapping[str, Any], retry_after: float | None = None
+    ) -> None:
         self.status = status
         self.outcome = dict(outcome)
+        self.retry_after = retry_after
+        """What the server's ``Retry-After`` asked, in seconds (1.12.0)."""
         super().__init__(self.message)
 
     @property
@@ -695,7 +700,8 @@ class _Api:
                 answer = json.loads(exc.read() or b"{}")
             except ValueError:
                 answer = {}
-            raise _FhirError(exc.code, answer if isinstance(answer, dict) else {}) from None
+            asked = retry_after(exc.headers.get("Retry-After") if exc.headers else None)
+            raise _FhirError(exc.code, answer if isinstance(answer, dict) else {}, asked) from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise SubstrateUnavailableError(
                 f"cannot reach the FHIR server {self._server}: {exc}"
@@ -811,7 +817,9 @@ class FhirSubstrate:
         "_journal",
         "_max_rows",
         "_patients",
+        "_residuals",
         "_settlements",
+        "_sleep",
         "_stage",
         "_stage_seconds",
         "_types",
@@ -862,6 +870,9 @@ class FhirSubstrate:
         self._compensated: dict[uuid.UUID, str] = {}
         self._settlements: dict[uuid.UUID, Settlement] = {}
         self._undone: set[uuid.UUID] = set()
+        self._residuals: dict[uuid.UUID, tuple[str, ...]] = {}
+        self._sleep: Callable[[float], None] = time.sleep
+        """How a put-back waits before it is tried again (1.12.0): tests pass their own."""
 
     # -- what it is -----------------------------------------------------------
 
@@ -1722,9 +1733,12 @@ class FhirSubstrate:
             self._undone.add(stage.handle.stage_id)
         if failures:
             stage.unsettled = True
+            self._residuals[stage.handle.stage_id] = tuple(failures)
             raise CommitUnsettledError(
                 f"stage {stage.handle.stage_id}: {why}, and the undo could not put everything "
-                f"back: {'; '.join(failures)}. The undo journal stays for recovery"
+                f"back: {'; '.join(failures)}. The undo journal stays for recovery",
+                residual=tuple(failures),
+                restored=restored,
             )
         return restored
 
@@ -1737,7 +1751,36 @@ class FhirSubstrate:
         now: Mapping[str, Any],
     ) -> str | None:
         """Put one resource back as ``before``, or mark it void when it was
-        created; a problem, or ``None`` when it is back."""
+        created; a problem, or ``None`` when it is back. A transient failure
+        (``429``, ``503``, the server out of reach) is tried again, on the
+        version read afresh (1.12.0, :func:`interlock.predicted.wait_before_retry`)."""
+        attempt = 0
+        while True:
+            try:
+                return self._restore_once(stage_id, kind, resource_id, before, now)
+            except (_FhirError, SubstrateUnavailableError) as exc:
+                status = exc.status if isinstance(exc, _FhirError) else None
+                asked = exc.retry_after if isinstance(exc, _FhirError) else None
+                wait = wait_before_retry(status, asked, attempt)
+                if wait is None:
+                    tries = f" (tried {attempt + 1} times)" if attempt else ""
+                    shown = f"HTTP {exc.status}: {exc}" if isinstance(exc, _FhirError) else exc
+                    return f"{kind.resource_type}/{resource_id}: {shown}{tries}"
+                self._sleep(wait)
+                attempt += 1
+                fresh = self._api.read(kind.resource_type, resource_id)
+                if fresh is None:
+                    return None if before is None else f"{kind.resource_type}/{resource_id} is gone"
+                now = fresh
+
+    def _restore_once(
+        self,
+        stage_id: uuid.UUID,
+        kind: FhirType,
+        resource_id: str,
+        before: Mapping[str, Any] | None,
+        now: Mapping[str, Any],
+    ) -> str | None:
         named = f"{kind.resource_type}/{resource_id}"
         if before is None:
             if now.get("status") == kind.void_status:
@@ -1752,15 +1795,12 @@ class FhirSubstrate:
         body["meta"] = meta
         if not meta:
             body.pop("meta")
-        try:
-            landed = self._api.call(
-                "PUT",
-                f"/{kind.resource_type}/{quote(resource_id, safe='')}",
-                body,
-                headers=self._headers(stage_id, _version(now)),
-            )
-        except (_FhirError, SubstrateUnavailableError) as exc:
-            return f"{named}: {exc}"
+        landed = self._api.call(
+            "PUT",
+            f"/{kind.resource_type}/{quote(resource_id, safe='')}",
+            body,
+            headers=self._headers(stage_id, _version(now)),
+        )
         if before is not None and kind.image(landed) != kind.image(before):
             return f"{named} came back other than it was"
         return None
@@ -1856,12 +1896,14 @@ class FhirSubstrate:
         if restored:
             self._undone.add(stage_id)
         if problems:
+            self._residuals[stage_id] = tuple(problems)
             logger.warning(
                 "stage %s: what it wrote could not be put back yet: %s",
                 stage_id,
                 "; ".join(problems),
             )
             return None
+        self._residuals.pop(stage_id, None)
         if foreign:
             logger.warning(
                 "stage %s: %s differ from what the stage read and are not its own to put "
@@ -2022,6 +2064,11 @@ class FhirSubstrate:
         """What recovery found and put back when it settled the stage, if it
         did (1.5.2)."""
         return self._settlements.pop(stage_id, None)
+
+    def residual(self, stage_id: uuid.UUID) -> tuple[str, ...]:
+        """What the stage's last put-back could not restore, and why, in words
+        (1.12.0); empty when it put everything back, or was never tried."""
+        return self._residuals.get(stage_id, ())
 
     # -- savepoints ----------------------------------------------------------------
 

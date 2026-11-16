@@ -9,6 +9,26 @@ Releases before 0.1.2 are described by their tags and commit history.
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-11-15
+
+Class V put-backs retry transient failures on a fresh version, name what could not be put
+back, and halt the scope in AgentGov rather than reporting a half-reverted state as a clean
+rollback (ESCROW_SPEC §4.4, E4-14 amended).
+
+### Added
+
+- **Class V put-back retries and residual halts** (`interlock.predicted`, `interlock.rest`,
+  `interlock.fhir`, `interlock.anchor`, `interlock.engine`):
+  - Transient put-back errors (`429`, `502`, `503`, `504` and unreachable servers) retry up to
+    `COMPENSATION_RETRIES = 3` times, reading the current version afresh each time and waiting
+    by the server's `Retry-After` header (capped at `MAX_WAIT = 2.0` seconds). Concurrent
+    conflicts (`409`, `412`) never retry so another caller's edit is not overwritten.
+  - When retries are exhausted or a put-back hits `409`/`412`, `CommitUnsettledError` carries
+    `residual` (each resource left unrestored and why) and `restored` (count restored), the
+    intent stays open on the chain (`RestSubstrate.residual` / `FhirSubstrate.residual`), and
+    `EscrowEngine._halt_on_residual` calls `LedgerAnchor.trip` to halt the plan's scope in
+    AgentGov with the residual resources in its signed memo.
+
 ## [1.11.0] - 2026-11-15
 
 What a deployment's own systems hold can be marked as such, and leaves only where the

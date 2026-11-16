@@ -954,3 +954,220 @@ def test_a_process_killed_after_a_write_that_set_off_a_rule_has_it_all_put_back(
     assert incident["status"] == "cancelled", "voided, as the type declares, never deleted"
     assert [t["id"] for t in server.find("tickets", account_id=GLOBEX)] == ["tkt-4"]
     assert not journal(tmp_path) and run.chain.unresolved_intents() == ()
+
+
+# -- a put-back that fails is retried, then named, then halts the scope (1.12.0) --------------
+
+
+def test_retry_after_and_wait_before_retry_bounds() -> None:
+    """Retry-After parses seconds and HTTP dates, and waits stop after retries or conflicts."""
+    import threading
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from interlock.predicted import COMPENSATION_RETRIES, MAX_WAIT, retry_after, wait_before_retry
+    from interlock.rest import _Api, _RestError
+
+    assert retry_after(None) is None
+    assert retry_after("") is None
+    assert retry_after("not-a-date") is None
+    assert retry_after("2") == 2.0
+    future = format_datetime(datetime.now(UTC) + timedelta(seconds=5), usegmt=True)
+    parsed = retry_after(future)
+    assert parsed is not None and 0.0 < parsed <= 6.0
+
+    assert wait_before_retry(503, None, 0) == 0.25
+    assert wait_before_retry(503, None, 1) == 0.5
+    assert wait_before_retry(503, None, 2) == 1.0
+    assert wait_before_retry(503, None, COMPENSATION_RETRIES) is None
+    assert wait_before_retry(429, 9.0, 0) == MAX_WAIT
+    assert wait_before_retry(None, None, 0) == 0.25
+    assert wait_before_retry(412, None, 0) is None
+    assert wait_before_retry(409, None, 0) is None
+
+    class _OnceHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            self.send_response(429)
+            self.send_header("Retry-After", "2")
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": {"message": "slow down"}}')
+
+    http = HTTPServer(("127.0.0.1", 0), _OnceHandler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = http.server_address[:2]
+        shown = host.decode() if isinstance(host, bytes) else str(host)
+        api = _Api(f"http://{shown}:{port}/api", token=None, ca_file=None, timeout=5.0)
+        with pytest.raises(_RestError) as caught:
+            api.call("GET", "/tickets/tkt-1")
+        assert caught.value.status == 429 and caught.value.retry_after == 2.0
+    finally:
+        http.shutdown()
+        http.server_close()
+
+
+class _PutBackFault:
+    """Wrap ``_Api`` to fail put-back writes, or inject a concurrent edit after ``read``."""
+
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        on_call: Any = None,
+        on_read: Any = None,
+    ) -> None:
+        self._inner = inner
+        self._on_call = on_call
+        self._on_read = on_read
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def read(self, kind: Any, resource_id: str) -> Any:
+        found = self._inner.read(kind, resource_id)
+        if self._on_read is not None:
+            self._on_read(kind, resource_id, found)
+        return found
+
+    def find(self, kind: Any, parameter: str, value: str, *, limit: int) -> Any:
+        return self._inner.find(kind, parameter, value, limit=limit)
+
+    def call(self, method: str, path: str, body: Any = None, **kwargs: Any) -> Any:
+        if self._on_call is not None:
+            self._on_call(method, path)
+        return self._inner.call(method, path, body, **kwargs)
+
+
+def test_a_put_back_retries_transient_503_and_429_with_retry_after(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    from agentgov import BudgetManager, money
+
+    from interlock.anchor import LedgerAnchor
+    from interlock.rest import _RestError
+
+    gov = BudgetManager()
+    gov.open_root("support-agent", money("10.00"))
+    anchor = LedgerAnchor(governed=gov)
+
+    sub = substrate(server, tmp_path)
+    waits: list[float] = []
+    sub._sleep = waits.append
+
+    patch_calls = 0
+
+    def fail_twice(method: str, path: str) -> None:
+        nonlocal patch_calls
+        if method == "PATCH" and path == "/tickets/tkt-2":
+            patch_calls += 1
+            if patch_calls == 2:
+                raise _RestError(429, {"error": {"message": "rate limited"}}, retry_after=1.5)
+            if patch_calls == 3:
+                raise _RestError(503, {"error": {"message": "busy"}})
+
+    sub._api = _PutBackFault(sub._api, on_call=fail_twice)  # type: ignore[assignment]
+    with pytest.raises(CompensatedError, match="not what was predicted") as caught:
+        engine(sub, tmp_path, anchor=anchor).execute(plan(patch("tkt-2", {"priority": "urgent"})))
+    assert waits == [1.5, 0.5]
+    assert ticket(server, 2)["priority"] == "normal"
+    assert ticket(server, 2)["assignee"] == "tier1"
+    assert caught.value.result is not None
+    assert caught.value.result.diff is not None  # type: ignore[attr-defined]
+    assert sub.residual(caught.value.result.diff.stage_id) == ()  # type: ignore[attr-defined]
+    assert gov.is_halted("support-agent") is False
+
+
+def test_a_persistent_503_on_put_back_leaves_intent_open_and_trips_the_breaker(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    from agentgov import BudgetManager, money
+
+    from interlock.anchor import LedgerAnchor
+    from interlock.rest import _RestError
+
+    gov = BudgetManager()
+    gov.open_root("support-agent", money("10.00"))
+    anchor = LedgerAnchor(governed=gov)
+
+    sub = substrate(server, tmp_path)
+    waits: list[float] = []
+    sub._sleep = waits.append
+
+    def down(method: str, path: str) -> None:
+        if method == "PATCH" and path.startswith("/incidents/"):
+            raise _RestError(503, {"error": {"message": "service down"}}, retry_after=0.5)
+
+    sub._api = _PutBackFault(sub._api, on_call=down)  # type: ignore[assignment]
+    run = engine(sub, tmp_path, anchor=anchor)
+    with pytest.raises(CommitUnsettledError, match="could not put everything back") as caught:
+        run.execute(plan(patch("tkt-2", {"priority": "urgent"})))
+
+    assert caught.value.restored == 1
+    assert len(caught.value.residual) == 1
+    assert "incidents/" in caught.value.residual[0]
+    assert "HTTP 503:" in caught.value.residual[0]
+    assert "(tried 4 times)" in caught.value.residual[0]
+    assert waits == [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    assert ticket(server, 2)["priority"] == "normal"
+    assert kinds(run)[-1] is RecordType.COMMIT_INTENT
+    (intent,) = run.chain.unresolved_intents()
+    assert intent.stage_id is not None
+    assert sub.residual(intent.stage_id) == caught.value.residual
+    assert gov.is_halted("support-agent") is True
+    gov.verify_integrity()
+    memo = gov.ledger.entries()[-1].memo
+    assert "1 resource restored" in memo and "incidents/" in memo
+    assert anchor.trip("support-agent", "already halted") is False
+    assert LedgerAnchor().trip("support-agent", "unanchored") is False
+
+
+def test_a_412_concurrent_edit_during_put_back_does_not_retry_and_trips_the_breaker(
+    server: LoopbackRestServer, tmp_path: Path
+) -> None:
+    from agentgov import BudgetManager, money
+
+    from interlock.anchor import LedgerAnchor
+
+    gov = BudgetManager()
+    gov.open_root("support-agent", money("10.00"))
+    anchor = LedgerAnchor(governed=gov)
+
+    sub = substrate(server, tmp_path)
+    waits: list[float] = []
+    sub._sleep = waits.append
+    read_during_put_back = 0
+
+    def race_second_read(kind: Any, resource_id: str, found: Any) -> None:
+        nonlocal read_during_put_back
+        if (
+            kind.table == "tickets"
+            and resource_id == "tkt-2"
+            and found is not None
+            and found[0].get("assignee") == "oncall"
+        ):
+            read_during_put_back += 1
+            if read_during_put_back == 2:
+                server.write("tickets", {**ticket(server, 2), "priority": "low"})
+
+    sub._api = _PutBackFault(sub._api, on_read=race_second_read)  # type: ignore[assignment]
+    run = engine(sub, tmp_path, anchor=anchor)
+    with pytest.raises(CommitUnsettledError, match="could not put everything back") as caught:
+        run.execute(plan(patch("tkt-2", {"priority": "urgent"})))
+
+    assert waits == []
+    assert caught.value.restored == 1
+    assert len(caught.value.residual) == 1
+    assert "tickets/tkt-2: HTTP 412:" in caught.value.residual[0]
+    assert "tried" not in caught.value.residual[0]
+    assert ticket(server, 2)["priority"] == "low"
+    (intent,) = run.chain.unresolved_intents()
+    assert intent.stage_id is not None
+    assert sub.resolve_intent(intent.stage_id) is None
+    assert gov.is_halted("support-agent") is True
+    assert "tickets/tkt-2: HTTP 412" in gov.ledger.entries()[-1].memo

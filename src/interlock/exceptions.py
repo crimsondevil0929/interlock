@@ -206,7 +206,18 @@ class CommitUnsettledError(StageError):
     marker once the server has decided. A commit whose reply alone was lost
     is not this error: its marker already answers, and the plan is reported
     as committed.
+
+    :ivar residual: For a predicted substrate whose put-back failed part way
+        (1.12.0): each resource it could not put back, and why, in words. The
+        engine trips the scope's breaker with them (a signed AgentGov entry), so
+        nothing more runs there until a person has put them right.
+    :ivar restored: How many resources the put-back did restore.
     """
+
+    def __init__(self, message: str, *, residual: tuple[str, ...] = (), restored: int = 0) -> None:
+        super().__init__(message)
+        self.residual = tuple(residual)
+        self.restored = restored
 
 
 class CompensatedError(StageError):
