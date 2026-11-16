@@ -35,6 +35,18 @@ substrate (:mod:`interlock.fhir`) builds its guarantee from exactly that:
    next recovery if not. It reads what the commit would have read (every
    written resource and the whole scope) and applies the same rule as step 5.
 
+7. **A put-back that fails is retried, then named, then halts the scope**
+   (1.12.0). A put-back answered ``429``, ``502``, ``503`` or ``504``, or one
+   that cannot reach the system, is tried again up to
+   :data:`COMPENSATION_RETRIES` times, waiting as ``Retry-After`` says (at most
+   :data:`MAX_WAIT` seconds). One that still fails, or that a person's edit
+   made conditional on a version that is gone (``409``, ``412``), is never
+   called a rollback: the commit raises
+   :class:`~interlock.exceptions.CommitUnsettledError` with each resource left
+   unrestored and why (``residual``), the intent stays open, and the engine
+   trips the scope's AgentGov breaker with that residual as the entry's memo:
+   a signed record of what is left, and a halt until a person resets it.
+
 Every receipt of such a substrate's plans says ``coverage.measurement =
 "predicted"``: what was judged is a prediction, made true by a conditional
 write and checked by a read-back. It is weaker than plan-bound in one way that
@@ -46,9 +58,10 @@ before it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Final
 
-__all__ = ["PREDICTED", "Settlement"]
+__all__ = ["PREDICTED", "TRANSIENT", "Settlement", "retry_after", "wait_before_retry"]
 
 PREDICTED: Final = "predicted"
 """ARC1 1.3's ``coverage.measurement`` for a predicted and verified substrate."""
@@ -75,3 +88,45 @@ class Settlement:
     restored: int
     discrepancies: tuple[str, ...] = ()
     foreign: tuple[str, ...] = ()
+
+
+TRANSIENT: Final = frozenset({429, 502, 503, 504})
+"""HTTP statuses a put-back is tried again after (1.12.0): the system is busy or briefly
+down. A ``409`` or ``412`` is not one: the resource moved, and trying again would undo
+someone else's change."""
+
+COMPENSATION_RETRIES: Final = 3
+"""How many times a put-back is tried again after a transient failure (1.12.0)."""
+
+MAX_WAIT: Final = 2.0
+"""The longest wait before a put-back is tried again, in seconds, whatever ``Retry-After``
+asks (1.12.0)."""
+
+
+def retry_after(value: str | None) -> float | None:
+    """A ``Retry-After`` header's wait, in seconds: a number, or an HTTP date; ``None`` when
+    there is none, or it cannot be read."""
+    if not value:
+        return None
+    text = value.strip()
+    if text.isdigit():
+        return float(text)
+    try:
+        from datetime import UTC, datetime
+
+        return max(0.0, (parsedate_to_datetime(text) - datetime.now(UTC)).total_seconds())
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def wait_before_retry(status: int | None, asked: float | None, attempt: int) -> float | None:
+    """How long to wait before trying a put-back again after failure ``attempt`` (from 0),
+    or ``None`` to stop: a status outside :data:`TRANSIENT` (``None``: the system could not
+    be reached, which is transient too), or the retries spent. The wait is what the server
+    asked, else a quarter second doubled each time, at most :data:`MAX_WAIT`."""
+    if attempt >= COMPENSATION_RETRIES:
+        return None
+    if status is not None and status not in TRANSIENT:
+        return None
+    wait = asked if asked is not None else 0.25 * (2**attempt)
+    return min(max(wait, 0.0), MAX_WAIT)
